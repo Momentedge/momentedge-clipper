@@ -7,5 +7,11 @@ edition = "2024"
 # r2r: ROS2 client bindings. `subscribe_untyped` lets us attach to a topic
 # given only its type name at runtime, decoding messages to serde_json::Value.
 r2r = "0.9.5"
+# Async runtime: a blocking thread spins the node; tokio tasks consume the
+# per-topic subscription streams and forward raw bytes over an mpsc channel.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+# `futures::StreamExt` drives the subscription streams (`sub.next().await`).
 futures = "0.3"
-serde_json = "1"
+# Logging via the `log` facade; pretty_env_logger is the backend (honours RUST_LOG).
+log = "0.4"
+pretty_env_logger = "0.5"
