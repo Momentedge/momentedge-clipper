@@ -1,0 +1,9 @@
+[package]
+name = "rclrs-sub"
+version.workspace = true
+edition.workspace = true
+
+# The rclrs counterpart to r2r-sub. Not implemented yet — rclrs has no
+# raw-CDR subscription (ros2-rust/ros2_rust#326), which the recorder needs, so
+# this crate carries no dependencies until that API exists (or we add it).
+[dependencies]

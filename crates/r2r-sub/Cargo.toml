@@ -1,0 +1,17 @@
+[package]
+name = "r2r-sub"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+# r2r: ROS2 client bindings. `subscribe_raw` yields serialized CDR (`Vec<u8>`)
+# — one copy out of the RMW, no field decode.
+r2r = "0.9.5"
+# Async runtime: a blocking thread spins the node; tokio tasks consume the
+# per-topic subscription streams and forward raw bytes over an mpsc channel.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+# `futures::StreamExt` drives the subscription streams (`sub.next().await`).
+futures = "0.3"
+# Logging via the `log` facade; pretty_env_logger is the backend (honours RUST_LOG).
+log = "0.4"
+pretty_env_logger = "0.5"

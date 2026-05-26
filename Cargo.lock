@@ -588,6 +588,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "r2r-sub"
+version = "0.0.1"
+dependencies = [
+ "futures",
+ "log",
+ "pretty_env_logger",
+ "r2r",
+ "tokio",
+]
+
+[[package]]
 name = "r2r_actions"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -688,6 +699,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "rclrs-sub"
+version = "0.0.1"
+
+[[package]]
 name = "regex"
 version = "1.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -715,17 +730,6 @@ name = "regex-syntax"
 version = "0.8.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
-
-[[package]]
-name = "ros2_subscribe"
-version = "0.0.1"
-dependencies = [
- "futures",
- "log",
- "pretty_env_logger",
- "r2r",
- "tokio",
-]
 
 [[package]]
 name = "rustc-hash"

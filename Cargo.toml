@@ -1,17 +1,11 @@
-[package]
-name = "ros2_subscribe"
+[workspace]
+# A virtual workspace doesn't infer the resolver from member editions, so set it
+# explicitly; "3" is the edition-2024 resolver. Without this Cargo falls back to
+# resolver "1" and warns.
+resolver = "3"
+members = ["crates/r2r-sub", "crates/rclrs-sub"]
+
+# Shared package metadata; members inherit with `version.workspace = true` etc.
+[workspace.package]
 version = "0.0.1"
 edition = "2024"
-
-[dependencies]
-# r2r: ROS2 client bindings. `subscribe_untyped` lets us attach to a topic
-# given only its type name at runtime, decoding messages to serde_json::Value.
-r2r = "0.9.5"
-# Async runtime: a blocking thread spins the node; tokio tasks consume the
-# per-topic subscription streams and forward raw bytes over an mpsc channel.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
-# `futures::StreamExt` drives the subscription streams (`sub.next().await`).
-futures = "0.3"
-# Logging via the `log` facade; pretty_env_logger is the backend (honours RUST_LOG).
-log = "0.4"
-pretty_env_logger = "0.5"
