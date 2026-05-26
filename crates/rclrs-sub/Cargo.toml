@@ -3,7 +3,18 @@ name = "rclrs-sub"
 version.workspace = true
 edition.workspace = true
 
-# The rclrs counterpart to r2r-sub. Not implemented yet — rclrs has no
-# raw-CDR subscription (ros2-rust/ros2_rust#326), which the recorder needs, so
-# this crate carries no dependencies until that API exists (or we add it).
 [dependencies]
+# rclrs: ROS2 client bindings. The serialized pub/sub API (raw CDR via
+# `rcl_take_serialized_message`) comes from ros2-rust/ros2_rust#592. That PR's
+# `create_serialized_subscription` hands rmw the *introspection* type support,
+# which rmw_fastrtps rejects ("Type support not from this implementation"), so
+# this points at a fork branch that fixes it to use `rosidl_typesupport_c` — the
+# same handle `create_dynamic_subscription` uses. Fix branch:
+#   https://github.com/stfl/ros2_rust/tree/serialized-transport-typesupport-fix
+# Unlike r2r, rclrs ships pre-generated rcl bindings and needs no bindgen; its
+# build.rs only reads ROS_DISTRO + AMENT_PREFIX_PATH and links the rcl/rmw libs
+# (see flake.nix).
+rclrs = { git = "https://github.com/stfl/ros2_rust", branch = "serialized-transport-typesupport-fix" }
+# Logging via the `log` facade; pretty_env_logger is the backend (honours RUST_LOG).
+log = "0.4"
+pretty_env_logger = "0.5"

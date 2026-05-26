@@ -50,6 +50,12 @@
             action-msgs
             unique-identifier-msgs
             std-srvs
+            # rclrs's vendored interfaces (rclrs/src/vendor) unconditionally link
+            # their typesupport C libs, so these must be on the link path even
+            # though no bag topic uses them — see ros2-rust/ros2_rust#557. r2r
+            # ignores them.
+            example-interfaces
+            test-msgs
           ];
         };
       in {
@@ -74,10 +80,14 @@
             "builtin_interfaces;std_msgs;sensor_msgs;geometry_msgs;nav_msgs;tf2_msgs;velodyne_msgs;rosgraph_msgs;action_msgs;unique_identifier_msgs;std_srvs";
 
           # Match ../ros2_sources so discovery + SHM line up: same RMW, same domain.
+          # ROS_DISTRO is required by rclrs's build.rs (it selects the committed
+          # rcl bindings, e.g. rcl_bindings_generated_jazzy.rs, via a cfg flag and
+          # then aborts if unset); r2r does not need it but is unaffected.
           shellHook = ''
             export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
             export ROS_DOMAIN_ID=''${ROS_DOMAIN_ID:-0}
-            echo "ROS2 Jazzy rust-subscribe shell — RMW=$RMW_IMPLEMENTATION  DOMAIN=$ROS_DOMAIN_ID"
+            export ROS_DISTRO=jazzy
+            echo "ROS2 Jazzy rust-subscribe shell — RMW=$RMW_IMPLEMENTATION  DOMAIN=$ROS_DOMAIN_ID  DISTRO=$ROS_DISTRO"
           '';
         };
       });
