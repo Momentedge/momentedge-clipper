@@ -1012,7 +1012,7 @@ dependencies = [
 [[package]]
 name = "rclrs"
 version = "0.7.0"
-source = "git+https://github.com/stfl/ros2_rust?branch=serialized-transport-typesupport-fix#71ed99ce217ee14ffaf1921f3d239503f5914dc7"
+source = "git+https://github.com/stfl/ros2_rust?branch=serialized-transport-typesupport-fix#36964dc72f5367879aa69a4e4da65011e0061e9b"
 dependencies = [
  "ament_rs",
  "async-std",

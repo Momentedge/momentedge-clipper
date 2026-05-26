@@ -116,7 +116,7 @@ fn record_topic(node: rclrs::Node, topic: String, ty: String) {
     let mut options = SubscriptionOptions::new(topic.as_str());
     options.qos = QoSProfile::topics_default().best_effort();
 
-    let sub = match node.create_serialized_subscription(msg_type, options) {
+    let mut sub = match node.create_serialized_subscription(msg_type, options) {
         Ok(sub) => sub,
         Err(e) => {
             // Typesupport library missing, or QoS rejected.
