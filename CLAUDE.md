@@ -1,11 +1,27 @@
 # ros2_subscribe — contributor notes
 
 [README.md](README.md) is the canonical overview: what this testing pad is, the
-`r2r-sub` vs `rclrs-sub` comparison, prerequisites, and the build/run/replay
-quickstart. Start there. This file covers what a contributor or agent needs
-*beyond* the README — the shared recorder internals, build mechanics, and
-conventions — without repeating it. Each crate has its own CLAUDE.md:
-[`r2r-sub`](crates/r2r-sub/CLAUDE.md), [`rclrs-sub`](crates/rclrs-sub/CLAUDE.md).
+`r2r-sub` vs `rclrs-sub` comparison, the triggered-recording workflow,
+prerequisites, and the build/run/replay quickstart. Start there. This file covers
+what a contributor or agent needs *beyond* the README — the shared recorder
+internals, build mechanics, and conventions — without repeating it. Each crate
+has its own CLAUDE.md: [`r2r-sub`](crates/r2r-sub/CLAUDE.md),
+[`rclrs-sub`](crates/rclrs-sub/CLAUDE.md),
+[`edgestream-rec`](crates/edgestream-rec/CLAUDE.md),
+[`trigger-pub`](crates/trigger-pub/CLAUDE.md).
+
+## Two recorder families
+
+The crates split into two unrelated models, and the "shared recorder model" below
+applies only to the first:
+
+- **All-topic indexers** — `r2r-sub` and `rclrs-sub`. Subscribe to every live
+  topic, take raw CDR, index by header stamp. The section below is about these.
+- **Triggered clip recorder** — `edgestream-rec` (+ `trigger-pub`). Owns no
+  sensor subscriptions and no index; it cuts clips out of a continuous on-disk
+  `ros2 bag record` on ROS2 trigger events, copying MCAP messages straight
+  through. Its internals live in [`edgestream-rec`](crates/edgestream-rec/CLAUDE.md);
+  the only shared idea is decoding nothing but the timestamp.
 
 ## The shared recorder model
 
@@ -24,8 +40,10 @@ point of the bench:
    `tf2_msgs/TFMessage`, first field a sequence) fails the sanity gate
    (`sec >= 0`, `nanosec < 1e9`) and is counted but not indexed.
 
-`rosbag2_interfaces/ReadSplitEvent` (`/events/read_split`) has no installed type
-support and is skipped by both binaries — expected, not a fault.
+`rosbag2_interfaces` is on the env and the `IDL_PACKAGE_FILTER`, so the split
+event types have type support: the indexers subscribe to `/events/read_split`
+(replay) and `/events/write_split` (record) rather than skipping them. Both
+events are header-less, so like `/tf` they are counted but not indexed.
 
 ## Build and environment mechanics
 
@@ -42,13 +60,25 @@ Setup is in the README; the parts that matter when changing the build:
   `test-msgs` are present only as an rclrs link requirement
   ([#557](https://github.com/ros2-rust/ros2_rust/issues/557)). Each crate's
   CLAUDE.md has the details.
+- `edgestream_msgs/` is a **local ament_cmake interface package** built by the
+  flake via `ros.buildRosPackage` (mirroring upstream `example-interfaces`) and
+  added to both the env and `IDL_PACKAGE_FILTER`, so its `Trigger`/`Recorded`
+  types get r2r bindings like any other message package. Flakes only see
+  git-tracked files: a newly added or renamed file under `edgestream_msgs/` must
+  be `git add`ed before `nix develop`/`cargo build`, or the eval fails with "Path
+  … is not tracked by Git".
+- `ros2bag` + `rosbag2-transport` + `rosbag2-storage-mcap` provide the standalone
+  `ros2 bag record` (`scripts/record.sh`) the triggered recorder reads from;
+  `rosbag2-interfaces` provides `WriteSplitEvent` on `/events/write_split`.
 
 ## Workspace layout
 
 A virtual workspace (no root package), so `resolver = "3"` (the edition-2024
 resolver) is set explicitly — a virtual workspace does not infer the resolver
 from member editions and otherwise falls back to `"1"` with a warning. Members
-are the two crates; shared metadata is in `[workspace.package]`.
+are the four crates (`r2r-sub`, `rclrs-sub`, `edgestream-rec`, `trigger-pub`);
+shared metadata is in `[workspace.package]`. `edgestream_msgs/` is a ROS2
+interface package, not a Cargo member.
 
 ## Sibling repositories
 

@@ -23,6 +23,22 @@
         };
         ros = pkgs.rosPackages.jazzy;
 
+        # Local interface package defining the edgestream Trigger/Recorded
+        # event messages. Built from ./edgestream_msgs with the standard rosidl
+        # generators, exactly like any other ament_cmake message package, so its
+        # typesupport lands on AMENT_PREFIX_PATH for both r2r codegen and the
+        # `ros2` CLI. Mirrors the upstream example-interfaces expression.
+        edgestream-msgs = ros.buildRosPackage {
+          pname = "edgestream_msgs";
+          version = "0.0.1";
+          src = ./edgestream_msgs;
+          buildType = "ament_cmake";
+          buildInputs = with ros; [ ament-cmake rosidl-default-generators builtin-interfaces ];
+          propagatedBuildInputs = with ros; [ rosidl-default-runtime builtin-interfaces ];
+          nativeBuildInputs = with ros; [ ament-cmake rosidl-default-generators ];
+          meta.description = "edgestream Trigger/Recorded event interfaces";
+        };
+
         # r2r generates Rust bindings (at `cargo build`) for every message
         # package on AMENT_PREFIX_PATH. List the packages whose types appear in
         # bags/example-011-ugv-ds.mcap plus the core rcl/rmw stack r2r links
@@ -37,6 +53,14 @@
             # CLI, handy for `ros2 topic list` from the same shell
             ros2cli
             ros2cli-common-extensions
+            # `ros2 bag record` with the mcap storage backend — the continuous
+            # circular recorder the triggered extractor reads from (see README).
+            ros2bag
+            rosbag2-transport
+            rosbag2-storage-mcap
+            # WriteSplitEvent on /events/write_split, published by rosbag2 each
+            # time it finalises a split; the extractor waits on it.
+            rosbag2-interfaces
             # message packages carried by the UGV bag (see ../ros2_sources/REPLAY.md)
             builtin-interfaces
             std-msgs
@@ -56,6 +80,8 @@
             # ignores them.
             example-interfaces
             test-msgs
+            # local edgestream Trigger/Recorded interfaces
+            edgestream-msgs
           ];
         };
       in {
@@ -77,7 +103,7 @@
           # separated, no auto dependency resolution, so every used package is
           # listed explicitly. Keeps the first build fast.
           IDL_PACKAGE_FILTER =
-            "builtin_interfaces;std_msgs;sensor_msgs;geometry_msgs;nav_msgs;tf2_msgs;velodyne_msgs;rosgraph_msgs;action_msgs;unique_identifier_msgs;std_srvs";
+            "builtin_interfaces;std_msgs;sensor_msgs;geometry_msgs;nav_msgs;tf2_msgs;velodyne_msgs;rosgraph_msgs;action_msgs;unique_identifier_msgs;std_srvs;rosbag2_interfaces;edgestream_msgs";
 
           # Match ../ros2_sources so discovery + SHM line up: same RMW, same domain.
           # ROS_DISTRO is required by rclrs's build.rs (it selects the committed

@@ -1,2 +1,7 @@
 /target
 .omc/
+
+# Continuous rosbag2 recording (5 s circular splits) and the clips the
+# triggered recorder cuts out of it — both are local runtime data.
+/record/
+/triggered/

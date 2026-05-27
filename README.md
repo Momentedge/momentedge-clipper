@@ -1,13 +1,20 @@
 # ros2_subscribe
 
-A testing pad for **ROS2-based recorders** written in Rust. Each binary attaches
-to *every* live ROS2 topic, takes each message as **raw serialized CDR** (one
-copy out of the middleware, with no field decoding), and indexes it by the
-message's own header timestamp. It is a bench for comparing ROS2 Rust client
-libraries and runtime models for a minimal-copy recorder front-end — not a
-finished tool.
+A testing pad for **ROS2-based recorders** written in Rust. It holds two
+families of tools:
 
-## The recorders
+- **All-topic indexers** (`r2r-sub`, `rclrs-sub`) — attach to *every* live ROS2
+  topic, take each message as **raw serialized CDR** (one copy out of the
+  middleware, with no field decoding), and index it by the message's own header
+  timestamp. A bench for comparing ROS2 Rust client libraries and runtime models
+  for a minimal-copy recorder front-end.
+- **Triggered clip recorder** (`edgestream-rec` + `trigger-pub`) — cuts clips out
+  of a continuous `ros2 bag record` on demand, copying MCAP messages straight
+  through without decoding their bodies. See [Triggered recording](#triggered-recording).
+
+It is a testing pad, not a finished tool.
+
+## The all-topic indexers
 
 Two binaries implement the same behaviour two different ways:
 
@@ -65,9 +72,10 @@ sets these for you.
 ### What you should see
 
 The UGV sample bag carries ~28 channels (camera, LIDAR packets, IMU, GPS,
-odometry, tf) over ~16 seconds. A healthy run subscribes to ~27 of them — one
-topic (`rosbag2_interfaces/ReadSplitEvent`) has no installed type support and is
-skipped — and logs a periodic per-topic index summary. For a high-rate topic
+odometry, tf) over ~16 seconds. A healthy run subscribes to all of them and logs
+a periodic per-topic index summary. `/tf` and the bag player's
+`/events/read_split` are header-less, so they are counted but not indexed. For a
+high-rate topic
 like `/sensor/camera/vi_sensor/imu`, the indexed time span converges on ~16 s,
 which is the bag's length and confirms the timestamps are being parsed
 correctly. Replaying with `--loop` resends identical stamps, reported as
@@ -76,12 +84,68 @@ correctly. Replaying with `--loop` resends identical stamps, reported as
 Set `RUST_LOG=debug` for a line per received message; the default `info` level
 logs startup, subscriptions, and the periodic index stats.
 
+## Triggered recording
+
+Instead of indexing every topic in memory, this workflow keeps a continuous
+on-disk recording and extracts short clips from it on demand.
+
+```
+ros2 bag record ──5 s mcap splits──▶ ./record/*.mcap
+       │ /events/write_split on each split boundary
+       ▼
+edgestream-rec ◀── /events/edgestream/trigger ── trigger-pub
+       ├──▶ ./triggered/<trigger_ns>_<name>.mcap
+       └──▶ /events/edgestream/recorded
+```
+
+- **`ros2 bag record`** (via `scripts/record.sh`) records all topics into 5 s
+  MCAP splits under `./record`, publishing a `rosbag2_interfaces/WriteSplitEvent`
+  on `/events/write_split` at each split boundary. It runs standalone —
+  `edgestream-rec` never starts it. `./record` is gitignored and not pruned, so
+  it grows until you stop recording or clear it.
+- **`edgestream-rec`** listens on `/events/edgestream/trigger`
+  (`edgestream_msgs/Trigger`: `name`, `description`, `trigger_time`, and the
+  `preroll`/`postroll` windows in nanoseconds). For each trigger it waits until
+  the clock passes `trigger_time + postroll` *and* the next split is finalised,
+  then bulk-copies every message in `[trigger_time - preroll, trigger_time +
+  postroll]` into `./triggered/<trigger_ns>_<name>.mcap` and publishes
+  `edgestream_msgs/Recorded` on `/events/edgestream/recorded`. The copy re-emits
+  raw MCAP message bytes — channels and schemas are carried over, message bodies
+  are never decoded.
+- **`trigger-pub`** publishes a trigger every 5 s (configurable), stamping
+  `trigger_time` with the current time — a development stand-in for a real
+  trigger source.
+
+Run it with the bag replay from `../ros2_sources` as the data source, one
+process per shell (all inside `nix develop`, sharing RMW + `ROS_DOMAIN_ID`):
+
+```bash
+# 1. data source — replay a bag (see ../ros2_sources/REPLAY.md)
+cd ../ros2_sources && nix develop --command ros2 bag play --loop bags/example-011-ugv-ds.mcap
+
+# 2. continuous recorder → ./record (5 s splits)
+nix develop --command ./scripts/record.sh
+
+# 3. triggered extractor → ./triggered
+nix develop --command cargo run -p edgestream-rec
+
+# 4. fire a trigger every 5 s (preroll/postroll 2 s here)
+nix develop --command cargo run -p trigger-pub -- --preroll 2000000000 --postroll 2000000000
+```
+
+Clips land in `./triggered` (gitignored); inspect one with `ros2 bag info
+triggered/<file>.mcap`.
+
 ## Layout
 
 ```
-crates/r2r-sub/      # r2r-based recorder
-crates/rclrs-sub/    # rclrs-based recorder
-flake.nix            # ROS2 Jazzy dev shell (system Rust)
+crates/r2r-sub/        # r2r all-topic indexer
+crates/rclrs-sub/      # rclrs all-topic indexer
+crates/edgestream-rec/ # r2r+tokio triggered clip recorder
+crates/trigger-pub/    # r2r periodic trigger publisher
+edgestream_msgs/       # local ROS2 interface package (Trigger, Recorded)
+scripts/record.sh      # standalone continuous `ros2 bag record`
+flake.nix              # ROS2 Jazzy dev shell (system Rust)
 ```
 
 `rclrs-sub` depends on a fork of `ros2_rust` that adds a raw serialized
@@ -94,4 +158,6 @@ checkout `../ros2_rust` is its working tree, needed only when changing it.
 Implementation rationale, concurrency design, build mechanics, and the fork
 details live in the `CLAUDE.md` files: [`CLAUDE.md`](CLAUDE.md) for the shared
 model and workspace, and one per crate
-([`r2r-sub`](crates/r2r-sub/CLAUDE.md), [`rclrs-sub`](crates/rclrs-sub/CLAUDE.md)).
+([`r2r-sub`](crates/r2r-sub/CLAUDE.md), [`rclrs-sub`](crates/rclrs-sub/CLAUDE.md),
+[`edgestream-rec`](crates/edgestream-rec/CLAUDE.md),
+[`trigger-pub`](crates/trigger-pub/CLAUDE.md)).
