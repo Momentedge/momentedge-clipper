@@ -32,24 +32,33 @@ windows are cut concurrently:
    finalised on disk before it is read. `write_split` events fan out over a
    `tokio::sync::broadcast`; a handler subscribes *before* it starts waiting, so
    events during the wait are captured, then consumes until it sees one
-   timestamped at/after the window end.
+   timestamped at/after the window end. That event's `closed_file` becomes the
+   newest split the extraction is allowed to read.
 3. **Extract** the window into `./triggered/<trigger_ns>_<name>.mcap` via
    `mcap_copy::extract_clip` (blocking IO, run on `spawn_blocking`).
 4. **Announce** by publishing `edgestream_msgs/Recorded`.
 
 ## The copy is direct (`mcap_copy.rs`)
 
-`extract_clip` lists `./record/*.mcap`, skips any split whose summary time range
-cannot overlap the window, and for the rest streams messages with
+`extract_clip` lists `./record/*.mcap`, orders them by file modification time
+(`sort_by_modified_time` — rosbag2 writes splits sequentially, so write order is
+captured without parsing the `record_<n>.mcap` names), and drops everything newer
+than the split the triggering `write_split` reported closed
+(`truncate_after_closed_file`). The still-open split rosbag2 has not finalised is
+therefore never read. Of the remaining splits it skips any whose summary time
+range cannot overlap the window, and for the rest streams messages with
 `mcap::MessageStream`, keeping those whose `log_time` is in the window.
-`mcap::Writer::write` re-emits each message's **raw serialized bytes** and
-deduplicates channels/schemas by content, so a topic spread across several splits
-collapses to one output channel. The CDR message bodies are never decoded — only
-each record's `log_time` is read. This is the same "take raw, don't decode the
-body" spirit as the other recorders, applied to file-to-file copy. A split that
-has no summary yet (the one rosbag2 still holds open) is scanned linearly, and a
-read error at the truncated tail ends that split's scan with the already-copied
-messages kept.
+
+The output channel for each message is mapped by **content**, not by the source
+file's IDs: separate split files assign their own numeric schema/channel IDs, so
+`output_channel_id` registers each distinct channel in the writer once
+(`add_schema`/`add_channel`) and caches the resulting ID, then messages are
+emitted with `write_to_known_channel` carrying their **raw serialized bytes**. A
+topic spread across several splits collapses to one output channel. The CDR
+message bodies are never decoded — only each record's `log_time` is read, the
+same "take raw, don't decode the body" spirit as the other recorders applied to a
+file-to-file copy. A read or write error on a closed input aborts the clip and is
+returned to the trigger handler rather than being silently truncated.
 
 ## Time base
 

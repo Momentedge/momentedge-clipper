@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 use log::debug;
@@ -42,7 +43,7 @@ pub fn extract_clip(
 ) -> Result<ClipStats> {
     let mut inputs = list_mcap_files(record_dir)
         .with_context(|| format!("listing splits in {}", record_dir.display()))?;
-    inputs.sort();
+    sort_by_modified_time(&mut inputs)?;
     if let Some(closed_file) = closed_through {
         truncate_after_closed_file(&mut inputs, closed_file)?;
     }
@@ -178,8 +179,27 @@ fn list_mcap_files(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
+/// Order splits by file modification time so the still-open split — the one
+/// rosbag2 is currently writing — sorts last. rosbag2 writes splits
+/// sequentially, so modification time reflects write order without depending on
+/// the `<bag>_<n>.mcap` naming convention (a lexicographic sort of which places
+/// `_10` before `_2`). [`truncate_after_closed_file`] relies on this ordering to
+/// find the boundary at the closed split.
+fn sort_by_modified_time(inputs: &mut [PathBuf]) -> Result<()> {
+    let mut modified: HashMap<PathBuf, SystemTime> = HashMap::new();
+    for path in inputs.iter() {
+        let mtime = std::fs::metadata(path)
+            .and_then(|m| m.modified())
+            .with_context(|| format!("reading modification time of {}", path.display()))?;
+        modified.insert(path.clone(), mtime);
+    }
+    inputs.sort_by(|a, b| modified[a].cmp(&modified[b]).then_with(|| a.cmp(b)));
+    Ok(())
+}
+
 /// Keep only files up to and including the split reported closed by rosbag2.
 /// Newer files include the active open split, which has no complete footer yet.
+/// Relies on [`sort_by_modified_time`] having ordered `inputs` by write time.
 fn truncate_after_closed_file(inputs: &mut Vec<PathBuf>, closed_file: &Path) -> Result<()> {
     let closed_name = closed_file
         .file_name()
@@ -202,7 +222,7 @@ mod tests {
     use super::*;
 
     use std::collections::BTreeMap;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     #[test]
     fn extract_clip_remaps_conflicting_source_channel_ids() -> Result<()> {
@@ -223,6 +243,36 @@ mod tests {
         assert_eq!(
             read_topics_and_times(&out)?,
             vec![("/topic_a".to_string(), 10), ("/topic_b".to_string(), 20)]
+        );
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn extract_clip_orders_splits_by_modified_time() -> Result<()> {
+        // Ordering follows modification time, not the filename. Lexicographically
+        // "rec_10" sorts before "rec_2", but rec_2 is written (and stamped)
+        // earlier, so it is the older split. With rec_10 as the closing split the
+        // window spans both, and rec_2 — older, in the preroll — must be kept
+        // rather than truncated away.
+        let root = test_dir("order")?;
+        let record_dir = root.join("record");
+        std::fs::create_dir_all(&record_dir)?;
+        let older = record_dir.join("rec_2.mcap");
+        let newer = record_dir.join("rec_10.mcap");
+        write_input(&older, "/topic", 2, b"x")?;
+        write_input(&newer, "/topic", 10, b"y")?;
+        set_mtime(&older, UNIX_EPOCH + Duration::from_secs(1_000))?;
+        set_mtime(&newer, UNIX_EPOCH + Duration::from_secs(2_000))?;
+
+        let out = root.join("out/clip.mcap");
+        let stats = extract_clip(&record_dir, &out, 0, 20, Some(&newer))?;
+
+        assert_eq!(stats.files_used, 2);
+        assert_eq!(stats.messages_copied, 2);
+        assert_eq!(
+            read_topics_and_times(&out)?,
+            vec![("/topic".to_string(), 2), ("/topic".to_string(), 10)]
         );
         std::fs::remove_dir_all(root)?;
         Ok(())
@@ -258,6 +308,11 @@ mod tests {
             data,
         )?;
         writer.finish()?;
+        Ok(())
+    }
+
+    fn set_mtime(path: &Path, when: SystemTime) -> Result<()> {
+        File::options().write(true).open(path)?.set_modified(when)?;
         Ok(())
     }
 
