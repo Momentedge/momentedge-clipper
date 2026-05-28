@@ -269,3 +269,45 @@ fn sanitize(name: &str) -> String {
         s
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_keeps_filename_safe_characters() {
+        assert_eq!(sanitize("clip-1_v.2"), "clip-1_v.2");
+    }
+
+    #[test]
+    fn sanitize_replaces_separators_and_whitespace() {
+        // The slash replacement is the safety property: a trigger name can never
+        // introduce a path component into <trigger_ns>_<name>.mcap.
+        assert_eq!(sanitize("a/b c"), "a_b_c");
+        assert_eq!(sanitize("../escape"), ".._escape");
+    }
+
+    #[test]
+    fn sanitize_falls_back_for_empty_names() {
+        assert_eq!(sanitize(""), "unnamed");
+        assert_eq!(sanitize("/"), "_");
+    }
+
+    #[test]
+    fn time_to_ns_flattens_seconds_and_nanos() {
+        let t = r2r::builtin_interfaces::msg::Time {
+            sec: 2,
+            nanosec: 500,
+        };
+        assert_eq!(time_to_ns(&t), 2_000_000_500);
+    }
+
+    #[test]
+    fn time_to_ns_clamps_negative_seconds_to_zero() {
+        let t = r2r::builtin_interfaces::msg::Time {
+            sec: -5,
+            nanosec: 250,
+        };
+        assert_eq!(time_to_ns(&t), 250);
+    }
+}

@@ -279,6 +279,98 @@ mod tests {
     }
 
     #[test]
+    fn extract_clip_keeps_only_messages_inside_the_window() -> Result<()> {
+        // The window bounds are inclusive; messages on either side are dropped.
+        // The split's own range straddles the window, so it is read message by
+        // message rather than skipped from its summary.
+        let root = test_dir("window")?;
+        let record_dir = root.join("record");
+        std::fs::create_dir_all(&record_dir)?;
+        let split = record_dir.join("rec_0.mcap");
+        write_inputs(&split, "/topic", &[50, 100, 150, 200, 250], b"x")?;
+
+        let out = root.join("out/clip.mcap");
+        let stats = extract_clip(&record_dir, &out, 100, 200, Some(&split))?;
+
+        assert_eq!(stats.messages_copied, 3);
+        assert_eq!(
+            read_topics_and_times(&out)?,
+            vec![
+                ("/topic".to_string(), 100),
+                ("/topic".to_string(), 150),
+                ("/topic".to_string(), 200),
+            ]
+        );
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn extract_clip_skips_splits_whose_range_misses_the_window() -> Result<()> {
+        // A split whose summarised time range is disjoint from the window is
+        // counted as scanned but rejected on the summary alone — never opened for
+        // message reading — so it does not count as used.
+        let root = test_dir("skip")?;
+        let record_dir = root.join("record");
+        std::fs::create_dir_all(&record_dir)?;
+        let early = record_dir.join("rec_0.mcap");
+        let inside = record_dir.join("rec_1.mcap");
+        write_inputs(&early, "/topic", &[10, 20], b"x")?;
+        write_inputs(&inside, "/topic", &[600, 700], b"y")?;
+        set_mtime(&early, UNIX_EPOCH + Duration::from_secs(1_000))?;
+        set_mtime(&inside, UNIX_EPOCH + Duration::from_secs(2_000))?;
+
+        let out = root.join("out/clip.mcap");
+        let stats = extract_clip(&record_dir, &out, 500, 1_000, Some(&inside))?;
+
+        assert_eq!(stats.files_scanned, 2);
+        assert_eq!(stats.files_used, 1);
+        assert_eq!(stats.messages_copied, 2);
+        assert_eq!(
+            read_topics_and_times(&out)?,
+            vec![("/topic".to_string(), 600), ("/topic".to_string(), 700)]
+        );
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn extract_clip_without_a_closed_split_reads_every_split() -> Result<()> {
+        // closed_through = None means no truncation: all in-window splits are read.
+        let root = test_dir("all")?;
+        let record_dir = root.join("record");
+        std::fs::create_dir_all(&record_dir)?;
+        write_input(&record_dir.join("rec_0.mcap"), "/topic", 10, b"x")?;
+        write_input(&record_dir.join("rec_1.mcap"), "/topic", 20, b"y")?;
+
+        let out = root.join("out/clip.mcap");
+        let stats = extract_clip(&record_dir, &out, 0, 100, None)?;
+
+        assert_eq!(stats.files_scanned, 2);
+        assert_eq!(stats.files_used, 2);
+        assert_eq!(stats.messages_copied, 2);
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn extract_clip_on_empty_record_dir_writes_an_empty_clip() -> Result<()> {
+        // The recorder may trigger before any split has landed; a missing record
+        // directory yields a valid, empty clip rather than an error.
+        let root = test_dir("empty")?;
+        let record_dir = root.join("record"); // intentionally never created
+        let out = root.join("out/clip.mcap");
+        let stats = extract_clip(&record_dir, &out, 0, 100, None)?;
+
+        assert_eq!(stats.files_scanned, 0);
+        assert_eq!(stats.messages_copied, 0);
+        assert!(out.exists());
+        assert!(read_topics_and_times(&out)?.is_empty());
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
     fn extract_clip_returns_closed_split_errors() -> Result<()> {
         let root = test_dir("error")?;
         let record_dir = root.join("record");
@@ -294,19 +386,43 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn extract_clip_errors_when_closed_split_is_absent() -> Result<()> {
+        // rosbag2 names a closed file that is not in the record directory: the
+        // boundary cannot be located, so the clip fails rather than guessing.
+        let root = test_dir("absent")?;
+        let record_dir = root.join("record");
+        std::fs::create_dir_all(&record_dir)?;
+        write_input(&record_dir.join("rec_0.mcap"), "/topic", 10, b"x")?;
+
+        let out = root.join("out/clip.mcap");
+        let missing = record_dir.join("rec_9.mcap");
+        let err = extract_clip(&record_dir, &out, 0, 100, Some(&missing)).unwrap_err();
+
+        assert!(format!("{err:#}").contains("was not found"));
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
     fn write_input(path: &Path, topic: &str, log_time: u64, data: &[u8]) -> Result<()> {
+        write_inputs(path, topic, &[log_time], data)
+    }
+
+    fn write_inputs(path: &Path, topic: &str, log_times: &[u64], data: &[u8]) -> Result<()> {
         let mut writer = mcap::Writer::new(BufWriter::new(File::create(path)?))?;
         let schema_id = writer.add_schema("std_msgs/msg/String", "ros2msg", b"string data")?;
         let channel_id = writer.add_channel(schema_id, topic, "cdr", &BTreeMap::new())?;
-        writer.write_to_known_channel(
-            &mcap::records::MessageHeader {
-                channel_id,
-                sequence: 0,
-                log_time,
-                publish_time: log_time,
-            },
-            data,
-        )?;
+        for (seq, &log_time) in log_times.iter().enumerate() {
+            writer.write_to_known_channel(
+                &mcap::records::MessageHeader {
+                    channel_id,
+                    sequence: seq as u32,
+                    log_time,
+                    publish_time: log_time,
+                },
+                data,
+            )?;
+        }
         writer.finish()?;
         Ok(())
     }
