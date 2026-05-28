@@ -35,13 +35,19 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::stream::StreamExt;
-use log::{debug, error, info, warn};
+use log::{debug, error, info};
 use r2r::{Publisher, QosProfile};
 use tokio::sync::broadcast;
 
 const TRIGGER_TOPIC: &str = "/events/edgestream/trigger";
 const SPLIT_TOPIC: &str = "/events/write_split";
 const RECORDED_TOPIC: &str = "/events/edgestream/recorded";
+
+#[derive(Clone, Debug)]
+struct SplitEvent {
+    observed_ns: u64,
+    closed_file: PathBuf,
+}
 
 struct Config {
     record_dir: PathBuf,
@@ -86,21 +92,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         SPLIT_TOPIC,
         QosProfile::default(),
     )?;
-    let recorded_pub = node
-        .create_publisher::<r2r::edgestream_msgs::msg::Recorded>(RECORDED_TOPIC, QosProfile::default())?;
+    let recorded_pub = node.create_publisher::<r2r::edgestream_msgs::msg::Recorded>(
+        RECORDED_TOPIC,
+        QosProfile::default(),
+    )?;
 
-    // Fan write_split events out as their observation time (ns since epoch). A
-    // trigger handler subscribes before it starts waiting, then consumes events
-    // until it sees one that occurred at/after its window end.
-    let (split_tx, _) = broadcast::channel::<u64>(64);
+    // Fan write_split events out with their observation time (ns since epoch)
+    // and the closed split path. A trigger handler subscribes before it starts
+    // waiting, then consumes events until it sees one at/after its window end.
+    let (split_tx, _) = broadcast::channel::<SplitEvent>(64);
 
     // write_split consumer.
     {
         let split_tx = split_tx.clone();
         tokio::spawn(async move {
             while let Some(ev) = split_sub.next().await {
-                debug!("write_split: closed={} opened={}", ev.closed_file, ev.opened_file);
-                let _ = split_tx.send(now_ns());
+                debug!(
+                    "write_split: closed={} opened={}",
+                    ev.closed_file, ev.opened_file
+                );
+                let _ = split_tx.send(SplitEvent {
+                    observed_ns: now_ns(),
+                    closed_file: PathBuf::from(ev.closed_file),
+                });
             }
         });
     }
@@ -132,8 +146,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // The node's single owner: spin continuously to feed the streams.
-    let worker = tokio::task::spawn_blocking(move || loop {
-        node.spin_once(Duration::from_millis(10));
+    let worker = tokio::task::spawn_blocking(move || {
+        loop {
+            node.spin_once(Duration::from_millis(10));
+        }
     });
     worker.await?;
     Ok(())
@@ -144,7 +160,7 @@ async fn handle_trigger(
     trig: r2r::edgestream_msgs::msg::Trigger,
     cfg: Arc<Config>,
     recorded_pub: Publisher<r2r::edgestream_msgs::msg::Recorded>,
-    mut split_rx: broadcast::Receiver<u64>,
+    mut split_rx: broadcast::Receiver<SplitEvent>,
 ) -> anyhow::Result<()> {
     let trigger_ns = time_to_ns(&trig.trigger_time);
     let start_ns = trigger_ns.saturating_sub(trig.preroll);
@@ -162,28 +178,36 @@ async fn handle_trigger(
 
     // 2. Wait for the first split finalised at/after the window end, so the file
     //    holding the tail of the window is closed and safe to read.
-    loop {
+    let closed_through = loop {
         match split_rx.recv().await {
-            Ok(observed_ns) if observed_ns >= end_ns => break,
+            Ok(ev) if ev.observed_ns >= end_ns => break ev.closed_file,
             Ok(_) => continue,
             Err(broadcast::error::RecvError::Lagged(n)) => {
                 debug!("split events lagged by {n}; continuing");
             }
             Err(broadcast::error::RecvError::Closed) => {
-                warn!("split event channel closed; extracting without a post-window split");
-                break;
+                anyhow::bail!("split event channel closed before a post-window split");
             }
         }
-    }
+    };
 
     // 3. Bulk-copy the window into ./triggered/<trigger_ns>_<name>.mcap. The copy
     //    is blocking file IO, so it runs off the async runtime.
-    let out_path = cfg.out_dir.join(format!("{trigger_ns}_{}.mcap", sanitize(&trig.name)));
+    let out_path = cfg
+        .out_dir
+        .join(format!("{trigger_ns}_{}.mcap", sanitize(&trig.name)));
     let stats = {
         let record_dir = cfg.record_dir.clone();
         let out_path = out_path.clone();
+        let closed_through = closed_through.clone();
         tokio::task::spawn_blocking(move || {
-            mcap_copy::extract_clip(&record_dir, &out_path, start_ns, end_ns)
+            mcap_copy::extract_clip(
+                &record_dir,
+                &out_path,
+                start_ns,
+                end_ns,
+                Some(&closed_through),
+            )
         })
         .await??
     };
@@ -206,7 +230,10 @@ async fn handle_trigger(
         preroll: trig.preroll,
     };
     recorded_pub.publish(&recorded)?;
-    info!("emitted {RECORDED_TOPIC} name={:?} filename={filename}", trig.name);
+    info!(
+        "emitted {RECORDED_TOPIC} name={:?} filename={filename}",
+        trig.name
+    );
     Ok(())
 }
 
@@ -228,7 +255,17 @@ fn time_to_ns(t: &r2r::builtin_interfaces::msg::Time) -> u64 {
 fn sanitize(name: &str) -> String {
     let s: String = name
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
-    if s.is_empty() { "unnamed".to_string() } else { s }
+    if s.is_empty() {
+        "unnamed".to_string()
+    } else {
+        s
+    }
 }

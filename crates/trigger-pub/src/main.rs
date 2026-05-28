@@ -48,7 +48,9 @@ fn parse_args() -> Args {
     while let Some(flag) = it.next() {
         let mut value = || it.next().expect("flag needs a value");
         match flag.as_str() {
-            "--period" => args.period = Duration::from_secs_f64(value().parse().expect("--period: number")),
+            "--period" => {
+                args.period = Duration::from_secs_f64(value().parse().expect("--period: number"))
+            }
             "--preroll" => args.preroll = value().parse().expect("--preroll: u64 ns"),
             "--postroll" => args.postroll = value().parse().expect("--postroll: u64 ns"),
             "--name" => args.name = value(),
@@ -69,11 +71,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let ctx = r2r::Context::create()?;
     let mut node = r2r::Node::create(ctx, "edgestream_trigger_pub", "")?;
-    let publisher = node
-        .create_publisher::<r2r::edgestream_msgs::msg::Trigger>(
-            "/events/edgestream/trigger",
-            QosProfile::default(),
-        )?;
+    let publisher = node.create_publisher::<r2r::edgestream_msgs::msg::Trigger>(
+        "/events/edgestream/trigger",
+        QosProfile::default(),
+    )?;
     // RosTime clock: the trigger_time stamp the recorder centres its window on.
     let mut clock = r2r::Clock::create(r2r::ClockType::RosTime)?;
 
