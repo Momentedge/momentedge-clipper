@@ -6,7 +6,9 @@ edition.workspace = true
 [dependencies]
 # r2r: ROS2 client bindings. Used here for a typed publisher of
 # edgestream_msgs/Trigger and a RosTime clock for the trigger_time stamp.
-r2r = "0.9.5"
+r2r.workspace = true
 # Logging via the `log` facade; pretty_env_logger is the backend (honours RUST_LOG).
-log = "0.4"
-pretty_env_logger = "0.5"
+log.workspace = true
+pretty_env_logger.workspace = true
+# Small PRNG for the per-trigger random pre/postroll windows.
+fastrand.workspace = true

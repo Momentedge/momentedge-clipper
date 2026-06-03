@@ -14,7 +14,7 @@ edition.workspace = true
 # Unlike r2r, rclrs ships pre-generated rcl bindings and needs no bindgen; its
 # build.rs only reads ROS_DISTRO + AMENT_PREFIX_PATH and links the rcl/rmw libs
 # (see flake.nix).
-rclrs = { git = "https://github.com/stfl/ros2_rust", branch = "serialized-transport-typesupport-fix" }
+rclrs.workspace = true
 # Logging via the `log` facade; pretty_env_logger is the backend (honours RUST_LOG).
-log = "0.4"
-pretty_env_logger = "0.5"
+log.workspace = true
+pretty_env_logger.workspace = true

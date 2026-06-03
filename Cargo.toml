@@ -9,3 +9,17 @@ members = ["crates/r2r-sub", "crates/rclrs-sub", "crates/edgestream-rec", "crate
 [workspace.package]
 version = "0.0.1"
 edition = "2024"
+
+# Shared dependency versions; members inherit with `<crate>.workspace = true` and
+# keep their own role comment (and any crate-specific features) at the use site.
+[workspace.dependencies]
+r2r = "0.9.5"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+futures = "0.3"
+mcap = "0.24"
+memmap2 = "0.9"
+anyhow = "1"
+log = "0.4"
+pretty_env_logger = "0.5"
+fastrand = "2"
+rclrs = { git = "https://github.com/stfl/ros2_rust", branch = "serialized-transport-typesupport-fix" }

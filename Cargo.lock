@@ -1540,6 +1540,7 @@ dependencies = [
 name = "trigger-pub"
 version = "0.0.1"
 dependencies = [
+ "fastrand",
  "log",
  "pretty_env_logger",
  "r2r",

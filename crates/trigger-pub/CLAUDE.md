@@ -7,19 +7,25 @@ something to react to without a real trigger source. Built on
 
 ## Behaviour
 
-A plain loop: every `--period` seconds (default 5) it stamps `trigger_time` with
+A plain loop: every `--period` seconds (default 1) it stamps `trigger_time` with
 the current RosTime via `r2r::Clock` (`ClockType::RosTime` →
 `Clock::to_builtin_time`), fills in an incrementing `name` (`<prefix>-<n>`), the
 `--description`, and the `--preroll`/`--postroll` windows (u64 nanoseconds), and
 publishes. It `spin_once`s briefly each iteration to keep the node healthy, then
 sleeps out the period.
 
+When `--preroll`/`--postroll` are omitted, each iteration draws that side a fresh
+random whole-second window in `[1, 10]` s (`fastrand`, `RANDOM_ROLL_SECS`), pre
+and post independently, so the recorder sees varied clip lengths. Passing either
+flag pins that side to a fixed nanosecond value instead.
+
 `trigger_time` being the publish-time stamp is the point: it is the "original
 timestamp" the recorder centres its `[t-preroll, t+postroll]` window on, the same
 idea as the other recorders keying off a message's own stamp.
 
 Flags: `--period <secs>`, `--preroll <ns>`, `--postroll <ns>`, `--name <prefix>`,
-`--description <text>` (all optional; see the module doc for defaults).
+`--description <text>` (all optional; see the module doc for defaults and the
+random-roll behaviour).
 
 ## Build
 

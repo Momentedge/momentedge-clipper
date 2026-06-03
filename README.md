@@ -112,9 +112,10 @@ edgestream-rec ◀── /events/edgestream/trigger ── trigger-pub
   `edgestream_msgs/Recorded` on `/events/edgestream/recorded`. The copy re-emits
   raw MCAP message bytes — channels and schemas are carried over, message bodies
   are never decoded.
-- **`trigger-pub`** publishes a trigger every 5 s (configurable), stamping
+- **`trigger-pub`** publishes a trigger every 1 s (configurable), stamping
   `trigger_time` with the current time — a development stand-in for a real
-  trigger source.
+  trigger source. With no `--preroll`/`--postroll` flags it draws each side a
+  random 1–10 s window per trigger; pass either flag to pin it.
 
 Run it with the bag replay from `../ros2_sources` as the data source, one
 process per shell (all inside `nix develop`, sharing RMW + `ROS_DOMAIN_ID`):
@@ -129,8 +130,8 @@ nix develop --command ./scripts/record.sh
 # 3. triggered extractor → ./triggered
 nix develop --command cargo run -p edgestream-rec
 
-# 4. fire a trigger every 5 s (preroll/postroll 2 s here)
-nix develop --command cargo run -p trigger-pub -- --preroll 2000000000 --postroll 2000000000
+# 4. fire a trigger every 1 s (random 1-10 s preroll/postroll per trigger)
+nix develop --command cargo run -p trigger-pub
 ```
 
 Clips land in `./triggered` (gitignored); inspect one with `ros2 bag info

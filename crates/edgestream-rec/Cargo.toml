@@ -6,20 +6,20 @@ edition.workspace = true
 [dependencies]
 # r2r: ROS2 client bindings. Typed subscriptions to the Trigger and
 # WriteSplitEvent topics, a typed Recorded publisher, and a RosTime clock.
-r2r = "0.9.5"
+r2r.workspace = true
 # Async runtime: a blocking thread spins the node; tokio tasks consume the
 # subscription streams and run each trigger's wait-and-extract flow concurrently.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+tokio.workspace = true
 # `futures::StreamExt` drives the subscription streams (`sub.next().await`).
-futures = "0.3"
+futures.workspace = true
 # MCAP read/write for the clip extraction. `Writer::write` re-emits each message's
 # raw bytes and deduplicates channels/schemas by content — a direct copy with no
 # CDR body decode.
-mcap = "0.24"
+mcap.workspace = true
 # Memory-map each input split so MessageStream reads borrow straight from the file.
-memmap2 = "0.9"
+memmap2.workspace = true
 # Error plumbing for the extraction path.
-anyhow = "1"
+anyhow.workspace = true
 # Logging via the `log` facade; pretty_env_logger is the backend (honours RUST_LOG).
-log = "0.4"
-pretty_env_logger = "0.5"
+log.workspace = true
+pretty_env_logger.workspace = true
