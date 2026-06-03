@@ -9,6 +9,8 @@
   };
 
   # Pull prebuilt ROS2 packages from the ROS binary cache instead of compiling.
+  # The aarch64 deployment closure additionally needs the @wentasah attic cache
+  # (https://attic.iid.ciirc.cvut.cz/ros) — see nix/README.md.
   nixConfig = {
     extra-substituters = [ "https://ros.cachix.org" ];
     extra-trusted-public-keys = [ "ros.cachix.org-1:dSyZxI8geDCJrwgvCOHDoAfOm5sV1wCPjBkKL+38Rvo=" ];
@@ -23,68 +25,38 @@
         };
         ros = pkgs.rosPackages.jazzy;
 
-        # Local interface package defining the edgestream Trigger/Recorded
-        # event messages. Built from ./edgestream_msgs with the standard rosidl
-        # generators, exactly like any other ament_cmake message package, so its
-        # typesupport lands on AMENT_PREFIX_PATH for both r2r codegen and the
-        # `ros2` CLI. Mirrors the upstream example-interfaces expression.
-        edgestream-msgs = ros.buildRosPackage {
-          pname = "edgestream_msgs";
-          version = "0.0.1";
+        # r2r does no dependency resolution, so codegen must be handed every
+        # used message package explicitly. This single filter drives both the
+        # dev shell (system cargo) and the nix-built binaries — keep it and
+        # nix/ros-env.nix's package list in step.
+        idlPackageFilter =
+          "builtin_interfaces;std_msgs;sensor_msgs;geometry_msgs;nav_msgs;tf2_msgs;velodyne_msgs;rosgraph_msgs;action_msgs;unique_identifier_msgs;std_srvs;rosbag2_interfaces;edgestream_msgs";
+
+        # Package definitions live under ./nix; the source paths are passed in
+        # from here so they stay anchored at the repo root. Flakes only see
+        # git-tracked files — a newly added file under nix/ or edgestream_msgs/
+        # must be `git add`ed before the eval sees it.
+        edgestream-msgs = import ./nix/edgestream-msgs.nix {
+          inherit ros;
           src = ./edgestream_msgs;
-          buildType = "ament_cmake";
-          buildInputs = with ros; [ ament-cmake rosidl-default-generators builtin-interfaces ];
-          propagatedBuildInputs = with ros; [ rosidl-default-runtime builtin-interfaces ];
-          nativeBuildInputs = with ros; [ ament-cmake rosidl-default-generators ];
-          meta.description = "edgestream Trigger/Recorded event interfaces";
+        };
+        rosEnv = import ./nix/ros-env.nix { inherit ros edgestream-msgs; };
+        binaries = import ./nix/binaries.nix {
+          inherit pkgs rosEnv idlPackageFilter;
+          src = ./.;
+          cargoLockFile = ./Cargo.lock;
+        };
+        images = import ./nix/images.nix { inherit pkgs rosEnv binaries; };
+      in {
+        # rosEnv is exposed for the aarch64 deployment probe: dry-run whether the
+        # full ROS2 closure is substitutable for a given system without building
+        # anything (`nix build --dry-run .#packages.aarch64-linux.rosEnv`).
+        packages = {
+          inherit rosEnv;
+          inherit (binaries) edgestream-rec trigger-pub;
+          inherit (images) edgestream-rec-image trigger-pub-image;
         };
 
-        # r2r generates Rust bindings (at `cargo build`) for every message
-        # package on AMENT_PREFIX_PATH. List the packages whose types appear in
-        # bags/example-011-ugv-ds.mcap plus the core rcl/rmw stack r2r links
-        # against. The matching IDL_PACKAGE_FILTER below restricts codegen to
-        # exactly these (r2r does no dependency resolution, so list them all).
-        rosEnv = ros.buildEnv {
-          paths = with ros; [
-            # core client library + Fast DDS RMW that r2r builds against
-            rcl
-            rcl-action
-            rmw-fastrtps-cpp
-            # CLI, handy for `ros2 topic list` from the same shell
-            ros2cli
-            ros2cli-common-extensions
-            # `ros2 bag record` with the mcap storage backend — the continuous
-            # circular recorder the triggered extractor reads from (see README).
-            ros2bag
-            rosbag2-transport
-            rosbag2-storage-mcap
-            # WriteSplitEvent on /events/write_split, published by rosbag2 each
-            # time it finalises a split; the extractor waits on it.
-            rosbag2-interfaces
-            # message packages carried by the UGV bag (see ../ros2_sources/REPLAY.md)
-            builtin-interfaces
-            std-msgs
-            sensor-msgs
-            geometry-msgs
-            nav-msgs
-            tf2-msgs
-            velodyne-msgs
-            rosgraph-msgs       # /clock when replaying with --clock
-            # pulled in by rcl/actions; r2r's codegen needs them present
-            action-msgs
-            unique-identifier-msgs
-            std-srvs
-            # rclrs's vendored interfaces (rclrs/src/vendor) unconditionally link
-            # their typesupport C libs, so these must be on the link path even
-            # though no bag topic uses them — see ros2-rust/ros2_rust#557. r2r
-            # ignores them.
-            example-interfaces
-            test-msgs
-            # local edgestream Trigger/Recorded interfaces
-            edgestream-msgs
-          ];
-        };
-      in {
         devShells.default = pkgs.mkShell {
           name = "ros2-rust-subscribe";
           # Rust itself is intentionally NOT provided here — use the system
@@ -99,11 +71,9 @@
           # bindgen (via r2r_common) needs to find libclang.
           LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
 
-          # Restrict r2r codegen to just the bag's packages — semicolon
-          # separated, no auto dependency resolution, so every used package is
-          # listed explicitly. Keeps the first build fast.
-          IDL_PACKAGE_FILTER =
-            "builtin_interfaces;std_msgs;sensor_msgs;geometry_msgs;nav_msgs;tf2_msgs;velodyne_msgs;rosgraph_msgs;action_msgs;unique_identifier_msgs;std_srvs;rosbag2_interfaces;edgestream_msgs";
+          # Restrict r2r codegen to just the bag's packages (shared with the
+          # nix-built binaries above). Keeps the first build fast.
+          IDL_PACKAGE_FILTER = idlPackageFilter;
 
           # Match ../ros2_sources so discovery + SHM line up: same RMW, same domain.
           # ROS_DISTRO is required by rclrs's build.rs (it selects the committed

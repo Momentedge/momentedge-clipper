@@ -1,0 +1,10 @@
+[Unit]
+Description=Prune edgestream recordings older than one day
+Documentation=https://github.com/momentedge/ros2_subscribe
+
+[Service]
+Type=oneshot
+# Directory to prune. Override per-host with a drop-in:
+#   systemctl --user edit edgestream-prune.service
+Environment=PRUNE_DIR=%h/edgestream-rec/captured
+ExecStart=%h/.local/bin/edgestream-prune.sh

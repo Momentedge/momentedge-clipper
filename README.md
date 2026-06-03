@@ -137,16 +137,84 @@ nix develop --command cargo run -p trigger-pub
 Clips land in `./triggered` (gitignored); inspect one with `ros2 bag info
 triggered/<file>.mcap`.
 
+## Deployment (Jetson Orin / Docker)
+
+The triggered recorder ships to an edge target — a Jetson Orin (aarch64) running
+an older ROS2 distro whose rosbag2 lacks the MCAP storage and `WriteSplitEvent`
+features this workflow depends on. The recorder runs its own ROS2 Jazzy stack
+inside Docker; the container is purely a packaging layer for a newer ROS2 on the
+old host. Only `edgestream-rec` and `trigger-pub` are deployed.
+
+The flake builds the images with `dockerTools`, reusing the same ROS env and
+nix-built binaries as the dev shell:
+
+```
+packages.edgestream-rec        packages.edgestream-rec-image    # → edgestream-rec:jazzy
+packages.trigger-pub           packages.trigger-pub-image       # → trigger-pub:jazzy
+```
+
+The `edgestream-rec` image carries both the `edgestream-rec` binary and `ros2 bag
+record`, so it backs two containers — the continuous recorder and the extractor.
+
+### Build on the target
+
+The Orin is aarch64 and the dev host is x86_64. Building natively on the Orin
+keeps the entire ROS2 closure as cache substitutions (only the three crates
+compile on-device); cross-compiling would miss the aarch64 binary cache, and
+emulation would compile the crates under qemu. nix on the Orin pulls aarch64
+ROS2 from `ros.cachix.org` **plus** the @wentasah attic cache
+`https://attic.iid.ciirc.cvut.cz/ros` — both are required for full
+substitutability. Add to `/etc/nix/nix.custom.conf`:
+
+```
+extra-substituters = https://ros.cachix.org https://attic.iid.ciirc.cvut.cz/ros
+extra-trusted-public-keys = ros.cachix.org-1:dSyZxI8geDCJrwgvCOHDoAfOm5sV1wCPjBkKL+38Rvo= ros:JR95vUYsShSqfA1VTYoFt1Nz6uXasm5QrcOsGry9f6Q=
+```
+
+```bash
+# on the Orin, in this repo
+nix build .#packages.aarch64-linux.edgestream-rec-image -o result-rec
+nix build .#packages.aarch64-linux.trigger-pub-image   -o result-trig
+sudo docker load -i result-rec      # → edgestream-rec:jazzy
+sudo docker load -i result-trig     # → trigger-pub:jazzy
+```
+
+### Run
+
+```bash
+./scripts/start_recorder.sh           # edgestream-record + edgestream-rec containers
+./scripts/start_demo_trigger_pub.sh   # edgestream-trigger container (demo trigger source)
+```
+
+Splits land in `~/edgestream-rec/recordings/`, clips in `~/edgestream-rec/captured/`
+(override with `EDGESTREAM_DIR`). Each container runs on the host network with
+`FASTDDS_BUILTIN_TRANSPORTS=UDPv4`: every container has a private `/dev/shm`, so
+FastDDS shared-memory delivery is silently dropped even though discovery matches
+— UDP is the transport that carries data both across the host's older ROS distro
+and between containers. Cross-distro recording works because rosbag2 stores raw
+serialized bytes and never decodes them; reception only needs endpoint discovery
+and QoS to match.
+
+### Retention
+
+`scripts/record.sh`-style continuous recording has no built-in retention, so the
+directories grow unbounded. `scripts/prune-recordings/` is a systemd user timer
+that deletes files older than 24 h; install it on the target with its
+`install-remote.sh` (see [`prune-recordings/README.md`](scripts/prune-recordings/README.md)).
+
 ## Layout
 
 ```
-crates/r2r-sub/        # r2r all-topic indexer
-crates/rclrs-sub/      # rclrs all-topic indexer
-crates/edgestream-rec/ # r2r+tokio triggered clip recorder
-crates/trigger-pub/    # r2r periodic trigger publisher
-edgestream_msgs/       # local ROS2 interface package (Trigger, Recorded)
-scripts/record.sh      # standalone continuous `ros2 bag record`
-flake.nix              # ROS2 Jazzy dev shell (system Rust)
+crates/r2r-sub/         # r2r all-topic indexer
+crates/rclrs-sub/       # rclrs all-topic indexer
+crates/edgestream-rec/  # r2r+tokio triggered clip recorder
+crates/trigger-pub/     # r2r periodic trigger publisher
+edgestream_msgs/        # local ROS2 interface package (Trigger, Recorded)
+nix/                    # flake package defs: edgestream-msgs, ros-env, binaries, images
+scripts/record.sh       # standalone continuous `ros2 bag record` (dev)
+scripts/start_recorder.sh, start_demo_trigger_pub.sh  # launch the deployed containers
+scripts/prune-recordings/  # systemd retention timer for the target
+flake.nix               # ROS2 Jazzy dev shell + nix-built binaries/images
 ```
 
 `rclrs-sub` depends on a fork of `ros2_rust` that adds a raw serialized
