@@ -5,3 +5,9 @@
 # triggered recorder cuts out of it — both are local runtime data.
 /record/
 /triggered/
+
+# colcon overlay built on the target by scripts/build-on-target.sh
+# (edgestream_msgs typesupport) — generated, not source.
+/build/
+/install/
+/log/

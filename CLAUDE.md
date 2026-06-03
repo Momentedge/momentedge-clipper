@@ -71,6 +71,28 @@ Setup is in the README; the parts that matter when changing the build:
   `ros2 bag record` (`scripts/record.sh`) the triggered recorder reads from;
   `rosbag2-interfaces` provides `WriteSplitEvent` on `/events/write_split`.
 
+## Deployment build model
+
+The nix flake above is for **development** (the dev shell, and `nix build
+.#edgestream-rec`/`trigger-pub` as build checks). **Deployment is a native build
+on the target**, not nix or Docker — see README "Deployment". The reasoning that
+shapes it:
+
+- The edge target runs a full ROS2 install (Humble) of the **same distro** the
+  recorder is built against, so `rosbag2` (MCAP storage + `WriteSplitEvent`),
+  `rcl`, `rmw_fastrtps_cpp`, and the standard message packages all come from the
+  host. Only `edgestream-rec` + `trigger-pub` (which link just `rcl`/`rmw` + the
+  `builtin_interfaces`/`rosbag2_interfaces`/`edgestream_msgs` types) and the
+  `edgestream_msgs` overlay are built — `scripts/build-on-target.sh` does both.
+- They are built **against the host's own ROS2 libraries** for ABI compatibility:
+  a nix-built binary bakes `/nix/store` RPATHs and would load the nix closure
+  rather than the host's ROS, defeating the point. So the build runs on the
+  target (or an ABI-identical apt box of the same arch+distro), not cross- or
+  nix-built.
+- Native (no container) means all ROS2 processes share the host `/dev/shm`, so
+  FastDDS shared-memory transport works and DDS interop with the host's other
+  nodes is direct — no per-container `/dev/shm` split and no UDP-only workaround.
+
 ## Workspace layout
 
 A virtual workspace (no root package), so `resolver = "3"` (the edition-2024

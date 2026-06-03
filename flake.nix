@@ -1,7 +1,7 @@
 {
   description = "Rust ROS2 subscriber (r2r) that attaches to every live topic";
 
-  # nixpkgs has no ROS2; nix-ros-overlay packages the full Jazzy distro.
+  # nixpkgs has no ROS2; nix-ros-overlay packages the full ROS2 distro.
   # Track the same overlay as ../ros2_sources so both shells share one RMW.
   inputs = {
     nix-ros-overlay.url = "github:lopsided98/nix-ros-overlay/master";
@@ -23,7 +23,14 @@
           inherit system;
           overlays = [ nix-ros-overlay.overlays.default ];
         };
-        ros = pkgs.rosPackages.jazzy;
+        # The single source of truth for the ROS2 distro the nix dev shell and
+        # nix-built binaries target. Drives the package set below and the
+        # ROS_DISTRO env (r2r's codegen is distro-agnostic, but rclrs's build.rs
+        # selects its committed rcl bindings by it). Switching distros is this
+        # line. The deployment target builds natively against its own apt ROS2
+        # (see README "Native build on the target"), independent of this.
+        rosDistro = "jazzy";
+        ros = pkgs.rosPackages.${rosDistro};
 
         # r2r does no dependency resolution, so codegen must be handed every
         # used message package explicitly. This single filter drives both the
@@ -42,19 +49,18 @@
         };
         rosEnv = import ./nix/ros-env.nix { inherit ros edgestream-msgs; };
         binaries = import ./nix/binaries.nix {
-          inherit pkgs rosEnv idlPackageFilter;
+          inherit pkgs rosEnv idlPackageFilter rosDistro;
           src = ./.;
           cargoLockFile = ./Cargo.lock;
         };
-        images = import ./nix/images.nix { inherit pkgs rosEnv binaries; };
       in {
-        # rosEnv is exposed for the aarch64 deployment probe: dry-run whether the
-        # full ROS2 closure is substitutable for a given system without building
-        # anything (`nix build --dry-run .#packages.aarch64-linux.rosEnv`).
+        # rosEnv (the dev shell's ROS2 closure) and the two nix-built binaries
+        # are exposed mostly as build checks — `nix build .#edgestream-rec`
+        # compiles the deployable under nix without the system cargo. The target
+        # deploys native apt builds, not these (see README "Deployment").
         packages = {
           inherit rosEnv;
           inherit (binaries) edgestream-rec trigger-pub;
-          inherit (images) edgestream-rec-image trigger-pub-image;
         };
 
         devShells.default = pkgs.mkShell {
@@ -82,8 +88,8 @@
           shellHook = ''
             export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
             export ROS_DOMAIN_ID=''${ROS_DOMAIN_ID:-0}
-            export ROS_DISTRO=jazzy
-            echo "ROS2 Jazzy rust-subscribe shell — RMW=$RMW_IMPLEMENTATION  DOMAIN=$ROS_DOMAIN_ID  DISTRO=$ROS_DISTRO"
+            export ROS_DISTRO=${rosDistro}
+            echo "ROS2 ${rosDistro} rust-subscribe shell — RMW=$RMW_IMPLEMENTATION  DOMAIN=$ROS_DOMAIN_ID  DISTRO=$ROS_DISTRO"
           '';
         };
       });

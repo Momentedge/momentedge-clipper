@@ -1,54 +1,60 @@
 #!/usr/bin/env bash
-# Launch the edgestream recorder stack on the deployment target (the Jetson Orin)
-# as Docker containers built from the nix images (see nix/images.nix). Two
-# containers make up "the recorder":
+# Launch the edgestream recorder stack natively on the Humble target (no Docker).
+# Two long-running processes make up "the recorder":
 #
-#   edgestream-record  continuous `ros2 bag record -a` of every live topic into
-#                      5 s MCAP splits under <data>/recordings. Wrapped in
-#                      `rm -rf` so the bag dir is fresh on each (re)start, which
-#                      rosbag2 requires (it refuses to write into an existing bag).
-#   edgestream-rec     the triggered extractor: cuts clips into <data>/captured
-#                      on each /events/edgestream/trigger, gated on /events/write_split.
+#   ros2 bag record  → <data>/recordings   every live topic in 5 s mcap splits;
+#                                           each split boundary publishes a
+#                                           WriteSplitEvent on /events/write_split
+#   edgestream-rec   → <data>/captured      cuts a clip per /events/edgestream/trigger,
+#                                           gated on /events/write_split
 #
-# Both run on the host network with FastDDS forced to UDP-only. Each container
-# gets a private /dev/shm, so FastDDS shared-memory delivery silently drops every
-# sample even though discovery still matches; UDPv4 is the interoperable transport
-# both across the host's older ROS distro and between the containers themselves.
-# Do NOT drop FASTDDS_BUILTIN_TRANSPORTS — without it nothing is received.
+# Running natively (not containerised) means every ROS2 process shares the host's
+# /dev/shm, so FastDDS shared-memory transport works and discovery/data interop
+# with the host's other Humble nodes is direct — none of the container-era
+# FASTDDS_BUILTIN_TRANSPORTS=UDPv4 workaround is needed.
 #
-# Docker needs root on the target, so the default runner is `sudo docker`;
-# override with DOCKER=docker if your user can reach the daemon directly.
-# Re-running recreates the containers.
+# Both processes are started detached (setsid + nohup), each with a pidfile and
+# log under <data>, mirroring scripts/prune-recordings. Re-running stops the
+# previous pair first. Build the binaries and the edgestream_msgs overlay with
+# scripts/build-on-target.sh before the first run.
 set -euo pipefail
 
-DOCKER="${DOCKER:-sudo docker}"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROS_SETUP="${ROS_SETUP:-/opt/ros/humble/setup.bash}"
 DATA_DIR="${EDGESTREAM_DIR:-$HOME/edgestream-rec}"
-IMAGE="${REC_IMAGE:-edgestream-rec:jazzy}"
-ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-0}"
+BIN_DIR="${BIN_DIR:-$REPO_ROOT/target/release}"
 SPLIT_SECONDS="${SPLIT_SECONDS:-5}"
+
+# shellcheck disable=SC1090
+source "$ROS_SETUP"
+# shellcheck disable=SC1091
+source "$REPO_ROOT/install/setup.bash"   # edgestream_msgs typesupport
 
 mkdir -p "$DATA_DIR/captured"
 
-# Continuous recorder → <data>/recordings (wiped + recreated on each start).
-$DOCKER rm -f edgestream-record >/dev/null 2>&1 || true
-$DOCKER run -d --name edgestream-record --restart unless-stopped \
-  --network host \
-  -e FASTDDS_BUILTIN_TRANSPORTS=UDPv4 \
-  -e ROS_DOMAIN_ID="$ROS_DOMAIN_ID" \
-  -v "$DATA_DIR:/data" \
-  "$IMAGE" \
-  bash -c "rm -rf /data/recordings && exec ros2 bag record -a --storage mcap --max-bag-duration $SPLIT_SECONDS --output /data/recordings"
+stop_prev() {  # $1: pidfile
+  [[ -f "$1" ]] || return 0
+  kill "$(cat "$1")" 2>/dev/null || true
+  rm -f "$1"
+}
 
-# Triggered extractor → <data>/captured, reading the splits above.
-$DOCKER rm -f edgestream-rec >/dev/null 2>&1 || true
-$DOCKER run -d --name edgestream-rec --restart unless-stopped \
-  --network host \
-  -e FASTDDS_BUILTIN_TRANSPORTS=UDPv4 \
-  -e ROS_DOMAIN_ID="$ROS_DOMAIN_ID" \
-  -v "$DATA_DIR:/data" \
-  "$IMAGE" \
-  edgestream-rec --record-dir /data/recordings --out-dir /data/captured
+# Continuous recorder. rosbag2 refuses to write into an existing bag dir, so the
+# recordings dir is wiped on each (re)start.
+stop_prev "$DATA_DIR/record.pid"
+rm -rf "$DATA_DIR/recordings"
+setsid nohup ros2 bag record -a --storage mcap \
+  --max-bag-duration "$SPLIT_SECONDS" --output "$DATA_DIR/recordings" \
+  >> "$DATA_DIR/record.log" 2>&1 &
+echo $! > "$DATA_DIR/record.pid"
 
-echo "recorder stack up:"
-$DOCKER ps --filter name=edgestream-re --format '  {{.Names}}  {{.Status}}'
-echo "recordings → $DATA_DIR/recordings   clips → $DATA_DIR/captured"
+# Triggered extractor, reading the splits above.
+stop_prev "$DATA_DIR/rec.pid"
+setsid nohup "$BIN_DIR/edgestream-rec" \
+  --record-dir "$DATA_DIR/recordings" --out-dir "$DATA_DIR/captured" \
+  >> "$DATA_DIR/rec.log" 2>&1 &
+echo $! > "$DATA_DIR/rec.pid"
+
+echo "recorder stack up (native, ROS2 ${ROS_DISTRO}):"
+echo "  ros2 bag record  pid $(cat "$DATA_DIR/record.pid")  → $DATA_DIR/recordings  (log: record.log)"
+echo "  edgestream-rec   pid $(cat "$DATA_DIR/rec.pid")  → $DATA_DIR/captured  (log: rec.log)"
+echo "stop with: kill \$(cat \"$DATA_DIR/record.pid\" \"$DATA_DIR/rec.pid\")"

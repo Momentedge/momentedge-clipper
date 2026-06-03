@@ -137,63 +137,57 @@ nix develop --command cargo run -p trigger-pub
 Clips land in `./triggered` (gitignored); inspect one with `ros2 bag info
 triggered/<file>.mcap`.
 
-## Deployment (Jetson Orin / Docker)
+## Deployment (Jetson / native build)
 
-The triggered recorder ships to an edge target — a Jetson Orin (aarch64) running
-an older ROS2 distro whose rosbag2 lacks the MCAP storage and `WriteSplitEvent`
-features this workflow depends on. The recorder runs its own ROS2 Jazzy stack
-inside Docker; the container is purely a packaging layer for a newer ROS2 on the
-old host. Only `edgestream-rec` and `trigger-pub` are deployed.
+The triggered recorder ships to an edge target — a Jetson running ROS2 Humble.
+The target runs the same ROS2 distro the recorder is built against, so the two
+binaries are compiled **natively on the target against its own ROS2 install**.
+There is no container and no bundled ROS: only `edgestream-rec` and `trigger-pub`
+are deployed, and rosbag2 with MCAP storage and the `WriteSplitEvent` on
+`/events/write_split` come from the host's ROS2 (`ros-humble-rosbag2-storage-mcap`),
+which the recorder reuses rather than shipping its own.
 
-The flake builds the images with `dockerTools`, reusing the same ROS env and
-nix-built binaries as the dev shell:
-
-```
-packages.edgestream-rec        packages.edgestream-rec-image    # → edgestream-rec:jazzy
-packages.trigger-pub           packages.trigger-pub-image       # → trigger-pub:jazzy
-```
-
-The `edgestream-rec` image carries both the `edgestream-rec` binary and `ros2 bag
-record`, so it backs two containers — the continuous recorder and the extractor.
+What gets built is only the Rust code and the local `edgestream_msgs` interface
+package; `rcl`, `rmw_fastrtps_cpp`, the standard message packages, and rosbag2
+are the host's ROS2. Building against the host's own libraries is what makes the
+binaries ABI-compatible with the rest of its ROS graph (the camera node, rosbag2,
+…) — a binary built against a different ROS2 build would link different
+typesupport and not interoperate.
 
 ### Build on the target
 
-The Orin is aarch64 and the dev host is x86_64. Building natively on the Orin
-keeps the entire ROS2 closure as cache substitutions (only the three crates
-compile on-device); cross-compiling would miss the aarch64 binary cache, and
-emulation would compile the crates under qemu. nix on the Orin pulls aarch64
-ROS2 from `ros.cachix.org` **plus** the @wentasah attic cache
-`https://attic.iid.ciirc.cvut.cz/ros` — both are required for full
-substitutability. Add to `/etc/nix/nix.custom.conf`:
-
-```
-extra-substituters = https://ros.cachix.org https://attic.iid.ciirc.cvut.cz/ros
-extra-trusted-public-keys = ros.cachix.org-1:dSyZxI8geDCJrwgvCOHDoAfOm5sV1wCPjBkKL+38Rvo= ros:JR95vUYsShSqfA1VTYoFt1Nz6uXasm5QrcOsGry9f6Q=
-```
+Prerequisites (Ubuntu 22.04 / ROS2 Humble):
 
 ```bash
-# on the Orin, in this repo
-nix build .#packages.aarch64-linux.edgestream-rec-image -o result-rec
-nix build .#packages.aarch64-linux.trigger-pub-image   -o result-trig
-sudo docker load -i result-rec      # → edgestream-rec:jazzy
-sudo docker load -i result-trig     # → trigger-pub:jazzy
+sudo apt install ros-humble-ros-base ros-humble-rosbag2-storage-mcap \
+                 ros-humble-rosbag2-transport ros-humble-ros2bag \
+                 ros-dev-tools clang libclang-dev
+# plus a Rust toolchain (rustup, or the distro cargo/rustc) on PATH
 ```
+
+Then, from a checkout of this repo on the target:
+
+```bash
+./scripts/build-on-target.sh
+```
+
+It builds `edgestream_msgs` into a colcon overlay (`./install`) and compiles
+`edgestream-rec` + `trigger-pub` (`./target/release`) against `/opt/ros/humble`.
+Override the ROS install with `ROS_SETUP=/opt/ros/<distro>/setup.bash`.
 
 ### Run
 
 ```bash
-./scripts/start_recorder.sh           # edgestream-record + edgestream-rec containers
-./scripts/start_demo_trigger_pub.sh   # edgestream-trigger container (demo trigger source)
+./scripts/start_recorder.sh           # ros2 bag record + edgestream-rec, detached
+./scripts/start_demo_trigger_pub.sh   # demo trigger source (foreground)
 ```
 
-Splits land in `~/edgestream-rec/recordings/`, clips in `~/edgestream-rec/captured/`
-(override with `EDGESTREAM_DIR`). Each container runs on the host network with
-`FASTDDS_BUILTIN_TRANSPORTS=UDPv4`: every container has a private `/dev/shm`, so
-FastDDS shared-memory delivery is silently dropped even though discovery matches
-— UDP is the transport that carries data both across the host's older ROS distro
-and between containers. Cross-distro recording works because rosbag2 stores raw
-serialized bytes and never decodes them; reception only needs endpoint discovery
-and QoS to match.
+`start_recorder.sh` launches the continuous `ros2 bag record` and the extractor
+as two detached processes, each with a pidfile and log under the data dir. Splits
+land in `~/edgestream-rec/recordings/`, clips in `~/edgestream-rec/captured/`
+(override with `EDGESTREAM_DIR`). Running natively, every ROS2 process shares the
+host `/dev/shm`, so FastDDS shared-memory transport works and discovery + data
+interop with the host's other Humble nodes is direct.
 
 ### Retention
 
@@ -210,10 +204,11 @@ crates/rclrs-sub/       # rclrs all-topic indexer
 crates/edgestream-rec/  # r2r+tokio triggered clip recorder
 crates/trigger-pub/     # r2r periodic trigger publisher
 edgestream_msgs/        # local ROS2 interface package (Trigger, Recorded)
-nix/                    # flake package defs: edgestream-msgs, ros-env, binaries, images
+nix/                    # flake package defs: edgestream-msgs, ros-env, binaries
 scripts/record.sh       # standalone continuous `ros2 bag record` (dev)
-scripts/start_recorder.sh, start_demo_trigger_pub.sh  # launch the deployed containers
-scripts/prune-recordings/  # systemd retention timer for the target
+scripts/build-on-target.sh  # native target build (edgestream_msgs overlay + binaries)
+scripts/start_recorder.sh, start_demo_trigger_pub.sh  # run the deployed binaries natively
+scripts/prune-recordings/  # retention loop for the target
 flake.nix               # ROS2 Jazzy dev shell + nix-built binaries/images
 ```
 

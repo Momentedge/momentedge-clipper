@@ -1,10 +1,13 @@
-# Deployable binaries built reproducibly with nix. The dev shell uses system
-# cargo; for a portable aarch64 image we build them here instead. Only
-# edgestream-rec and trigger-pub are packaged — r2r-sub/rclrs-sub are out of
-# scope. r2r's build script (bindgen + rcl codegen) needs the same environment
-# the dev shell's shellHook sets: rosEnv's setup hook exports AMENT_PREFIX_PATH,
-# and the explicit knobs below match the shell.
-{ pkgs, rosEnv, idlPackageFilter, src, cargoLockFile }:
+# The two deployable crates built reproducibly with nix, against the nix ROS
+# closure (rosEnv) — a build check that mirrors the dev shell without the system
+# cargo. This is NOT the deployment artifact: the target builds these natively
+# against its own apt ROS2 (see README "Native build on the target"), since a
+# nix-built binary bakes /nix/store RPATHs and would drag the nix closure along
+# instead of using the host's ROS. Only edgestream-rec and trigger-pub are built
+# — r2r-sub/rclrs-sub are out of scope. r2r's build script (bindgen + rcl codegen)
+# needs the same environment the dev shell's shellHook sets: rosEnv's setup hook
+# exports AMENT_PREFIX_PATH, and the explicit knobs below match the shell.
+{ pkgs, rosEnv, idlPackageFilter, rosDistro, src, cargoLockFile }:
 
 let
   mkBin = pname: pkgs.rustPlatform.buildRustPackage {
@@ -23,7 +26,7 @@ let
     buildInputs = [ rosEnv ];
     LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
     IDL_PACKAGE_FILTER = idlPackageFilter;
-    ROS_DISTRO = "jazzy";
+    ROS_DISTRO = rosDistro;
   };
 in {
   edgestream-rec = mkBin "edgestream-rec";
