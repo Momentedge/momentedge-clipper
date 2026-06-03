@@ -170,47 +170,20 @@ async fn handle_trigger(
         trig.name, trig.preroll, trig.postroll
     );
 
-    // 1. Wait out the postroll: hold until the wall clock passes the window end.
-    let now = now_ns();
-    if end_ns > now {
-        tokio::time::sleep(Duration::from_nanos(end_ns - now)).await;
-    }
-
-    // 2. Wait for the first split finalised at/after the window end, so the file
-    //    holding the tail of the window is closed and safe to read.
-    let closed_through = loop {
-        match split_rx.recv().await {
-            Ok(ev) if ev.observed_ns >= end_ns => break ev.closed_file,
-            Ok(_) => continue,
-            Err(broadcast::error::RecvError::Lagged(n)) => {
-                debug!("split events lagged by {n}; continuing");
-            }
-            Err(broadcast::error::RecvError::Closed) => {
-                anyhow::bail!("split event channel closed before a post-window split");
-            }
-        }
-    };
-
-    // 3. Bulk-copy the window into ./triggered/<trigger_ns>_<name>.mcap. The copy
-    //    is blocking file IO, so it runs off the async runtime.
+    // Wait out the postroll, rendezvous with the closing split, and copy the
+    // window. Each trigger runs this on its own task, so overlapping windows are
+    // cut concurrently against the shared record dir and split channel.
     let out_path = cfg
         .out_dir
         .join(format!("{trigger_ns}_{}.mcap", sanitize(&trig.name)));
-    let stats = {
-        let record_dir = cfg.record_dir.clone();
-        let out_path = out_path.clone();
-        let closed_through = closed_through.clone();
-        tokio::task::spawn_blocking(move || {
-            mcap_copy::extract_clip(
-                &record_dir,
-                &out_path,
-                start_ns,
-                end_ns,
-                Some(&closed_through),
-            )
-        })
-        .await??
-    };
+    let stats = record_clip(
+        start_ns,
+        end_ns,
+        out_path.clone(),
+        cfg.record_dir.clone(),
+        &mut split_rx,
+    )
+    .await?;
     info!(
         "clip {} written: {} msgs from {}/{} splits, {:.1} MiB",
         out_path.display(),
@@ -235,6 +208,48 @@ async fn handle_trigger(
         trig.name
     );
     Ok(())
+}
+
+/// The decode-free, ROS-free core of [`handle_trigger`]: wait out the postroll,
+/// wait for the `write_split` that finalises the window's tail, then bulk-copy
+/// the clip. It owns the postroll sleep, the split rendezvous and the blocking
+/// extraction, but neither the `Trigger`/`Recorded` types nor the publisher —
+/// so overlapping windows (each on its own task, sharing `record_dir` and one
+/// split broadcast) can be exercised without a live ROS graph.
+async fn record_clip(
+    start_ns: u64,
+    end_ns: u64,
+    out_path: PathBuf,
+    record_dir: PathBuf,
+    split_rx: &mut broadcast::Receiver<SplitEvent>,
+) -> anyhow::Result<mcap_copy::ClipStats> {
+    // 1. Wait out the postroll: hold until the wall clock passes the window end.
+    let now = now_ns();
+    if end_ns > now {
+        tokio::time::sleep(Duration::from_nanos(end_ns - now)).await;
+    }
+
+    // 2. Wait for the first split finalised at/after the window end, so the file
+    //    holding the tail of the window is closed and safe to read.
+    let closed_through = loop {
+        match split_rx.recv().await {
+            Ok(ev) if ev.observed_ns >= end_ns => break ev.closed_file,
+            Ok(_) => continue,
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                debug!("split events lagged by {n}; continuing");
+            }
+            Err(broadcast::error::RecvError::Closed) => {
+                anyhow::bail!("split event channel closed before a post-window split");
+            }
+        }
+    };
+
+    // 3. Bulk-copy the window into the clip. The copy is blocking file IO, so it
+    //    runs off the async runtime.
+    tokio::task::spawn_blocking(move || {
+        mcap_copy::extract_clip(&record_dir, &out_path, start_ns, end_ns, Some(&closed_through))
+    })
+    .await?
 }
 
 /// Nanoseconds since the Unix epoch on the system clock.
@@ -309,5 +324,286 @@ mod tests {
             nanosec: 250,
         };
         assert_eq!(time_to_ns(&t), 250);
+    }
+
+    // --- Overlapping triggers ------------------------------------------------
+    //
+    // These drive `record_clip` directly (the ROS-free core), spawning one task
+    // per trigger against a shared record dir and a single split broadcast — the
+    // same wiring as the live consumer loop. They exercise the postroll sleep, so
+    // they run on real (short) wall-clock time. Window bounds and message stamps
+    // are absolute `now`-relative nanoseconds; assertions compare what each clip
+    // captured against what its window should hold, independent of the clock.
+
+    use std::collections::BTreeMap;
+    use std::fs::File;
+    use std::io::BufWriter;
+    use std::path::Path;
+
+    use memmap2::Mmap;
+    use tokio::sync::mpsc;
+
+    const MS: u64 = 1_000_000;
+
+    #[tokio::test]
+    async fn overlapping_triggers_overtake_each_write_correct_clips() -> anyhow::Result<()> {
+        // trigger2 is "published" after trigger1 yet its window is fully nested in
+        // trigger1's postroll: start1 < start2 and end2 < end1. Because each
+        // trigger sleeps independently out to its own window end, trigger2
+        // *overtakes* — it finishes first — and both clips must still hold exactly
+        // their own window's messages.
+        let root = temp_root("overtake")?;
+        let record_dir = root.join("record");
+        let out_dir = root.join("triggered");
+        std::fs::create_dir_all(&record_dir)?;
+
+        let now = now_ns();
+        let (start1, end1) = (now, now + 500 * MS); // outer window
+        let (start2, end2) = (now + 20 * MS, now + 150 * MS); // nested window
+        assert!(
+            start1 < start2 && end2 < end1,
+            "window 2 must nest inside window 1"
+        );
+
+        // Two splits: rec_0 holds the earlier half, rec_1 the later half, so each
+        // clip has to read across both files. Stamps are placed on/inside/outside
+        // the two windows.
+        let early = record_dir.join("rec_0.mcap");
+        let late = record_dir.join("rec_1.mcap");
+        write_split_file(
+            &early,
+            "/topic",
+            &[
+                now.saturating_sub(20 * MS), // before both
+                now,                         // start1 only
+                now + 20 * MS,               // start2: both
+                now + 80 * MS,               // both
+            ],
+        )?;
+        write_split_file(
+            &late,
+            "/topic",
+            &[
+                now + 150 * MS, // end2: both
+                now + 300 * MS, // after end2: window 1 only
+                now + 500 * MS, // end1: window 1 only
+                now + 700 * MS, // after both
+            ],
+        )?;
+        set_split_mtime(&early, UNIX_EPOCH + Duration::from_secs(1_000))?;
+        set_split_mtime(&late, UNIX_EPOCH + Duration::from_secs(2_000))?;
+
+        // One broadcast feeds both handlers; both subscribe before any send, just
+        // as the live loop does.
+        let (split_tx, _) = broadcast::channel::<SplitEvent>(64);
+        let mut rx1 = split_tx.subscribe();
+        let mut rx2 = split_tx.subscribe();
+
+        // Completion order is observed here: whoever finishes first sends first.
+        let (done_tx, mut done_rx) = mpsc::unbounded_channel::<&'static str>();
+
+        let h1 = {
+            let out = out_dir.join("clip1.mcap");
+            let rec = record_dir.clone();
+            let done = done_tx.clone();
+            tokio::spawn(async move {
+                let stats = record_clip(start1, end1, out, rec, &mut rx1).await?;
+                done.send("clip1").ok();
+                anyhow::Ok(stats)
+            })
+        };
+        let h2 = {
+            let out = out_dir.join("clip2.mcap");
+            let rec = record_dir.clone();
+            let done = done_tx.clone();
+            tokio::spawn(async move {
+                let stats = record_clip(start2, end2, out, rec, &mut rx2).await?;
+                done.send("clip2").ok();
+                anyhow::Ok(stats)
+            })
+        };
+        drop(done_tx);
+
+        // The split that closes both windows' tails: observed well after end1,
+        // naming the newest split. Buffered now; each handler consumes it once its
+        // own postroll sleep elapses.
+        split_tx.send(SplitEvent {
+            observed_ns: end1 + 50 * MS,
+            closed_file: late.clone(),
+        })?;
+
+        let s1 = h1.await??;
+        let s2 = h2.await??;
+
+        // The overtake: the nested, earlier-ending trigger2 reported done first.
+        assert_eq!(
+            done_rx.recv().await,
+            Some("clip2"),
+            "trigger2 should overtake trigger1"
+        );
+
+        // Both clips hold exactly their window's messages — neither leaks the
+        // other's.
+        assert_eq!(
+            sorted_clip_times(&out_dir.join("clip1.mcap"))?,
+            vec![
+                now,
+                now + 20 * MS,
+                now + 80 * MS,
+                now + 150 * MS,
+                now + 300 * MS,
+                now + 500 * MS,
+            ],
+        );
+        assert_eq!(s1.messages_copied, 6);
+
+        assert_eq!(
+            sorted_clip_times(&out_dir.join("clip2.mcap"))?,
+            vec![now + 20 * MS, now + 80 * MS, now + 150 * MS],
+        );
+        assert_eq!(s2.messages_copied, 3);
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn overlapping_triggers_partial_overlap_each_write_correct_clips() -> anyhow::Result<()> {
+        // Staggered windows that overlap without nesting: start1 < start2 < end1 <
+        // end2. The shared region [start2, end1] lands in both clips; the
+        // exclusive tails land in only one each.
+        let root = temp_root("partial")?;
+        let record_dir = root.join("record");
+        let out_dir = root.join("triggered");
+        std::fs::create_dir_all(&record_dir)?;
+
+        let now = now_ns();
+        let (start1, end1) = (now, now + 200 * MS);
+        let (start2, end2) = (now + 100 * MS, now + 500 * MS);
+        assert!(
+            start1 < start2 && start2 < end1 && end1 < end2,
+            "windows must overlap without either nesting"
+        );
+
+        let early = record_dir.join("rec_0.mcap");
+        let late = record_dir.join("rec_1.mcap");
+        write_split_file(
+            &early,
+            "/topic",
+            &[
+                now.saturating_sub(20 * MS), // before both
+                now,                         // window 1 only (< start2)
+                now + 50 * MS,               // window 1 only
+                now + 100 * MS,              // start2: shared region
+                now + 150 * MS,              // shared region
+            ],
+        )?;
+        write_split_file(
+            &late,
+            "/topic",
+            &[
+                now + 200 * MS, // end1: shared region (last stamp in both)
+                now + 300 * MS, // window 2 only (> end1)
+                now + 500 * MS, // end2: window 2 only
+                now + 700 * MS, // after both
+            ],
+        )?;
+        set_split_mtime(&early, UNIX_EPOCH + Duration::from_secs(1_000))?;
+        set_split_mtime(&late, UNIX_EPOCH + Duration::from_secs(2_000))?;
+
+        let (split_tx, _) = broadcast::channel::<SplitEvent>(64);
+        let mut rx1 = split_tx.subscribe();
+        let mut rx2 = split_tx.subscribe();
+
+        let h1 = {
+            let out = out_dir.join("clip1.mcap");
+            let rec = record_dir.clone();
+            tokio::spawn(async move { record_clip(start1, end1, out, rec, &mut rx1).await })
+        };
+        let h2 = {
+            let out = out_dir.join("clip2.mcap");
+            let rec = record_dir.clone();
+            tokio::spawn(async move { record_clip(start2, end2, out, rec, &mut rx2).await })
+        };
+
+        // Observed after the later window end so both handlers accept it.
+        split_tx.send(SplitEvent {
+            observed_ns: end2 + 50 * MS,
+            closed_file: late.clone(),
+        })?;
+
+        let s1 = h1.await??;
+        let s2 = h2.await??;
+
+        assert_eq!(
+            sorted_clip_times(&out_dir.join("clip1.mcap"))?,
+            vec![
+                now,
+                now + 50 * MS,
+                now + 100 * MS,
+                now + 150 * MS,
+                now + 200 * MS,
+            ],
+        );
+        assert_eq!(s1.messages_copied, 5);
+
+        assert_eq!(
+            sorted_clip_times(&out_dir.join("clip2.mcap"))?,
+            vec![
+                now + 100 * MS,
+                now + 150 * MS,
+                now + 200 * MS,
+                now + 300 * MS,
+                now + 500 * MS,
+            ],
+        );
+        assert_eq!(s2.messages_copied, 5);
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    fn write_split_file(path: &Path, topic: &str, log_times: &[u64]) -> anyhow::Result<()> {
+        let mut writer = mcap::Writer::new(BufWriter::new(File::create(path)?))?;
+        let schema_id = writer.add_schema("std_msgs/msg/String", "ros2msg", b"string data")?;
+        let channel_id = writer.add_channel(schema_id, topic, "cdr", &BTreeMap::new())?;
+        for (seq, &log_time) in log_times.iter().enumerate() {
+            writer.write_to_known_channel(
+                &mcap::records::MessageHeader {
+                    channel_id,
+                    sequence: seq as u32,
+                    log_time,
+                    publish_time: log_time,
+                },
+                b"payload",
+            )?;
+        }
+        writer.finish()?;
+        Ok(())
+    }
+
+    fn sorted_clip_times(path: &Path) -> anyhow::Result<Vec<u64>> {
+        let file = File::open(path)?;
+        let mmap = unsafe { Mmap::map(&file)? };
+        let mut times = mcap::MessageStream::new(&mmap)?
+            .map(|msg| Ok(msg?.log_time))
+            .collect::<anyhow::Result<Vec<u64>>>()?;
+        times.sort_unstable();
+        Ok(times)
+    }
+
+    fn set_split_mtime(path: &Path, when: SystemTime) -> anyhow::Result<()> {
+        File::options().write(true).open(path)?.set_modified(when)?;
+        Ok(())
+    }
+
+    fn temp_root(name: &str) -> anyhow::Result<PathBuf> {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "edgestream-rec-overlap-{name}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path)?;
+        Ok(path)
     }
 }
