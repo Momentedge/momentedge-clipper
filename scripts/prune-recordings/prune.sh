@@ -1,33 +1,49 @@
 #!/usr/bin/env bash
-# Delete recordings older than one day from a captured directory.
+# Continuously delete recordings older than one day from a captured directory.
 #
-# The directory to prune is taken from $PRUNE_DIR, then the first positional
-# argument, then a default of ~/edgestream-rec/captured. Regular files with an
-# mtime older than 24 h are removed and any empty subdirectories left behind are
-# cleaned up. A missing directory is not an error — the script exits 0 so the
-# systemd timer driving it stays green before the first recording lands.
+# Loops forever: prune, sleep 1 min, repeat. The directory to prune is taken from
+# $PRUNE_DIR, then the first positional argument, then ~/edgestream-rec/captured.
+# Each pruned path and a summary count are logged to stdout — redirect it to a
+# file when running detached. A missing directory is skipped, not fatal — the
+# loop keeps running so it picks up once the first recording lands.
+#
+# Run it directly; for a persistent background run on a host:
+#   setsid nohup ~/.local/bin/edgestream-prune.sh >> ~/edgestream-rec/prune.log 2>&1 &
+#
+# On start it writes its own PID to $PRUNE_PIDFILE (default ~/edgestream-rec/
+# prune.pid) so a redeploy can stop the previous run with `kill $(cat …)`.
 set -euo pipefail
 
 PRUNE_DIR="${PRUNE_DIR:-${1:-$HOME/edgestream-rec/captured}}"
+PRUNE_PIDFILE="${PRUNE_PIDFILE:-$HOME/edgestream-rec/prune.pid}"
 
-if [[ ! -d "$PRUNE_DIR" ]]; then
-  echo "prune: directory does not exist, nothing to do: $PRUNE_DIR"
-  exit 0
-fi
+echo "$$" > "$PRUNE_PIDFILE"
 
-# -mmin +1440 = modified more than 1440 minutes (24 h) ago. -print before -delete
-# so each path is logged before it is removed; stdout is captured by the systemd
-# service journal. Files first, then the now-empty directories they leave behind.
-count=0
-while IFS= read -r f; do
-  echo "pruned: $f"
-  count=$((count + 1))
-done < <(find "$PRUNE_DIR" -mindepth 1 -type f -mmin +1440 -print -delete)
+prune_once() {
+  if [[ ! -d "$PRUNE_DIR" ]]; then
+    echo "prune: directory does not exist, nothing to do: $PRUNE_DIR"
+    return
+  fi
 
-find "$PRUNE_DIR" -mindepth 1 -type d -empty -delete
+  # -mmin +1440 = modified more than 1440 minutes (24 h) ago. -print before
+  # -delete so each path is logged before it is removed. Files first, then the
+  # now-empty directories they leave behind.
+  local count=0 f
+  while IFS= read -r f; do
+    echo "pruned: $f"
+    count=$((count + 1))
+  done < <(find "$PRUNE_DIR" -mindepth 1 -type f -mmin +1440 -print -delete)
 
-if ((count > 0)); then
-  echo "pruned $count file(s) older than 24h from $PRUNE_DIR"
-else
-  echo "nothing to prune in $PRUNE_DIR"
-fi
+  find "$PRUNE_DIR" -mindepth 1 -type d -empty -delete
+
+  if ((count > 0)); then
+    echo "pruned $count file(s) older than 24h from $PRUNE_DIR"
+  else
+    echo "nothing to prune in $PRUNE_DIR"
+  fi
+}
+
+while true; do
+  prune_once
+  sleep 60
+done

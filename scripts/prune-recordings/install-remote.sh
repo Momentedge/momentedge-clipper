@@ -1,39 +1,51 @@
 #!/usr/bin/env bash
-# Install the prune script + systemd user timer onto a remote edgestream host.
+# Deploy the prune loop to a remote edgestream host and start it in the background.
 #
-# Copies prune.sh to ~/.local/bin/edgestream-prune.sh and the .service/.timer
-# units to ~/.config/systemd/user/, enables user lingering (so the timer runs
-# without an active login), then enables and starts the timer.
+# Copies prune.sh to ~/.local/bin/edgestream-prune.sh, stops any previous run,
+# and relaunches it detached with setsid+nohup so it survives the SSH session.
+# Output goes to ~/edgestream-rec/prune.log.
 #
 # Usage:
 #   ./install-remote.sh [user@host]
 # Defaults to melikag@100.67.74.107. The pruned directory defaults to
-# ~/edgestream-rec/captured (set in the .service); override it on the host with
-#   systemctl --user edit edgestream-prune.service
+# ~/edgestream-rec/captured; override it by exporting PRUNE_DIR for the launch
+# (edit the ExecStart line below) or pass it as the script's first argument.
 set -euo pipefail
 
 TARGET="${1:-melikag@100.67.74.107}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-echo "installing edgestream prune timer on $TARGET"
+echo "deploying prune loop to $TARGET"
 
-# Stage files into place, creating the directories they need.
-ssh "$TARGET" 'mkdir -p ~/.local/bin ~/.config/systemd/user ~/edgestream-rec/captured'
+ssh "$TARGET" 'mkdir -p ~/.local/bin ~/edgestream-rec/captured'
 scp "$HERE/prune.sh" "$TARGET:.local/bin/edgestream-prune.sh"
-scp "$HERE/edgestream-prune.service" "$HERE/edgestream-prune.timer" \
-  "$TARGET:.config/systemd/user/"
 
-# Linger lets the user manager (and thus the timer) keep running without a login
-# session. Then load the new units and start the timer.
 ssh "$TARGET" '
   set -euo pipefail
   chmod +x ~/.local/bin/edgestream-prune.sh
-  loginctl enable-linger "$USER"
-  systemctl --user daemon-reload
-  systemctl --user enable --now edgestream-prune.timer
-  echo "--- timer ---"
-  systemctl --user list-timers edgestream-prune.timer --no-pager
+
+  # Remove any earlier systemd-based install.
+  systemctl --user disable --now edgestream-prune.service edgestream-prune.timer 2>/dev/null || true
+  rm -f ~/.config/systemd/user/edgestream-prune.service ~/.config/systemd/user/edgestream-prune.timer
+  systemctl --user daemon-reload 2>/dev/null || true
+
+  # Stop the previous loop via its PID file (the script records its own PID).
+  # Avoid pkill -f: this very SSH command line contains the script name.
+  pidfile=~/edgestream-rec/prune.pid
+  [ -f "$pidfile" ] && kill "$(cat "$pidfile")" 2>/dev/null || true
+  sleep 1
+
+  # Relaunch detached: fds redirected away from the SSH channel so it returns.
+  setsid nohup ~/.local/bin/edgestream-prune.sh >> ~/edgestream-rec/prune.log 2>&1 < /dev/null &
+  sleep 2
+  pid=$(cat "$pidfile" 2>/dev/null || true)
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    echo "--- running (pid $pid) ---"
+    tail -n 3 ~/edgestream-rec/prune.log
+  else
+    echo "FAILED to start"; exit 1
+  fi
 '
 
 echo "done. follow pruned-file logs with:"
-echo "  ssh $TARGET 'journalctl --user-unit=edgestream-prune.service -f'"
+echo "  ssh $TARGET 'tail -f ~/edgestream-rec/prune.log'"
