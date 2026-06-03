@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "ros2_subscribe",
+  "project_id": "46411bcb-5608-4097-adbe-f42edd9ae8b9"
+}
