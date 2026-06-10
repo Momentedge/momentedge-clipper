@@ -193,6 +193,7 @@ needed), overridable per key by `EDGESTREAM_*` environment variables
 record_dir = "./record-cont"   # bag directory of the continuous recording
 out_dir = "./triggered-cont"   # where clips are written
 grace_secs = 30                # wait past the window end for coverage before cutting
+extract_parallelism = 1        # concurrent clip copies (1 = one at a time, FIFO)
 ```
 
 `record-continuous.sh` records unchunked with the rosbag2 message cache
@@ -200,8 +201,10 @@ disabled (`--storage-preset-profile fastwrite --max-cache-size 0`), so each
 message is visible to the tail as soon as it is written; the extractor also
 reads chunked recordings (override with the `STORAGE_PRESET` / `MAX_CACHE_SIZE`
 env vars, and size the extractor's `grace_secs` to the resulting flush
-latency). Clips have the same form as `edgestream-rec`'s and
-land in `./triggered-cont`. The single recording file has no retention — it
+latency). Clips have the same form as `edgestream-rec`'s and land in
+`./triggered-cont`, fsynced before the `/events/edgestream/recorded` announce
+(a clip whose name is already taken gets a `_<n>` suffix). The single
+recording file has no retention — it
 grows until you stop recording (hole-punch retention is tracked in beads:
 `ros2_subscribe-wkg`).
 

@@ -114,6 +114,13 @@ impl Extent {
 /// How far the recording provably reaches: the highest message `log_time` the
 /// tail has seen on disk, and whether the recording has ended (DataEnd/Footer
 /// scanned — nothing more will ever appear).
+///
+/// "Provably" rests on an ordering assumption: messages land in the file in
+/// (approximately) non-decreasing `log_time` order. rosbag2 has that shape —
+/// one writer, `log_time` stamped at receive — up to millisecond-scale
+/// interleaving between concurrent subscription callbacks, which the flush
+/// and extraction latency in front of every cut dwarfs. A high-water mark at
+/// or past a window end therefore implies the window's messages are on disk.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Coverage {
     pub high_water_ns: u64,
@@ -393,6 +400,14 @@ impl Tailer {
                         let mut prefix = [0u8; 14];
                         file.read_exact_at(&mut prefix, offset + 9)?;
                         delta.absorb_time(u64::from_le_bytes(prefix[6..14].try_into().unwrap()));
+                    } else {
+                        // A conformant Message body is >= 22 bytes (its fixed
+                        // fields alone); below 14 not even log_time exists.
+                        // No writer produces this — corrupt or mis-framed
+                        // data. The record is still consumed (the framing is
+                        // self-consistent), but its time cannot count toward
+                        // extent bounds or coverage.
+                        warn!("message record at {offset} is only {len} B; no timestamp to index");
                     }
                 }
                 op::CHUNK => {

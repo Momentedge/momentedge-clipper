@@ -32,6 +32,9 @@
 //!                before cutting from what is on disk (default 30; must
 //!                exceed the recorder's flush latency — for a chunked
 //!                recording roughly chunk size / aggregate data rate)
+//!   extract_parallelism  concurrent clip copies (default 1: extractions
+//!                queue FIFO — the bulk copy competes with the recorder's
+//!                writes for disk bandwidth; waiting is always concurrent)
 //!
 //! Logging uses the `log` facade with a pretty_env_logger backend; `RUST_LOG`
 //! controls verbosity.
@@ -43,11 +46,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use anyhow::Context;
 use futures::stream::StreamExt;
 use log::{error, info, warn};
 use r2r::{Publisher, QosProfile};
 use serde::Deserialize;
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 
 use tail::{Coverage, Tailer};
 
@@ -64,6 +68,13 @@ struct Config {
     /// latency only; the timeout fires when the recorded topics go quiet, and
     /// the clip then simply ends at the last data that exists.
     grace_secs: u64,
+    /// How many clip extractions may run at once. The default of 1
+    /// serializes the bulk copies FIFO: extraction reads compete with the
+    /// recorder's writes on the same disk, and concurrent copies inflate the
+    /// recorder's flush latency (rosbag2's cache drops messages when it
+    /// cannot drain). Waiting — postroll, coverage — is always concurrent;
+    /// only the copy is gated. Raise on storage with IO headroom.
+    extract_parallelism: usize,
 }
 
 impl Config {
@@ -82,6 +93,7 @@ fn load_config() -> Result<Config, config::ConfigError> {
         .set_default("record_dir", "./record-cont")?
         .set_default("out_dir", "./triggered-cont")?
         .set_default("grace_secs", 30_u64)?
+        .set_default("extract_parallelism", 1_u64)?
         .add_source(config::File::with_name(&file).required(false))
         .add_source(config::Environment::with_prefix("EDGESTREAM"))
         .build()?
@@ -110,12 +122,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (tailer, coverage_rx) = Tailer::new();
 
     // The tail thread: discovers and scans the recording for the process's
-    // lifetime (blocking IO, so off the async runtime).
-    {
+    // lifetime (blocking IO, so off the async runtime). The handle is watched
+    // at the bottom of main: with a dead tailer every clip degrades to a
+    // grace-timeout cut, so the process exits instead.
+    let tail_task = {
         let tailer = tailer.clone();
         let record_dir = cfg.record_dir.clone();
-        tokio::task::spawn_blocking(move || tailer.run(&record_dir));
-    }
+        tokio::task::spawn_blocking(move || tailer.run(&record_dir))
+    };
+
+    // One permit per allowed concurrent clip copy; see Config::extract_parallelism.
+    let extract_permits = Arc::new(Semaphore::new(cfg.extract_parallelism.max(1)));
 
     // trigger consumer: spawn one handler per trigger.
     {
@@ -127,9 +144,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let recorded_pub = recorded_pub.clone();
                 let tailer = tailer.clone();
                 let coverage_rx = coverage_rx.clone();
+                let permits = extract_permits.clone();
                 tokio::spawn(async move {
                     if let Err(e) =
-                        handle_trigger(trig, cfg, recorded_pub, tailer, coverage_rx).await
+                        handle_trigger(trig, cfg, recorded_pub, tailer, coverage_rx, permits).await
                     {
                         error!("trigger handling failed: {e:#}");
                     }
@@ -143,15 +161,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cfg.record_dir.display(),
         cfg.out_dir.display(),
     );
+    if !cfg.record_dir.is_dir() {
+        warn!(
+            "record dir {} does not exist; the tail idles until the continuous \
+             recording (scripts/record-continuous.sh) creates it",
+            cfg.record_dir.display()
+        );
+    }
 
     // The node's single owner: spin continuously to feed the streams.
-    let worker = tokio::task::spawn_blocking(move || {
+    let spin_task = tokio::task::spawn_blocking(move || {
         loop {
             node.spin_once(Duration::from_millis(10));
         }
     });
-    worker.await?;
-    Ok(())
+
+    // Neither thread returns, so either handle resolving means a panic (or an
+    // impossible clean exit). Exit non-zero so a supervisor restarts the
+    // recorder rather than letting it limp on with a dead tail or node.
+    tokio::select! {
+        res = tail_task => {
+            res?;
+            Err("tail thread exited unexpectedly".into())
+        }
+        res = spin_task => {
+            res?;
+            Err("node spin thread exited unexpectedly".into())
+        }
+    }
 }
 
 /// Run one trigger's wait-then-extract-then-announce flow.
@@ -161,6 +198,7 @@ async fn handle_trigger(
     recorded_pub: Publisher<r2r::edgestream_msgs::msg::Recorded>,
     tailer: Arc<Tailer>,
     coverage_rx: watch::Receiver<Coverage>,
+    permits: Arc<Semaphore>,
 ) -> anyhow::Result<()> {
     let trigger_ns = time_to_ns(&trig.trigger_time);
     let start_ns = trigger_ns.saturating_sub(trig.preroll);
@@ -176,21 +214,22 @@ async fn handle_trigger(
     let stats = record_clip(
         start_ns,
         end_ns,
-        out_path.clone(),
+        out_path,
         tailer,
         coverage_rx,
         cfg.grace(),
+        permits,
     )
     .await?;
     info!(
         "clip {} written: {} msgs from {} extents, {:.1} MiB",
-        out_path.display(),
+        stats.out_path.display(),
         stats.messages_copied,
         stats.extents_read,
         stats.bytes_copied as f64 / 1_048_576.0,
     );
 
-    let filename = out_path.to_string_lossy().into_owned();
+    let filename = stats.out_path.to_string_lossy().into_owned();
     let recorded = r2r::edgestream_msgs::msg::Recorded {
         name: trig.name.clone(),
         filename: filename.clone(),
@@ -208,7 +247,8 @@ async fn handle_trigger(
 
 /// The decode-free, ROS-free core of [`handle_trigger`]: wait out the
 /// postroll on the wall clock, wait for the tail's coverage to reach the
-/// window end, then snapshot the window plan and run the blocking extraction.
+/// window end, then — holding an extraction permit — snapshot the window
+/// plan and run the blocking extraction.
 async fn record_clip(
     start_ns: u64,
     end_ns: u64,
@@ -216,6 +256,7 @@ async fn record_clip(
     tailer: Arc<Tailer>,
     mut coverage_rx: watch::Receiver<Coverage>,
     grace: Duration,
+    permits: Arc<Semaphore>,
 ) -> anyhow::Result<clip::ClipStats> {
     // 1. Wait out the postroll: hold until the wall clock passes the window end.
     let now = now_ns();
@@ -236,8 +277,14 @@ async fn record_clip(
         ),
     }
 
-    // 3. Snapshot the plan and bulk-copy the window. The copy is blocking file
-    //    IO, so it runs off the async runtime.
+    // 3. Acquire an extraction permit (FIFO; default one copy at a time —
+    //    the bulk copy competes with the recorder's writes for disk
+    //    bandwidth), then snapshot the plan and bulk-copy the window. The
+    //    copy is blocking file IO, so it runs off the async runtime.
+    let _permit = permits
+        .acquire_owned()
+        .await
+        .context("extraction semaphore closed")?;
     let plan = tailer.plan_window(start_ns, end_ns);
     tokio::task::spawn_blocking(move || clip::extract_clip(&plan, &out_path, start_ns, end_ns))
         .await?
@@ -290,6 +337,7 @@ mod tests {
                 record_dir = "/data/record"
                 out_dir = "/data/clips"
                 grace_secs = 7
+                extract_parallelism = 3
                 "#,
                 config::FileFormat::Toml,
             ))
@@ -300,6 +348,7 @@ mod tests {
         assert_eq!(cfg.record_dir, PathBuf::from("/data/record"));
         assert_eq!(cfg.out_dir, PathBuf::from("/data/clips"));
         assert_eq!(cfg.grace(), Duration::from_secs(7));
+        assert_eq!(cfg.extract_parallelism, 3);
     }
 
     #[test]

@@ -49,7 +49,9 @@ yields three artefacts, shared with the per-trigger handlers:
   during the tail; the default fastwrite profile is unchunked and skips that
   cost entirely.
 - **Coverage watch** — a `tokio::sync::watch` of the highest `log_time` on
-  disk plus an `ended` flag (DataEnd/Footer scanned).
+  disk plus an `ended` flag (DataEnd/Footer scanned). Sound because messages
+  land in the file in (approximately) non-decreasing `log_time` order —
+  rosbag2's single writer stamps `log_time` at receive.
 
 Per top-level `Message` record only the 14-byte prefix is read (channel id,
 sequence, `log_time`); bodies are first touched at extraction. The same
@@ -76,10 +78,14 @@ windows are cut concurrently against the one shared tail:
    from what exists, with a warning. The grace must exceed the recorder's
    flush latency: near zero for the fastwrite profile, roughly one chunk fill
    (chunk size / aggregate data rate) for chunked profiles.
-3. **Extract** via a `plan_window` snapshot (file handle, overlapping extents,
-   channel registry) handed to `clip::extract_clip` (blocking IO, run on
+3. **Extract** under an extraction permit (`extract_parallelism`, default 1:
+   copies queue FIFO so concurrent windows don't compete with the recorder
+   for disk bandwidth; the waits in steps 1–2 stay concurrent): a
+   `plan_window` snapshot (file handle, overlapping extents, channel
+   registry) handed to `clip::extract_clip` (blocking IO, run on
    `spawn_blocking`).
-4. **Announce** by publishing `edgestream_msgs/Recorded`.
+4. **Announce** by publishing `edgestream_msgs/Recorded` — after the clip is
+   fsynced, so the announce implies a durable file.
 
 ## The copy is direct (`clip.rs`)
 
@@ -95,7 +101,9 @@ cached; `mcap::Writer` deduplicates schemas/channels by content. The clip ends
 with `Writer::finish()`, which writes the summary section, footer and closing
 magic — every clip is a complete, standalone MCAP of the same form as
 `edgestream-rec`'s (`mcap::MessageStream` over a clip is the validity check the
-unit tests use).
+unit tests use). The output file is created with `create_new` — a duplicate
+trigger (same stamp and name) writes a `_<n>`-suffixed sibling instead of two
+writers interleaving one file — and fsynced before `extract_clip` returns.
 
 ## Time base
 
@@ -120,6 +128,10 @@ spins the node, the typed trigger stream is consumed on a tokio task, the
 `Recorded` publisher is `Clone` and shared into each handler. A second
 `spawn_blocking` thread runs the tail loop for the process's lifetime; it
 talks to handlers only through the mutex-guarded index and the coverage watch.
+Clip copies are gated by a FIFO semaphore (`extract_parallelism`, default 1).
+`main` `select!`s on the tail and spin thread handles and exits non-zero if
+either dies, for a supervisor to restart — with a dead tailer the process
+would otherwise limp on, cutting every clip at the grace timeout.
 
 ## Retention
 
@@ -146,5 +158,5 @@ defaults → optional TOML file → `EDGESTREAM_*` environment variables
 The TOML file is `edgestream-rec-cont.toml` in the working directory unless
 `$EDGESTREAM_CONFIG` names another path; a missing file is fine, so
 the binary runs with no setup. The keys (`record_dir`, `out_dir`,
-`grace_secs`) and their defaults are listed in the
+`grace_secs`, `extract_parallelism`) and their defaults are listed in the
 [README](../../README.md#continuous-single-file-variant).
