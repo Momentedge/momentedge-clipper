@@ -187,7 +187,9 @@ nix develop --command cargo run -p edgestream-rec-cont
 `record-continuous.sh` records unchunked with the rosbag2 message cache
 disabled (`--storage-preset-profile fastwrite --max-cache-size 0`), so each
 message is visible to the tail as soon as it is written; the extractor also
-reads chunked recordings. Clips have the same form as `edgestream-rec`'s and
+reads chunked recordings (override with the `STORAGE_PRESET` / `MAX_CACHE_SIZE`
+env vars, and size `--grace-secs` on the extractor to the resulting flush
+latency). Clips have the same form as `edgestream-rec`'s and
 land in `./triggered-cont`. The single recording file has no retention — it
 grows until you stop recording (hole-punch retention is tracked in beads:
 `ros2_subscribe-wkg`).

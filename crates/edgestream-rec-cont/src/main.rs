@@ -24,6 +24,10 @@
 //! Flags (all optional):
 //!   --record-dir <dir>   bag directory of the continuous recording (default ./record-cont)
 //!   --out-dir <dir>      where clips are written                   (default ./triggered-cont)
+//!   --grace-secs <n>     how long past the window end to wait for coverage
+//!                        before cutting from what is on disk (default 30; must
+//!                        exceed the recorder's flush latency — for a chunked
+//!                        recording roughly chunk size / aggregate data rate)
 //!
 //! Logging uses the `log` facade with a pretty_env_logger backend; `RUST_LOG`
 //! controls verbosity.
@@ -45,22 +49,22 @@ use tail::{Coverage, Tailer};
 const TRIGGER_TOPIC: &str = "/events/edgestream/trigger";
 const RECORDED_TOPIC: &str = "/events/edgestream/recorded";
 
-/// How long past the window end to keep waiting for the recording to cover
-/// `trigger_time + postroll` before cutting the clip from what is on disk.
-/// Coverage normally lags the wall clock by the recorder's write-through
-/// latency only; the timeout fires when the recorded topics go quiet, and the
-/// clip then simply ends at the last data that exists.
-const COVERAGE_GRACE: Duration = Duration::from_secs(30);
-
 struct Config {
     record_dir: PathBuf,
     out_dir: PathBuf,
+    /// How long past the window end to keep waiting for the recording to
+    /// cover `trigger_time + postroll` before cutting the clip from what is
+    /// on disk. Coverage normally lags the wall clock by the recorder's flush
+    /// latency only; the timeout fires when the recorded topics go quiet, and
+    /// the clip then simply ends at the last data that exists.
+    grace: Duration,
 }
 
 fn parse_args() -> Config {
     let mut cfg = Config {
         record_dir: PathBuf::from("./record-cont"),
         out_dir: PathBuf::from("./triggered-cont"),
+        grace: Duration::from_secs(30),
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -68,6 +72,9 @@ fn parse_args() -> Config {
         match flag.as_str() {
             "--record-dir" => cfg.record_dir = PathBuf::from(value()),
             "--out-dir" => cfg.out_dir = PathBuf::from(value()),
+            "--grace-secs" => {
+                cfg.grace = Duration::from_secs(value().parse().expect("--grace-secs: u64"))
+            }
             other => panic!("unknown flag: {other}"),
         }
     }
@@ -159,7 +166,15 @@ async fn handle_trigger(
     let out_path = cfg
         .out_dir
         .join(format!("{trigger_ns}_{}.mcap", sanitize(&trig.name)));
-    let stats = record_clip(start_ns, end_ns, out_path.clone(), tailer, coverage_rx).await?;
+    let stats = record_clip(
+        start_ns,
+        end_ns,
+        out_path.clone(),
+        tailer,
+        coverage_rx,
+        cfg.grace,
+    )
+    .await?;
     info!(
         "clip {} written: {} msgs from {} extents, {:.1} MiB",
         out_path.display(),
@@ -193,6 +208,7 @@ async fn record_clip(
     out_path: PathBuf,
     tailer: Arc<Tailer>,
     mut coverage_rx: watch::Receiver<Coverage>,
+    grace: Duration,
 ) -> anyhow::Result<clip::ClipStats> {
     // 1. Wait out the postroll: hold until the wall clock passes the window end.
     let now = now_ns();
@@ -204,11 +220,11 @@ async fn record_clip(
     //    with log_time at/after it is on disk (or the recording ended). The
     //    grace timeout bounds the wait when the recorded topics go quiet.
     let covered = coverage_rx.wait_for(|c| c.ended || c.high_water_ns >= end_ns);
-    match tokio::time::timeout(COVERAGE_GRACE, covered).await {
+    match tokio::time::timeout(grace, covered).await {
         Ok(Ok(_)) => {}
         Ok(Err(_)) => anyhow::bail!("tail stopped before the window was covered"),
         Err(_) => warn!(
-            "window end {end_ns} still uncovered after {COVERAGE_GRACE:?}; \
+            "window end {end_ns} still uncovered after {grace:?}; \
              cutting the clip from what is on disk"
         ),
     }

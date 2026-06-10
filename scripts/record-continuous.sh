@@ -4,7 +4,7 @@
 #
 # Records ONE growing MCAP file under ./record-cont — no splits, no
 # WriteSplitEvent. The extractor keeps the file open and tails it, so the
-# storage settings here are chosen for tail latency:
+# storage defaults here are chosen for tail latency:
 #
 #   --storage-preset-profile fastwrite   no chunking, no CRC: every record is a
 #                                        top-level MCAP record, visible to the
@@ -13,7 +13,15 @@
 #                                        is written through to the file directly
 #
 # The extractor also reads chunked (zstd/lz4) files, so these settings are a
-# latency choice, not a correctness requirement.
+# latency choice, not a correctness requirement. Override per run via env:
+#
+#   STORAGE_PRESET   rosbag2 mcap preset (fastwrite | none | zstd_fast |
+#                    zstd_small); "none" is the stock rosbag2 chunked profile,
+#                    whose on-disk visibility lags by roughly one chunk fill
+#                    (chunk size / aggregate data rate)
+#   MAX_CACHE_SIZE   rosbag2 message cache in bytes (104857600 is the rosbag2
+#                    default; the cache drains eagerly, so it adds little
+#                    steady-state latency either way)
 #
 # Topic selection comes from an optional rosbag2 recorder-parameters YAML — the
 # rosbag2_transport Recorder node schema, the same file scripts/record.sh
@@ -33,6 +41,8 @@ set -euo pipefail
 
 CONFIG="${1:-}"
 OUT_DIR="${2:-./record-cont}"
+STORAGE_PRESET="${STORAGE_PRESET:-fastwrite}"
+MAX_CACHE_SIZE="${MAX_CACHE_SIZE:-0}"
 
 SELECT_ARGS=(--all-topics)
 if [[ -n "$CONFIG" ]]; then
@@ -70,9 +80,9 @@ EOF
 fi
 
 rm -rf "$OUT_DIR"
-echo "recording into $OUT_DIR (one continuous mcap, fastwrite) — Ctrl-C to stop"
+echo "recording into $OUT_DIR (one continuous mcap, preset=$STORAGE_PRESET cache=$MAX_CACHE_SIZE) — Ctrl-C to stop"
 exec ros2 bag record "${SELECT_ARGS[@]}" \
   --storage mcap \
-  --storage-preset-profile fastwrite \
-  --max-cache-size 0 \
+  --storage-preset-profile "$STORAGE_PRESET" \
+  --max-cache-size "$MAX_CACHE_SIZE" \
   --output "$OUT_DIR"

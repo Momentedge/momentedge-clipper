@@ -71,9 +71,11 @@ windows are cut concurrently against the one shared tail:
    `trigger_time + postroll`.
 2. **Wait for coverage.** Block on the coverage watch until a message with
    `log_time` at/after the window end is on disk (or the recording ended).
-   This replaces `edgestream-rec`'s split rendezvous. A 30 s grace timeout
-   (`COVERAGE_GRACE`) bounds the wait when the recorded topics go quiet; on
-   timeout the clip is cut from what exists, with a warning.
+   This replaces `edgestream-rec`'s split rendezvous. A grace timeout
+   (`--grace-secs`, default 30 s) bounds the wait; on timeout the clip is cut
+   from what exists, with a warning. The grace must exceed the recorder's
+   flush latency: near zero for the fastwrite profile, roughly one chunk fill
+   (chunk size / aggregate data rate) for chunked profiles.
 3. **Extract** via a `plan_window` snapshot (file handle, overlapping extents,
    channel registry) handed to `clip::extract_clip` (blocking IO, run on
    `spawn_blocking`).
