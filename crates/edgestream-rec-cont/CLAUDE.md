@@ -44,10 +44,13 @@ yields three artefacts, shared with the per-trigger handlers:
   its window; the overlap test is exact (real min/max, not a heuristic), so no
   in-window message can be missed.
 - **Schema/channel registry** — owned copies of every `Schema`/`Channel`
-  record, keyed by channel ID (unique within one continuous file). Chunked
-  recordings carry these records *inside* chunks, so chunks are decompressed
-  during the tail; the default fastwrite profile is unchunked and skips that
-  cost entirely.
+  record, keyed by channel ID (unique within one continuous file). The MCAP
+  spec puts a Schema before any Channel referencing it, so resolution always
+  succeeds on conformant files; an inverted (invalid) file degrades the
+  channel to schemaless rather than erroring. Chunked recordings carry these
+  records *inside* chunks, so chunks are decompressed during the tail
+  (zstd, lz4 and uncompressed chunks all work — mcap's default features);
+  the default fastwrite profile is unchunked and skips that cost entirely.
 - **Coverage watch** — a `tokio::sync::watch` of the highest `log_time` on
   disk plus an `ended` flag (DataEnd/Footer scanned). Sound because messages
   land in the file in (approximately) non-decreasing `log_time` order —
@@ -110,6 +113,15 @@ partly written file is removed, so the clip directory never holds a
 footer-less file that could be mistaken for a clip. A *deleted* recording is
 not an error — the plan's `Arc<File>` keeps the inode readable, so extractions
 in flight across a recorder restart still complete.
+
+**Known limitation:** a record with intact framing but an unparseable body
+(disk corruption) fails every clip whose window overlaps its extent —
+`LinearReader` yields the parse error and halts, and the tail (which only
+frames records, never parsing message bodies) has already counted the region
+as covered. The failure is loud and clean (error logged, partial clip
+removed), and any linear-scanning MCAP reader breaks on the same byte, so
+this matches the ecosystem baseline; skipping such records via our own
+framing walk is tracked in beads as `ros2_subscribe-ba3`.
 
 ## Time base
 

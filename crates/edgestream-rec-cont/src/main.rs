@@ -393,7 +393,7 @@ mod tests {
     }
 
     use crate::clip::tests::read_clip;
-    use crate::tail::tests::{scan_to_end, test_dir, write_recording};
+    use crate::tail::tests::{scan_to_end, test_dir, write_recording, write_unfinished_recording};
 
     #[tokio::test]
     async fn record_clip_grace_timeout_cuts_what_is_on_disk() -> anyhow::Result<()> {
@@ -493,6 +493,154 @@ mod tests {
             "the cut must wait for the wall clock to pass the window end"
         );
         assert_eq!(stats.messages_copied, 1, "the future message is outside");
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn record_clip_cuts_immediately_when_the_recording_ended() -> anyhow::Result<()> {
+        let root = test_dir("ended")?;
+        let rec = root.join("rec.mcap");
+        write_recording(&rec, false, &[("/t", 100), ("/t", 200)])?;
+
+        // Footer scanned → ended. The high-water mark (200) stays far below
+        // the window end, so only the ended flag can release the coverage
+        // wait — it must short-circuit the 30 s grace, cutting what exists.
+        let (tailer, coverage_rx) = Tailer::new();
+        let file = Arc::new(std::fs::File::open(&rec)?);
+        tailer.attach(file.clone());
+        scan_to_end(&tailer, &file, 8)?;
+
+        let started = std::time::Instant::now();
+        let stats = record_clip(
+            50,
+            1_000_000,
+            root.join("clip.mcap"),
+            tailer,
+            coverage_rx,
+            Duration::from_secs(30),
+            Arc::new(Semaphore::new(1)),
+        )
+        .await?;
+
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "ended must short-circuit the grace wait"
+        );
+        assert_eq!(stats.messages_copied, 2);
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn coverage_exactly_at_the_window_end_releases_the_wait() -> anyhow::Result<()> {
+        let root = test_dir("cov-eq")?;
+        let rec = root.join("rec.mcap");
+        // A live (unfinished) recording whose newest message sits EXACTLY at
+        // the window end: `high_water >= end` must release the wait without
+        // the ended flag and without burning the grace timeout.
+        write_unfinished_recording(&rec, "/t", &[100, 1_000])?;
+
+        let (tailer, coverage_rx) = Tailer::new();
+        let file = Arc::new(std::fs::File::open(&rec)?);
+        tailer.attach(file.clone());
+        scan_to_end(&tailer, &file, 8)?;
+        {
+            let cov = coverage_rx.borrow();
+            assert!(!cov.ended, "no footer was written");
+            assert_eq!(cov.high_water_ns, 1_000);
+        }
+
+        let started = std::time::Instant::now();
+        let stats = record_clip(
+            0,
+            1_000,
+            root.join("clip.mcap"),
+            tailer,
+            coverage_rx,
+            Duration::from_secs(30),
+            Arc::new(Semaphore::new(1)),
+        )
+        .await?;
+
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "high_water == end satisfies the wait (>=, not >)"
+        );
+        assert_eq!(stats.messages_copied, 2, "the boundary message is inside");
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_overlapping_triggers_serialize_and_take_distinct_paths()
+    -> anyhow::Result<()> {
+        let root = test_dir("overlap")?;
+        let rec = root.join("rec.mcap");
+        write_recording(
+            &rec,
+            false,
+            &[("/t", 100), ("/t", 200), ("/t", 300), ("/t", 400)],
+        )?;
+
+        let (tailer, coverage_rx) = Tailer::new();
+        let file = Arc::new(std::fs::File::open(&rec)?);
+        tailer.attach(file.clone());
+        scan_to_end(&tailer, &file, 8)?;
+
+        // Two overlapping windows racing for the same out path and a single
+        // extraction permit: the copies serialize FIFO, the second writer
+        // lands on a `_1` sibling, and both clips come out complete.
+        let permits = Arc::new(Semaphore::new(1));
+        let out = root.join("clip.mcap");
+        let (a, b) = tokio::join!(
+            record_clip(
+                100,
+                300,
+                out.clone(),
+                tailer.clone(),
+                coverage_rx.clone(),
+                Duration::from_secs(30),
+                permits.clone(),
+            ),
+            record_clip(
+                200,
+                400,
+                out.clone(),
+                tailer.clone(),
+                coverage_rx.clone(),
+                Duration::from_secs(30),
+                permits.clone(),
+            ),
+        );
+        let (a, b) = (a?, b?);
+
+        assert_ne!(
+            a.out_path, b.out_path,
+            "two writers must never share a file"
+        );
+        let mut paths = vec![a.out_path.clone(), b.out_path.clone()];
+        paths.sort();
+        assert_eq!(paths, vec![out, root.join("clip_1.mcap")]);
+        assert_eq!(
+            read_clip(&a.out_path)?,
+            vec![
+                ("/t".to_string(), 100),
+                ("/t".to_string(), 200),
+                ("/t".to_string(), 300),
+            ]
+        );
+        assert_eq!(
+            read_clip(&b.out_path)?,
+            vec![
+                ("/t".to_string(), 200),
+                ("/t".to_string(), 300),
+                ("/t".to_string(), 400),
+            ]
+        );
 
         std::fs::remove_dir_all(root)?;
         Ok(())

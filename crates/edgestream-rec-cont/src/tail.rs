@@ -65,7 +65,7 @@ const TAIL_POLL: Duration = Duration::from_millis(50);
 const DISCOVER_POLL: Duration = Duration::from_millis(200);
 
 /// MCAP record opcodes the tail dispatches on.
-mod op {
+pub(crate) mod op {
     pub const FOOTER: u8 = 0x02;
     pub const SCHEMA: u8 = 0x03;
     pub const CHANNEL: u8 = 0x04;
@@ -436,6 +436,14 @@ impl Tailer {
     /// Publish one pass's delta: registry inserts (channels resolve their
     /// schema against the registry as updated by this pass), extent appends,
     /// then the coverage watch.
+    ///
+    /// The MCAP spec requires a Schema record to appear before any Channel
+    /// referencing it, so a channel's schema is always complete on disk — and
+    /// thus in the registry — by the pass that consumes the channel record.
+    /// A file violating that order still resolves when both records land in
+    /// one pass (schemas apply first); otherwise the channel degrades to
+    /// schemaless instead of failing, where the reference reader hard-errors
+    /// (`McapError::UnknownSchema`).
     fn apply(&self, delta: ScanDelta, ended: bool) {
         let mut st = self.state.lock().unwrap();
         for (id, schema) in delta.schemas {
@@ -694,7 +702,7 @@ pub(crate) mod tests {
     }
 
     /// A length-prefixed top-level record as the writer lays it down.
-    fn raw_record(opcode: u8, body: &[u8]) -> Vec<u8> {
+    pub(crate) fn raw_record(opcode: u8, body: &[u8]) -> Vec<u8> {
         let mut rec = vec![opcode];
         rec.extend_from_slice(&(body.len() as u64).to_le_bytes());
         rec.extend_from_slice(body);
@@ -702,7 +710,12 @@ pub(crate) mod tests {
     }
 
     /// A conformant `Message` record body (22 fixed bytes + payload).
-    fn message_body(channel_id: u16, sequence: u32, log_time: u64, payload: &[u8]) -> Vec<u8> {
+    pub(crate) fn message_body(
+        channel_id: u16,
+        sequence: u32,
+        log_time: u64,
+        payload: &[u8],
+    ) -> Vec<u8> {
         let mut body = Vec::new();
         body.extend_from_slice(&channel_id.to_le_bytes());
         body.extend_from_slice(&sequence.to_le_bytes());
@@ -713,7 +726,7 @@ pub(crate) mod tests {
     }
 
     /// A `Channel` record body (id, schema_id, topic, encoding, empty metadata).
-    fn channel_body(id: u16, schema_id: u16, topic: &str, encoding: &str) -> Vec<u8> {
+    pub(crate) fn channel_body(id: u16, schema_id: u16, topic: &str, encoding: &str) -> Vec<u8> {
         let mut body = Vec::new();
         body.extend_from_slice(&id.to_le_bytes());
         body.extend_from_slice(&schema_id.to_le_bytes());
@@ -726,12 +739,75 @@ pub(crate) mod tests {
     }
 
     /// The magic followed by the given raw records, as one file.
-    fn write_raw(path: &Path, records: &[Vec<u8>]) -> Result<()> {
+    pub(crate) fn write_raw(path: &Path, records: &[Vec<u8>]) -> Result<()> {
         let mut bytes = MAGIC.to_vec();
         for rec in records {
             bytes.extend_from_slice(rec);
         }
         std::fs::write(path, bytes)?;
+        Ok(())
+    }
+
+    /// A recording that is still being written: one schemaless channel and its
+    /// messages, with no DataEnd/Footer — exactly the shape a live tail sees.
+    pub(crate) fn write_unfinished_recording(
+        path: &Path,
+        topic: &str,
+        stamps: &[u64],
+    ) -> Result<()> {
+        let mut records = vec![raw_record(op::CHANNEL, &channel_body(1, 0, topic, "cdr"))];
+        for (seq, t) in stamps.iter().enumerate() {
+            records.push(raw_record(
+                op::MESSAGE,
+                &message_body(1, seq as u32, *t, b"payload"),
+            ));
+        }
+        write_raw(path, &records)
+    }
+
+    /// A `Schema` record body (id, name, encoding, length-prefixed data).
+    fn schema_body(id: u16, name: &str, encoding: &str, data: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&id.to_le_bytes());
+        body.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        body.extend_from_slice(name.as_bytes());
+        body.extend_from_slice(&(encoding.len() as u32).to_le_bytes());
+        body.extend_from_slice(encoding.as_bytes());
+        body.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        body.extend_from_slice(data);
+        body
+    }
+
+    #[test]
+    fn schema_following_its_channel_in_one_pass_still_resolves() -> Result<()> {
+        let root = test_dir("schema-after")?;
+        let path = root.join("rec.mcap");
+        // The spec orders Schema before any Channel referencing it; this file
+        // violates that. `apply` inserts a pass's schemas before resolving its
+        // channels, so the inversion still resolves — leniency, not a promise:
+        // a schema arriving only in a *later* pass stays unresolved (see
+        // `dangling_schema_id_yields_a_channel_without_schema`).
+        write_raw(
+            &path,
+            &[
+                raw_record(op::CHANNEL, &channel_body(1, 5, "/x", "cdr")),
+                raw_record(
+                    op::SCHEMA,
+                    &schema_body(5, "std_msgs/msg/String", "ros2msg", b"string data"),
+                ),
+            ],
+        )?;
+
+        let (tailer, _coverage) = Tailer::new();
+        let file = File::open(&path)?;
+        scan_to_end(&tailer, &file, MAGIC.len() as u64)?;
+
+        let plan = tailer.plan_window(0, u64::MAX);
+        let ch = plan.channels.get(&1).expect("channel registered");
+        let schema = ch.schema.as_ref().expect("same-pass schema resolves");
+        assert_eq!(schema.name, "std_msgs/msg/String");
+
+        std::fs::remove_dir_all(root)?;
         Ok(())
     }
 

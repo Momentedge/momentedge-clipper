@@ -236,7 +236,11 @@ pub(crate) mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
-    use crate::tail::tests::{scan_to_end, test_dir, write_recording, write_recording_opts};
+    use crate::tail::op;
+    use crate::tail::tests::{
+        channel_body, message_body, raw_record, scan_to_end, test_dir, write_raw, write_recording,
+        write_recording_opts,
+    };
     use crate::tail::{Extent, Tailer};
 
     /// Read a finished clip back; `MessageStream` insists on a complete
@@ -597,6 +601,166 @@ pub(crate) mod tests {
         // The failure happened before any file was created; the pre-existing
         // files are not ours to delete.
         assert_eq!(std::fs::read(&out)?, b"existing");
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn clip_spanning_multiple_extents_copies_each_message_once() -> Result<()> {
+        let root = test_dir("clip-multiextent")?;
+        let rec = root.join("rec.mcap");
+        // 1 MiB messages close an extent every ~4 messages; the window must
+        // straddle at least one extent boundary and lose nothing at the seam.
+        let payload = vec![0u8; 1 << 20];
+        let stamps: Vec<(&str, u64)> = (1..=9).map(|i| ("/big", i * 10)).collect();
+        write_recording_opts(
+            &rec,
+            mcap::WriteOptions::new()
+                .use_chunks(false)
+                .compression(None),
+            &payload,
+            &stamps,
+        )?;
+        let tailer = tail_whole(&rec)?;
+        assert!(
+            tailer.plan_window(0, u64::MAX).extents.len() >= 2,
+            "precondition: the recording spans several extents"
+        );
+
+        let out = root.join("clip.mcap");
+        let plan = tailer.plan_window(30, 70);
+        let stats = extract_clip(&plan, &out, 30, 70)?;
+
+        assert!(
+            stats.extents_read >= 2,
+            "the window must cross an extent boundary, read {}",
+            stats.extents_read
+        );
+        assert_eq!(stats.messages_copied, 5);
+        assert_eq!(
+            read_clip(&out)?,
+            (3..=7)
+                .map(|i| ("/big".to_string(), i * 10))
+                .collect::<Vec<_>>()
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn record_larger_than_the_extent_cap_stays_whole_and_extracts() -> Result<()> {
+        let root = test_dir("clip-oversized")?;
+        let rec = root.join("rec.mcap");
+        // Every record exceeds EXTENT_CAP_BYTES on its own: extents close at
+        // record boundaries, so each must hold exactly one (oversized) record
+        // rather than splitting it.
+        let payload = vec![0u8; 5 << 20];
+        write_recording_opts(
+            &rec,
+            mcap::WriteOptions::new()
+                .use_chunks(false)
+                .compression(None),
+            &payload,
+            &[("/big", 10), ("/big", 20), ("/big", 30)],
+        )?;
+        let tailer = tail_whole(&rec)?;
+
+        let all = tailer.plan_window(0, u64::MAX);
+        assert_eq!(all.extents.len(), 3, "one oversized extent per message");
+        for pair in all.extents.windows(2) {
+            assert_eq!(pair[1].offset, pair[0].offset + pair[0].len);
+        }
+
+        let out = root.join("clip.mcap");
+        let plan = tailer.plan_window(15, 25);
+        let stats = extract_clip(&plan, &out, 15, 25)?;
+
+        assert_eq!(stats.extents_read, 1);
+        assert_eq!(stats.messages_copied, 1);
+        assert_eq!(
+            stats.bytes_copied,
+            5 << 20,
+            "the oversized body must come through intact"
+        );
+        assert_eq!(read_clip(&out)?, vec![("/big".to_string(), 20)]);
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn every_chunk_compression_extracts_identically() -> Result<()> {
+        let root = test_dir("clip-compressions")?;
+        let stamps = [("/a", 10), ("/b", 20), ("/a", 30), ("/b", 40)];
+        let expected = vec![("/b".to_string(), 20), ("/a".to_string(), 30)];
+
+        for (name, compression) in [
+            ("uncompressed", None),
+            ("lz4", Some(mcap::Compression::Lz4)),
+            ("zstd", Some(mcap::Compression::Zstd)),
+        ] {
+            let rec = root.join(format!("rec-{name}.mcap"));
+            write_recording_opts(
+                &rec,
+                mcap::WriteOptions::new()
+                    .use_chunks(true)
+                    .compression(compression)
+                    .chunk_size(Some(128)),
+                b"payload",
+                &stamps,
+            )?;
+            let tailer = tail_whole(&rec)?;
+            let plan = tailer.plan_window(20, 30);
+            assert_eq!(plan.channels.len(), 2, "{name}: registry from chunks");
+
+            let out = root.join(format!("clip-{name}.mcap"));
+            let stats = extract_clip(&plan, &out, 20, 30)?;
+            assert_eq!(stats.messages_copied, 2, "{name}");
+            assert_eq!(read_clip(&out)?, expected, "{name}");
+        }
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_record_inside_an_extent_fails_the_clip_cleanly() -> Result<()> {
+        let root = test_dir("clip-poisoned")?;
+        let rec = root.join("rec.mcap");
+        // A runt Message (4-byte body) with intact framing, wedged between
+        // valid messages. The lenient tail consumes it with a warning and its
+        // bytes land in the extent; the strict extraction hits it and must
+        // fail the clip loudly and cleanly — not emit a silently incomplete
+        // one. Lenient skip-on-extract is tracked separately in beads.
+        write_raw(
+            &rec,
+            &[
+                raw_record(op::CHANNEL, &channel_body(1, 0, "/t", "cdr")),
+                raw_record(op::MESSAGE, &message_body(1, 0, 10, b"x")),
+                raw_record(op::MESSAGE, &[0xAA; 4]),
+                raw_record(op::MESSAGE, &message_body(1, 2, 30, b"x")),
+            ],
+        )?;
+        let (tailer, coverage) = Tailer::new();
+        let file = Arc::new(File::open(&rec)?);
+        tailer.attach(file.clone());
+        scan_to_end(&tailer, &file, 8)?;
+        assert_eq!(
+            coverage.borrow().high_water_ns,
+            30,
+            "the tail scans past the runt"
+        );
+
+        let out = root.join("clip.mcap");
+        let plan = tailer.plan_window(0, 100);
+        let err = extract_clip(&plan, &out, 0, 100).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("parsing extent record"),
+            "unexpected error: {err:#}"
+        );
+        assert!(!out.exists(), "partial clip must be removed on failure");
 
         std::fs::remove_dir_all(root)?;
         Ok(())
