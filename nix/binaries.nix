@@ -30,5 +30,6 @@ let
   };
 in {
   edgestream-rec = mkBin "edgestream-rec";
+  edgestream-rec-cont = mkBin "edgestream-rec-cont";
   trigger-pub = mkBin "trigger-pub";
 }

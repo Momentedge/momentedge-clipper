@@ -8,9 +8,11 @@ families of tools:
   middleware, with no field decoding), and index it by the message's own header
   timestamp. A bench for comparing ROS2 Rust client libraries and runtime models
   for a minimal-copy recorder front-end.
-- **Triggered clip recorder** (`edgestream-rec` + `trigger-pub`) — cuts clips out
-  of a continuous `ros2 bag record` on demand, copying MCAP messages straight
-  through without decoding their bodies. See [Triggered recording](#triggered-recording).
+- **Triggered clip recorders** (`edgestream-rec`, `edgestream-rec-cont` +
+  `trigger-pub`) — cut clips out of a continuous `ros2 bag record` on demand,
+  copying MCAP messages straight through without decoding their bodies.
+  `edgestream-rec` reads closed 5 s bag splits; `edgestream-rec-cont` tails one
+  growing MCAP file. See [Triggered recording](#triggered-recording).
 
 It is a testing pad, not a finished tool.
 
@@ -157,6 +159,39 @@ nix develop --command cargo run -p trigger-pub
 Clips land in `./triggered` (gitignored); inspect one with `ros2 bag info
 triggered/<file>.mcap`.
 
+### Continuous single-file variant
+
+`edgestream-rec-cont` cuts the same clips out of **one growing MCAP file**
+instead of 5 s splits — no split boundaries and no `/events/write_split`. It
+keeps the recording open and tails it, so clip latency is bounded by the
+recorder's write-through latency rather than the split duration.
+
+```
+ros2 bag record ──one growing mcap──▶ ./record-cont/<bag>_0.mcap
+       ▲ kept open + tailed
+edgestream-rec-cont ◀── /events/edgestream/trigger ── trigger-pub
+       ├──▶ ./triggered-cont/<trigger_ns>_<name>.mcap
+       └──▶ /events/edgestream/recorded
+```
+
+Run it like the split-based pipeline, swapping steps 2–3:
+
+```bash
+# 2. continuous recorder → ./record-cont (one file, fastwrite profile)
+nix develop --command ./scripts/record-continuous.sh   # optional: config/cam_sim.yaml
+
+# 3. tailing extractor → ./triggered-cont
+nix develop --command cargo run -p edgestream-rec-cont
+```
+
+`record-continuous.sh` records unchunked with the rosbag2 message cache
+disabled (`--storage-preset-profile fastwrite --max-cache-size 0`), so each
+message is visible to the tail as soon as it is written; the extractor also
+reads chunked recordings. Clips have the same form as `edgestream-rec`'s and
+land in `./triggered-cont`. The single recording file has no retention — it
+grows until you stop recording (hole-punch retention is tracked in beads:
+`ros2_subscribe-wkg`).
+
 ## Deployment (Jetson / native build)
 
 The triggered recorder ships to an edge target — a Jetson running ROS2 Humble.
@@ -221,13 +256,15 @@ that deletes files older than 24 h; install it on the target with its
 ```
 crates/r2r-sub/         # r2r all-topic indexer
 crates/rclrs-sub/       # rclrs all-topic indexer
-crates/edgestream-rec/  # r2r+tokio triggered clip recorder
+crates/edgestream-rec/  # r2r+tokio triggered clip recorder (5 s bag splits)
+crates/edgestream-rec-cont/  # triggered clip recorder tailing one continuous mcap
 crates/trigger-pub/     # r2r periodic trigger publisher
 edgestream_msgs/        # local ROS2 interface package (Trigger, Recorded)
 sim/                    # synthetic gscam camera, raw + H.265 (sim/cam_sim.sh) — see sim/README.md
 nix/                    # flake package defs: edgestream-msgs, ros-env, binaries
 config/                 # rosbag2 recorder-params YAMLs for record.sh (topic selection)
-scripts/record.sh       # standalone continuous `ros2 bag record` (dev)
+scripts/record.sh       # standalone `ros2 bag record`, 5 s splits (dev)
+scripts/record-continuous.sh  # standalone `ros2 bag record`, one growing file (dev)
 scripts/build-on-target.sh  # native target build (edgestream_msgs overlay + binaries)
 scripts/start_recorder.sh, start_demo_trigger_pub.sh  # run the deployed binaries natively
 scripts/prune-recordings/  # retention loop for the target

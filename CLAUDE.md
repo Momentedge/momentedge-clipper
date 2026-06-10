@@ -8,6 +8,7 @@ internals, build mechanics, and conventions — without repeating it. Each crate
 has its own CLAUDE.md: [`r2r-sub`](crates/r2r-sub/CLAUDE.md),
 [`rclrs-sub`](crates/rclrs-sub/CLAUDE.md),
 [`edgestream-rec`](crates/edgestream-rec/CLAUDE.md),
+[`edgestream-rec-cont`](crates/edgestream-rec-cont/CLAUDE.md),
 [`trigger-pub`](crates/trigger-pub/CLAUDE.md); the sim camera (`sim/`) has
 [`sim/CLAUDE.md`](sim/CLAUDE.md).
 
@@ -18,11 +19,15 @@ applies only to the first:
 
 - **All-topic indexers** — `r2r-sub` and `rclrs-sub`. Subscribe to every live
   topic, take raw CDR, index by header stamp. The section below is about these.
-- **Triggered clip recorder** — `edgestream-rec` (+ `trigger-pub`). Owns no
-  sensor subscriptions and no index; it cuts clips out of a continuous on-disk
-  `ros2 bag record` on ROS2 trigger events, copying MCAP messages straight
-  through. Its internals live in [`edgestream-rec`](crates/edgestream-rec/CLAUDE.md);
-  the only shared idea is decoding nothing but the timestamp.
+- **Triggered clip recorders** — `edgestream-rec` and `edgestream-rec-cont`
+  (+ `trigger-pub`). They own no sensor subscriptions and no message index;
+  they cut clips out of a continuous on-disk `ros2 bag record` on ROS2 trigger
+  events, copying MCAP messages straight through. `edgestream-rec` reads
+  closed 5 s bag splits, gated on `/events/write_split`;
+  `edgestream-rec-cont` tails one growing MCAP file and needs no split events.
+  Internals live in [`edgestream-rec`](crates/edgestream-rec/CLAUDE.md) and
+  [`edgestream-rec-cont`](crates/edgestream-rec-cont/CLAUDE.md); the only
+  shared idea is decoding nothing but the timestamp.
 
 ## The sim camera (`sim/`)
 
@@ -114,7 +119,8 @@ shapes it:
 A virtual workspace (no root package), so `resolver = "3"` (the edition-2024
 resolver) is set explicitly — a virtual workspace does not infer the resolver
 from member editions and otherwise falls back to `"1"` with a warning. Members
-are the four crates (`r2r-sub`, `rclrs-sub`, `edgestream-rec`, `trigger-pub`);
+are the five crates (`r2r-sub`, `rclrs-sub`, `edgestream-rec`,
+`edgestream-rec-cont`, `trigger-pub`);
 shared metadata is in `[workspace.package]`. `edgestream_msgs/` (ROS2 interface
 package) and `sim/` (the sim camera's launch/config tree) are not Cargo members.
 

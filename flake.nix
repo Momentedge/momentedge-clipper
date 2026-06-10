@@ -74,7 +74,7 @@
         # deploys native apt builds, not these (see README "Deployment").
         packages = {
           inherit rosEnv;
-          inherit (binaries) edgestream-rec trigger-pub;
+          inherit (binaries) edgestream-rec edgestream-rec-cont trigger-pub;
         };
 
         devShells.default = pkgs.mkShell {

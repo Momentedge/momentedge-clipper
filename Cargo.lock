@@ -435,6 +435,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "edgestream-rec-cont"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "futures",
+ "log",
+ "mcap",
+ "pretty_env_logger",
+ "r2r",
+ "tokio",
+]
+
+[[package]]
 name = "either"
 version = "1.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

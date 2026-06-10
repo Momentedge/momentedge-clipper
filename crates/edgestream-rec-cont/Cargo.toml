@@ -1,0 +1,23 @@
+[package]
+name = "edgestream-rec-cont"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+# r2r: ROS2 client bindings. Typed subscription to the Trigger topic and a typed
+# Recorded publisher. No WriteSplitEvent — coverage comes from tailing the file.
+r2r.workspace = true
+# Async runtime: a blocking thread spins the node, another tails the recording;
+# tokio tasks consume the trigger stream and run each clip concurrently.
+tokio.workspace = true
+# `futures::StreamExt` drives the subscription stream (`sub.next().await`).
+futures.workspace = true
+# MCAP record parsing (`parse_record`, `read::LinearReader::sans_magic`,
+# `read::ChunkReader`) for the tail scan and extraction, and `Writer` for the
+# clip output (schemas/channels by content, summary + footer on `finish`).
+mcap.workspace = true
+# Error plumbing for the tail and extraction paths.
+anyhow.workspace = true
+# Logging via the `log` facade; pretty_env_logger is the backend (honours RUST_LOG).
+log.workspace = true
+pretty_env_logger.workspace = true

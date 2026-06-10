@@ -1,10 +1,13 @@
 /target
 .omc/
 
-# Continuous rosbag2 recording (5 s circular splits) and the clips the
-# triggered recorder cuts out of it — both are local runtime data.
+# Continuous rosbag2 recordings (5 s splits for edgestream-rec, one growing
+# file for edgestream-rec-cont) and the clips the triggered recorders cut out
+# of them — all local runtime data.
 /record/
 /triggered/
+/record-cont/
+/triggered-cont/
 
 # Python launch-file bytecode (sim/launch)
 __pycache__/
@@ -24,3 +27,6 @@ __pycache__/
 *.db
 .beads-credential-key
 .beads/proxieddb/
+
+# nix build output symlink
+/result

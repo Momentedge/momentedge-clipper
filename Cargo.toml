@@ -3,7 +3,13 @@
 # explicitly; "3" is the edition-2024 resolver. Without this Cargo falls back to
 # resolver "1" and warns.
 resolver = "3"
-members = ["crates/r2r-sub", "crates/rclrs-sub", "crates/edgestream-rec", "crates/trigger-pub"]
+members = [
+    "crates/r2r-sub",
+    "crates/rclrs-sub",
+    "crates/edgestream-rec",
+    "crates/edgestream-rec-cont",
+    "crates/trigger-pub",
+]
 
 # Shared package metadata; members inherit with `version.workspace = true` etc.
 [workspace.package]
