@@ -51,47 +51,34 @@ pub fn extract_clip(
     }
     let out_file =
         File::create(out_path).with_context(|| format!("creating {}", out_path.display()))?;
-    let mut writer = mcap::Writer::new(BufWriter::new(out_file)).context("opening mcap writer")?;
-
-    let mut stats = ClipStats::default();
-    let mut out_ids: HashMap<u16, u16> = HashMap::new();
+    let mut clip = ClipWriter {
+        writer: mcap::Writer::new(BufWriter::new(out_file)).context("opening mcap writer")?,
+        channels: &plan.channels,
+        out_ids: HashMap::new(),
+        start_ns,
+        end_ns,
+        stats: ClipStats::default(),
+    };
 
     if let Some(file) = &plan.file {
         for extent in &plan.extents {
-            stats.extents_read += 1;
+            clip.stats.extents_read += 1;
             let mut buf = vec![0u8; extent.len as usize];
-            file.read_exact_at(&mut buf, extent.offset).with_context(|| {
-                format!("reading extent at {} (+{} B)", extent.offset, extent.len)
-            })?;
+            file.read_exact_at(&mut buf, extent.offset)
+                .with_context(|| {
+                    format!("reading extent at {} (+{} B)", extent.offset, extent.len)
+                })?;
             for rec in mcap::read::LinearReader::sans_magic(&buf) {
                 match rec.context("parsing extent record")? {
-                    Record::Message { header, data } => copy_message(
-                        &mut writer,
-                        &mut out_ids,
-                        &plan.channels,
-                        &header,
-                        &data,
-                        start_ns,
-                        end_ns,
-                        &mut stats,
-                    )?,
+                    Record::Message { header, data } => clip.copy_message(&header, &data)?,
                     Record::Chunk { header, data } => {
-                        for rec in mcap::read::ChunkReader::new(header, &data)
-                            .context("opening chunk")?
+                        for rec in
+                            mcap::read::ChunkReader::new(header, &data).context("opening chunk")?
                         {
                             if let Record::Message { header, data } =
                                 rec.context("reading record inside chunk")?
                             {
-                                copy_message(
-                                    &mut writer,
-                                    &mut out_ids,
-                                    &plan.channels,
-                                    &header,
-                                    &data,
-                                    start_ns,
-                                    end_ns,
-                                    &mut stats,
-                                )?;
+                                clip.copy_message(&header, &data)?;
                             }
                         }
                     }
@@ -101,68 +88,68 @@ pub fn extract_clip(
         }
     }
 
-    writer.finish().context("finalising output mcap")?;
-    Ok(stats)
+    clip.writer.finish().context("finalising output mcap")?;
+    Ok(clip.stats)
 }
 
-/// Write one message through if its `log_time` is in the window.
-#[allow(clippy::too_many_arguments)]
-fn copy_message(
-    writer: &mut mcap::Writer<BufWriter<File>>,
-    out_ids: &mut HashMap<u16, u16>,
-    channels: &HashMap<u16, ChannelDef>,
-    header: &mcap::records::MessageHeader,
-    data: &[u8],
+/// One clip being assembled: the output writer, the recording's channel
+/// registry, the window bounds, and the running stats — the state every
+/// copied message touches.
+struct ClipWriter<'a> {
+    writer: mcap::Writer<BufWriter<File>>,
+    channels: &'a HashMap<u16, ChannelDef>,
+    /// Recording channel ID → output channel ID, filled on first use.
+    out_ids: HashMap<u16, u16>,
     start_ns: u64,
     end_ns: u64,
-    stats: &mut ClipStats,
-) -> Result<()> {
-    if header.log_time < start_ns || header.log_time > end_ns {
-        return Ok(());
-    }
-    let channel_id = output_channel_id(writer, out_ids, channels, header.channel_id)?;
-    stats.bytes_copied += data.len() as u64;
-    writer
-        .write_to_known_channel(
-            &mcap::records::MessageHeader {
-                channel_id,
-                sequence: header.sequence,
-                log_time: header.log_time,
-                publish_time: header.publish_time,
-            },
-            data,
-        )
-        .context("writing message")?;
-    stats.messages_copied += 1;
-    Ok(())
+    stats: ClipStats,
 }
 
-/// Map a recording channel ID into the output file and cache the result. The
-/// writer deduplicates schemas/channels by content, so the mapping stays
-/// stable however often a definition is registered.
-fn output_channel_id(
-    writer: &mut mcap::Writer<BufWriter<File>>,
-    out_ids: &mut HashMap<u16, u16>,
-    channels: &HashMap<u16, ChannelDef>,
-    src_id: u16,
-) -> Result<u16> {
-    if let Some(id) = out_ids.get(&src_id) {
-        return Ok(*id);
+impl ClipWriter<'_> {
+    /// Write one message through if its `log_time` is in the window.
+    fn copy_message(&mut self, header: &mcap::records::MessageHeader, data: &[u8]) -> Result<()> {
+        if header.log_time < self.start_ns || header.log_time > self.end_ns {
+            return Ok(());
+        }
+        let channel_id = self.output_channel_id(header.channel_id)?;
+        self.writer
+            .write_to_known_channel(
+                &mcap::records::MessageHeader {
+                    channel_id,
+                    ..*header
+                },
+                data,
+            )
+            .context("writing message")?;
+        self.stats.messages_copied += 1;
+        self.stats.bytes_copied += data.len() as u64;
+        Ok(())
     }
-    let def = channels.get(&src_id).with_context(|| {
-        format!("message on channel {src_id} with no Channel record in the recording")
-    })?;
-    let schema_id = match &def.schema {
-        Some(schema) => writer
-            .add_schema(&schema.name, &schema.encoding, &schema.data)
-            .with_context(|| format!("adding schema {}", schema.name))?,
-        None => 0,
-    };
-    let channel_id = writer
-        .add_channel(schema_id, &def.topic, &def.message_encoding, &def.metadata)
-        .with_context(|| format!("adding channel {}", def.topic))?;
-    out_ids.insert(src_id, channel_id);
-    Ok(channel_id)
+
+    /// Map a recording channel ID into the output file and cache the result.
+    /// The writer deduplicates schemas/channels by content, so the mapping
+    /// stays stable however often a definition is registered.
+    fn output_channel_id(&mut self, src_id: u16) -> Result<u16> {
+        if let Some(id) = self.out_ids.get(&src_id) {
+            return Ok(*id);
+        }
+        let def = self.channels.get(&src_id).with_context(|| {
+            format!("message on channel {src_id} with no Channel record in the recording")
+        })?;
+        let schema_id = match &def.schema {
+            Some(schema) => self
+                .writer
+                .add_schema(&schema.name, &schema.encoding, &schema.data)
+                .with_context(|| format!("adding schema {}", schema.name))?,
+            None => 0,
+        };
+        let channel_id = self
+            .writer
+            .add_channel(schema_id, &def.topic, &def.message_encoding, &def.metadata)
+            .with_context(|| format!("adding channel {}", def.topic))?;
+        self.out_ids.insert(src_id, channel_id);
+        Ok(channel_id)
+    }
 }
 
 #[cfg(test)]
@@ -171,8 +158,8 @@ mod tests {
 
     use std::sync::Arc;
 
-    use crate::tail::tests::{scan_to_end, test_dir, write_recording};
     use crate::tail::Tailer;
+    use crate::tail::tests::{scan_to_end, test_dir, write_recording};
 
     /// Read a finished clip back; `MessageStream` insists on a complete
     /// summary/footer/magic, so this doubles as a validity check.
@@ -189,8 +176,7 @@ mod tests {
     fn tail_whole(path: &Path) -> Result<Arc<Tailer>> {
         let (tailer, _coverage) = Tailer::new();
         let file = Arc::new(File::open(path)?);
-        tailer.attach(file);
-        let file = File::open(path)?;
+        tailer.attach(file.clone());
         scan_to_end(&tailer, &file, 8)?;
         Ok(tailer)
     }
@@ -202,7 +188,13 @@ mod tests {
         write_recording(
             &rec,
             false,
-            &[("/t", 50), ("/t", 100), ("/t", 150), ("/t", 200), ("/t", 250)],
+            &[
+                ("/t", 50),
+                ("/t", 100),
+                ("/t", 150),
+                ("/t", 200),
+                ("/t", 250),
+            ],
         )?;
         let tailer = tail_whole(&rec)?;
 

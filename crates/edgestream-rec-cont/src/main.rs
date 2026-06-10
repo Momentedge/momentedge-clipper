@@ -114,7 +114,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let tailer = tailer.clone();
                 let coverage_rx = coverage_rx.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_trigger(trig, cfg, recorded_pub, tailer, coverage_rx).await
+                    if let Err(e) =
+                        handle_trigger(trig, cfg, recorded_pub, tailer, coverage_rx).await
                     {
                         error!("trigger handling failed: {e:#}");
                     }
@@ -247,7 +248,11 @@ fn sanitize(name: &str) -> String {
             }
         })
         .collect();
-    if s.is_empty() { "unnamed".to_string() } else { s }
+    if s.is_empty() {
+        "unnamed".to_string()
+    } else {
+        s
+    }
 }
 
 #[cfg(test)]

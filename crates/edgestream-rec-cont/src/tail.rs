@@ -114,7 +114,7 @@ impl Extent {
 /// How far the recording provably reaches: the highest message `log_time` the
 /// tail has seen on disk, and whether the recording has ended (DataEnd/Footer
 /// scanned — nothing more will ever appear).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct Coverage {
     pub high_water_ns: u64,
     pub ended: bool,
@@ -310,7 +310,8 @@ impl Tailer {
     /// Scan one recording until the path stops referring to it (recorder
     /// restart → `Ok`), alternating incremental passes with short sleeps.
     fn tail_file(&self, path: &Path) -> Result<()> {
-        let file = Arc::new(File::open(path).with_context(|| format!("opening {}", path.display()))?);
+        let file =
+            Arc::new(File::open(path).with_context(|| format!("opening {}", path.display()))?);
         self.attach(file.clone());
 
         // The writer may not have put the 8 magic bytes on disk yet.
@@ -511,7 +512,9 @@ pub(crate) mod tests {
                 .compression(Some(mcap::Compression::Zstd))
                 .chunk_size(Some(128))
         } else {
-            mcap::WriteOptions::new().use_chunks(false).compression(None)
+            mcap::WriteOptions::new()
+                .use_chunks(false)
+                .compression(None)
         };
         let mut writer = opts.create(BufWriter::new(File::create(path)?))?;
         let mut ids: HashMap<&str, u16> = HashMap::new();
@@ -551,7 +554,11 @@ pub(crate) mod tests {
     }
 
     /// Drive scan passes the way `tail_file` does until no further progress.
-    pub(crate) fn scan_to_end(tailer: &Tailer, file: &File, mut offset: u64) -> Result<ScanProgress> {
+    pub(crate) fn scan_to_end(
+        tailer: &Tailer,
+        file: &File,
+        mut offset: u64,
+    ) -> Result<ScanProgress> {
         loop {
             let progress = tailer.scan_available(file, offset, file_len(file)?)?;
             if progress.ended || progress.offset == offset {
