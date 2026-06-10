@@ -6,6 +6,13 @@
 /record/
 /triggered/
 
+# Python launch-file bytecode (sim/launch)
+__pycache__/
+*.pyc
+
+# bag output when `sim/cam_sim.sh record` is run from inside sim/
+/sim/record/
+
 # colcon overlay built on the target by scripts/build-on-target.sh
 # (edgestream_msgs typesupport) — generated, not source.
 /build/

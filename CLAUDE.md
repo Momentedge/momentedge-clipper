@@ -8,7 +8,8 @@ internals, build mechanics, and conventions — without repeating it. Each crate
 has its own CLAUDE.md: [`r2r-sub`](crates/r2r-sub/CLAUDE.md),
 [`rclrs-sub`](crates/rclrs-sub/CLAUDE.md),
 [`edgestream-rec`](crates/edgestream-rec/CLAUDE.md),
-[`trigger-pub`](crates/trigger-pub/CLAUDE.md).
+[`trigger-pub`](crates/trigger-pub/CLAUDE.md); the sim camera (`sim/`) has
+[`sim/CLAUDE.md`](sim/CLAUDE.md).
 
 ## Two recorder families
 
@@ -22,6 +23,16 @@ applies only to the first:
   `ros2 bag record` on ROS2 trigger events, copying MCAP messages straight
   through. Its internals live in [`edgestream-rec`](crates/edgestream-rec/CLAUDE.md);
   the only shared idea is decoding nothing but the timestamp.
+
+## The sim camera (`sim/`)
+
+`sim/` is the in-repo data source: a synthetic gscam camera (`videotestsrc` →
+raw + H.265 topics) driven by `sim/cam_sim.sh` (`run` / `record` / `stop`). It
+is a launch/config tree, not a Cargo crate. Its ROS packages (`ros-core`,
+`gscam`, the image_transport plugins, `rclcpp-components`) ride env-only in the
+shared `nix/ros-env.nix`, and the dev shell adds the GStreamer plugin set
+(`GST_PLUGIN_SYSTEM_PATH_1_0` exported by the shellHook). Overview and usage:
+[`sim/README.md`](sim/README.md); gotchas: [`sim/CLAUDE.md`](sim/CLAUDE.md).
 
 ## The shared recorder model
 
@@ -58,8 +69,13 @@ Setup is in the README; the parts that matter when changing the build:
   `IDL_PACKAGE_FILTER` + bindgen (`LIBCLANG_PATH`); rclrs uses pre-generated
   bindings selected by `ROS_DISTRO` and needs neither. `example-interfaces` and
   `test-msgs` are present only as an rclrs link requirement
-  ([#557](https://github.com/ros2-rust/ros2_rust/issues/557)). Each crate's
-  CLAUDE.md has the details.
+  ([#557](https://github.com/ros2-rust/ros2_rust/issues/557)); the sim
+  camera's stack (`ros-core`, `gscam`, the image_transport plugins,
+  `rclcpp-components`) serves only `sim/`, with `ffmpeg-image-transport-msgs`
+  doubling as the type support `ros2 bag record` needs to capture the H.265
+  topic (`config/cam_sim.yaml`). Env-only packages like these stay out of
+  `IDL_PACKAGE_FILTER` — no Rust crate decodes them. Each crate's CLAUDE.md has
+  the details.
 - `edgestream_msgs/` is a **local ament_cmake interface package** built by the
   flake via `ros.buildRosPackage` (mirroring upstream `example-interfaces`) and
   added to both the env and `IDL_PACKAGE_FILTER`, so its `Trigger`/`Recorded`
@@ -99,8 +115,8 @@ A virtual workspace (no root package), so `resolver = "3"` (the edition-2024
 resolver) is set explicitly — a virtual workspace does not infer the resolver
 from member editions and otherwise falls back to `"1"` with a warning. Members
 are the four crates (`r2r-sub`, `rclrs-sub`, `edgestream-rec`, `trigger-pub`);
-shared metadata is in `[workspace.package]`. `edgestream_msgs/` is a ROS2
-interface package, not a Cargo member.
+shared metadata is in `[workspace.package]`. `edgestream_msgs/` (ROS2 interface
+package) and `sim/` (the sim camera's launch/config tree) are not Cargo members.
 
 ## Sibling repositories
 

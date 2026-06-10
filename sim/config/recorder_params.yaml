@@ -1,0 +1,27 @@
+# Parameters for the rosbag2_transport::Recorder component composed next to
+# gscam in launch/sim_camera_record.launch.py. The schema is the standard
+# rosbag2 recorder node-parameters YAML:
+# https://github.com/ros2/rosbag2/blob/jazzy/README.md#composition
+#
+# The launch file dumps the ros__parameters dict out of this file (composable
+# nodes take parameter dicts, not file paths) and injects storage.uri from the
+# out:= launch argument.
+#
+# The topic list matches the default ns:='' — with ns:=/sim etc. the topics
+# move and this list must follow.
+recorder:
+  ros__parameters:
+    record:
+      topics:
+        - /camera/image_raw             # sensor_msgs/Image, rgb8 — heavy (~190 MB/s at 1080p30)
+        - /camera/camera_info           # sensor_msgs/CameraInfo
+        - /camera/image_raw/compressed  # sensor_msgs/CompressedImage, JPEG
+        - /camera/image_raw/ffmpeg      # ffmpeg_image_transport_msgs/FFMPEGPacket, H.265
+      # No terminal of its own inside the container.
+      disable_keyboard_controls: true
+    storage:
+      storage_id: "mcap"
+      # uri is set by the launch file (out:= argument).
+      # For 5 s splits compatible with this repo's edgestream-rec
+      # (WriteSplitEvent on /events/write_split at each boundary):
+      # max_bagfile_duration: 5

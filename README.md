@@ -35,8 +35,10 @@ leading header stamp (such as `/tf`) are counted but not indexed.
   prebuilt packages from `ros.cachix.org` (nixpkgs has no ROS2).
 - **System Rust** (`cargo`/`rustc` on your `PATH`). The flake intentionally does
   not provide a Rust toolchain.
-- **A data source** — the sibling repo `../ros2_sources`, which replays a bag of
-  recorded sensor data onto live ROS2 topics.
+- **A data source** — the in-repo synthetic camera ([`sim/`](sim/README.md)),
+  which publishes a gscam test pattern raw + H.265, or the sibling repo
+  `../ros2_sources`, which replays a bag of recorded sensor data onto live
+  ROS2 topics.
 
 ## Quickstart
 
@@ -48,8 +50,10 @@ nix develop
 cargo build
 ```
 
-To see a recorder work, you need something publishing. In one terminal, replay
-the bag from `../ros2_sources` (see its `REPLAY.md`):
+To see a recorder work, you need something publishing. In one terminal, either
+start the in-repo sim camera (`sim/cam_sim.sh`, see
+[`sim/README.md`](sim/README.md)) or replay the bag from `../ros2_sources`
+(see its `REPLAY.md`):
 
 ```bash
 cd ../ros2_sources
@@ -98,11 +102,27 @@ edgestream-rec ◀── /events/edgestream/trigger ── trigger-pub
        └──▶ /events/edgestream/recorded
 ```
 
-- **`ros2 bag record`** (via `scripts/record.sh`) records all topics into 5 s
-  MCAP splits under `./record`, publishing a `rosbag2_interfaces/WriteSplitEvent`
-  on `/events/write_split` at each split boundary. It runs standalone —
+- **`ros2 bag record`** (via `scripts/record.sh`) records into 5 s MCAP splits
+  under `./record`, publishing a `rosbag2_interfaces/WriteSplitEvent` on
+  `/events/write_split` at each split boundary. It runs standalone —
   `edgestream-rec` never starts it. `./record` is gitignored and not pruned, so
-  it grows until you stop recording or clear it.
+  it grows until you stop recording or clear it. By default every live topic is
+  recorded; pass a rosbag2 recorder-parameters YAML to select topics:
+
+  ```bash
+  ./scripts/record.sh                       # all topics → ./record
+  ./scripts/record.sh config/cam_sim.yaml   # only the sim camera topics (sim/)
+  ./scripts/record.sh my.yaml /tmp/record   # optional 2nd arg: output dir
+  ```
+
+  The config uses the standard `rosbag2_transport` Recorder node-parameters
+  schema (the same file a composable Recorder node accepts);
+  [`config/cam_sim.yaml`](config/cam_sim.yaml) is the example, listing the four
+  `/camera/...` topics published by the in-repo sim camera
+  ([`sim/`](sim/README.md)). The script honours the
+  `record.*` topic-selection keys (`topics`, `all`/`all_topics`, `regex`,
+  `exclude_regex`, `exclude_topics`); storage settings (MCAP, 5 s splits) are
+  fixed by the script because `edgestream-rec` depends on them.
 - **`edgestream-rec`** listens on `/events/edgestream/trigger`
   (`edgestream_msgs/Trigger`: `name`, `description`, `trigger_time`, and the
   `preroll`/`postroll` windows in nanoseconds). For each trigger it waits until
@@ -204,7 +224,9 @@ crates/rclrs-sub/       # rclrs all-topic indexer
 crates/edgestream-rec/  # r2r+tokio triggered clip recorder
 crates/trigger-pub/     # r2r periodic trigger publisher
 edgestream_msgs/        # local ROS2 interface package (Trigger, Recorded)
+sim/                    # synthetic gscam camera, raw + H.265 (sim/cam_sim.sh) — see sim/README.md
 nix/                    # flake package defs: edgestream-msgs, ros-env, binaries
+config/                 # rosbag2 recorder-params YAMLs for record.sh (topic selection)
 scripts/record.sh       # standalone continuous `ros2 bag record` (dev)
 scripts/build-on-target.sh  # native target build (edgestream_msgs overlay + binaries)
 scripts/start_recorder.sh, start_demo_trigger_pub.sh  # run the deployed binaries natively
