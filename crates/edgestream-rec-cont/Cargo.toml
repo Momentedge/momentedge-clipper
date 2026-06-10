@@ -18,6 +18,11 @@ futures.workspace = true
 mcap.workspace = true
 # Error plumbing for the tail and extraction paths.
 anyhow.workspace = true
+# Layered configuration: defaults -> optional TOML file -> EDGESTREAM_*
+# environment variables, deserialized into `Config` (no CLI args).
+config.workspace = true
+# Derives `Deserialize` for `Config`.
+serde.workspace = true
 # Logging via the `log` facade; pretty_env_logger is the backend (honours RUST_LOG).
 log.workspace = true
 pretty_env_logger.workspace = true

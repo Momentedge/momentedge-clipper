@@ -21,13 +21,17 @@
 //! (no `use_sim_time`). Each trigger is handled in its own task, so
 //! overlapping windows are cut concurrently against one shared tail.
 //!
-//! Flags (all optional):
-//!   --record-dir <dir>   bag directory of the continuous recording (default ./record-cont)
-//!   --out-dir <dir>      where clips are written                   (default ./triggered-cont)
-//!   --grace-secs <n>     how long past the window end to wait for coverage
-//!                        before cutting from what is on disk (default 30; must
-//!                        exceed the recorder's flush latency — for a chunked
-//!                        recording roughly chunk size / aggregate data rate)
+//! Configuration is layered (defaults → TOML file → environment, via
+//! config-rs); there are no CLI args. The TOML file is
+//! `edgestream-rec-cont.toml` in the working directory, or the path in
+//! `$EDGESTREAM_CONFIG`; each key also reads from an
+//! `EDGESTREAM_<KEY>` environment variable. Keys (all optional):
+//!   record_dir   bag directory of the continuous recording (default ./record-cont)
+//!   out_dir      where clips are written                   (default ./triggered-cont)
+//!   grace_secs   how long past the window end to wait for coverage
+//!                before cutting from what is on disk (default 30; must
+//!                exceed the recorder's flush latency — for a chunked
+//!                recording roughly chunk size / aggregate data rate)
 //!
 //! Logging uses the `log` facade with a pretty_env_logger backend; `RUST_LOG`
 //! controls verbosity.
@@ -42,6 +46,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use futures::stream::StreamExt;
 use log::{error, info, warn};
 use r2r::{Publisher, QosProfile};
+use serde::Deserialize;
 use tokio::sync::watch;
 
 use tail::{Coverage, Tailer};
@@ -49,6 +54,7 @@ use tail::{Coverage, Tailer};
 const TRIGGER_TOPIC: &str = "/events/edgestream/trigger";
 const RECORDED_TOPIC: &str = "/events/edgestream/recorded";
 
+#[derive(Debug, Deserialize)]
 struct Config {
     record_dir: PathBuf,
     out_dir: PathBuf,
@@ -57,28 +63,29 @@ struct Config {
     /// on disk. Coverage normally lags the wall clock by the recorder's flush
     /// latency only; the timeout fires when the recorded topics go quiet, and
     /// the clip then simply ends at the last data that exists.
-    grace: Duration,
+    grace_secs: u64,
 }
 
-fn parse_args() -> Config {
-    let mut cfg = Config {
-        record_dir: PathBuf::from("./record-cont"),
-        out_dir: PathBuf::from("./triggered-cont"),
-        grace: Duration::from_secs(30),
-    };
-    let mut it = std::env::args().skip(1);
-    while let Some(flag) = it.next() {
-        let mut value = || it.next().expect("flag needs a value");
-        match flag.as_str() {
-            "--record-dir" => cfg.record_dir = PathBuf::from(value()),
-            "--out-dir" => cfg.out_dir = PathBuf::from(value()),
-            "--grace-secs" => {
-                cfg.grace = Duration::from_secs(value().parse().expect("--grace-secs: u64"))
-            }
-            other => panic!("unknown flag: {other}"),
-        }
+impl Config {
+    fn grace(&self) -> Duration {
+        Duration::from_secs(self.grace_secs)
     }
-    cfg
+}
+
+/// Layered load: defaults, then the TOML file (`edgestream-rec-cont.toml` in
+/// the working directory, or `$EDGESTREAM_CONFIG`; missing is fine), then
+/// `EDGESTREAM_<KEY>` environment variables.
+fn load_config() -> Result<Config, config::ConfigError> {
+    let file = std::env::var("EDGESTREAM_CONFIG")
+        .unwrap_or_else(|_| "edgestream-rec-cont.toml".to_string());
+    config::Config::builder()
+        .set_default("record_dir", "./record-cont")?
+        .set_default("out_dir", "./triggered-cont")?
+        .set_default("grace_secs", 30_u64)?
+        .add_source(config::File::with_name(&file).required(false))
+        .add_source(config::Environment::with_prefix("EDGESTREAM"))
+        .build()?
+        .try_deserialize()
 }
 
 #[tokio::main]
@@ -88,7 +95,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .parse_default_env()
         .init();
 
-    let cfg = Arc::new(parse_args());
+    let cfg = Arc::new(load_config()?);
 
     let ctx = r2r::Context::create()?;
     let mut node = r2r::Node::create(ctx, "edgestream_recorder_cont", "")?;
@@ -172,7 +179,7 @@ async fn handle_trigger(
         out_path.clone(),
         tailer,
         coverage_rx,
-        cfg.grace,
+        cfg.grace(),
     )
     .await?;
     info!(
@@ -274,6 +281,26 @@ fn sanitize(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_loads_every_key_from_toml() {
+        let cfg: Config = config::Config::builder()
+            .add_source(config::File::from_str(
+                r#"
+                record_dir = "/data/record"
+                out_dir = "/data/clips"
+                grace_secs = 7
+                "#,
+                config::FileFormat::Toml,
+            ))
+            .build()
+            .unwrap()
+            .try_deserialize()
+            .unwrap();
+        assert_eq!(cfg.record_dir, PathBuf::from("/data/record"));
+        assert_eq!(cfg.out_dir, PathBuf::from("/data/clips"));
+        assert_eq!(cfg.grace(), Duration::from_secs(7));
+    }
 
     #[test]
     fn sanitize_replaces_separators_and_whitespace() {

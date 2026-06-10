@@ -57,7 +57,7 @@ sequence, `log_time`); bodies are first touched at extraction. The same
 to file tailing.
 
 **Recorder restarts:** the recording is discovered as the newest `*.mcap`
-under `--record-dir`; when that path stops resolving to the tailed inode (the
+under `record_dir`; when that path stops resolving to the tailed inode (the
 record script wipes the bag dir on restart), the index resets and the new file
 is tailed from scratch. In-flight extractions hold their own `Arc<File>` and
 finish safely against the deleted inode.
@@ -72,7 +72,7 @@ windows are cut concurrently against the one shared tail:
 2. **Wait for coverage.** Block on the coverage watch until a message with
    `log_time` at/after the window end is on disk (or the recording ended).
    This replaces `edgestream-rec`'s split rendezvous. A grace timeout
-   (`--grace-secs`, default 30 s) bounds the wait; on timeout the clip is cut
+   (`grace_secs`, default 30 s) bounds the wait; on timeout the clip is cut
    from what exists, with a warning. The grace must exceed the recorder's
    flush latency: near zero for the fastwrite profile, roughly one chunk fill
    (chunk size / aggregate data rate) for chunked profiles.
@@ -132,8 +132,19 @@ losing access, st_size growth, punch/extraction coordination).
 ## Run
 
 ```bash
-nix develop --command cargo run -p edgestream-rec-cont   # --record-dir ./record-cont --out-dir ./triggered-cont
+nix develop --command cargo run -p edgestream-rec-cont
 ```
 
 Needs `scripts/record-continuous.sh` running (for `./record-cont`) and a
 trigger publisher (`trigger-pub`). `RUST_LOG=debug` raises verbosity.
+
+## Configuration
+
+There are no CLI args. `load_config` in `main.rs` layers config-rs sources —
+defaults → optional TOML file → `EDGESTREAM_*` environment variables
+(later wins) — and deserializes the merged result into `Config` via serde.
+The TOML file is `edgestream-rec-cont.toml` in the working directory unless
+`$EDGESTREAM_CONFIG` names another path; a missing file is fine, so
+the binary runs with no setup. The keys (`record_dir`, `out_dir`,
+`grace_secs`) and their defaults are listed in the
+[README](../../README.md#continuous-single-file-variant).

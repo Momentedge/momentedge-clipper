@@ -184,11 +184,22 @@ nix develop --command ./scripts/record-continuous.sh   # optional: config/cam_si
 nix develop --command cargo run -p edgestream-rec-cont
 ```
 
+The extractor takes no CLI args. It reads `edgestream-rec-cont.toml` from the
+working directory (or the path in `$EDGESTREAM_CONFIG`; no file is
+needed), overridable per key by `EDGESTREAM_*` environment variables
+(e.g. `EDGESTREAM_GRACE_SECS=60`). All keys are optional:
+
+```toml
+record_dir = "./record-cont"   # bag directory of the continuous recording
+out_dir = "./triggered-cont"   # where clips are written
+grace_secs = 30                # wait past the window end for coverage before cutting
+```
+
 `record-continuous.sh` records unchunked with the rosbag2 message cache
 disabled (`--storage-preset-profile fastwrite --max-cache-size 0`), so each
 message is visible to the tail as soon as it is written; the extractor also
 reads chunked recordings (override with the `STORAGE_PRESET` / `MAX_CACHE_SIZE`
-env vars, and size `--grace-secs` on the extractor to the resulting flush
+env vars, and size the extractor's `grace_secs` to the resulting flush
 latency). Clips have the same form as `edgestream-rec`'s and
 land in `./triggered-cont`. The single recording file has no retention — it
 grows until you stop recording (hole-punch retention is tracked in beads:
