@@ -43,8 +43,10 @@ pub struct ClipStats {
 /// Copy every message in `[start_ns, end_ns]` (inclusive bounds, matching the
 /// split-based recorder) from the planned extents into a freshly created MCAP
 /// at `out_path` (or a `_<n>`-suffixed sibling if that name is taken — see
-/// [`create_clip_file`]). The clip is fsynced before this returns, so a
-/// caller may announce it as durably on disk.
+/// [`create_clip_file`]). All-or-nothing: on success the clip is complete and
+/// fsynced before this returns, so a caller may announce it as durably on
+/// disk; on error the partly written file is removed, so a failed extraction
+/// leaves nothing that could be mistaken for a clip.
 pub fn extract_clip(
     plan: &WindowPlan,
     out_path: &Path,
@@ -56,6 +58,25 @@ pub fn extract_clip(
             .with_context(|| format!("creating output dir {}", parent.display()))?;
     }
     let (out_file, out_path) = create_clip_file(out_path)?;
+    copy_window(plan, out_file, out_path.clone(), start_ns, end_ns).inspect_err(|_| {
+        // A failed copy must not leave a half-written, footer-less file that
+        // looks like a clip; the error itself is what the caller reports.
+        if let Err(e) = std::fs::remove_file(&out_path) {
+            warn!("removing partial clip {}: {e}", out_path.display());
+        }
+    })
+}
+
+/// Assemble the clip into the freshly created `out_file`: register window
+/// channels from the registry on first use, stream the planned extents,
+/// finish and fsync. The caller removes `out_path` if this fails.
+fn copy_window(
+    plan: &WindowPlan,
+    out_file: File,
+    out_path: PathBuf,
+    start_ns: u64,
+    end_ns: u64,
+) -> Result<ClipStats> {
     let mut clip = ClipWriter {
         writer: mcap::Writer::new(BufWriter::new(out_file)).context("opening mcap writer")?,
         channels: &plan.channels,
@@ -209,17 +230,18 @@ impl ClipWriter<'_> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
+    use std::collections::BTreeMap;
     use std::sync::Arc;
 
-    use crate::tail::Tailer;
-    use crate::tail::tests::{scan_to_end, test_dir, write_recording};
+    use crate::tail::tests::{scan_to_end, test_dir, write_recording, write_recording_opts};
+    use crate::tail::{Extent, Tailer};
 
     /// Read a finished clip back; `MessageStream` insists on a complete
     /// summary/footer/magic, so this doubles as a validity check.
-    fn read_clip(path: &Path) -> Result<Vec<(String, u64)>> {
+    pub(crate) fn read_clip(path: &Path) -> Result<Vec<(String, u64)>> {
         let buf = std::fs::read(path)?;
         mcap::MessageStream::new(&buf)?
             .map(|msg| {
@@ -351,6 +373,230 @@ mod tests {
         let buf = std::fs::read(&out)?;
         let summary = mcap::Summary::read(&buf)?.expect("clip has a summary");
         assert_eq!(summary.channels.len(), 2);
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn deleted_recording_still_extracts_through_the_open_handle() -> Result<()> {
+        let root = test_dir("clip-deleted")?;
+        let rec = root.join("rec.mcap");
+        write_recording(&rec, false, &[("/t", 10), ("/t", 20)])?;
+        let tailer = tail_whole(&rec)?;
+        let plan = tailer.plan_window(0, 100);
+
+        // The recorder-restart scenario: the bag directory is wiped while a
+        // window is still being cut. The plan's `Arc<File>` keeps the inode
+        // alive, so the extraction must succeed against the deleted path.
+        std::fs::remove_file(&rec)?;
+        let out = root.join("clip.mcap");
+        let stats = extract_clip(&plan, &out, 0, 100)?;
+
+        assert_eq!(stats.messages_copied, 2);
+        assert_eq!(
+            read_clip(&out)?,
+            vec![("/t".to_string(), 10), ("/t".to_string(), 20)]
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn truncated_recording_fails_extraction_and_removes_the_partial_clip() -> Result<()> {
+        let root = test_dir("clip-truncated")?;
+        let rec = root.join("rec.mcap");
+        write_recording(&rec, false, &[("/t", 10), ("/t", 20), ("/t", 30)])?;
+        let tailer = tail_whole(&rec)?;
+        let plan = tailer.plan_window(0, 100);
+
+        // Shrink the recording under the plan (append-only violated — e.g. a
+        // damaged filesystem). The extent read must fail, and the failure must
+        // not leave a half-written clip behind.
+        let last = plan.extents.last().expect("plan covers the recording");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&rec)?
+            .set_len(last.offset + last.len / 2)?;
+
+        let out = root.join("clip.mcap");
+        let err = extract_clip(&plan, &out, 0, 100).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("reading extent"),
+            "unexpected error: {err:#}"
+        );
+        assert!(!out.exists(), "partial clip must be removed on failure");
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn message_on_unknown_channel_fails_and_removes_the_partial_clip() -> Result<()> {
+        let root = test_dir("clip-nochannel")?;
+        let rec = root.join("rec.mcap");
+        write_recording(&rec, false, &[("/t", 10)])?;
+        let tailer = tail_whole(&rec)?;
+        let mut plan = tailer.plan_window(0, 100);
+        plan.channels.clear();
+
+        let out = root.join("clip.mcap");
+        let err = extract_clip(&plan, &out, 0, 100).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("no Channel record"),
+            "unexpected error: {err:#}"
+        );
+        assert!(!out.exists(), "partial clip must be removed on failure");
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn garbage_extent_bytes_fail_parsing_and_remove_the_partial_clip() -> Result<()> {
+        let root = test_dir("clip-garbage")?;
+        let junk = root.join("junk.bin");
+        std::fs::write(&junk, [0xFFu8; 64])?;
+
+        // A plan whose extent points at bytes that are not record-framed at
+        // all — the index is corrupt or reading the wrong file.
+        let plan = WindowPlan {
+            file: Some(Arc::new(File::open(&junk)?)),
+            extents: vec![Extent {
+                offset: 0,
+                len: 64,
+                time: Some((0, u64::MAX)),
+            }],
+            channels: HashMap::new(),
+        };
+
+        let out = root.join("clip.mcap");
+        let err = extract_clip(&plan, &out, 0, u64::MAX).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("parsing extent record"),
+            "unexpected error: {err:#}"
+        );
+        assert!(!out.exists(), "partial clip must be removed on failure");
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn window_between_messages_is_a_valid_empty_clip() -> Result<()> {
+        let root = test_dir("clip-gap")?;
+        let rec = root.join("rec.mcap");
+        write_recording(&rec, false, &[("/t", 100), ("/t", 200)])?;
+        let tailer = tail_whole(&rec)?;
+
+        // The extent (time bounds 100..200) overlaps the window, so it is
+        // planned and read — but no individual message falls inside it.
+        let out = root.join("clip.mcap");
+        let plan = tailer.plan_window(120, 180);
+        let stats = extract_clip(&plan, &out, 120, 180)?;
+
+        assert!(stats.extents_read > 0, "the covering extent is read");
+        assert_eq!(stats.messages_copied, 0);
+        assert!(read_clip(&out)?.is_empty());
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn clip_cuts_inside_a_single_chunk() -> Result<()> {
+        let root = test_dir("clip-onechunk")?;
+        let rec = root.join("rec.mcap");
+        // A chunk size far above the data volume puts every message into one
+        // chunk; the window must still select individual messages inside it.
+        let opts = mcap::WriteOptions::new()
+            .use_chunks(true)
+            .compression(Some(mcap::Compression::Zstd))
+            .chunk_size(Some(1 << 20));
+        write_recording_opts(
+            &rec,
+            opts,
+            b"payload",
+            &[("/t", 10), ("/t", 20), ("/t", 30), ("/t", 40), ("/t", 50)],
+        )?;
+        let tailer = tail_whole(&rec)?;
+
+        let out = root.join("clip.mcap");
+        let plan = tailer.plan_window(20, 40);
+        let stats = extract_clip(&plan, &out, 20, 40)?;
+
+        assert_eq!(stats.messages_copied, 3);
+        assert_eq!(
+            read_clip(&out)?,
+            vec![
+                ("/t".to_string(), 20),
+                ("/t".to_string(), 30),
+                ("/t".to_string(), 40),
+            ]
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn schemaless_channel_clips_through() -> Result<()> {
+        let root = test_dir("clip-schemaless")?;
+        let rec = root.join("rec.mcap");
+        // MCAP allows a channel with schema_id 0 (no schema). The registry
+        // must carry it as `schema: None` and the clip must reproduce it.
+        let mut writer = mcap::WriteOptions::new()
+            .use_chunks(false)
+            .compression(None)
+            .create(BufWriter::new(File::create(&rec)?))?;
+        let ch = writer.add_channel(0, "/raw", "cdr", &BTreeMap::new())?;
+        writer.write_to_known_channel(
+            &mcap::records::MessageHeader {
+                channel_id: ch,
+                sequence: 0,
+                log_time: 10,
+                publish_time: 10,
+            },
+            b"x",
+        )?;
+        writer.finish()?;
+
+        let tailer = tail_whole(&rec)?;
+        let plan = tailer.plan_window(0, 100);
+        assert!(
+            plan.channels.values().all(|c| c.schema.is_none()),
+            "schema_id 0 must resolve to no schema"
+        );
+
+        let out = root.join("clip.mcap");
+        let stats = extract_clip(&plan, &out, 0, 100)?;
+        assert_eq!(stats.messages_copied, 1);
+        assert_eq!(read_clip(&out)?, vec![("/raw".to_string(), 10)]);
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn suffix_search_gives_up_after_1000_and_touches_nothing() -> Result<()> {
+        let root = test_dir("clip-suffix-cap")?;
+        let out = root.join("clip.mcap");
+        std::fs::write(&out, b"existing")?;
+        for n in 1..=1000 {
+            std::fs::write(root.join(format!("clip_{n}.mcap")), b"existing")?;
+        }
+
+        let (tailer, _coverage) = Tailer::new();
+        let plan = tailer.plan_window(0, 100);
+        let err = extract_clip(&plan, &out, 0, 100).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("creating"),
+            "unexpected error: {err:#}"
+        );
+        // The failure happened before any file was created; the pre-existing
+        // files are not ours to delete.
+        assert_eq!(std::fs::read(&out)?, b"existing");
 
         std::fs::remove_dir_all(root)?;
         Ok(())

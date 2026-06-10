@@ -104,6 +104,12 @@ magic — every clip is a complete, standalone MCAP of the same form as
 unit tests use). The output file is created with `create_new` — a duplicate
 trigger (same stamp and name) writes a `_<n>`-suffixed sibling instead of two
 writers interleaving one file — and fsynced before `extract_clip` returns.
+Extraction is all-or-nothing: on any error (recording truncated under the
+plan, a message on an unregistered channel, unparseable extent bytes) the
+partly written file is removed, so the clip directory never holds a
+footer-less file that could be mistaken for a clip. A *deleted* recording is
+not an error — the plan's `Arc<File>` keeps the inode readable, so extractions
+in flight across a recorder restart still complete.
 
 ## Time base
 

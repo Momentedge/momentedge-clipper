@@ -373,4 +373,128 @@ mod tests {
         };
         assert_eq!(time_to_ns(&neg), 250);
     }
+
+    #[test]
+    fn config_rejects_a_non_numeric_grace() {
+        let res = config::Config::builder()
+            .add_source(config::File::from_str(
+                r#"
+                record_dir = "/data/record"
+                out_dir = "/data/clips"
+                grace_secs = "soon"
+                extract_parallelism = 1
+                "#,
+                config::FileFormat::Toml,
+            ))
+            .build()
+            .unwrap()
+            .try_deserialize::<Config>();
+        assert!(res.is_err());
+    }
+
+    use crate::clip::tests::read_clip;
+    use crate::tail::tests::{scan_to_end, test_dir, write_recording};
+
+    #[tokio::test]
+    async fn record_clip_grace_timeout_cuts_what_is_on_disk() -> anyhow::Result<()> {
+        let root = test_dir("grace")?;
+        let (tailer, coverage_rx) = Tailer::new();
+
+        // The window end is far in the past on the wall clock (no postroll
+        // sleep), but coverage never reaches it — no recording was ever
+        // discovered. The grace timeout must fire and cut a valid empty clip
+        // instead of hanging or erroring.
+        let stats = record_clip(
+            0,
+            1_000,
+            root.join("clip.mcap"),
+            tailer,
+            coverage_rx,
+            Duration::from_millis(50),
+            Arc::new(Semaphore::new(1)),
+        )
+        .await?;
+
+        assert_eq!(stats.messages_copied, 0);
+        assert!(read_clip(&stats.out_path)?.is_empty());
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn record_clip_completes_once_coverage_arrives() -> anyhow::Result<()> {
+        let root = test_dir("cov")?;
+        let rec = root.join("rec.mcap");
+        write_recording(&rec, false, &[("/t", 100), ("/t", 900), ("/t", 2_000)])?;
+
+        // The tail discovers and scans the recording a little later, as a
+        // live tail would; record_clip must block on the coverage watch until
+        // a message at/after the window end (1_000) is on disk.
+        let (tailer, coverage_rx) = Tailer::new();
+        let scanner = tailer.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            let file = Arc::new(std::fs::File::open(&rec).unwrap());
+            scanner.attach(file.clone());
+            scan_to_end(&scanner, &file, 8).unwrap();
+        });
+
+        let stats = record_clip(
+            100,
+            1_000,
+            root.join("clip.mcap"),
+            tailer,
+            coverage_rx,
+            Duration::from_secs(10),
+            Arc::new(Semaphore::new(1)),
+        )
+        .await?;
+
+        assert_eq!(stats.messages_copied, 2);
+        assert_eq!(
+            read_clip(&stats.out_path)?,
+            vec![("/t".to_string(), 100), ("/t".to_string(), 900)]
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn record_clip_waits_out_the_postroll() -> anyhow::Result<()> {
+        let root = test_dir("postroll")?;
+        let rec = root.join("rec.mcap");
+        let now = now_ns();
+        // One message inside the window, one past the window end so coverage
+        // is already satisfied — only the wall-clock wait holds the cut back.
+        write_recording(&rec, false, &[("/t", now), ("/t", now + 300_000_000)])?;
+
+        let (tailer, coverage_rx) = Tailer::new();
+        let file = Arc::new(std::fs::File::open(&rec)?);
+        tailer.attach(file.clone());
+        scan_to_end(&tailer, &file, 8)?;
+
+        let end_ns = now + 150_000_000; // 150 ms past the trigger stamp
+        let started = std::time::Instant::now();
+        let stats = record_clip(
+            now.saturating_sub(1_000_000_000),
+            end_ns,
+            root.join("clip.mcap"),
+            tailer,
+            coverage_rx,
+            Duration::from_secs(10),
+            Arc::new(Semaphore::new(1)),
+        )
+        .await?;
+
+        assert!(
+            started.elapsed() >= Duration::from_millis(50),
+            "the cut must wait for the wall clock to pass the window end"
+        );
+        assert_eq!(stats.messages_copied, 1, "the future message is outside");
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
 }

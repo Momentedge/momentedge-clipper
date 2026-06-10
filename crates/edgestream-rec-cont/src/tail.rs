@@ -155,6 +155,7 @@ pub struct Tailer {
 }
 
 /// Where one scan pass stopped and whether the recording ended.
+#[derive(Debug)]
 pub(crate) struct ScanProgress {
     pub(crate) offset: u64,
     pub(crate) ended: bool,
@@ -531,6 +532,17 @@ pub(crate) mod tests {
                 .use_chunks(false)
                 .compression(None)
         };
+        write_recording_opts(path, opts, b"payload", stamps)
+    }
+
+    /// [`write_recording`] with explicit writer options and payload, for tests
+    /// that need a specific chunk layout or extent-cap-sized messages.
+    pub(crate) fn write_recording_opts(
+        path: &Path,
+        opts: mcap::WriteOptions,
+        payload: &[u8],
+        stamps: &[(&str, u64)],
+    ) -> Result<()> {
         let mut writer = opts.create(BufWriter::new(File::create(path)?))?;
         let mut ids: HashMap<&str, u16> = HashMap::new();
         for (seq, (topic, log_time)) in stamps.iter().enumerate() {
@@ -551,7 +563,7 @@ pub(crate) mod tests {
                     log_time: *log_time,
                     publish_time: *log_time,
                 },
-                b"payload",
+                payload,
             )?;
         }
         writer.finish()?;
@@ -669,6 +681,337 @@ pub(crate) mod tests {
 
         assert!(tailer.plan_window(300, 500).extents.is_empty());
         assert!(!tailer.plan_window(150, 500).extents.is_empty());
+
+        // Inclusive boundaries, exactly at the extent's min/max (100, 200):
+        // a window touching a bound by one nanosecond still plans the extent.
+        assert!(!tailer.plan_window(200, 500).extents.is_empty());
+        assert!(tailer.plan_window(201, 500).extents.is_empty());
+        assert!(!tailer.plan_window(0, 100).extents.is_empty());
+        assert!(tailer.plan_window(0, 99).extents.is_empty());
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// A length-prefixed top-level record as the writer lays it down.
+    fn raw_record(opcode: u8, body: &[u8]) -> Vec<u8> {
+        let mut rec = vec![opcode];
+        rec.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        rec.extend_from_slice(body);
+        rec
+    }
+
+    /// A conformant `Message` record body (22 fixed bytes + payload).
+    fn message_body(channel_id: u16, sequence: u32, log_time: u64, payload: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&channel_id.to_le_bytes());
+        body.extend_from_slice(&sequence.to_le_bytes());
+        body.extend_from_slice(&log_time.to_le_bytes());
+        body.extend_from_slice(&log_time.to_le_bytes()); // publish_time
+        body.extend_from_slice(payload);
+        body
+    }
+
+    /// A `Channel` record body (id, schema_id, topic, encoding, empty metadata).
+    fn channel_body(id: u16, schema_id: u16, topic: &str, encoding: &str) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&id.to_le_bytes());
+        body.extend_from_slice(&schema_id.to_le_bytes());
+        body.extend_from_slice(&(topic.len() as u32).to_le_bytes());
+        body.extend_from_slice(topic.as_bytes());
+        body.extend_from_slice(&(encoding.len() as u32).to_le_bytes());
+        body.extend_from_slice(encoding.as_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body
+    }
+
+    /// The magic followed by the given raw records, as one file.
+    fn write_raw(path: &Path, records: &[Vec<u8>]) -> Result<()> {
+        let mut bytes = MAGIC.to_vec();
+        for rec in records {
+            bytes.extend_from_slice(rec);
+        }
+        std::fs::write(path, bytes)?;
+        Ok(())
+    }
+
+    #[test]
+    fn non_mcap_file_is_rejected() -> Result<()> {
+        let root = test_dir("badmagic")?;
+        let path = root.join("rec.mcap");
+        std::fs::write(&path, b"definitely not an mcap file")?;
+
+        let (tailer, _coverage) = Tailer::new();
+        let err = tailer.tail_file(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("not an MCAP file"),
+            "unexpected error: {err:#}"
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_record_length_is_a_framing_desync() -> Result<()> {
+        let root = test_dir("desync")?;
+        let path = root.join("rec.mcap");
+        let mut bytes = MAGIC.to_vec();
+        bytes.push(op::MESSAGE);
+        bytes.extend_from_slice(&(MAX_RECORD_LEN + 1).to_le_bytes());
+        std::fs::write(&path, bytes)?;
+
+        let (tailer, _coverage) = Tailer::new();
+        let file = File::open(&path)?;
+        let err = scan_to_end(&tailer, &file, MAGIC.len() as u64).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("framing desynchronised"),
+            "unexpected error: {err:#}"
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn corrupt_chunk_fails_the_scan_with_context() -> Result<()> {
+        let root = test_dir("badchunk")?;
+        let path = root.join("rec.mcap");
+        write_raw(&path, &[raw_record(op::CHUNK, &[0xFF; 16])])?;
+
+        let (tailer, _coverage) = Tailer::new();
+        let file = File::open(&path)?;
+        let err = scan_to_end(&tailer, &file, MAGIC.len() as u64).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("absorbing chunk"),
+            "unexpected error: {err:#}"
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn runt_message_is_consumed_without_poisoning_the_index() -> Result<()> {
+        let root = test_dir("runt")?;
+        let path = root.join("rec.mcap");
+        // First record: a Message too short to even hold a log_time. The scan
+        // must warn, consume it (the framing is self-consistent) and keep
+        // indexing the records behind it.
+        write_raw(
+            &path,
+            &[
+                raw_record(op::MESSAGE, &[0xAA; 4]),
+                raw_record(op::MESSAGE, &message_body(1, 0, 42, b"x")),
+            ],
+        )?;
+
+        let (tailer, coverage) = Tailer::new();
+        let file = File::open(&path)?;
+        let progress = scan_to_end(&tailer, &file, MAGIC.len() as u64)?;
+        assert_eq!(
+            progress.offset,
+            file.metadata()?.len(),
+            "both records consumed"
+        );
+        assert_eq!(coverage.borrow().high_water_ns, 42);
+
+        let plan = tailer.plan_window(0, 100);
+        assert_eq!(plan.extents.len(), 1);
+        assert_eq!(
+            plan.extents[0].time,
+            Some((42, 42)),
+            "the runt contributes no time bound"
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn bare_magic_or_partial_header_makes_no_progress() -> Result<()> {
+        let root = test_dir("stub")?;
+        let path = root.join("rec.mcap");
+        let mut bytes = MAGIC.to_vec();
+        bytes.extend_from_slice(&[0x05, 0x01, 0x02, 0x03, 0x04]); // 5 of 9 header bytes
+        std::fs::write(&path, bytes)?;
+
+        let (tailer, coverage) = Tailer::new();
+        let file = File::open(&path)?;
+        let start = MAGIC.len() as u64;
+
+        // Only the magic on disk: nothing to scan, nothing to error on.
+        let p = tailer.scan_available(&file, start, start)?;
+        assert_eq!(p.offset, start);
+        assert!(!p.ended);
+
+        // A record header still being appended: same outcome.
+        let p = tailer.scan_available(&file, start, file.metadata()?.len())?;
+        assert_eq!(p.offset, start);
+        assert!(!p.ended);
+        assert_eq!(coverage.borrow().high_water_ns, 0);
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn out_of_order_stamps_keep_high_water_and_widen_extent_bounds() -> Result<()> {
+        let root = test_dir("ooo")?;
+        let path = root.join("rec.mcap");
+        write_recording(&path, false, &[("/a", 100), ("/a", 50)])?;
+
+        let (tailer, coverage) = Tailer::new();
+        let file = Arc::new(File::open(&path)?);
+        tailer.attach(file.clone());
+        scan_to_end(&tailer, &file, MAGIC.len() as u64)?;
+
+        assert_eq!(
+            coverage.borrow().high_water_ns,
+            100,
+            "high water never moves backwards"
+        );
+        let plan = tailer.plan_window(40, 60);
+        assert_eq!(plan.extents.len(), 1, "the late stamp widens the bounds");
+        assert_eq!(plan.extents[0].time, Some((50, 100)));
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn extents_close_at_the_cap_and_tile_contiguously() -> Result<()> {
+        let root = test_dir("cap")?;
+        let path = root.join("rec.mcap");
+        let payload = vec![0u8; 1 << 20]; // 1 MiB per message, ~9 MiB total
+        let stamps: Vec<(&str, u64)> = (1..=9).map(|i| ("/big", i)).collect();
+        write_recording_opts(
+            &path,
+            mcap::WriteOptions::new()
+                .use_chunks(false)
+                .compression(None),
+            &payload,
+            &stamps,
+        )?;
+
+        let (tailer, _coverage) = Tailer::new();
+        let file = Arc::new(File::open(&path)?);
+        tailer.attach(file.clone());
+        scan_to_end(&tailer, &file, MAGIC.len() as u64)?;
+
+        let plan = tailer.plan_window(0, u64::MAX);
+        assert!(plan.extents.len() >= 2, "the cap must have closed extents");
+        assert_eq!(plan.extents[0].offset, MAGIC.len() as u64);
+        for pair in plan.extents.windows(2) {
+            assert_eq!(
+                pair[1].offset,
+                pair[0].offset + pair[0].len,
+                "extents tile the data section with no gap or overlap"
+            );
+        }
+        for e in &plan.extents[..plan.extents.len() - 1] {
+            assert!(e.len >= EXTENT_CAP_BYTES, "closed extents reached the cap");
+        }
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn attach_resets_index_registry_and_coverage() -> Result<()> {
+        let root = test_dir("reattach")?;
+        let path = root.join("rec.mcap");
+        write_recording(&path, false, &[("/a", 400)])?;
+
+        let (tailer, coverage) = Tailer::new();
+        let file = Arc::new(File::open(&path)?);
+        tailer.attach(file.clone());
+        scan_to_end(&tailer, &file, MAGIC.len() as u64)?;
+        assert_eq!(coverage.borrow().high_water_ns, 400);
+        assert!(!tailer.plan_window(0, u64::MAX).extents.is_empty());
+
+        // The recorder restarted into a fresh file: everything known about
+        // the old one is gone, including its coverage.
+        let empty = root.join("empty.mcap");
+        std::fs::write(&empty, b"")?;
+        tailer.attach(Arc::new(File::open(&empty)?));
+
+        let cov = *coverage.borrow();
+        assert_eq!(cov.high_water_ns, 0);
+        assert!(!cov.ended);
+        let plan = tailer.plan_window(0, u64::MAX);
+        assert!(plan.extents.is_empty());
+        assert!(plan.channels.is_empty());
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn replaced_detects_deletion_and_recreation() -> Result<()> {
+        let root = test_dir("replaced")?;
+        let path = root.join("rec.mcap");
+        std::fs::write(&path, b"x")?;
+        let file = File::open(&path)?;
+
+        assert!(!replaced(&path, &file)?);
+        std::fs::remove_file(&path)?;
+        assert!(replaced(&path, &file)?, "deleted path means replaced");
+        std::fs::write(&path, b"y")?;
+        assert!(
+            replaced(&path, &file)?,
+            "a recreated file is a different inode"
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn newest_mcap_picks_the_latest_and_ignores_non_mcap() -> Result<()> {
+        let root = test_dir("discover")?;
+        assert_eq!(newest_mcap(&root.join("missing")), None);
+        assert_eq!(newest_mcap(&root), None, "no mcap yet");
+
+        let old = root.join("old.mcap");
+        std::fs::write(&old, b"")?;
+        File::options()
+            .write(true)
+            .open(&old)?
+            .set_modified(SystemTime::now() - Duration::from_secs(60))?;
+        let newer = root.join("new.mcap");
+        std::fs::write(&newer, b"")?;
+        std::fs::write(root.join("note.txt"), b"")?; // newest mtime, wrong extension
+
+        assert_eq!(newest_mcap(&root), Some(newer));
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn dangling_schema_id_yields_a_channel_without_schema() -> Result<()> {
+        let root = test_dir("dangling")?;
+        let path = root.join("rec.mcap");
+        // A Channel referencing schema 7, which never appears on disk —
+        // either corruption or a schema record still in flight. The channel
+        // must still register (messages on it are clippable, schemaless).
+        write_raw(
+            &path,
+            &[
+                raw_record(op::CHANNEL, &channel_body(1, 7, "/raw", "cdr")),
+                raw_record(op::MESSAGE, &message_body(1, 0, 10, b"x")),
+            ],
+        )?;
+
+        let (tailer, _coverage) = Tailer::new();
+        let file = File::open(&path)?;
+        scan_to_end(&tailer, &file, MAGIC.len() as u64)?;
+
+        let plan = tailer.plan_window(0, 100);
+        let ch = plan.channels.get(&1).expect("channel registered");
+        assert_eq!(ch.topic, "/raw");
+        assert!(ch.schema.is_none());
 
         std::fs::remove_dir_all(root)?;
         Ok(())
