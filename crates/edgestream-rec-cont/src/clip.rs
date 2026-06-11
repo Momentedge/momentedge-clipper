@@ -1293,7 +1293,7 @@ pub(crate) mod tests {
         tailer.attach(file.clone());
         scan_to_end(&tailer, &file, 8)?;
         assert_eq!(
-            coverage.borrow().high_water_ns,
+            coverage.get().high_water_ns,
             30,
             "the tail scans past the runt"
         );

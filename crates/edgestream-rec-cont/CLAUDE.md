@@ -6,7 +6,7 @@ that crate waits for rosbag2 split boundaries (`/events/write_split`) and reads
 closed split files, this one keeps the single growing recording open and
 **tails it**, so a clip can be cut as soon as the data is physically on disk:
 clip latency is bounded by the recorder's write-through latency, not a split
-duration. Built on [r2r](https://github.com/sequenceplanner/r2r) with tokio.
+duration. Built on [r2r](https://github.com/sequenceplanner/r2r) over plain OS threads — there is no async runtime.
 
 ## The pipeline it sits in
 
@@ -51,10 +51,11 @@ yields three artefacts, shared with the per-trigger handlers:
   records *inside* chunks, so chunks are decompressed during the tail
   (zstd, lz4 and uncompressed chunks all work — mcap's default features);
   the default fastwrite profile is unchunked and skips that cost entirely.
-- **Coverage watch** — a `tokio::sync::watch` of the highest `log_time` on
-  disk plus an `ended` flag (DataEnd/Footer scanned). Sound because messages
-  land in the file in (approximately) non-decreasing `log_time` order —
-  rosbag2's single writer stamps `log_time` at receive.
+- **Coverage watch** — a `Watch<Coverage>` (`Mutex` + `Condvar`, `src/watch.rs`)
+  holding the highest `log_time` on disk plus an `ended` flag
+  (DataEnd/Footer scanned). Sound because messages land in the file in
+  (approximately) non-decreasing `log_time` order — rosbag2's single writer
+  stamps `log_time` at receive.
 
 Per top-level `Message` record only the 14-byte prefix is read (channel id,
 sequence, `log_time`); bodies are first touched at extraction. The same
@@ -107,7 +108,7 @@ hold their own `Arc<File>` and finish safely against the deleted inode.
 
 ## Per-trigger flow (`handle_trigger`)
 
-Each admitted `edgestream_msgs/Trigger` is handled in its own tokio task, so
+Each admitted `edgestream_msgs/Trigger` is handled on its own thread, so
 overlapping windows are cut concurrently against the one shared tail. Admission
 is bounded: at most `MAX_ACTIVE_TRIGGERS` (16) handlers may be active at once,
 and a trigger that arrives while all of them are is rejected — logged with
@@ -123,12 +124,14 @@ and a trigger that arrives while all of them are is rejected — logged with
    from what exists, with a warning. The grace must exceed the recorder's
    flush latency: near zero for the fastwrite profile, roughly one chunk fill
    (chunk size / aggregate data rate) for chunked profiles.
-3. **Extract** under an extraction permit (`extract_parallelism`, default 1:
-   copies queue FIFO so concurrent windows don't compete with the recorder
-   for disk bandwidth; the waits in steps 1–2 stay concurrent): a
-   `plan_window` snapshot (file handle, overlapping extents, channel
-   registry) handed to `clip::extract_clip` (blocking IO, run on
-   `spawn_blocking`).
+3. **Extract** via the extraction worker pool (`extract_parallelism` threads,
+   default 1): the handler queues an `ExtractJob` (window bounds, output path,
+   bounded reply channel) on the shared FIFO channel and blocks on the reply.
+   A worker dequeues the job, snapshots `plan_window` at copy start (so a job
+   that waited in the queue still cuts from the freshest index), runs
+   `clip::extract_clip`, and sends the result back. With the default single
+   worker the bulk copies serialize FIFO; the waits in steps 1–2 are always
+   concurrent.
 4. **Announce** by publishing `edgestream_msgs/Recorded` — only after the
    extraction has moved the clip into `out_dir` and fsynced that directory, so
    the announce names an already-moved, crash-durable file.
@@ -224,49 +227,80 @@ No `rosbag2_interfaces` subscription — coverage comes from the file itself.
 
 ## Concurrency
 
-Same single-owner node model as `edgestream-rec`: one `spawn_blocking` thread
-spins the node, the typed trigger stream is consumed on a tokio task, the
-`Recorded` publisher is `Clone` and shared into each handler. A second
-`spawn_blocking` thread runs the tail loop for the process's lifetime; it
-talks to handlers only through the mutex-guarded index and the coverage watch.
-Clip copies are gated by a FIFO semaphore (`extract_parallelism`, default 1).
+**Thread inventory.** Four singleton threads and the extraction worker pool
+run for the process's lifetime, plus one short-lived thread per admitted
+trigger:
 
-Trigger admission is gated by a second semaphore: `MAX_ACTIVE_TRIGGERS` (16)
-permits bound how many handlers may be active (admitted, waiting, or
-extracting) at once. The consumer takes a permit without waiting before
-spawning a handler task; the permit rides in the task and returns when the
-handler finishes — panic included, since it returns on drop — so the bound
-never ratchets down. A trigger arriving while no permit is free is rejected
-with `error!` and otherwise ignored (no handler, no clip, no announcement).
-The cap is a flood-sanity bound rather than a resource necessity: an active
-handler is a cheap tokio green task that sleeps through the postroll and then
-awaits the coverage watch — the heavy copy stage is already serialized by the
-FIFO `extract_parallelism` semaphore. 16 comfortably exceeds any legitimate
-concurrent trigger burst. Per-trigger failures stay isolated inside each
-handler task — logged and counted, never propagated to the consumer.
+- **`tail`** — runs `Tailer::run`; performs all blocking file IO for the
+  incremental scan.
+- **`node-spin`** — the node's single owner; loops `node.spin_once(10 ms)` to
+  pump the DDS executor and feed the typed streams. Because the node is owned
+  here, no other thread touches it.
+- **`trigger-consumer`** — drains the typed `Trigger` subscription with
+  `futures::executor::block_on` on the stream, so the stream is consumed on
+  this thread without an async runtime. For each admitted trigger it spawns a
+  named `trigger-<ns>` handler thread.
+- **`extract-N`** (N = 0 .. `extract_parallelism − 1`) — the extraction worker
+  pool; each worker loops on the shared FIFO job channel.
+- **`signals`** — blocks on signal-hook's iterator and forwards the first
+  SIGINT or SIGTERM into a channel for `supervise`.
+- **`trigger-<ns>`** (one per admitted trigger) — runs the wait/extract/announce
+  flow for one trigger; exits when the clip is published or an error is logged.
 
-`supervise()` `select!`s on all three long-lived task handles — tail thread,
-node spin thread, and trigger consumer — plus a SIGINT (`ctrl_c`) future, and
-returns as soon as any branch resolves. SIGINT resolves to `Ok(())`, which
-`main` treats as a requested, orderly stop: it logs the shutdown and exits
-zero. Any task resolving instead returns `Err`, and the process exits non-zero
-so a supervisor can restart it — a dead tailer silently degrades every clip to
-a grace-timeout cut, a dead spin thread silently stops delivering triggers, and
-a dead consumer silently stops acting on them. The tail task resolves a typed
-`anyhow::Result<()>` (its loop runs for the process's lifetime and never
-returns `Ok` on its own), so its supervision arm separates three shapes: a scan
-fault it could not retry past comes back as the inner `Err` and is wrapped to
-name the tail thread while preserving the scan-fault root cause; a clean `Ok`
-return is an unexpected exit; a panic is the `JoinError`. The other two arms
-carry the `JoinError` panic payload in their error chains. A failure to
-install the signal handler itself surfaces as an error naming "signal handler"
-so it is never mistaken for a dead task. Because the spin and tail loops run
-inside `spawn_blocking` and never return on their own, the tokio runtime is
-torn down with `shutdown_background()` after `supervise()` resolves; without
-it the blocking threads would hold the process open indefinitely. In-flight
-extraction tasks die with the runtime — safe because the capturing-dir startup
-reset reclaims any stranded staged file, and `out_dir` only ever holds complete
-clips.
+The `Recorded` publisher is `Clone` and is shared into each handler thread.
+
+**Admission.** `Admission` is an `AtomicUsize` counter with a fixed `limit`
+(`MAX_ACTIVE_TRIGGERS` = 16). The consumer calls `try_acquire` before spawning
+each handler: if the counter is below the limit it is incremented and an
+`AdmissionPermit` is returned; otherwise `None` is returned and the trigger is
+rejected with `error!` — no handler, no clip, no announcement. The permit
+holds an `Arc<Admission>` and decrements the counter on `Drop`, so a panicking
+handler returns its slot through unwinding. The cap is a flood-sanity bound
+rather than a resource necessity: an active handler is a parked thread sleeping
+through its postroll and waiting on the coverage watch — the heavy copy stage
+is already serialized by the extraction worker pool. 16 comfortably exceeds
+any legitimate concurrent trigger burst. Per-trigger failures stay isolated
+inside each handler thread — logged and counted, never propagated to the
+consumer.
+
+**Extraction worker pool.** `spawn_extract_workers` starts `extract_parallelism`
+threads (at least one) sharing one unbounded FIFO channel. A handler enqueues
+an `ExtractJob` (window bounds, output path, bounded(1) reply channel) and
+blocks on the reply. The worker dequeues FIFO, snapshots `plan_window` at copy
+start (after dequeue, so a queued job still cuts from the freshest index), runs
+`clip::extract_clip`, and replies. `std::panic::catch_unwind` isolates a
+panicking extraction per job; the pool thread survives and continues processing.
+With the default `extract_parallelism = 1` bulk copies serialize in submission
+order; postroll and coverage waiting are always concurrent.
+
+**`supervise()`.** Each long-lived companion thread is started with
+`spawn_supervised`: the closure sends its return value over a `bounded(1)`
+channel before returning; a panic unwinds without sending, dropping the sender.
+`supervise` uses `crossbeam_channel::select!` on four arms:
+
+1. **tail channel** — receives `anyhow::Result<()>`. `Ok(())` is an unexpected
+   exit (the loop never returns on its own); `Err(e)` wraps the scan-fault root
+   cause under "tail thread failed". A disconnect (panic) harvests the join
+   handle for the payload under "tail thread exited unexpectedly".
+2. **spin channel** — receives `()`. Any result (clean exit or panic/disconnect)
+   is an error naming the node spin thread.
+3. **consumer channel** — receives `()`. Same shape, names the trigger consumer.
+4. **signal channel** — receives `i32` (SIGINT or SIGTERM). A delivered signal
+   is the requested, orderly stop: `supervise` returns `Ok(())` and `main`
+   exits zero. A disconnect (signal forwarder thread died) is an error naming
+   the signal handler — losing it silently would mean SIGINT could never trigger
+   a clean shutdown.
+
+A dead tailer silently degrades every clip to a grace-timeout cut; a dead spin
+thread silently stops delivering triggers; a dead consumer silently stops acting
+on them — all three must run for the process's lifetime, so any of them ending
+is non-zero exit for a supervisor to restart.
+
+**Process-exit teardown.** `main` returning ends the process, which kills all
+remaining threads — the immortal spin/tail loops, parked handler threads, and
+any in-flight extraction. That is safe by construction: the capturing-dir reset
+at startup reclaims any stranded staged file, and `out_dir` only ever holds
+complete clips. There is no explicit runtime teardown step.
 
 ## Integration tests (`tests/e2e.rs`)
 

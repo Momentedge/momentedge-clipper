@@ -58,7 +58,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use log::{info, warn};
 use mcap::records::Record;
-use tokio::sync::watch;
+
+use crate::watch::Watch;
 
 /// The 8 magic bytes opening (and, after `finish`, closing) every MCAP file.
 const MAGIC: [u8; 8] = *b"\x89MCAP0\r\n";
@@ -186,7 +187,7 @@ struct IndexState {
 /// it via [`Tailer::plan_window`] and wait on the coverage watch.
 pub struct Tailer {
     state: Mutex<IndexState>,
-    coverage_tx: watch::Sender<Coverage>,
+    coverage: Arc<Watch<Coverage>>,
 }
 
 /// Where one scan pass stopped, whether the recording ended, and whether a
@@ -314,14 +315,14 @@ impl ScanDelta {
 
 impl Tailer {
     /// A fresh tailer plus the coverage watch trigger handlers wait on.
-    pub fn new() -> (Arc<Self>, watch::Receiver<Coverage>) {
-        let (coverage_tx, coverage_rx) = watch::channel(Coverage::default());
+    pub fn new() -> (Arc<Self>, Arc<Watch<Coverage>>) {
+        let coverage = Arc::new(Watch::new(Coverage::default()));
         (
             Arc::new(Tailer {
                 state: Mutex::new(IndexState::default()),
-                coverage_tx,
+                coverage: coverage.clone(),
             }),
-            coverage_rx,
+            coverage,
         )
     }
 
@@ -377,7 +378,7 @@ impl Tailer {
             ..IndexState::default()
         };
         drop(st);
-        self.coverage_tx.send_replace(Coverage::default());
+        self.coverage.send_replace(Coverage::default());
     }
 
     /// Scan one recording until the path stops referring to it (recorder
@@ -661,7 +662,7 @@ impl Tailer {
         st.open = delta.open;
         drop(st);
 
-        self.coverage_tx.send_if_modified(|c| {
+        self.coverage.send_if_modified(|c| {
             let mut changed = false;
             if delta.high_water_ns > c.high_water_ns {
                 c.high_water_ns = delta.high_water_ns;
@@ -846,7 +847,7 @@ pub(crate) mod tests {
         let p2 = scan_to_end(&tailer, &file, p1.offset)?;
         assert!(p2.ended, "full file ends with DataEnd/Footer");
 
-        let cov = *coverage.borrow();
+        let cov = coverage.get();
         assert_eq!(cov.high_water_ns, 400);
         assert!(cov.ended);
 
@@ -871,7 +872,7 @@ pub(crate) mod tests {
         let progress = scan_to_end(&tailer, &file, MAGIC.len() as u64)?;
 
         assert!(progress.ended);
-        assert_eq!(coverage.borrow().high_water_ns, 30);
+        assert_eq!(coverage.get().high_water_ns, 30);
         let plan = tailer.plan_window(0, 100);
         assert_eq!(plan.channels.len(), 2, "channels live inside the chunks");
         assert!(
@@ -1115,7 +1116,7 @@ pub(crate) mod tests {
         );
 
         // The good prefix was applied before the fault.
-        assert_eq!(coverage.borrow().high_water_ns, 200);
+        assert_eq!(coverage.get().high_water_ns, 200);
         assert!(
             !tailer.plan_window(50, 250).extents.is_empty(),
             "the prefix's extent stays plannable across the fault"
@@ -1150,7 +1151,7 @@ pub(crate) mod tests {
             file.metadata()?.len(),
             "the bad chunk and the good records after it are all consumed"
         );
-        assert_eq!(coverage.borrow().high_water_ns, 42);
+        assert_eq!(coverage.get().high_water_ns, 42);
 
         let plan = tailer.plan_window(0, 100);
         assert!(!plan.extents.is_empty(), "the good message is indexed");
@@ -1198,7 +1199,7 @@ pub(crate) mod tests {
             "the chunk and the records after it are all consumed"
         );
         assert_eq!(
-            coverage.borrow().high_water_ns,
+            coverage.get().high_water_ns,
             700,
             "the dropped chunk's message (500) never reaches coverage"
         );
@@ -1249,7 +1250,7 @@ pub(crate) mod tests {
         let file = File::open(&path)?;
         let progress = scan_to_end(&tailer, &file, MAGIC.len() as u64)?;
         assert_eq!(progress.offset, file.metadata()?.len(), "all records consumed");
-        assert_eq!(coverage.borrow().high_water_ns, 300);
+        assert_eq!(coverage.get().high_water_ns, 300);
         assert!(
             tailer.plan_window(0, u64::MAX).channels.contains_key(&9),
             "data after the unsupported chunk still indexes"
@@ -1289,7 +1290,7 @@ pub(crate) mod tests {
         let file = File::open(&path)?;
         let progress = scan_to_end(&tailer, &file, MAGIC.len() as u64)?;
         assert_eq!(progress.offset, file.metadata()?.len(), "all records consumed");
-        assert_eq!(coverage.borrow().high_water_ns, 55);
+        assert_eq!(coverage.get().high_water_ns, 55);
 
         let plan = tailer.plan_window(0, 100);
         assert!(
@@ -1326,7 +1327,7 @@ pub(crate) mod tests {
             file.metadata()?.len(),
             "both records consumed"
         );
-        assert_eq!(coverage.borrow().high_water_ns, 42);
+        assert_eq!(coverage.get().high_water_ns, 42);
 
         let plan = tailer.plan_window(0, 100);
         assert_eq!(plan.extents.len(), 1);
@@ -1361,7 +1362,7 @@ pub(crate) mod tests {
         let p = tailer.scan_available(&file, start, file.metadata()?.len());
         assert_eq!(p.offset, start);
         assert!(!p.ended && p.fault.is_none());
-        assert_eq!(coverage.borrow().high_water_ns, 0);
+        assert_eq!(coverage.get().high_water_ns, 0);
 
         std::fs::remove_dir_all(root)?;
         Ok(())
@@ -1379,7 +1380,7 @@ pub(crate) mod tests {
         scan_to_end(&tailer, &file, MAGIC.len() as u64)?;
 
         assert_eq!(
-            coverage.borrow().high_water_ns,
+            coverage.get().high_water_ns,
             100,
             "high water never moves backwards"
         );
@@ -1439,7 +1440,7 @@ pub(crate) mod tests {
         let file = Arc::new(File::open(&path)?);
         tailer.attach(file.clone());
         scan_to_end(&tailer, &file, MAGIC.len() as u64)?;
-        assert_eq!(coverage.borrow().high_water_ns, 400);
+        assert_eq!(coverage.get().high_water_ns, 400);
         assert!(!tailer.plan_window(0, u64::MAX).extents.is_empty());
 
         // The recorder restarted into a fresh file: everything known about
@@ -1448,7 +1449,7 @@ pub(crate) mod tests {
         std::fs::write(&empty, b"")?;
         tailer.attach(Arc::new(File::open(&empty)?));
 
-        let cov = *coverage.borrow();
+        let cov = coverage.get();
         assert_eq!(cov.high_water_ns, 0);
         assert!(!cov.ended);
         let plan = tailer.plan_window(0, u64::MAX);
@@ -1585,7 +1586,7 @@ pub(crate) mod tests {
         );
 
         // The good prefix survived every retry — the index was never wiped.
-        let cov = *coverage.borrow();
+        let cov = coverage.get();
         assert_eq!(cov.high_water_ns, 200, "the prefix's coverage survived");
         assert!(
             !tailer.plan_window(50, 250).extents.is_empty(),
@@ -1619,7 +1620,7 @@ pub(crate) mod tests {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
             {
-                let cov = *coverage.borrow();
+                let cov = coverage.get();
                 if cov.high_water_ns == 1_000 && cov.ended {
                     break;
                 }

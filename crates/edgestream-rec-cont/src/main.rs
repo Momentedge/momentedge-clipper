@@ -20,10 +20,18 @@
 //!
 //! Time base: MCAP `log_time`, the trigger stamp, and the wait clock are all
 //! treated as nanoseconds on the system (ROS) clock — this assumes the default
-//! (no `use_sim_time`). Each trigger is handled in its own task, so
+//! (no `use_sim_time`). Each trigger is handled on its own thread, so
 //! overlapping windows are cut concurrently against one shared tail — at most
 //! [`MAX_ACTIVE_TRIGGERS`] at once; a trigger beyond that limit is rejected,
 //! logged, and ignored.
+//!
+//! Everything runs on plain OS threads — there is no async runtime. The main
+//! thread supervises ([`supervise`]) four long-lived companions over
+//! crossbeam channels: the tail thread (file scan), the node spin thread
+//! (ROS executor), the trigger consumer (drains the typed subscription with
+//! `futures::executor::block_on`), and a signal forwarder (SIGINT/SIGTERM →
+//! orderly exit 0). Clip copies run on a fixed pool of
+//! `extract_parallelism` worker threads consuming one FIFO job channel.
 //!
 //! Configuration is layered (defaults → TOML file → environment, via
 //! config-rs); there are no CLI args. The TOML file is
@@ -36,7 +44,7 @@
 //!                before cutting from what is on disk (default 30; must
 //!                exceed the recorder's flush latency — for a chunked
 //!                recording roughly chunk size / aggregate data rate)
-//!   extract_parallelism  concurrent clip copies (default 1: extractions
+//!   extract_parallelism  extraction worker threads (default 1: copies
 //!                queue FIFO — the bulk copy competes with the recorder's
 //!                writes for disk bandwidth; waiting is always concurrent)
 //!
@@ -45,19 +53,25 @@
 
 mod clip;
 mod tail;
+mod watch;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
+use crossbeam_channel::{Receiver, Sender, bounded, select, unbounded};
+use futures::executor::block_on;
 use futures::stream::StreamExt;
 use log::{error, info, warn};
 use r2r::{Publisher, QosProfile};
 use serde::Deserialize;
-use tokio::sync::{Semaphore, watch};
+use signal_hook::consts::{SIGINT, SIGTERM};
 
 use tail::{Coverage, Tailer};
+use watch::Watch;
 
 const TRIGGER_TOPIC: &str = "/events/edgestream/trigger";
 const RECORDED_TOPIC: &str = "/events/edgestream/recorded";
@@ -67,12 +81,12 @@ const RECORDED_TOPIC: &str = "/events/edgestream/recorded";
 /// `error!`-logged and ignored — no handler is spawned, no clip is cut, and no
 /// `Recorded` message is published.
 ///
-/// An active handler is cheap: it is a green task sleeping out its postroll
-/// window and waiting on coverage, plus a clone of the coverage receiver. The
-/// heavy work — the bulk file copy — is already serialized by
-/// `extract_parallelism`. This constant is therefore a flood-sanity bound on
-/// task and announcement growth, not a resource budget; 16 comfortably exceeds
-/// any legitimate concurrent burst.
+/// An active handler is one parked thread: it sleeps out its postroll window
+/// and waits on the coverage watch. The heavy work — the bulk file copy — is
+/// already serialized by the extraction worker pool (`extract_parallelism`).
+/// This constant is therefore a flood-sanity bound on thread and announcement
+/// growth, not a resource budget; 16 comfortably exceeds any legitimate
+/// concurrent burst.
 const MAX_ACTIVE_TRIGGERS: usize = 16;
 
 #[derive(Debug, Deserialize)]
@@ -85,12 +99,13 @@ struct Config {
     /// latency only; the timeout fires when the recorded topics go quiet, and
     /// the clip then simply ends at the last data that exists.
     grace_secs: u64,
-    /// How many clip extractions may run at once. The default of 1
-    /// serializes the bulk copies FIFO: extraction reads compete with the
-    /// recorder's writes on the same disk, and concurrent copies inflate the
-    /// recorder's flush latency (rosbag2's cache drops messages when it
-    /// cannot drain). Waiting — postroll, coverage — is always concurrent;
-    /// only the copy is gated. Raise on storage with IO headroom.
+    /// How many clip extractions may run at once — the size of the extraction
+    /// worker pool. The default of 1 serializes the bulk copies FIFO:
+    /// extraction reads compete with the recorder's writes on the same disk,
+    /// and concurrent copies inflate the recorder's flush latency (rosbag2's
+    /// cache drops messages when it cannot drain). Waiting — postroll,
+    /// coverage — is always concurrent; only the copy is queued. Raise on
+    /// storage with IO headroom.
     extract_parallelism: usize,
 }
 
@@ -117,24 +132,184 @@ fn load_config() -> Result<Config, config::ConfigError> {
         .try_deserialize()
 }
 
-/// Entry point: build an explicit multi-thread runtime, run the async body,
-/// then call shutdown_background() before returning. The tail and spin threads
-/// are immortal spawn_blocking loops; dropping the runtime (what #[tokio::main]
-/// does) waits for all blocking tasks to finish, which hangs the process forever
-/// on any exit path. shutdown_background() detaches those threads immediately so
-/// the process exits via normal return with the correct status. In-flight
-/// extraction threads die with the process — the capturing-dir reset at startup
-/// ensures out_dir never sees a partial clip from a previous run.
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
-    let result = rt.block_on(run());
-    rt.shutdown_background();
-    result
+/// One supervised thread: the channel its closure's return value arrives on,
+/// and the join handle [`supervise`] harvests a panic payload from after a
+/// disconnect.
+type Supervised<T> = (Receiver<T>, JoinHandle<()>);
+
+/// Spawn a named thread whose return value arrives on the paired channel.
+///
+/// [`supervise`] selects on that channel: a received value is the thread's
+/// verdict (clean return or typed error); a disconnect without a value means
+/// the closure unwound (panicked) before it could send, and the join handle
+/// then carries the payload.
+fn spawn_supervised<T: Send + 'static>(
+    name: &str,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Supervised<T> {
+    let (tx, rx) = bounded(1);
+    let handle = thread::Builder::new()
+        .name(name.to_string())
+        .spawn(move || {
+            // The send fails only when supervision is already gone, and the
+            // value is then moot.
+            let _ = tx.send(f());
+        })
+        .expect("spawning thread");
+    (rx, handle)
 }
 
-async fn run() -> Result<(), Box<dyn std::error::Error>> {
+/// Render a panic payload (from [`JoinHandle::join`] or
+/// [`std::panic::catch_unwind`]) as text: panics carry a `&str` or `String`
+/// message in practice; anything else gets a placeholder.
+fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_string())
+}
+
+/// The error for a supervised thread whose result channel disconnected
+/// without a value: the closure unwound before it could send, so the join —
+/// immediate, the disconnect proves the thread is already dead — carries the
+/// panic payload.
+fn harvest_panic(handle: JoinHandle<()>) -> anyhow::Error {
+    match handle.join() {
+        Err(payload) => anyhow::anyhow!("thread panicked: {}", panic_text(payload.as_ref())),
+        // Unreachable for spawn_supervised threads (a returning closure always
+        // sends first), but a sane shape regardless.
+        Ok(()) => anyhow::anyhow!("thread exited without reporting a result"),
+    }
+}
+
+/// Deliver SIGINT/SIGTERM as a message on the returned channel: a dedicated
+/// thread blocks on signal-hook's iterator and forwards the first shutdown
+/// signal for [`supervise`] to select on. Both signals mean the same
+/// requested, orderly stop (the process exits zero) — SIGTERM is what process
+/// supervisors send first.
+fn signal_channel() -> anyhow::Result<Receiver<i32>> {
+    let (tx, rx) = bounded(1);
+    let mut signals = signal_hook::iterator::Signals::new([SIGINT, SIGTERM])?;
+    thread::Builder::new()
+        .name("signals".to_string())
+        .spawn(move || {
+            if let Some(sig) = signals.forever().next() {
+                let _ = tx.send(sig);
+            }
+        })?;
+    Ok(rx)
+}
+
+fn signal_name(sig: i32) -> &'static str {
+    match sig {
+        SIGINT => "SIGINT",
+        SIGTERM => "SIGTERM",
+        _ => "shutdown signal",
+    }
+}
+
+/// Bounded admission for trigger handlers: [`MAX_ACTIVE_TRIGGERS`] permits
+/// bound how many may be active (admitted, waiting, or extracting) at once.
+/// The consumer takes a permit without waiting before spawning a handler
+/// thread; the permit rides in the thread and returns when the handler
+/// finishes — panic included, since it returns on drop, which unwinding
+/// covers — so the bound never ratchets down.
+struct Admission {
+    active: AtomicUsize,
+    limit: usize,
+}
+
+impl Admission {
+    fn new(limit: usize) -> Arc<Self> {
+        Arc::new(Admission {
+            active: AtomicUsize::new(0),
+            limit,
+        })
+    }
+
+    /// Take a permit if one is free, without waiting. `None` means every
+    /// permit is held by an active handler — the caller rejects the trigger.
+    fn try_acquire(self: Arc<Self>) -> Option<AdmissionPermit> {
+        self.active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < self.limit).then_some(n + 1)
+            })
+            .ok()
+            .map(|_| AdmissionPermit(self))
+    }
+}
+
+/// An admitted handler's slot; returns to the [`Admission`] count on drop.
+struct AdmissionPermit(Arc<Admission>);
+
+impl Drop for AdmissionPermit {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// One queued clip extraction: the window, the destination, and the channel
+/// the worker replies on. Queued by [`record_clip`]; dequeued FIFO by the
+/// extraction workers.
+struct ExtractJob {
+    start_ns: u64,
+    end_ns: u64,
+    out_path: PathBuf,
+    reply: Sender<anyhow::Result<clip::ClipStats>>,
+}
+
+/// Spawn the fixed extraction worker pool: `parallelism` threads consuming
+/// one shared channel. The channel is FIFO, so with the default single worker
+/// the bulk copies serialize in submission order — extraction reads compete
+/// with the recorder's writes for disk bandwidth (see
+/// [`Config::extract_parallelism`]).
+///
+/// The window plan is snapshotted in the worker, after dequeue: the plan is
+/// taken at copy start, so a job that waited in the queue still cuts from the
+/// freshest index. A panicking extraction is caught and replied as an error —
+/// per-job isolation, the pool outlives it.
+fn spawn_extract_workers(parallelism: usize, tailer: Arc<Tailer>) -> Sender<ExtractJob> {
+    let (tx, rx) = unbounded::<ExtractJob>();
+    for i in 0..parallelism.max(1) {
+        let rx = rx.clone();
+        let tailer = tailer.clone();
+        thread::Builder::new()
+            .name(format!("extract-{i}"))
+            .spawn(move || {
+                for job in rx.iter() {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let plan = tailer.plan_window(job.start_ns, job.end_ns);
+                        clip::extract_clip(&plan, &job.out_path, job.start_ns, job.end_ns)
+                    }))
+                    .unwrap_or_else(|payload| {
+                        Err(anyhow::anyhow!(
+                            "extraction panicked: {}",
+                            panic_text(payload.as_ref())
+                        ))
+                    });
+                    // A send failure means the handler is gone (its thread
+                    // died); there is no one left to care about this clip.
+                    let _ = job.reply.send(result);
+                }
+            })
+            .expect("spawning extraction worker");
+    }
+    tx
+}
+
+/// Entry point and supervisor. Spawns the long-lived threads — tail, node
+/// spin, trigger consumer, the extraction worker pool, and the signal
+/// forwarder — then blocks in [`supervise`] until a shutdown signal (exit 0)
+/// or the first dead critical thread (exit non-zero, for a supervisor to
+/// restart the process).
+///
+/// Returning ends the process, which kills the remaining threads: the
+/// immortal spin/tail loops, parked handlers, and any in-flight extraction.
+/// That is safe for clips by construction — the capturing-dir reset at
+/// startup reclaims any stranded staged file, and `out_dir` only ever holds
+/// complete clips.
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     pretty_env_logger::formatted_builder()
         .filter_level(log::LevelFilter::Info)
         .parse_default_env()
@@ -159,65 +334,64 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         QosProfile::default(),
     )?;
 
-    let (tailer, coverage_rx) = Tailer::new();
+    let (tailer, coverage) = Tailer::new();
 
     // The tail thread: discovers and scans the recording for the process's
-    // lifetime (blocking IO, so off the async runtime). Its handle is passed
-    // to supervise(): with a dead tailer every clip degrades to a grace-timeout
-    // cut, so the process exits rather than limping on silently.
-    let tail_task = {
+    // lifetime (blocking IO on its own thread). Supervised: with a dead tailer
+    // every clip degrades to a grace-timeout cut, so the process exits rather
+    // than limping on silently.
+    let tail = {
         let tailer = tailer.clone();
         let record_dir = cfg.record_dir.clone();
-        tokio::task::spawn_blocking(move || tailer.run(&record_dir))
+        spawn_supervised("tail", move || tailer.run(&record_dir))
     };
 
-    // One permit per allowed concurrent clip copy; see Config::extract_parallelism.
-    let extract_permits = Arc::new(Semaphore::new(cfg.extract_parallelism.max(1)));
+    // One worker per allowed concurrent clip copy; see Config::extract_parallelism.
+    let extract_tx = spawn_extract_workers(cfg.extract_parallelism, tailer);
 
-    // Admission gate for trigger handlers: MAX_ACTIVE_TRIGGERS permits bound
-    // how many may be active (admitted, waiting, or extracting) at once. Each
-    // handler task holds its permit for its whole life, so the permit returns
-    // when the handler finishes — panic included, since it returns on drop.
-    let active_triggers = Arc::new(Semaphore::new(MAX_ACTIVE_TRIGGERS));
+    // Admission gate for trigger handlers; see [`Admission`].
+    let admission = Admission::new(MAX_ACTIVE_TRIGGERS);
 
     // Trigger consumer: drains the typed trigger stream for the process's
-    // lifetime, spawning one handler task per admitted trigger. A trigger
+    // lifetime, spawning one handler thread per admitted trigger. A trigger
     // arriving while all MAX_ACTIVE_TRIGGERS handlers are active is rejected
-    // with error! and ignored — no handler, no clip, no Recorded. The handle is
-    // passed to supervise() so a dead consumer (stream closed or panic) is
-    // caught and the process exits rather than silently stopping on triggers.
-    let consumer_task = {
+    // with error! and ignored — no handler, no clip, no Recorded. Supervised:
+    // a dead consumer (stream closed or panic) must exit the process rather
+    // than silently stopping on triggers.
+    let consumer = {
         let cfg = cfg.clone();
-        let tailer = tailer.clone();
-        tokio::spawn(async move {
-            while let Some(trig) = trigger_sub.next().await {
-                let permit = match active_triggers.clone().try_acquire_owned() {
-                    Ok(permit) => permit,
-                    Err(_) => {
-                        error!(
-                            "trigger rejected: all {MAX_ACTIVE_TRIGGERS} trigger handlers are busy; \
-                             ignoring name={:?} trigger_time={}",
-                            trig.name,
-                            time_to_ns(&trig.trigger_time),
-                        );
-                        continue;
-                    }
+        let coverage = coverage.clone();
+        spawn_supervised("trigger-consumer", move || {
+            while let Some(trig) = block_on(trigger_sub.next()) {
+                let Some(permit) = admission.clone().try_acquire() else {
+                    error!(
+                        "trigger rejected: all {MAX_ACTIVE_TRIGGERS} trigger handlers are busy; \
+                         ignoring name={:?} trigger_time={}",
+                        trig.name,
+                        time_to_ns(&trig.trigger_time),
+                    );
+                    continue;
                 };
                 let cfg = cfg.clone();
                 let recorded_pub = recorded_pub.clone();
-                let tailer = tailer.clone();
-                let coverage_rx = coverage_rx.clone();
-                let permits = extract_permits.clone();
+                let coverage = coverage.clone();
+                let extract_tx = extract_tx.clone();
                 // Per-trigger error isolation: a failed extraction is logged
-                // and counted but does not tear down the consumer loop.
-                tokio::spawn(async move {
-                    let _permit = permit;
-                    if let Err(e) =
-                        handle_trigger(trig, cfg, recorded_pub, tailer, coverage_rx, permits).await
-                    {
-                        error!("trigger handling failed: {e:#}");
-                    }
-                });
+                // and counted but does not tear down the consumer loop, and a
+                // panic dies with the handler's own thread.
+                let spawned = thread::Builder::new()
+                    .name(format!("trigger-{}", time_to_ns(&trig.trigger_time)))
+                    .spawn(move || {
+                        let _permit = permit;
+                        if let Err(e) =
+                            handle_trigger(trig, cfg, recorded_pub, coverage, extract_tx)
+                        {
+                            error!("trigger handling failed: {e:#}");
+                        }
+                    });
+                if let Err(e) = spawned {
+                    error!("spawning a trigger handler failed: {e}");
+                }
             }
         })
     };
@@ -236,96 +410,98 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // The node's single owner: spin continuously to feed the streams.
-    // Its handle is passed to supervise() alongside the tail and consumer
-    // handles; any of the three exiting is an error.
-    let spin_task = tokio::task::spawn_blocking(move || {
+    // Supervised alongside the tail and consumer; any of the three exiting is
+    // an error.
+    let spin: Supervised<()> = spawn_supervised("node-spin", move || {
         loop {
             node.spin_once(Duration::from_millis(10));
         }
     });
 
-    // All three long-lived tasks must run for the recorder's lifetime.
-    // supervise() returns Ok(()) on SIGINT (requested shutdown) or Err on any
-    // task exit or signal handler failure. Either way main() calls
-    // shutdown_background() before returning, so the process never hangs.
-    match supervise(tail_task, spin_task, consumer_task, tokio::signal::ctrl_c()).await {
-        Ok(()) => {
-            info!("SIGINT received; shutting down");
-            Ok(())
-        }
+    let signal_rx = signal_channel().context("signal handler failed to install")?;
+
+    match supervise(tail, spin, consumer, signal_rx) {
+        Ok(()) => Ok(()),
         Err(e) => Err(e.into()),
     }
 }
 
-/// Watch the three critical long-lived tasks and a shutdown signal; return
-/// when any of them resolves.
+/// Watch the three critical long-lived threads and the shutdown signal;
+/// return when any of them resolves.
 ///
-/// Returns `Ok(())` when `shutdown` resolves `Ok(())` — that is the requested,
-/// orderly stop path (SIGINT / ctrl_c). The caller logs the shutdown and exits
-/// zero. Every other arm returns `Err`: a task exiting (clean or panic) is a
-/// fault that a supervisor must respond to by restarting the process; a signal
-/// handler installation failure (`shutdown` resolves `Err`) must not be silent
-/// either, since it means SIGINT could never trigger a clean shutdown.
+/// Each supervised thread reports on its channel (see [`spawn_supervised`]):
+/// a received value is its verdict, a disconnect without a value is a panic,
+/// harvested through the join handle so the payload lands in the error chain.
 ///
-/// The tail task carries a typed `anyhow::Result<()>`: its loop never returns
-/// `Ok` on its own, so a clean return is treated as an unexpected exit, while
-/// a scan fault it could not retry past surfaces as the inner `Err`, wrapped
-/// so the operator sees the scan-fault root cause and the path it named.
+/// Returns `Ok(())` when the signal channel delivers SIGINT or SIGTERM — the
+/// requested, orderly stop path; the signal is logged here and the caller
+/// exits zero. Every other arm returns `Err`: a thread exiting (clean or
+/// panic) is a fault that a supervisor must respond to by restarting the
+/// process, and the signal channel disconnecting (the forwarder thread died)
+/// must not be silent either, since it means SIGINT could never trigger a
+/// clean shutdown.
 ///
-/// All three tasks must run for the lifetime of the process:
-/// the tail thread feeds coverage and the extent index (a dead tailer silently
+/// The tail thread carries a typed `anyhow::Result<()>`: its loop never
+/// returns `Ok` on its own, so a clean return is treated as an unexpected
+/// exit, while a scan fault it could not retry past surfaces as the inner
+/// `Err`, wrapped so the operator sees the scan-fault root cause and the path
+/// it named.
+///
+/// All three threads must run for the lifetime of the process: the tail
+/// thread feeds coverage and the extent index (a dead tailer silently
 /// degrades every clip to a grace-timeout cut); the spin thread pumps the ROS
 /// node (a dead spin thread silently stops delivering triggers); the trigger
 /// consumer drains the typed stream (a dead consumer silently stops acting on
 /// triggers).
-async fn supervise(
-    tail: tokio::task::JoinHandle<anyhow::Result<()>>,
-    spin: tokio::task::JoinHandle<()>,
-    consumer: tokio::task::JoinHandle<()>,
-    shutdown: impl std::future::Future<Output = std::io::Result<()>>,
+fn supervise(
+    tail: Supervised<anyhow::Result<()>>,
+    spin: Supervised<()>,
+    consumer: Supervised<()>,
+    signal: Receiver<i32>,
 ) -> anyhow::Result<()> {
-    tokio::select! {
-        res = tail => {
-            match res {
-                // run() loops for the process's lifetime, so a clean return is
-                // as unexpected as the other tasks ending. A scan fault it
-                // could not retry past comes back as the inner Err, wrapped so
-                // the operator sees the root cause; a panic is the join Err.
-                Ok(Ok(())) => anyhow::bail!("tail thread exited unexpectedly"),
-                Ok(Err(e)) => Err(e.context("tail thread failed")),
-                Err(e) => Err(anyhow::Error::new(e).context("tail thread exited unexpectedly")),
+    let (tail_rx, tail_handle) = tail;
+    let (spin_rx, spin_handle) = spin;
+    let (consumer_rx, consumer_handle) = consumer;
+    select! {
+        recv(tail_rx) -> res => match res {
+            // run() loops for the process's lifetime, so a clean return is
+            // as unexpected as the other threads ending. A scan fault it
+            // could not retry past comes back as the inner Err, wrapped so
+            // the operator sees the root cause; a panic is the disconnect.
+            Ok(Ok(())) => anyhow::bail!("tail thread exited unexpectedly"),
+            Ok(Err(e)) => Err(e.context("tail thread failed")),
+            Err(_) => Err(harvest_panic(tail_handle).context("tail thread exited unexpectedly")),
+        },
+        recv(spin_rx) -> res => match res {
+            Ok(()) => anyhow::bail!("node spin thread exited unexpectedly"),
+            Err(_) => {
+                Err(harvest_panic(spin_handle).context("node spin thread exited unexpectedly"))
             }
-        }
-        res = spin => {
-            match res {
-                Ok(()) => anyhow::bail!("node spin thread exited unexpectedly"),
-                Err(e) => Err(anyhow::Error::new(e).context("node spin thread exited unexpectedly")),
+        },
+        recv(consumer_rx) -> res => match res {
+            Ok(()) => anyhow::bail!("trigger consumer exited unexpectedly"),
+            Err(_) => {
+                Err(harvest_panic(consumer_handle).context("trigger consumer exited unexpectedly"))
             }
-        }
-        res = consumer => {
-            match res {
-                Ok(()) => anyhow::bail!("trigger consumer exited unexpectedly"),
-                Err(e) => Err(anyhow::Error::new(e).context("trigger consumer exited unexpectedly")),
+        },
+        recv(signal) -> res => match res {
+            // Requested shutdown — not a fault; the caller exits zero.
+            Ok(sig) => {
+                info!("{} received; shutting down", signal_name(sig));
+                Ok(())
             }
-        }
-        res = shutdown => {
-            match res {
-                // Requested shutdown — not a fault; the caller exits zero.
-                Ok(()) => Ok(()),
-                Err(e) => Err(anyhow::Error::new(e).context("signal handler failed to install")),
-            }
-        }
+            Err(_) => anyhow::bail!("signal handler thread exited unexpectedly"),
+        },
     }
 }
 
 /// Run one trigger's wait-then-extract-then-announce flow.
-async fn handle_trigger(
+fn handle_trigger(
     trig: r2r::edgestream_msgs::msg::Trigger,
     cfg: Arc<Config>,
     recorded_pub: Publisher<r2r::edgestream_msgs::msg::Recorded>,
-    tailer: Arc<Tailer>,
-    coverage_rx: watch::Receiver<Coverage>,
-    permits: Arc<Semaphore>,
+    coverage: Arc<Watch<Coverage>>,
+    extract_tx: Sender<ExtractJob>,
 ) -> anyhow::Result<()> {
     let trigger_ns = time_to_ns(&trig.trigger_time);
     let start_ns = trigger_ns.saturating_sub(trig.preroll);
@@ -342,12 +518,10 @@ async fn handle_trigger(
         start_ns,
         end_ns,
         out_path,
-        tailer,
-        coverage_rx,
+        &coverage,
         cfg.grace(),
-        permits,
-    )
-    .await?;
+        &extract_tx,
+    )?;
     info!(
         "clip {} written: {} msgs from {} extents, {:.1} MiB",
         stats.out_path.display(),
@@ -383,49 +557,53 @@ async fn handle_trigger(
 
 /// The decode-free, ROS-free core of [`handle_trigger`]: wait out the
 /// postroll on the wall clock, wait for the tail's coverage to reach the
-/// window end, then — holding an extraction permit — snapshot the window
-/// plan and run the blocking extraction. The extraction stages the clip and
-/// moves it atomically into `out_dir`, so the returned [`clip::ClipStats`]
-/// already names a durable file: the caller may announce it immediately.
-async fn record_clip(
+/// window end, then queue the extraction on the worker channel and block on
+/// the reply. The workers dequeue FIFO and snapshot the window plan at copy
+/// start, so a job that waited in the queue still cuts from the freshest
+/// index. The extraction stages the clip and moves it atomically into
+/// `out_dir`, so the returned [`clip::ClipStats`] already names a durable
+/// file: the caller may announce it immediately.
+fn record_clip(
     start_ns: u64,
     end_ns: u64,
     out_path: PathBuf,
-    tailer: Arc<Tailer>,
-    mut coverage_rx: watch::Receiver<Coverage>,
+    coverage: &Watch<Coverage>,
     grace: Duration,
-    permits: Arc<Semaphore>,
+    extract_tx: &Sender<ExtractJob>,
 ) -> anyhow::Result<clip::ClipStats> {
     // 1. Wait out the postroll: hold until the wall clock passes the window end.
     let now = now_ns();
     if end_ns > now {
-        tokio::time::sleep(Duration::from_nanos(end_ns - now)).await;
+        thread::sleep(Duration::from_nanos(end_ns - now));
     }
 
     // 2. Wait until the recording provably covers the window end: a message
     //    with log_time at/after it is on disk (or the recording ended). The
-    //    grace timeout bounds the wait when the recorded topics go quiet.
-    let covered = coverage_rx.wait_for(|c| c.ended || c.high_water_ns >= end_ns);
-    match tokio::time::timeout(grace, covered).await {
-        Ok(Ok(_)) => {}
-        Ok(Err(_)) => anyhow::bail!("tail stopped before the window was covered"),
-        Err(_) => warn!(
+    //    grace timeout bounds the wait when the recorded topics go quiet —
+    //    and bounds every other stall the same way (a dead tail thread
+    //    already exits the process through supervision).
+    if !coverage.wait_timeout_for(grace, |c| c.ended || c.high_water_ns >= end_ns) {
+        warn!(
             "window end {end_ns} still uncovered after {grace:?}; \
              cutting the clip from what is on disk"
-        ),
+        );
     }
 
-    // 3. Acquire an extraction permit (FIFO; default one copy at a time —
-    //    the bulk copy competes with the recorder's writes for disk
-    //    bandwidth), then snapshot the plan and bulk-copy the window. The
-    //    copy is blocking file IO, so it runs off the async runtime.
-    let _permit = permits
-        .acquire_owned()
-        .await
-        .context("extraction semaphore closed")?;
-    let plan = tailer.plan_window(start_ns, end_ns);
-    tokio::task::spawn_blocking(move || clip::extract_clip(&plan, &out_path, start_ns, end_ns))
-        .await?
+    // 3. Queue the copy on the extraction workers (FIFO; default one copy at
+    //    a time — the bulk copy competes with the recorder's writes for disk
+    //    bandwidth) and block on the reply.
+    let (reply_tx, reply_rx) = bounded(1);
+    extract_tx
+        .send(ExtractJob {
+            start_ns,
+            end_ns,
+            out_path,
+            reply: reply_tx,
+        })
+        .map_err(|_| anyhow::anyhow!("the extraction workers are gone"))?;
+    reply_rx
+        .recv()
+        .map_err(|_| anyhow::anyhow!("the extraction worker dropped the job"))?
 }
 
 /// Nanoseconds since the Unix epoch on the system clock.
@@ -532,20 +710,33 @@ mod tests {
 
     // ── supervise() tests ──────────────────────────────────────────────────
 
-    #[tokio::test]
-    async fn supervise_carries_tail_failure_cause() -> anyhow::Result<()> {
-        // The tail task now resolves a typed anyhow::Result. A scan fault it
-        // could not retry past comes back as Ok(Err(_)); supervise must wrap it
-        // so the formatted chain names the tail thread AND carries the
-        // scan-fault root cause for the operator.
-        let tail =
-            tokio::spawn(async { Err(anyhow::anyhow!("scan of X faulted at offset 42")) });
-        let spin = tokio::spawn(std::future::pending::<()>());
-        let consumer = tokio::spawn(std::future::pending::<()>());
+    /// A supervised arm that never resolves: the sender is leaked so the
+    /// channel never disconnects, and the handle is a finished no-op thread
+    /// ([`supervise`] joins a handle only after a disconnect).
+    fn pending<T: Send + 'static>() -> Supervised<T> {
+        let (tx, rx) = bounded::<T>(1);
+        std::mem::forget(tx);
+        (rx, thread::spawn(|| {}))
+    }
 
-        let err = supervise(tail, spin, consumer, std::future::pending::<std::io::Result<()>>())
-            .await
-            .unwrap_err();
+    /// A signal channel that never fires (and never disconnects).
+    fn no_signal() -> Receiver<i32> {
+        let (tx, rx) = bounded::<i32>(1);
+        std::mem::forget(tx);
+        rx
+    }
+
+    #[test]
+    fn supervise_carries_tail_failure_cause() {
+        // The tail thread resolves a typed anyhow::Result. A scan fault it
+        // could not retry past comes back as a received Err; supervise must
+        // wrap it so the formatted chain names the tail thread AND carries
+        // the scan-fault root cause for the operator.
+        let tail = spawn_supervised("tail", || -> anyhow::Result<()> {
+            Err(anyhow::anyhow!("scan of X faulted at offset 42"))
+        });
+
+        let err = supervise(tail, pending(), pending(), no_signal()).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("tail thread"),
@@ -555,40 +746,34 @@ mod tests {
             msg.contains("faulted at offset 42"),
             "error must carry the scan-fault root cause, got: {msg}"
         );
-        Ok(())
     }
 
-    #[tokio::test]
-    async fn supervise_reports_consumer_end() -> anyhow::Result<()> {
-        // A consumer task that exits cleanly (stream ended or explicit return)
-        // is an error: the recorder stops receiving triggers with no noise. The
-        // other two tasks and the shutdown signal are parked as "pending forever"
-        // to isolate the consumer signal.
-        let tail = tokio::spawn(std::future::pending::<anyhow::Result<()>>());
-        let spin = tokio::spawn(std::future::pending::<()>());
-        let consumer = tokio::spawn(async {});   // completes immediately
+    #[test]
+    fn supervise_reports_consumer_end() {
+        // A consumer thread that exits cleanly (stream ended or explicit
+        // return) is an error: the recorder stops receiving triggers with no
+        // noise. The other arms are parked as "pending forever" to isolate
+        // the consumer signal.
+        let consumer = spawn_supervised("trigger-consumer", || {});
 
-        let err = supervise(tail, spin, consumer, std::future::pending::<std::io::Result<()>>())
-            .await
-            .unwrap_err();
+        let err = supervise(pending(), pending(), consumer, no_signal()).unwrap_err();
         assert!(
             format!("{err:#}").contains("trigger consumer"),
             "error must name the trigger consumer, got: {err:#}"
         );
-        Ok(())
     }
 
-    #[tokio::test]
-    async fn supervise_reports_consumer_panic() -> anyhow::Result<()> {
-        // A panicking consumer wraps its JoinError; the formatted chain must
-        // carry the panic payload so the operator knows what went wrong.
-        let tail = tokio::spawn(std::future::pending::<anyhow::Result<()>>());
-        let spin = tokio::spawn(std::future::pending::<()>());
-        let consumer = tokio::spawn(async { panic!("boom") });
+    #[test]
+    fn supervise_reports_consumer_panic() {
+        // A panicking consumer drops its result sender without a send; the
+        // disconnect routes through the join handle so the formatted chain
+        // carries the panic payload and the operator knows what went wrong.
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let consumer: Supervised<()> = spawn_supervised("trigger-consumer", || panic!("boom"));
 
-        let err = supervise(tail, spin, consumer, std::future::pending::<std::io::Result<()>>())
-            .await
-            .unwrap_err();
+        let err = supervise(pending(), pending(), consumer, no_signal()).unwrap_err();
+        std::panic::set_hook(prev_hook);
         let msg = format!("{err:#}");
         assert!(
             msg.contains("trigger consumer"),
@@ -598,92 +783,72 @@ mod tests {
             msg.contains("boom") || msg.contains("panic"),
             "error must carry the panic context, got: {msg}"
         );
-        Ok(())
     }
 
-    #[tokio::test]
-    async fn supervise_reports_tail_end() -> anyhow::Result<()> {
+    #[test]
+    fn supervise_reports_tail_end() {
         // The tail loop never returns Ok on its own, so a clean Ok(()) return
         // is an unexpected exit: clips would degrade to grace-timeout cuts
         // silently if not caught.
-        let tail = tokio::spawn(async { Ok(()) }); // returns Ok immediately
-        let spin = tokio::spawn(std::future::pending::<()>());
-        let consumer = tokio::spawn(std::future::pending::<()>());
+        let tail = spawn_supervised("tail", || -> anyhow::Result<()> { Ok(()) });
 
-        let err = supervise(tail, spin, consumer, std::future::pending::<std::io::Result<()>>())
-            .await
-            .unwrap_err();
+        let err = supervise(tail, pending(), pending(), no_signal()).unwrap_err();
         assert!(
             format!("{err:#}").contains("tail thread"),
             "error must name the tail thread, got: {err:#}"
         );
-        Ok(())
     }
 
-    #[tokio::test]
-    async fn supervise_reports_spin_end() -> anyhow::Result<()> {
-        // The spin thread exiting means the node is no longer pumping messages:
-        // triggers silently stop arriving.
-        let tail = tokio::spawn(std::future::pending::<anyhow::Result<()>>());
-        let spin = tokio::spawn(async {});       // completes immediately
-        let consumer = tokio::spawn(std::future::pending::<()>());
+    #[test]
+    fn supervise_reports_spin_end() {
+        // The spin thread exiting means the node is no longer pumping
+        // messages: triggers silently stop arriving.
+        let spin = spawn_supervised("node-spin", || {});
 
-        let err = supervise(tail, spin, consumer, std::future::pending::<std::io::Result<()>>())
-            .await
-            .unwrap_err();
+        let err = supervise(pending(), spin, pending(), no_signal()).unwrap_err();
         assert!(
             format!("{err:#}").contains("node spin thread"),
             "error must name the node spin thread, got: {err:#}"
         );
-        Ok(())
     }
 
-    #[tokio::test]
-    async fn supervise_returns_ok_on_shutdown_signal() -> anyhow::Result<()> {
-        // A clean shutdown signal (SIGINT / ctrl_c) is a requested, orderly
-        // stop — not a fault. supervise() must return Ok(()) so main can log
-        // the shutdown and exit zero, distinguishing it from a dead task.
-        let tail = tokio::spawn(std::future::pending::<anyhow::Result<()>>());
-        let spin = tokio::spawn(std::future::pending::<()>());
-        let consumer = tokio::spawn(std::future::pending::<()>());
-        let shutdown = std::future::ready(Ok(()) as std::io::Result<()>);
+    #[test]
+    fn supervise_returns_ok_on_shutdown_signal() {
+        // A delivered shutdown signal (SIGINT / SIGTERM) is a requested,
+        // orderly stop — not a fault. supervise() must return Ok(()) so main
+        // can exit zero, distinguishing it from a dead thread.
+        let (sig_tx, sig_rx) = bounded(1);
+        sig_tx.send(SIGINT).unwrap();
 
-        let result = supervise(tail, spin, consumer, shutdown).await;
-        assert!(result.is_ok(), "SIGINT must return Ok(()), got: {result:?}");
-        Ok(())
+        let result = supervise(pending(), pending(), pending(), sig_rx);
+        assert!(result.is_ok(), "a signal must return Ok(()), got: {result:?}");
     }
 
-    #[tokio::test]
-    async fn supervise_reports_signal_handler_failure() -> anyhow::Result<()> {
-        // A failure to install the signal handler must surface as an error
-        // naming the signal handler — a silent failure here would mean SIGINT
-        // could never trigger a clean shutdown.
-        let tail = tokio::spawn(std::future::pending::<anyhow::Result<()>>());
-        let spin = tokio::spawn(std::future::pending::<()>());
-        let consumer = tokio::spawn(std::future::pending::<()>());
-        let shutdown =
-            std::future::ready(Err(std::io::Error::other("install failed")) as std::io::Result<()>);
+    #[test]
+    fn supervise_reports_signal_handler_failure() {
+        // The signal forwarder dying (its channel disconnecting) must surface
+        // as an error naming the signal handler — losing it silently would
+        // mean SIGINT/SIGTERM could never trigger a clean shutdown. (An
+        // installation failure carries the same attribution, raised in main()
+        // before supervision starts.)
+        let (sig_tx, sig_rx) = bounded::<i32>(1);
+        drop(sig_tx);
 
-        let err = supervise(tail, spin, consumer, shutdown).await.unwrap_err();
-        let msg = format!("{err:#}");
+        let err = supervise(pending(), pending(), pending(), sig_rx).unwrap_err();
         assert!(
-            msg.contains("signal handler"),
-            "error must name the signal handler, got: {msg}"
+            format!("{err:#}").contains("signal handler"),
+            "error must name the signal handler, got: {err:#}"
         );
-        assert!(
-            msg.contains("install failed"),
-            "error must carry the io error, got: {msg}"
-        );
-        Ok(())
     }
 
     use crate::clip::tests::read_clip;
     use crate::tail::tests::{scan_to_end, test_dir, write_recording, write_unfinished_recording};
 
-    #[tokio::test]
-    async fn record_clip_grace_timeout_cuts_what_is_on_disk() -> anyhow::Result<()> {
+    #[test]
+    fn record_clip_grace_timeout_cuts_what_is_on_disk() -> anyhow::Result<()> {
         let root = test_dir("grace")?;
-        let (tailer, coverage_rx) = Tailer::new();
+        let (tailer, coverage) = Tailer::new();
+        let extract_tx = spawn_extract_workers(1, tailer);
 
         // The window end is far in the past on the wall clock (no postroll
         // sleep), but coverage never reaches it — no recording was ever
@@ -693,12 +858,10 @@ mod tests {
             0,
             1_000,
             root.join("clip.mcap"),
-            tailer,
-            coverage_rx,
+            &coverage,
             Duration::from_millis(50),
-            Arc::new(Semaphore::new(1)),
-        )
-        .await?;
+            &extract_tx,
+        )?;
 
         assert_eq!(stats.messages_copied, 0);
         assert!(read_clip(&stats.out_path)?.is_empty());
@@ -707,8 +870,8 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn record_clip_completes_once_coverage_arrives() -> anyhow::Result<()> {
+    #[test]
+    fn record_clip_completes_once_coverage_arrives() -> anyhow::Result<()> {
         let root = test_dir("cov")?;
         let rec = root.join("rec.mcap");
         write_recording(&rec, false, &[("/t", 100), ("/t", 900), ("/t", 2_000)])?;
@@ -716,7 +879,7 @@ mod tests {
         // The tail discovers and scans the recording a little later, as a
         // live tail would; record_clip must block on the coverage watch until
         // a message at/after the window end (1_000) is on disk.
-        let (tailer, coverage_rx) = Tailer::new();
+        let (tailer, coverage) = Tailer::new();
         let scanner = tailer.clone();
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(50));
@@ -725,16 +888,15 @@ mod tests {
             scan_to_end(&scanner, &file, 8).unwrap();
         });
 
+        let extract_tx = spawn_extract_workers(1, tailer);
         let stats = record_clip(
             100,
             1_000,
             root.join("clip.mcap"),
-            tailer,
-            coverage_rx,
+            &coverage,
             Duration::from_secs(10),
-            Arc::new(Semaphore::new(1)),
-        )
-        .await?;
+            &extract_tx,
+        )?;
 
         assert_eq!(stats.messages_copied, 2);
         assert_eq!(
@@ -746,8 +908,8 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn record_clip_waits_out_the_postroll() -> anyhow::Result<()> {
+    #[test]
+    fn record_clip_waits_out_the_postroll() -> anyhow::Result<()> {
         let root = test_dir("postroll")?;
         let rec = root.join("rec.mcap");
         let now = now_ns();
@@ -755,23 +917,22 @@ mod tests {
         // is already satisfied — only the wall-clock wait holds the cut back.
         write_recording(&rec, false, &[("/t", now), ("/t", now + 300_000_000)])?;
 
-        let (tailer, coverage_rx) = Tailer::new();
+        let (tailer, coverage) = Tailer::new();
         let file = Arc::new(std::fs::File::open(&rec)?);
         tailer.attach(file.clone());
         scan_to_end(&tailer, &file, 8)?;
 
+        let extract_tx = spawn_extract_workers(1, tailer);
         let end_ns = now + 150_000_000; // 150 ms past the trigger stamp
         let started = std::time::Instant::now();
         let stats = record_clip(
             now.saturating_sub(1_000_000_000),
             end_ns,
             root.join("clip.mcap"),
-            tailer,
-            coverage_rx,
+            &coverage,
             Duration::from_secs(10),
-            Arc::new(Semaphore::new(1)),
-        )
-        .await?;
+            &extract_tx,
+        )?;
 
         assert!(
             started.elapsed() >= Duration::from_millis(50),
@@ -783,8 +944,8 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn record_clip_cuts_immediately_when_the_recording_ended() -> anyhow::Result<()> {
+    #[test]
+    fn record_clip_cuts_immediately_when_the_recording_ended() -> anyhow::Result<()> {
         let root = test_dir("ended")?;
         let rec = root.join("rec.mcap");
         write_recording(&rec, false, &[("/t", 100), ("/t", 200)])?;
@@ -792,22 +953,21 @@ mod tests {
         // Footer scanned → ended. The high-water mark (200) stays far below
         // the window end, so only the ended flag can release the coverage
         // wait — it must short-circuit the 30 s grace, cutting what exists.
-        let (tailer, coverage_rx) = Tailer::new();
+        let (tailer, coverage) = Tailer::new();
         let file = Arc::new(std::fs::File::open(&rec)?);
         tailer.attach(file.clone());
         scan_to_end(&tailer, &file, 8)?;
 
+        let extract_tx = spawn_extract_workers(1, tailer);
         let started = std::time::Instant::now();
         let stats = record_clip(
             50,
             1_000_000,
             root.join("clip.mcap"),
-            tailer,
-            coverage_rx,
+            &coverage,
             Duration::from_secs(30),
-            Arc::new(Semaphore::new(1)),
-        )
-        .await?;
+            &extract_tx,
+        )?;
 
         assert!(
             started.elapsed() < Duration::from_secs(5),
@@ -819,8 +979,8 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn coverage_exactly_at_the_window_end_releases_the_wait() -> anyhow::Result<()> {
+    #[test]
+    fn coverage_exactly_at_the_window_end_releases_the_wait() -> anyhow::Result<()> {
         let root = test_dir("cov-eq")?;
         let rec = root.join("rec.mcap");
         // A live (unfinished) recording whose newest message sits EXACTLY at
@@ -828,27 +988,26 @@ mod tests {
         // the ended flag and without burning the grace timeout.
         write_unfinished_recording(&rec, "/t", &[100, 1_000])?;
 
-        let (tailer, coverage_rx) = Tailer::new();
+        let (tailer, coverage) = Tailer::new();
         let file = Arc::new(std::fs::File::open(&rec)?);
         tailer.attach(file.clone());
         scan_to_end(&tailer, &file, 8)?;
         {
-            let cov = coverage_rx.borrow();
+            let cov = coverage.get();
             assert!(!cov.ended, "no footer was written");
             assert_eq!(cov.high_water_ns, 1_000);
         }
 
+        let extract_tx = spawn_extract_workers(1, tailer);
         let started = std::time::Instant::now();
         let stats = record_clip(
             0,
             1_000,
             root.join("clip.mcap"),
-            tailer,
-            coverage_rx,
+            &coverage,
             Duration::from_secs(30),
-            Arc::new(Semaphore::new(1)),
-        )
-        .await?;
+            &extract_tx,
+        )?;
 
         assert!(
             started.elapsed() < Duration::from_secs(5),
@@ -860,9 +1019,8 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn concurrent_overlapping_triggers_serialize_and_take_distinct_paths()
-    -> anyhow::Result<()> {
+    #[test]
+    fn concurrent_overlapping_triggers_serialize_and_take_distinct_paths() -> anyhow::Result<()> {
         let root = test_dir("overlap")?;
         let rec = root.join("rec.mcap");
         write_recording(
@@ -871,37 +1029,34 @@ mod tests {
             &[("/t", 100), ("/t", 200), ("/t", 300), ("/t", 400)],
         )?;
 
-        let (tailer, coverage_rx) = Tailer::new();
+        let (tailer, coverage) = Tailer::new();
         let file = Arc::new(std::fs::File::open(&rec)?);
         tailer.attach(file.clone());
         scan_to_end(&tailer, &file, 8)?;
 
         // Two overlapping windows racing for the same out path and a single
-        // extraction permit: the copies serialize FIFO, the second writer
+        // extraction worker: the copies serialize FIFO, the second writer
         // lands on a `_1` sibling, and both clips come out complete.
-        let permits = Arc::new(Semaphore::new(1));
+        let extract_tx = spawn_extract_workers(1, tailer);
         let out = root.join("clip.mcap");
-        let (a, b) = tokio::join!(
-            record_clip(
-                100,
-                300,
-                out.clone(),
-                tailer.clone(),
-                coverage_rx.clone(),
-                Duration::from_secs(30),
-                permits.clone(),
-            ),
-            record_clip(
-                200,
-                400,
-                out.clone(),
-                tailer.clone(),
-                coverage_rx.clone(),
-                Duration::from_secs(30),
-                permits.clone(),
-            ),
-        );
-        let (a, b) = (a?, b?);
+        let cut = |start_ns: u64, end_ns: u64| {
+            let coverage = coverage.clone();
+            let extract_tx = extract_tx.clone();
+            let out = out.clone();
+            std::thread::spawn(move || {
+                record_clip(
+                    start_ns,
+                    end_ns,
+                    out,
+                    &coverage,
+                    Duration::from_secs(30),
+                    &extract_tx,
+                )
+            })
+        };
+        let (ha, hb) = (cut(100, 300), cut(200, 400));
+        let a = ha.join().unwrap()?;
+        let b = hb.join().unwrap()?;
 
         assert_ne!(
             a.out_path, b.out_path,
@@ -931,77 +1086,133 @@ mod tests {
         Ok(())
     }
 
+    /// FIFO is a property of the worker channel, observed end to end: two
+    /// jobs racing for the same desired out path are submitted in a known
+    /// order, and the single worker dequeues them in exactly that order, so
+    /// the first job claims the unsuffixed name and the second resolves to
+    /// the `_1` sibling — deterministically, not as one of two race outcomes.
+    #[test]
+    fn extract_workers_dequeue_jobs_fifo() -> anyhow::Result<()> {
+        let root = test_dir("fifo")?;
+        let rec = root.join("rec.mcap");
+        write_recording(&rec, false, &[("/t", 100), ("/t", 200)])?;
+
+        let (tailer, _coverage) = Tailer::new();
+        let file = Arc::new(std::fs::File::open(&rec)?);
+        tailer.attach(file.clone());
+        scan_to_end(&tailer, &file, 8)?;
+
+        let extract_tx = spawn_extract_workers(1, tailer);
+        let out = root.join("clip.mcap");
+        let (reply_a, recv_a) = bounded(1);
+        let (reply_b, recv_b) = bounded(1);
+        extract_tx.send(ExtractJob {
+            start_ns: 0,
+            end_ns: 300,
+            out_path: out.clone(),
+            reply: reply_a,
+        })?;
+        extract_tx.send(ExtractJob {
+            start_ns: 0,
+            end_ns: 300,
+            out_path: out.clone(),
+            reply: reply_b,
+        })?;
+
+        let a = recv_a.recv()??;
+        let b = recv_b.recv()??;
+        assert_eq!(a.out_path, out, "the first-submitted job claims the name");
+        assert_eq!(
+            b.out_path,
+            root.join("clip_1.mcap"),
+            "the second job resolves against the taken name"
+        );
+        assert_eq!(a.messages_copied, 2);
+        assert_eq!(b.messages_copied, 2);
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
     /// Admission at the limit, rejection above it, and slot reuse — the
     /// acceptance test for MAX_ACTIVE_TRIGGERS. This is the exact scenario the
     /// recorder must handle: 16 concurrent trigger handlers admitted, the 17th
     /// rejected (flood-sanity bound), then a completed handler returns its
     /// permit and a later trigger is admitted. Mirrors the consumer loop: a
-    /// permit is taken without waiting and rides in the handler task until it
-    /// finishes.
-    #[tokio::test]
-    async fn admission_at_the_limit_rejection_above_and_slot_reuse() -> anyhow::Result<()> {
-        let active = Arc::new(Semaphore::new(MAX_ACTIVE_TRIGGERS));
-        // Each handler parks on a watch receiver until released, as a real
-        // handler does while it waits out its window and extracts.
-        let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+    /// permit is taken without waiting and rides in the handler thread until
+    /// it finishes.
+    #[test]
+    fn admission_at_the_limit_rejection_above_and_slot_reuse() -> anyhow::Result<()> {
+        let active = Admission::new(MAX_ACTIVE_TRIGGERS);
+        // Each handler parks on a watch until released, as a real handler
+        // does while it waits out its window and extracts.
+        let release = Arc::new(Watch::new(false));
 
+        let mut handlers = Vec::new();
         for i in 0..MAX_ACTIVE_TRIGGERS {
             let permit = active
                 .clone()
-                .try_acquire_owned()
-                .map_err(|_| anyhow::anyhow!("trigger {i} rejected; expected admission"))?;
-            let mut release_rx = release_rx.clone();
-            tokio::spawn(async move {
+                .try_acquire()
+                .ok_or_else(|| anyhow::anyhow!("trigger {i} rejected; expected admission"))?;
+            let release = release.clone();
+            handlers.push(std::thread::spawn(move || {
                 let _permit = permit;
-                release_rx.wait_for(|&v| v).await.ok();
-            });
+                release.wait_timeout_for(Duration::from_secs(30), |&v| v);
+            }));
         }
 
-        // Trigger 17: every permit is held by a pending handler — admission
+        // Trigger 17: every permit is held by a parked handler — admission
         // must fail immediately, without waiting.
         assert!(
-            active.clone().try_acquire_owned().is_err(),
+            active.clone().try_acquire().is_none(),
             "trigger beyond the limit must be rejected"
         );
 
         // Handlers complete; their permits return, so a later trigger is
-        // admitted (acquire_owned waits for the first returned permit).
-        release_tx.send(true).unwrap();
-        let _readmitted = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            active.clone().acquire_owned(),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("a completed handler must free a slot"))??;
+        // admitted as soon as the first one comes back.
+        release.send_replace(true);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let _readmitted = loop {
+            if let Some(permit) = active.clone().try_acquire() {
+                break permit;
+            }
+            if std::time::Instant::now() >= deadline {
+                anyhow::bail!("a completed handler must free a slot");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
 
+        for h in handlers {
+            h.join().unwrap();
+        }
         Ok(())
     }
 
     /// A panicking handler must return its permit: the admission bound would
     /// otherwise ratchet down with every panic until every trigger is
-    /// rejected. The permit is held by the handler task and returns on drop,
-    /// which unwinding covers.
-    #[tokio::test]
-    async fn panicking_handler_returns_its_permit() -> anyhow::Result<()> {
+    /// rejected. The permit is held by the handler thread and returns on
+    /// drop, which unwinding covers.
+    #[test]
+    fn panicking_handler_returns_its_permit() -> anyhow::Result<()> {
         // Suppress the panic backtrace noise in test output.
         let prev_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
 
-        let active = Arc::new(Semaphore::new(1));
+        let active = Admission::new(1);
         let permit = active
             .clone()
-            .try_acquire_owned()
-            .map_err(|_| anyhow::anyhow!("fresh semaphore must admit"))?;
-        let handler = tokio::spawn(async move {
+            .try_acquire()
+            .ok_or_else(|| anyhow::anyhow!("a fresh admission gate must admit"))?;
+        let handler = std::thread::spawn(move || {
             let _permit = permit;
             panic!("boom");
         });
-        let joined = handler.await;
+        let joined = handler.join();
         std::panic::set_hook(prev_hook);
         assert!(joined.is_err(), "the handler must have panicked");
 
         assert!(
-            active.try_acquire_owned().is_ok(),
+            active.try_acquire().is_some(),
             "the panicked handler's permit must be free again"
         );
         Ok(())

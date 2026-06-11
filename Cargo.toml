@@ -22,6 +22,8 @@ edition = "2024"
 r2r = "0.9.5"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "signal"] }
 futures = "0.3"
+crossbeam-channel = "0.5"
+signal-hook = "0.3"
 mcap = "0.24"
 memmap2 = "0.9"
 anyhow = "1"
