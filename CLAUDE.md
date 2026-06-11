@@ -66,7 +66,16 @@ events are header-less, so like `/tf` they are counted but not indexed.
 Setup is in the README; the parts that matter when changing the build:
 
 - Builds run **inside the dev shell**: `nix develop --command cargo build`
-  (likewise `clippy`). Rust is the system toolchain, not the flake's.
+  (likewise `clippy`, `test`, and `llvm-cov`). Rust is the system toolchain,
+  not the flake's.
+- Test coverage is `cargo-llvm-cov`, which — like Rust itself — comes from
+  the system, not this flake (commands in README "Tests and coverage"). The
+  system toolchain includes the `llvm-tools` component, so `cargo-llvm-cov`
+  finds `llvm-cov`/`llvm-profdata` through the rustc sysroot, version-matched
+  to rustc's own LLVM by construction. The flake exports nothing for coverage;
+  in particular `LLVM_COV`/`LLVM_PROFDATA` stay unset — they would override
+  the sysroot tools with an LLVM whose major version then has to be kept
+  **>= the system rustc's LLVM major** by hand.
 - The shellHook exports `RMW_IMPLEMENTATION=rmw_fastrtps_cpp`, `ROS_DOMAIN_ID=0`,
   and `ROS_DISTRO=jazzy`.
 - The flake's message-package list serves **both** build models from one

@@ -209,6 +209,31 @@ recording file has no retention — it
 grows until you stop recording (hole-punch retention is tracked in beads:
 `ros2_subscribe-wkg`).
 
+## Tests and coverage
+
+Tests run with plain `cargo test` inside the dev shell. Line/branch coverage
+comes from [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov). Like
+Rust itself it is not part of this flake — it and the `llvm-tools` toolchain
+component it needs (`llvm-cov`/`llvm-profdata`, discovered via the rustc
+sysroot) come from the system:
+
+```bash
+# Summary table on stdout (the triggered clip recorders carry the test suites)
+nix develop --command cargo llvm-cov -p edgestream-rec -p edgestream-rec-cont
+
+# Browsable HTML report → target/llvm-cov/html/index.html
+nix develop --command cargo llvm-cov -p edgestream-rec -p edgestream-rec-cont --html
+
+# lcov output for editor/CI integration
+nix develop --command cargo llvm-cov -p edgestream-rec -p edgestream-rec-cont --lcov --output-path lcov.info
+```
+
+Coverage builds are instrumented and use their own target directory
+(`target/llvm-cov-target`), so they neither clobber nor reuse the normal
+`cargo build` cache — expect a full rebuild on the first run. Dropping the
+`-p` flags covers the whole workspace, at the cost of also instrument-building
+the all-topic indexers and their r2r/rclrs codegen.
+
 ## Deployment (Jetson / native build)
 
 The triggered recorder ships to an edge target — a Jetson running ROS2 Humble.

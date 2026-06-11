@@ -1,6 +1,9 @@
 /target
 .omc/
 
+# cargo-llvm-cov output (README "Tests and coverage")
+/lcov.info
+
 # Continuous rosbag2 recordings (5 s splits for edgestream-rec, one growing
 # file for edgestream-rec-cont) and the clips the triggered recorders cut out
 # of them — all local runtime data.
