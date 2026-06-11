@@ -206,7 +206,12 @@ latency). Clips have the same form as `edgestream-rec`'s and land in
 (a clip whose name is already taken gets a `_<n>` suffix; localized damage in
 the recording — an unparseable record, a chunk failing its CRC — is skipped
 with a logged error rather than failing the clip; a failed extraction removes
-its partial file, so every clip on disk is complete). The single
+its partial file, so every clip on disk is complete). Coverage trusts the
+recorder's approximately non-decreasing `log_time` order (rosbag2's single
+writer stamps `log_time` at receive): a message the recorder appends out of
+order, after its window has already been cut, is not guaranteed into the
+clip — `grace_secs` is the knob that absorbs flush latency, not arbitrary
+reordering. The single
 recording file has no retention — it
 grows until you stop recording (hole-punch retention is tracked in beads:
 `ros2_subscribe-wkg`).
