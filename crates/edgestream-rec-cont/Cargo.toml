@@ -26,3 +26,15 @@ serde.workspace = true
 # Logging via the `log` facade; pretty_env_logger is the backend (honours RUST_LOG).
 log.workspace = true
 pretty_env_logger.workspace = true
+
+# Dev-dependencies serve the live e2e suite (tests/e2e.rs + tests/harness/);
+# the inline unit tests use only the crate's own dependencies.
+[dev-dependencies]
+# Per-test temp trees (record/, triggered/, logs/) wiped on drop.
+tempfile = "3"
+# Process-group signalling (SIGINT/SIGTERM/SIGKILL) for tearing down the
+# ros2 / recorder / extractor child processes, panic included.
+libc = "0.2"
+# Test structuring: expands the storage-profile matrix into per-case tests
+# that nextest runs as isolated processes.
+rstest = "0.26"

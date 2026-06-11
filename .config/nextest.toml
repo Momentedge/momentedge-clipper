@@ -1,0 +1,38 @@
+# Repo-wide cargo-nextest configuration. The `e2e` profile is the required
+# runner for the live ROS2 suite (crates/edgestream-rec-cont/tests/e2e.rs) —
+# see README "Integration tests (live ROS2 e2e)".
+
+# One live test at a time: every e2e test drives a real `ros2 bag record`
+# against the disk and a real DDS graph; concurrent suites would compete for
+# disk bandwidth (inflating the recorder's flush latency the tests measure
+# against) even though each test has its own ROS_DOMAIN_ID.
+[test-groups.ros-e2e]
+max-threads = 1
+
+# The e2e binary serializes under every profile: gated off (EDGESTREAM_E2E
+# unset) its tests skip in microseconds, gated on they must never overlap.
+[[profile.default.overrides]]
+filter = "binary(e2e)"
+test-group = "ros-e2e"
+
+[profile.e2e]
+# A live test spends its wall clock sleeping out real trigger windows and
+# python CLI startup; 60 s flags a straggler, two periods terminates it, and
+# the grace period lets the harness's Drop teardown SIGTERM the children.
+slow-timeout = { period = "60s", terminate-after = 2, grace-period = "10s" }
+# DDS discovery is timing-sensitive; one retry absorbs a rare discovery miss.
+retries = 1
+# Children are killed group-wide when a test's guards drop; anything still
+# holding the test's output handles after this window is a real leak (e.g. an
+# orphaned ros2 daemon).
+leak-timeout = "2s"
+
+[[profile.e2e.overrides]]
+filter = "binary(e2e)"
+test-group = "ros-e2e"
+
+# Live damage injection races the tail's scan by design — the closest test to
+# real corruption, and the one acknowledged flaky case.
+[[profile.e2e.overrides]]
+filter = "test(corrupt_tail_health_live)"
+retries = 2

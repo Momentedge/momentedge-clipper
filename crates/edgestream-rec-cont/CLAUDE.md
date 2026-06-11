@@ -268,6 +268,46 @@ extraction tasks die with the runtime — safe because the capturing-dir startup
 reset reclaims any stranded staged file, and `out_dir` only ever holds complete
 clips.
 
+## Integration tests (`tests/e2e.rs`)
+
+The inline `#[cfg(test)]` suites cover the tail/clip/supervise logic against
+synthetic MCAP files; `tests/e2e.rs` covers the contract against the real
+stack — a live `ros2 bag record` started through the production
+`scripts/record-continuous.sh`, triggers published with the ros2 CLI, and
+`Recorded` asserted via `ros2 topic echo`. How to run it (gating, the
+cargo-nextest prerequisite, the exact command) is in the
+[README](../../README.md#integration-tests-live-ros2-e2e); this section is the
+rationale.
+
+- **Everything is a child process; the test owns no ROS node.** The ros2 CLI
+  resolves `edgestream_msgs` types from `AMENT_PREFIX_PATH`, so the test
+  binary needs no r2r dependency and carries no process-global DDS state.
+  The binary under test is located via `CARGO_BIN_EXE_edgestream-rec-cont`.
+- **nextest is the required runner, not launch_testing**: process-per-test
+  isolation, per-test slow-timeouts, leak detection for orphaned children,
+  and the `ros-e2e` test group (`.config/nextest.toml`) serializing the suite
+  — concurrent bag records would contend for disk and skew the flush-latency
+  assumptions. The unit under test is a Cargo binary and the assertions are
+  typed in-repo MCAP reads, which ament's Python harness has no access to.
+- **Isolation is per test**: a unique `ROS_DOMAIN_ID` (defense in depth on
+  top of the serialization) and a `tempfile` tree for `record/`,
+  `triggered/`, and child logs. `harness::Proc` spawns every child in its own
+  process group and SIGTERM/SIGKILLs the group on drop, so a panicking test
+  strands nothing.
+- **rstest is the structuring layer**: the storage-profile matrix is one
+  parameterized test (`#[case]` per profile), which nextest still expands
+  into isolated per-case processes. Bring-up composes through `TestEnv`
+  methods rather than fixture-on-fixture injection — rstest resolves a
+  fixture fresh at each injection site, so fixtures sharing a `domain`
+  dependency would each get a different domain.
+- **Determinism over realism, except where realism is the point.** The
+  chunked-profile case stops the recorder cleanly so the footer (`ended`)
+  releases the coverage wait instead of racing a chunk flush; the offline
+  corruption test plants a framing fault at a known record boundary of a
+  closed file. Only `corrupt_tail_health_live` races the scan by design (the
+  closest test to real corruption) and is the one case with extra nextest
+  retries.
+
 ## Retention
 
 None. The single file grows until the recording stops. Punching holes below a

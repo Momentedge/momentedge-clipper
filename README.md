@@ -253,6 +253,36 @@ Coverage builds are instrumented and use their own target directory
 `-p` flags covers the whole workspace, at the cost of also instrument-building
 the all-topic indexers and their r2r/rclrs codegen.
 
+### Integration tests (live ROS2 e2e)
+
+`crates/edgestream-rec-cont/tests/e2e.rs` drives the real stack end to end: a
+real `ros2 bag record` (the production `scripts/record-continuous.sh`
+invocation), CLI-published triggers, and a `ros2 topic echo` listener for the
+`Recorded` announcements. The matrix covers the fastwrite and zstd_fast
+storage profiles, a recorder restart during operation, two grace-timeout
+degraded paths, and offline/live corruption of the recording.
+
+The suite is gated on `EDGESTREAM_E2E`: unset (plain `cargo test`,
+`cargo llvm-cov`) every e2e test prints a skip notice and passes, so the
+commands above are unaffected. With the gate set, a missing prerequisite (no
+`ros2` on PATH, `edgestream_msgs` not resolvable) fails loudly instead of
+skipping.
+
+[cargo-nextest](https://nexte.st/) is a hard prerequisite for the gated run —
+like Rust itself it comes from the system, not this flake. Its `e2e` profile
+(`.config/nextest.toml`) runs each test in its own process, serializes the
+suite (one DDS graph and one disk at a time), and enforces per-test timeouts:
+
+```bash
+nix develop --command bash -c \
+  'EDGESTREAM_E2E=1 cargo nextest run -p edgestream-rec-cont --profile e2e -E "binary(e2e)"'
+```
+
+Each test runs in its own `ROS_DOMAIN_ID` (band 80–101) with its own temp
+dirs, so a recorder already running on the host's domain 0 is unaffected.
+Expect a few minutes of wall clock: the tests sleep out real trigger windows
+against a live recording.
+
 ## Deployment (Jetson / native build)
 
 The triggered recorder ships to an edge target — a Jetson running ROS2 Humble.
