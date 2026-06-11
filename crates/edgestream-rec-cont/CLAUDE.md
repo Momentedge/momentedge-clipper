@@ -61,11 +61,49 @@ sequence, `log_time`); bodies are first touched at extraction. The same
 "decode only the timestamp" discipline as the rest of the workspace, applied
 to file tailing.
 
+**Damage in the recording is survivable up to the point of framing desync.**
+The scan tolerates localized damage the same way extraction does (see "The copy
+is direct (`clip.rs`)"): a chunk that fails to decompress, fails its CRC, or
+carries an unsupported compression algorithm contributes nothing — its interior
+is absorbed into a throwaway sub-delta merged into the live state only once the
+chunk iterates cleanly, so a chunk whose CRC fails mid-iteration leaves no
+registry entry and no time folded into coverage or extent bounds, and coverage
+never claims data the cut would silently drop. An unparseable top-level
+`Schema`/`Channel` record (spec-legal bytes the parser rejects, e.g. an
+invalid-UTF-8 name) is warned and skipped. Both keep the framing intact — the
+length prefix is self-consistent — so the record is consumed and the scan keeps
+indexing the records behind it.
+
+A **framing** fault has no resync point and so cannot be skipped: a record whose
+declared length exceeds `MAX_RECORD_LEN`, or an IO error reading a record's
+header or body. The scan stops at the faulted record, having already applied the
+delta it accumulated before it, and reports the fault with that record's offset.
+Everything before the fault therefore stays plannable — clips cut from the
+pre-fault index still extract and announce. The tail then retries from exactly
+that offset, never re-attaching and never rescanning from scratch (the index is
+attached once per recording, so a retry that resumed earlier would re-extend an
+extent the open delta already spans and underflow). Retries are bounded by
+`MAX_SCAN_FAULTS` consecutive faults with backoff escalating from `DISCOVER_POLL`
+toward `SCAN_BACKOFF_CAP`, slept in `DISCOVER_POLL` increments so a recorder
+restart mid-backoff is noticed within one increment and taken as recovery; a
+single fault-free pass resets the count, so transient trouble that clears never
+accumulates. Exhausting the budget is fatal: every retry in a row ended in a
+fault — usually the same stuck byte — so `run()` returns the fault (named with
+the path, offset, and attempt count), `supervise()` carries it out, and the
+process exits non-zero for a supervisor to restart. Limping on would degrade every clip to a
+grace-timeout cut with no other signal, which is exactly what the fail-fast
+budget exists to prevent.
+
 **Recorder restarts:** the recording is discovered as the newest `*.mcap`
 under `record_dir`; when that path stops resolving to the tailed inode (the
 record script wipes the bag dir on restart), the index resets and the new file
-is tailed from scratch. In-flight extractions hold their own `Arc<File>` and
-finish safely against the deleted inode.
+is tailed from scratch. This is the one path that re-attaches and resets
+everything — distinct from a scan fault, which keeps the index. A `NotFound`
+when opening the discovered path is the same race resolved the same way: the
+file vanished between discovery and open, so it is treated as a replacement and
+re-discovery loops. A magic mismatch stays fatal — an append-only file whose
+first eight bytes are wrong can never become a valid MCAP. In-flight extractions
+hold their own `Arc<File>` and finish safely against the deleted inode.
 
 ## Per-trigger flow (`handle_trigger`)
 
@@ -192,11 +230,16 @@ Clip copies are gated by a FIFO semaphore (`extract_parallelism`, default 1).
 node spin thread, and trigger consumer — plus a SIGINT (`ctrl_c`) future, and
 returns as soon as any branch resolves. SIGINT resolves to `Ok(())`, which
 `main` treats as a requested, orderly stop: it logs the shutdown and exits
-zero. Any task resolving instead returns `Err` (clean exit or panic, with the
-`JoinError` panic payload carried in the error chain), and the process exits
-non-zero so a supervisor can restart it — a dead tailer silently degrades every
-clip to a grace-timeout cut, a dead spin thread silently stops delivering
-triggers, and a dead consumer silently stops acting on them. A failure to
+zero. Any task resolving instead returns `Err`, and the process exits non-zero
+so a supervisor can restart it — a dead tailer silently degrades every clip to
+a grace-timeout cut, a dead spin thread silently stops delivering triggers, and
+a dead consumer silently stops acting on them. The tail task resolves a typed
+`anyhow::Result<()>` (its loop runs for the process's lifetime and never
+returns `Ok` on its own), so its supervision arm separates three shapes: a scan
+fault it could not retry past comes back as the inner `Err` and is wrapped to
+name the tail thread while preserving the scan-fault root cause; a clean `Ok`
+return is an unexpected exit; a panic is the `JoinError`. The other two arms
+carry the `JoinError` panic payload in their error chains. A failure to
 install the signal handler itself surfaces as an error naming "signal handler"
 so it is never mistaken for a dead task. Because the spin and tail loops run
 inside `spawn_blocking` and never return on their own, the tokio runtime is

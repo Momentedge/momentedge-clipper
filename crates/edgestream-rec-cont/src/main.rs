@@ -231,6 +231,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 /// handler installation failure (`shutdown` resolves `Err`) must not be silent
 /// either, since it means SIGINT could never trigger a clean shutdown.
 ///
+/// The tail task carries a typed `anyhow::Result<()>`: its loop never returns
+/// `Ok` on its own, so a clean return is treated as an unexpected exit, while
+/// a scan fault it could not retry past surfaces as the inner `Err`, wrapped
+/// so the operator sees the scan-fault root cause and the path it named.
+///
 /// All three tasks must run for the lifetime of the process:
 /// the tail thread feeds coverage and the extent index (a dead tailer silently
 /// degrades every clip to a grace-timeout cut); the spin thread pumps the ROS
@@ -238,7 +243,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 /// consumer drains the typed stream (a dead consumer silently stops acting on
 /// triggers).
 async fn supervise(
-    tail: tokio::task::JoinHandle<()>,
+    tail: tokio::task::JoinHandle<anyhow::Result<()>>,
     spin: tokio::task::JoinHandle<()>,
     consumer: tokio::task::JoinHandle<()>,
     shutdown: impl std::future::Future<Output = std::io::Result<()>>,
@@ -246,7 +251,12 @@ async fn supervise(
     tokio::select! {
         res = tail => {
             match res {
-                Ok(()) => anyhow::bail!("tail thread exited unexpectedly"),
+                // run() loops for the process's lifetime, so a clean return is
+                // as unexpected as the other tasks ending. A scan fault it
+                // could not retry past comes back as the inner Err, wrapped so
+                // the operator sees the root cause; a panic is the join Err.
+                Ok(Ok(())) => anyhow::bail!("tail thread exited unexpectedly"),
+                Ok(Err(e)) => Err(e.context("tail thread failed")),
                 Err(e) => Err(anyhow::Error::new(e).context("tail thread exited unexpectedly")),
             }
         }
@@ -487,12 +497,38 @@ mod tests {
     // ── supervise() tests ──────────────────────────────────────────────────
 
     #[tokio::test]
+    async fn supervise_carries_tail_failure_cause() -> anyhow::Result<()> {
+        // The tail task now resolves a typed anyhow::Result. A scan fault it
+        // could not retry past comes back as Ok(Err(_)); supervise must wrap it
+        // so the formatted chain names the tail thread AND carries the
+        // scan-fault root cause for the operator.
+        let tail =
+            tokio::spawn(async { Err(anyhow::anyhow!("scan of X faulted at offset 42")) });
+        let spin = tokio::spawn(std::future::pending::<()>());
+        let consumer = tokio::spawn(std::future::pending::<()>());
+
+        let err = supervise(tail, spin, consumer, std::future::pending::<std::io::Result<()>>())
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("tail thread"),
+            "error must name the tail thread, got: {msg}"
+        );
+        assert!(
+            msg.contains("faulted at offset 42"),
+            "error must carry the scan-fault root cause, got: {msg}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn supervise_reports_consumer_end() -> anyhow::Result<()> {
         // A consumer task that exits cleanly (stream ended or explicit return)
         // is an error: the recorder stops receiving triggers with no noise. The
         // other two tasks and the shutdown signal are parked as "pending forever"
         // to isolate the consumer signal.
-        let tail = tokio::spawn(std::future::pending::<()>());
+        let tail = tokio::spawn(std::future::pending::<anyhow::Result<()>>());
         let spin = tokio::spawn(std::future::pending::<()>());
         let consumer = tokio::spawn(async {});   // completes immediately
 
@@ -510,7 +546,7 @@ mod tests {
     async fn supervise_reports_consumer_panic() -> anyhow::Result<()> {
         // A panicking consumer wraps its JoinError; the formatted chain must
         // carry the panic payload so the operator knows what went wrong.
-        let tail = tokio::spawn(std::future::pending::<()>());
+        let tail = tokio::spawn(std::future::pending::<anyhow::Result<()>>());
         let spin = tokio::spawn(std::future::pending::<()>());
         let consumer = tokio::spawn(async { panic!("boom") });
 
@@ -531,9 +567,10 @@ mod tests {
 
     #[tokio::test]
     async fn supervise_reports_tail_end() -> anyhow::Result<()> {
-        // The tail thread exiting is an error: clips would degrade to grace-
-        // timeout cuts silently if not caught.
-        let tail = tokio::spawn(async {});       // completes immediately
+        // The tail loop never returns Ok on its own, so a clean Ok(()) return
+        // is an unexpected exit: clips would degrade to grace-timeout cuts
+        // silently if not caught.
+        let tail = tokio::spawn(async { Ok(()) }); // returns Ok immediately
         let spin = tokio::spawn(std::future::pending::<()>());
         let consumer = tokio::spawn(std::future::pending::<()>());
 
@@ -551,7 +588,7 @@ mod tests {
     async fn supervise_reports_spin_end() -> anyhow::Result<()> {
         // The spin thread exiting means the node is no longer pumping messages:
         // triggers silently stop arriving.
-        let tail = tokio::spawn(std::future::pending::<()>());
+        let tail = tokio::spawn(std::future::pending::<anyhow::Result<()>>());
         let spin = tokio::spawn(async {});       // completes immediately
         let consumer = tokio::spawn(std::future::pending::<()>());
 
@@ -570,7 +607,7 @@ mod tests {
         // A clean shutdown signal (SIGINT / ctrl_c) is a requested, orderly
         // stop — not a fault. supervise() must return Ok(()) so main can log
         // the shutdown and exit zero, distinguishing it from a dead task.
-        let tail = tokio::spawn(std::future::pending::<()>());
+        let tail = tokio::spawn(std::future::pending::<anyhow::Result<()>>());
         let spin = tokio::spawn(std::future::pending::<()>());
         let consumer = tokio::spawn(std::future::pending::<()>());
         let shutdown = std::future::ready(Ok(()) as std::io::Result<()>);
@@ -585,7 +622,7 @@ mod tests {
         // A failure to install the signal handler must surface as an error
         // naming the signal handler — a silent failure here would mean SIGINT
         // could never trigger a clean shutdown.
-        let tail = tokio::spawn(std::future::pending::<()>());
+        let tail = tokio::spawn(std::future::pending::<anyhow::Result<()>>());
         let spin = tokio::spawn(std::future::pending::<()>());
         let consumer = tokio::spawn(std::future::pending::<()>());
         let shutdown =

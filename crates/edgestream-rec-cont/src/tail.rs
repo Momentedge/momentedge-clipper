@@ -34,6 +34,19 @@
 //! script wipes and recreates the bag directory on restart). Re-discovery
 //! resets the whole index — the old file's data is gone. Extractions already
 //! holding the old file handle finish safely against the deleted inode.
+//!
+//! Damage in the recording is tolerated the way [`crate::clip`] tolerates it
+//! at extraction: a damaged chunk, an unparseable schema/channel, or a runt
+//! message is warned and skipped, the framing intact. A **framing** fault has
+//! no resync point (a record length past [`MAX_RECORD_LEN`], or an IO error
+//! reading a record), so the scan stops at it, having applied everything
+//! before it. The tail then retries from exactly that offset — never
+//! re-attaching, never rescanning from scratch — under a bounded,
+//! backing-off [`MAX_SCAN_FAULTS`] budget, treating a recorder restart during
+//! the backoff as recovery. Only when the same byte faults through the whole
+//! budget does [`Tailer::run`] return an error and the process exit for a
+//! supervisor to restart: a tailer wedged on a stuck file would otherwise
+//! degrade every clip to a grace-timeout cut with no other signal.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
@@ -63,8 +76,28 @@ pub(crate) const MAX_RECORD_LEN: u64 = 1 << 31;
 /// Sleep between scan passes when the file has not grown.
 const TAIL_POLL: Duration = Duration::from_millis(50);
 
-/// Sleep between attempts to discover the recording file.
+/// Sleep between attempts to discover the recording file. Also the first
+/// step of the scan-fault backoff (see [`SCAN_BACKOFF_CAP`]).
 const DISCOVER_POLL: Duration = Duration::from_millis(200);
+
+/// How many consecutive faulted scan passes [`Tailer::tail_file`] tolerates
+/// before giving up on a recording and returning an error. A fault is a
+/// framing desync with no resync point (an oversized record length, or an IO
+/// error reading a record); skipped localized damage is not a fault and never
+/// counts here. The counter resets on any fault-free pass, so transient
+/// trouble that clears does not accumulate toward the limit. Reaching it means
+/// every retry in a row ended in a fault — usually the same stuck byte — and
+/// the recorder is better restarted than tailed forever against a wall.
+pub(crate) const MAX_SCAN_FAULTS: u32 = 5;
+
+/// Ceiling on the scan-fault backoff. Between faulted passes the wait doubles
+/// from [`DISCOVER_POLL`] (200, 400, 800, 1600 ms) up to this cap, so the
+/// `MAX_SCAN_FAULTS` retries span roughly three seconds before exhaustion —
+/// long enough to ride out a brief hiccup, short enough that a genuinely stuck
+/// file is escalated promptly. The backoff is slept in `DISCOVER_POLL`
+/// increments so a recorder restart (the file replaced) is noticed within one
+/// increment and treated as recovery.
+pub(crate) const SCAN_BACKOFF_CAP: Duration = Duration::from_millis(3200);
 
 /// MCAP record opcodes the tail dispatches on.
 pub(crate) mod op {
@@ -156,11 +189,16 @@ pub struct Tailer {
     coverage_tx: watch::Sender<Coverage>,
 }
 
-/// Where one scan pass stopped and whether the recording ended.
+/// Where one scan pass stopped, whether the recording ended, and whether a
+/// fault stopped it short. A fault carries the framing error; `offset` is then
+/// the byte offset of the faulted record (where a retry resumes), not the file
+/// end. `ended` and `fault` are mutually exclusive — a pass that hits the
+/// footer cannot also fault.
 #[derive(Debug)]
 pub(crate) struct ScanProgress {
     pub(crate) offset: u64,
     pub(crate) ended: bool,
+    pub(crate) fault: Option<anyhow::Error>,
 }
 
 /// Registry and extent updates of one scan pass, collected without the state
@@ -221,12 +259,32 @@ impl ScanDelta {
     /// Decompress one chunk record body and absorb its interior records. The
     /// only reason chunk bodies are read during the tail: chunked writers put
     /// Schema/Channel records inside chunks.
+    ///
+    /// All-or-nothing: the interior is absorbed into a fresh sub-delta and
+    /// merged into `self` only once the chunk iterates cleanly
+    /// ([`mcap::read::ChunkReader`] verifies the CRC at the end of iteration).
+    /// A chunk that fails to decompress, fails its CRC, or holds an
+    /// unparseable interior record therefore contributes nothing — matching
+    /// clip.rs, which drops the whole chunk at extraction, so coverage never
+    /// claims data the cut would silently leave out. Only the registry and
+    /// time bounds move; the extent fields (`closed`/`open`) belong to
+    /// [`Self::extend_extent`] and the chunk's own record offset, untouched here.
     fn absorb_chunk(&mut self, body: &[u8]) -> Result<()> {
         let Record::Chunk { header, data } = mcap::parse_record(op::CHUNK, body)? else {
             bail!("chunk opcode did not parse as a chunk record");
         };
+        let mut sub = ScanDelta::default();
         for rec in mcap::read::ChunkReader::new(header, &data).context("opening chunk")? {
-            self.absorb_parsed(rec.context("reading record inside chunk")?);
+            sub.absorb_parsed(rec.context("reading record inside chunk")?);
+        }
+        self.schemas.extend(sub.schemas);
+        self.channels.extend(sub.channels);
+        self.high_water_ns = self.high_water_ns.max(sub.high_water_ns);
+        if let Some((min, max)) = sub.pending_time {
+            self.pending_time = Some(match self.pending_time {
+                Some((omin, omax)) => (omin.min(min), omax.max(max)),
+                None => (min, max),
+            });
         }
         Ok(())
     }
@@ -286,7 +344,16 @@ impl Tailer {
 
     /// Tail forever: discover the newest `*.mcap` under `record_dir`, scan it
     /// until it is replaced, start over. Blocking — run on its own thread.
-    pub fn run(&self, record_dir: &Path) {
+    ///
+    /// Returns only when [`Self::tail_file`] fails: a scan fault it could not
+    /// retry past, a recording that is not an MCAP, or an IO error around the
+    /// tailed file. The error names the file, and the supervisor exits the
+    /// process for a restart — limping on would degrade every clip to a
+    /// grace-timeout cut silently. A missing or empty record directory is not a fault: discovery
+    /// idles until the continuous recording creates the bag dir, the
+    /// documented startup state. `tail_file` returning `Ok` (a recorder
+    /// restart) just loops back to re-discover the new file.
+    pub fn run(&self, record_dir: &Path) -> Result<()> {
         loop {
             let path = loop {
                 if let Some(p) = newest_mcap(record_dir) {
@@ -295,13 +362,9 @@ impl Tailer {
                 std::thread::sleep(DISCOVER_POLL);
             };
             info!("tailing {}", path.display());
-            match self.tail_file(&path) {
-                Ok(()) => info!("recording {} replaced; re-discovering", path.display()),
-                Err(e) => {
-                    warn!("tailing {} failed: {e:#}; re-discovering", path.display());
-                    std::thread::sleep(DISCOVER_POLL);
-                }
-            }
+            self.tail_file(&path)
+                .with_context(|| format!("tailing {}", path.display()))?;
+            info!("recording {} replaced; re-discovering", path.display());
         }
     }
 
@@ -319,9 +382,30 @@ impl Tailer {
 
     /// Scan one recording until the path stops referring to it (recorder
     /// restart → `Ok`), alternating incremental passes with short sleeps.
+    ///
+    /// The index is attached once here and never wiped while this recording is
+    /// tailed: a scan fault does not re-attach or rescan from scratch. A fault
+    /// leaves the partial delta applied and reports the faulted offset, so a
+    /// retry resumes exactly there (see [`Self::scan_available`]). Consecutive
+    /// faults are bounded by [`MAX_SCAN_FAULTS`] with backoff growing from
+    /// [`DISCOVER_POLL`] to [`SCAN_BACKOFF_CAP`]; a fault-free pass resets the
+    /// count. The backoff is slept in `DISCOVER_POLL` increments while polling
+    /// [`replaced`], so a recorder restart during backoff is recovery (`Ok`),
+    /// not a continued fault. Exhausting the retries returns the last fault,
+    /// named with the path, offset, and attempt count: the same byte faulted
+    /// every retry, so the file is genuinely stuck and the process exits for a
+    /// supervisor to restart rather than degrading every clip silently.
+    ///
+    /// A `NotFound` on open means the file vanished between discovery and open
+    /// (the record script wiping the bag dir) — treated as a replacement, not
+    /// an error. A magic mismatch stays fatal: an append-only file whose first
+    /// eight bytes are wrong can never become a valid MCAP.
     fn tail_file(&self, path: &Path) -> Result<()> {
-        let file =
-            Arc::new(File::open(path).with_context(|| format!("opening {}", path.display()))?);
+        let file = match File::open(path) {
+            Ok(f) => Arc::new(f),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e).with_context(|| format!("opening {}", path.display())),
+        };
         self.attach(file.clone());
 
         // The writer may not have put the 8 magic bytes on disk yet.
@@ -338,8 +422,40 @@ impl Tailer {
         }
 
         let mut offset = MAGIC.len() as u64;
+        let mut consecutive_faults = 0u32;
         loop {
-            let progress = self.scan_available(&file, offset, file_len(&file)?)?;
+            let progress = self.scan_available(&file, offset, file_len(&file)?);
+            let made_progress = progress.offset != offset;
+            offset = progress.offset;
+
+            if let Some(fault) = progress.fault {
+                consecutive_faults += 1;
+                if consecutive_faults >= MAX_SCAN_FAULTS {
+                    return Err(fault).with_context(|| {
+                        format!(
+                            "scan of {} faulted at offset {offset} on {consecutive_faults} \
+                             consecutive passes; giving up",
+                            path.display()
+                        )
+                    });
+                }
+                // Back off (doubling from DISCOVER_POLL, capped) before
+                // retrying at the same offset, but watch for a replacement
+                // throughout: a restart mid-backoff is recovery, not a fault.
+                let backoff = backoff_for(consecutive_faults);
+                warn!(
+                    "scan of {} faulted at offset {offset} ({fault:#}); \
+                     retry {consecutive_faults}/{MAX_SCAN_FAULTS} after {backoff:?}",
+                    path.display()
+                );
+                if self.replaced_during(path, &file, backoff)? {
+                    return Ok(());
+                }
+                continue;
+            }
+
+            consecutive_faults = 0;
+
             if progress.ended {
                 // DataEnd/Footer scanned: the recording is complete. Nothing
                 // more will appear; wait for the next recording to replace it.
@@ -349,39 +465,78 @@ impl Tailer {
                 }
                 return Ok(());
             }
-            if progress.offset == offset {
+            if !made_progress {
                 if replaced(path, &file)? {
                     return Ok(());
                 }
                 std::thread::sleep(TAIL_POLL);
             }
-            offset = progress.offset;
         }
+    }
+
+    /// Sleep up to `total`, in [`DISCOVER_POLL`] increments, returning early
+    /// `true` as soon as `path` no longer refers to `file` (recorder restart).
+    /// Lets a fault backoff treat a replacement during the wait as recovery.
+    fn replaced_during(&self, path: &Path, file: &File, total: Duration) -> Result<bool> {
+        let mut waited = Duration::ZERO;
+        while waited < total {
+            if replaced(path, file)? {
+                return Ok(true);
+            }
+            let step = DISCOVER_POLL.min(total - waited);
+            std::thread::sleep(step);
+            waited += step;
+        }
+        replaced(path, file)
     }
 
     /// One incremental pass: consume every record completely on disk in
     /// `[offset, file_len)`, then publish the index/registry/coverage updates.
     /// Stops without error at the first record still being appended.
+    ///
+    /// Returns a plain [`ScanProgress`] rather than a `Result`: localized
+    /// damage is skipped (a damaged chunk, an unparseable schema/channel, a
+    /// runt message — warned and consumed), and only **framing** faults stop
+    /// the pass. A framing fault — a record length past [`MAX_RECORD_LEN`], or
+    /// an IO error reading a record's header or body — leaves no resync point,
+    /// so the pass applies the delta it accumulated up to the faulted record
+    /// and reports `fault = Some(_)` with `offset` at that record.
+    ///
+    /// **Resume invariant:** the partial delta is already applied, so a caller
+    /// retrying after a fault MUST resume at the returned `offset` (the faulted
+    /// record), never earlier. Re-scanning an already-applied region makes
+    /// [`ScanDelta::extend_extent`] compute `record_end - open.offset` across
+    /// bytes the open extent already spans and underflow.
     pub(crate) fn scan_available(
         &self,
         file: &File,
         mut offset: u64,
         file_len: u64,
-    ) -> Result<ScanProgress> {
+    ) -> ScanProgress {
         let mut delta = ScanDelta {
             open: self.state.lock().unwrap().open,
             ..ScanDelta::default()
         };
         let mut ended = false;
+        // The offset of the faulted record is `offset` (left unadvanced) when
+        // a fault breaks the loop; the partial delta is applied regardless.
+        let mut fault: Option<anyhow::Error> = None;
 
         while offset + 9 <= file_len {
             let mut hdr = [0u8; 9];
-            file.read_exact_at(&mut hdr, offset)
-                .with_context(|| format!("reading record header at {offset}"))?;
+            if let Err(e) = file.read_exact_at(&mut hdr, offset) {
+                fault = Some(anyhow::Error::new(e).context(format!(
+                    "reading record header at {offset}; framing desynchronised?"
+                )));
+                break;
+            }
             let opcode = hdr[0];
             let len = u64::from_le_bytes(hdr[1..9].try_into().unwrap());
             if len > MAX_RECORD_LEN {
-                bail!("record at offset {offset} declares {len} bytes; framing desynchronised?");
+                fault = Some(anyhow::anyhow!(
+                    "record at offset {offset} declares {len} bytes; framing desynchronised?"
+                ));
+                break;
             }
             let end = offset + 9 + len;
             if end > file_len {
@@ -389,11 +544,24 @@ impl Tailer {
             }
             match opcode {
                 op::SCHEMA | op::CHANNEL => {
-                    let body = read_body(file, offset + 9, len)?;
-                    delta.absorb_parsed(
-                        mcap::parse_record(opcode, &body)
-                            .with_context(|| format!("parsing record at {offset}"))?,
-                    );
+                    let body = match read_body(file, offset + 9, len) {
+                        Ok(body) => body,
+                        Err(e) => {
+                            fault = Some(e.context(format!(
+                                "reading record body at {offset}; framing desynchronised?"
+                            )));
+                            break;
+                        }
+                    };
+                    // An unparseable Schema/Channel (e.g. an invalid-UTF-8
+                    // name or topic — spec-legal bytes the parser rejects) is
+                    // warned and consumed, not propagated: the framing is
+                    // intact, so the scan skips the record and keeps indexing
+                    // the rest, as the CHUNK arm does for a damaged chunk.
+                    match mcap::parse_record(opcode, &body) {
+                        Ok(rec) => delta.absorb_parsed(rec),
+                        Err(e) => warn!("parsing record at {offset}: {e:#}; skipping it"),
+                    }
                 }
                 op::MESSAGE => {
                     // Decode only the 14-byte prefix: channel_id u16,
@@ -401,7 +569,12 @@ impl Tailer {
                     // untouched until extraction.
                     if len >= 14 {
                         let mut prefix = [0u8; 14];
-                        file.read_exact_at(&mut prefix, offset + 9)?;
+                        if let Err(e) = file.read_exact_at(&mut prefix, offset + 9) {
+                            fault = Some(anyhow::Error::new(e).context(format!(
+                                "reading message prefix at {offset}; framing desynchronised?"
+                            )));
+                            break;
+                        }
                         delta.absorb_time(u64::from_le_bytes(prefix[6..14].try_into().unwrap()));
                     } else {
                         // A conformant Message body is >= 22 bytes (its fixed
@@ -414,10 +587,25 @@ impl Tailer {
                     }
                 }
                 op::CHUNK => {
-                    let body = read_body(file, offset + 9, len)?;
-                    delta
-                        .absorb_chunk(&body)
-                        .with_context(|| format!("absorbing chunk at {offset}"))?;
+                    let body = match read_body(file, offset + 9, len) {
+                        Ok(body) => body,
+                        Err(e) => {
+                            fault = Some(e.context(format!(
+                                "reading record body at {offset}; framing desynchronised?"
+                            )));
+                            break;
+                        }
+                    };
+                    if let Err(e) = delta.absorb_chunk(&body) {
+                        // A chunk that fails to decompress, fails its CRC, or
+                        // holds an unparseable interior record cannot say which
+                        // of its bytes are lying, so its whole contribution is
+                        // dropped — clip.rs drops the same chunk at extraction.
+                        // The record's framing is intact (its length prefix is
+                        // self-consistent), so it is still consumed: the scan
+                        // skips it and keeps indexing the records behind it.
+                        warn!("absorbing chunk at {offset}: {e:#}; skipping it");
+                    }
                 }
                 op::DATA_END | op::FOOTER => {
                     ended = true;
@@ -432,7 +620,11 @@ impl Tailer {
         }
 
         self.apply(delta, ended);
-        Ok(ScanProgress { offset, ended })
+        ScanProgress {
+            offset,
+            ended,
+            fault,
+        }
     }
 
     /// Publish one pass's delta: registry inserts (channels resolve their
@@ -482,6 +674,16 @@ impl Tailer {
             changed
         });
     }
+}
+
+/// The scan-fault backoff for the `n`th consecutive fault (1-based): doubling
+/// from [`DISCOVER_POLL`], capped at [`SCAN_BACKOFF_CAP`]. `n == 1` yields
+/// `DISCOVER_POLL`.
+fn backoff_for(n: u32) -> Duration {
+    let doublings = n.saturating_sub(1);
+    DISCOVER_POLL
+        .saturating_mul(1u32.checked_shl(doublings).unwrap_or(u32::MAX))
+        .min(SCAN_BACKOFF_CAP)
 }
 
 /// The newest `*.mcap` directly under `dir` by modification time — the file
@@ -590,15 +792,19 @@ pub(crate) mod tests {
         Ok(path)
     }
 
-    /// Drive scan passes the way `tail_file` does until no further progress.
+    /// Drive scan passes the way `tail_file` does until the recording ends, a
+    /// pass faults, or a pass makes no progress (the file stopped growing).
+    /// Stays a `Result` only because `file_len` can fail; the scan itself no
+    /// longer returns a `Result`. Stops on a fault without retrying — retry and
+    /// backoff are `tail_file`'s job, exercised through the `run()`-level tests.
     pub(crate) fn scan_to_end(
         tailer: &Tailer,
         file: &File,
         mut offset: u64,
     ) -> Result<ScanProgress> {
         loop {
-            let progress = tailer.scan_available(file, offset, file_len(file)?)?;
-            if progress.ended || progress.offset == offset {
+            let progress = tailer.scan_available(file, offset, file_len(file)?);
+            if progress.ended || progress.fault.is_some() || progress.offset == offset {
                 return Ok(progress);
             }
             offset = progress.offset;
@@ -740,6 +946,31 @@ pub(crate) mod tests {
         body
     }
 
+    /// An uncompressed `Chunk` record body wrapping `records` (each a raw
+    /// length-prefixed interior record), with a caller-supplied
+    /// `uncompressed_crc`. `mcap::read::ChunkReader` yields the interior
+    /// records as it walks and verifies the CRC only at the end of iteration,
+    /// so a deliberately wrong CRC lets a test absorb the messages and then
+    /// fail. `compression` is the chunk's algorithm string (empty for none);
+    /// an unknown string fails `ChunkReader` construction outright.
+    pub(crate) fn chunk_body(
+        compression: &str,
+        uncompressed_crc: u32,
+        records: &[Vec<u8>],
+    ) -> Vec<u8> {
+        let interior: Vec<u8> = records.concat();
+        let mut body = Vec::new();
+        body.extend_from_slice(&0u64.to_le_bytes()); // message_start_time
+        body.extend_from_slice(&0u64.to_le_bytes()); // message_end_time
+        body.extend_from_slice(&(interior.len() as u64).to_le_bytes()); // uncompressed_size
+        body.extend_from_slice(&uncompressed_crc.to_le_bytes());
+        body.extend_from_slice(&(compression.len() as u32).to_le_bytes());
+        body.extend_from_slice(compression.as_bytes());
+        body.extend_from_slice(&(interior.len() as u64).to_le_bytes()); // records length
+        body.extend_from_slice(&interior);
+        body
+    }
+
     /// The magic followed by the given raw records, as one file.
     pub(crate) fn write_raw(path: &Path, records: &[Vec<u8>]) -> Result<()> {
         let mut bytes = MAGIC.to_vec();
@@ -831,20 +1062,63 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn oversized_record_length_is_a_framing_desync() -> Result<()> {
+    fn tail_file_on_a_missing_path_is_not_an_error() -> Result<()> {
+        let root = test_dir("missing")?;
+        let path = root.join("gone.mcap");
+
+        // The newest-mcap discovery can race the record script wiping the bag
+        // dir: the file vanishes between discovery and open. A NotFound on
+        // open is the same as a replacement — Ok(()), re-discover — not a fault.
+        let (tailer, _coverage) = Tailer::new();
+        tailer.tail_file(&path)?;
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_record_length_faults_after_applying_the_good_prefix() -> Result<()> {
         let root = test_dir("desync")?;
         let path = root.join("rec.mcap");
+        // A clean prefix — channel + two messages — then a record header whose
+        // declared length is past MAX_RECORD_LEN. The scan applies the prefix,
+        // then faults at the oversized record: there is no resync point, but
+        // the index the prefix built must survive (this is what makes the
+        // bounded retry idempotent — it resumes exactly at the fault offset).
+        let good = [
+            raw_record(op::CHANNEL, &channel_body(1, 0, "/t", "cdr")),
+            raw_record(op::MESSAGE, &message_body(1, 0, 100, b"x")),
+            raw_record(op::MESSAGE, &message_body(1, 1, 200, b"y")),
+        ];
+        let bad_offset = MAGIC.len() as u64 + good.iter().map(|r| r.len() as u64).sum::<u64>();
         let mut bytes = MAGIC.to_vec();
+        for rec in &good {
+            bytes.extend_from_slice(rec);
+        }
         bytes.push(op::MESSAGE);
         bytes.extend_from_slice(&(MAX_RECORD_LEN + 1).to_le_bytes());
         std::fs::write(&path, bytes)?;
 
-        let (tailer, _coverage) = Tailer::new();
+        let (tailer, coverage) = Tailer::new();
         let file = File::open(&path)?;
-        let err = scan_to_end(&tailer, &file, MAGIC.len() as u64).unwrap_err();
+        let progress = scan_to_end(&tailer, &file, MAGIC.len() as u64)?;
+
+        let fault = progress.fault.expect("the oversized record must fault");
+        let msg = format!("{fault:#}");
         assert!(
-            format!("{err:#}").contains("framing desynchronised"),
-            "unexpected error: {err:#}"
+            msg.contains("framing desynchronised") && msg.contains(&bad_offset.to_string()),
+            "fault must name the framing desync and the offset: {msg}"
+        );
+        assert_eq!(
+            progress.offset, bad_offset,
+            "the fault offset is the oversized record, so a retry resumes there"
+        );
+
+        // The good prefix was applied before the fault.
+        assert_eq!(coverage.borrow().high_water_ns, 200);
+        assert!(
+            !tailer.plan_window(50, 250).extents.is_empty(),
+            "the prefix's extent stays plannable across the fault"
         );
 
         std::fs::remove_dir_all(root)?;
@@ -852,18 +1126,178 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn corrupt_chunk_fails_the_scan_with_context() -> Result<()> {
+    fn corrupt_chunk_is_skipped_without_poisoning_the_scan() -> Result<()> {
         let root = test_dir("badchunk")?;
         let path = root.join("rec.mcap");
-        write_raw(&path, &[raw_record(op::CHUNK, &[0xFF; 16])])?;
+        // A chunk record whose body is garbage cannot absorb; the scan must
+        // warn, consume it (the framing is intact — the length prefix is
+        // self-consistent), and keep indexing the records behind it, exactly
+        // as clip.rs drops a damaged chunk during extraction.
+        write_raw(
+            &path,
+            &[
+                raw_record(op::CHUNK, &[0xFF; 16]),
+                raw_record(op::CHANNEL, &channel_body(1, 0, "/t", "cdr")),
+                raw_record(op::MESSAGE, &message_body(1, 0, 42, b"x")),
+            ],
+        )?;
 
-        let (tailer, _coverage) = Tailer::new();
+        let (tailer, coverage) = Tailer::new();
         let file = File::open(&path)?;
-        let err = scan_to_end(&tailer, &file, MAGIC.len() as u64).unwrap_err();
-        assert!(
-            format!("{err:#}").contains("absorbing chunk"),
-            "unexpected error: {err:#}"
+        let progress = scan_to_end(&tailer, &file, MAGIC.len() as u64)?;
+        assert_eq!(
+            progress.offset,
+            file.metadata()?.len(),
+            "the bad chunk and the good records after it are all consumed"
         );
+        assert_eq!(coverage.borrow().high_water_ns, 42);
+
+        let plan = tailer.plan_window(0, 100);
+        assert!(!plan.extents.is_empty(), "the good message is indexed");
+        let ch = plan.channels.get(&1).expect("channel after the chunk registered");
+        assert_eq!(ch.topic, "/t");
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn chunk_failing_its_crc_contributes_nothing() -> Result<()> {
+        let root = test_dir("chunk-rollback")?;
+        let path = root.join("rec.mcap");
+        // A chunk whose interior is a valid channel + message but whose
+        // uncompressed_crc is wrong: ChunkReader yields both records and only
+        // fails the CRC at the end of iteration. Because extraction would drop
+        // the whole chunk, the scan must claim none of it — no channel
+        // registered, no time folded into coverage or extent bounds — even
+        // though the records absorbed cleanly before the CRC check failed.
+        let chunk = chunk_body(
+            "",
+            0xDEAD_BEEF, // not the real CRC of the interior
+            &[
+                raw_record(op::CHANNEL, &channel_body(1, 0, "/inside", "cdr")),
+                raw_record(op::MESSAGE, &message_body(1, 0, 500, b"x")),
+            ],
+        );
+        // A good message after the chunk proves the scan keeps going.
+        write_raw(
+            &path,
+            &[
+                raw_record(op::CHUNK, &chunk),
+                raw_record(op::CHANNEL, &channel_body(2, 0, "/after", "cdr")),
+                raw_record(op::MESSAGE, &message_body(2, 0, 700, b"y")),
+            ],
+        )?;
+
+        let (tailer, coverage) = Tailer::new();
+        let file = File::open(&path)?;
+        let progress = scan_to_end(&tailer, &file, MAGIC.len() as u64)?;
+        assert_eq!(
+            progress.offset,
+            file.metadata()?.len(),
+            "the chunk and the records after it are all consumed"
+        );
+        assert_eq!(
+            coverage.borrow().high_water_ns,
+            700,
+            "the dropped chunk's message (500) never reaches coverage"
+        );
+
+        let plan = tailer.plan_window(0, u64::MAX);
+        assert!(plan.channels.contains_key(&2), "the post-chunk channel registers");
+        assert!(
+            !plan.channels.contains_key(&1),
+            "the failed chunk's channel must not register"
+        );
+        // No extent may claim the dropped message's time (500); only the good
+        // post-chunk message (700) is in the bounds.
+        for e in &plan.extents {
+            if let Some((min, max)) = e.time {
+                assert!(
+                    !(min <= 500 && 500 <= max),
+                    "extent {e:?} must not cover the dropped message's time"
+                );
+            }
+        }
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn unsupported_chunk_compression_is_skipped() -> Result<()> {
+        let root = test_dir("chunk-compression")?;
+        let path = root.join("rec.mcap");
+        // A spec-legal chunk whose compression algorithm this build does not
+        // support: ChunkReader construction fails, so the chunk is skipped
+        // whole rather than poisoning the scan — the records behind it index.
+        let chunk = chunk_body(
+            "custom-xyz",
+            0,
+            &[raw_record(op::MESSAGE, &message_body(1, 0, 100, b"x"))],
+        );
+        write_raw(
+            &path,
+            &[
+                raw_record(op::CHUNK, &chunk),
+                raw_record(op::CHANNEL, &channel_body(9, 0, "/after", "cdr")),
+                raw_record(op::MESSAGE, &message_body(9, 0, 300, b"y")),
+            ],
+        )?;
+
+        let (tailer, coverage) = Tailer::new();
+        let file = File::open(&path)?;
+        let progress = scan_to_end(&tailer, &file, MAGIC.len() as u64)?;
+        assert_eq!(progress.offset, file.metadata()?.len(), "all records consumed");
+        assert_eq!(coverage.borrow().high_water_ns, 300);
+        assert!(
+            tailer.plan_window(0, u64::MAX).channels.contains_key(&9),
+            "data after the unsupported chunk still indexes"
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn unparseable_top_level_channel_is_skipped() -> Result<()> {
+        let root = test_dir("bad-channel")?;
+        let path = root.join("rec.mcap");
+        // A Channel record whose topic field carries invalid UTF-8 bytes:
+        // mcap::parse_record fails on it. The scan must warn, consume the
+        // record (its framing is intact), and keep indexing — the same
+        // leniency the CHUNK arm already gives a damaged chunk.
+        let mut bad_channel = Vec::new();
+        bad_channel.extend_from_slice(&1u16.to_le_bytes()); // id
+        bad_channel.extend_from_slice(&0u16.to_le_bytes()); // schema_id
+        bad_channel.extend_from_slice(&2u32.to_le_bytes()); // topic length
+        bad_channel.extend_from_slice(&[0xFF, 0xFE]); // invalid UTF-8 topic
+        bad_channel.extend_from_slice(&(3u32).to_le_bytes()); // encoding length
+        bad_channel.extend_from_slice(b"cdr");
+        bad_channel.extend_from_slice(&0u32.to_le_bytes()); // empty metadata
+
+        write_raw(
+            &path,
+            &[
+                raw_record(op::CHANNEL, &bad_channel),
+                raw_record(op::CHANNEL, &channel_body(2, 0, "/good", "cdr")),
+                raw_record(op::MESSAGE, &message_body(2, 0, 55, b"x")),
+            ],
+        )?;
+
+        let (tailer, coverage) = Tailer::new();
+        let file = File::open(&path)?;
+        let progress = scan_to_end(&tailer, &file, MAGIC.len() as u64)?;
+        assert_eq!(progress.offset, file.metadata()?.len(), "all records consumed");
+        assert_eq!(coverage.borrow().high_water_ns, 55);
+
+        let plan = tailer.plan_window(0, 100);
+        assert!(
+            !plan.channels.contains_key(&1),
+            "the unparseable channel must not register"
+        );
+        let ch = plan.channels.get(&2).expect("the good channel registers");
+        assert_eq!(ch.topic, "/good");
 
         std::fs::remove_dir_all(root)?;
         Ok(())
@@ -918,15 +1352,15 @@ pub(crate) mod tests {
         let file = File::open(&path)?;
         let start = MAGIC.len() as u64;
 
-        // Only the magic on disk: nothing to scan, nothing to error on.
-        let p = tailer.scan_available(&file, start, start)?;
+        // Only the magic on disk: nothing to scan, nothing to fault on.
+        let p = tailer.scan_available(&file, start, start);
         assert_eq!(p.offset, start);
-        assert!(!p.ended);
+        assert!(!p.ended && p.fault.is_none());
 
         // A record header still being appended: same outcome.
-        let p = tailer.scan_available(&file, start, file.metadata()?.len())?;
+        let p = tailer.scan_available(&file, start, file.metadata()?.len());
         assert_eq!(p.offset, start);
-        assert!(!p.ended);
+        assert!(!p.ended && p.fault.is_none());
         assert_eq!(coverage.borrow().high_water_ns, 0);
 
         std::fs::remove_dir_all(root)?;
@@ -1091,6 +1525,121 @@ pub(crate) mod tests {
         assert_eq!(ch.topic, "/raw");
         assert!(ch.schema.is_none());
 
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// A recording whose good prefix (channel + two messages at 100 and 200)
+    /// indexes cleanly but is followed by a record header with an oversized
+    /// length: a framing fault with no resync point. The prefix is the part a
+    /// retry must preserve and keep plannable.
+    fn write_poisoned_recording(path: &Path) -> Result<()> {
+        let mut bytes = MAGIC.to_vec();
+        for rec in [
+            raw_record(op::CHANNEL, &channel_body(1, 0, "/t", "cdr")),
+            raw_record(op::MESSAGE, &message_body(1, 0, 100, b"x")),
+            raw_record(op::MESSAGE, &message_body(1, 1, 200, b"y")),
+        ] {
+            bytes.extend_from_slice(&rec);
+        }
+        bytes.push(op::MESSAGE);
+        bytes.extend_from_slice(&(MAX_RECORD_LEN + 1).to_le_bytes());
+        std::fs::write(path, bytes)?;
+        Ok(())
+    }
+
+    #[test]
+    fn run_gives_up_on_a_persistently_faulting_recording() -> Result<()> {
+        let root = test_dir("run-fatal")?;
+        write_poisoned_recording(&root.join("a.mcap"))?;
+
+        let (tailer, coverage) = Tailer::new();
+        let runner = tailer.clone();
+        let dir = root.clone();
+        let started = std::time::Instant::now();
+        let handle = std::thread::spawn(move || runner.run(&dir));
+
+        // The same byte faults on every pass, so run() must exhaust the retry
+        // budget and return Err well within the deadline.
+        let deadline = std::time::Instant::now() + Duration::from_secs(25);
+        while !handle.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "run() must give up on a stuck recording"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let elapsed = started.elapsed();
+        let err = handle.join().unwrap().unwrap_err();
+
+        // The escalating backoff (200+400+800+1600 ms) means giving up takes a
+        // few seconds, not a fixed cadence. Lower bound only — CI-safe.
+        assert!(
+            elapsed >= Duration::from_millis(2500),
+            "the backoff must escalate before giving up (took {elapsed:?})"
+        );
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("framing desynchronised") && msg.contains("faulted at offset"),
+            "the error chain must name the desync and offset: {msg}"
+        );
+
+        // The good prefix survived every retry — the index was never wiped.
+        let cov = *coverage.borrow();
+        assert_eq!(cov.high_water_ns, 200, "the prefix's coverage survived");
+        assert!(
+            !tailer.plan_window(50, 250).extents.is_empty(),
+            "the prefix's extent stayed plannable through the retries"
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn run_recovers_when_the_faulting_recording_is_replaced() -> Result<()> {
+        let root = test_dir("run-recover")?;
+        let poisoned = root.join("a.mcap");
+        write_poisoned_recording(&poisoned)?;
+
+        let (tailer, coverage) = Tailer::new();
+        let runner = tailer.clone();
+        let dir = root.clone();
+        let handle = std::thread::spawn(move || runner.run(&dir));
+
+        // While run() is backing off over the poisoned file, replace it with a
+        // finished good recording: the restart mid-backoff is recovery, and the
+        // tail discovers and indexes the replacement.
+        std::thread::sleep(Duration::from_millis(500));
+        std::fs::remove_file(&poisoned)?;
+        let good = root.join("b.mcap");
+        write_recording(&good, false, &[("/t", 1_000)])?;
+
+        // Poll the coverage watch until the replacement is fully indexed.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            {
+                let cov = *coverage.borrow();
+                if cov.high_water_ns == 1_000 && cov.ended {
+                    break;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the replacement recording must be discovered and indexed"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        // Recovery, not a fatal exit: the run loop is still alive, re-tailing.
+        assert!(
+            !handle.is_finished(),
+            "run() must keep tailing after recovering from the fault"
+        );
+
+        // The thread is detached: it loops forever against the good recording
+        // and dies with the test process. Do not join it.
+        drop(handle);
         std::fs::remove_dir_all(root)?;
         Ok(())
     }
