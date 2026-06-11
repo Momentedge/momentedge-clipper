@@ -53,57 +53,188 @@ pub struct ClipStats {
     pub chunks_dropped: u64,
 }
 
+/// The name of the capturing subdirectory under the final output directory.
+/// A clip is assembled here and moved out only once complete; observers of the
+/// final directory therefore never see an in-progress or footer-less file. A
+/// subdirectory (not a sibling) guarantees the same filesystem, so the
+/// stage-two move is a true atomic rename rather than a copy.
+const CAPTURING_DIR: &str = ".capturing";
+
+/// Prepare a fresh capturing directory under `out_dir`, to be called once at
+/// startup before any clip is cut. Removing and recreating it discards any
+/// leftover from a previous run — a crash between [`publish_clip`]'s hard link
+/// and the staged-file unlink strands a stale link in the capturing directory,
+/// harmless to published clips but otherwise accumulating across restarts. The
+/// recreate (`create_dir_all`) also ensures `out_dir` itself exists, so a first
+/// run with no output tree is ready to publish into. A missing capturing
+/// directory is not an error; any other IO failure is, since a process that
+/// cannot prepare its output directory must not start.
+pub fn reset_capturing_dir(out_dir: &Path) -> Result<()> {
+    let capturing = out_dir.join(CAPTURING_DIR);
+    match std::fs::remove_dir_all(&capturing) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("clearing capturing dir {}", capturing.display()));
+        }
+    }
+    std::fs::create_dir_all(&capturing)
+        .with_context(|| format!("creating capturing dir {}", capturing.display()))
+}
+
+/// A clip that finished assembling in the capturing directory, awaiting its
+/// move into the final directory. [`stage_clip`] produces one and
+/// [`publish_clip`] consumes it. Dropping one without publishing — an early
+/// return or a panic between the stages — removes the staged file, so a clip
+/// that never reached the final directory never lingers in the capturing area
+/// either.
+#[must_use = "a staged clip must be published or it is cleaned up unpublished"]
+pub struct StagedClip {
+    /// Where the completed, fsynced file currently lives in the capturing dir.
+    staged_path: PathBuf,
+    /// The final directory the clip belongs in once published.
+    out_dir: PathBuf,
+    /// The caller's desired final filename (no directory). Publication resolves
+    /// collisions against the final directory starting from this name, so the
+    /// suffixed name used while staging never leaks into the final path.
+    desired_name: std::ffi::OsString,
+    /// The copy counters, carried through to the published [`ClipStats`].
+    stats: ClipStats,
+    /// Cleared once the file is linked into the final directory, so the `Drop`
+    /// cleanup unlinks the staged file only while it is still the live copy.
+    staged: bool,
+}
+
+impl Drop for StagedClip {
+    fn drop(&mut self) {
+        // Only the unpublished staged file is ours to remove; once it is linked
+        // into the final directory the staged name has already been unlinked.
+        if self.staged
+            && let Err(e) = std::fs::remove_file(&self.staged_path)
+        {
+            warn!("removing staged clip {}: {e}", self.staged_path.display());
+        }
+    }
+}
+
 /// Copy every message in `[start_ns, end_ns]` (inclusive bounds, matching the
-/// split-based recorder) from the planned extents into a freshly created MCAP
-/// at `out_path` (or a `_<n>`-suffixed sibling if that name is taken — see
-/// [`create_clip_file`]). Localized damage in the recording — an unparseable
-/// record body, a message on an unregistered channel, a chunk failing CRC or
-/// decompression — is skipped with an error log and counted in [`ClipStats`];
-/// the clip keeps everything else. Errors that do surface are all-or-nothing:
-/// on success the clip is complete and fsynced before this returns, so a
-/// caller may announce it as durably on disk; on error the partly written
-/// file is removed, so a failed extraction leaves nothing that could be
-/// mistaken for a clip.
+/// split-based recorder) from the planned extents into a clip published at
+/// `out_path` (or a `_<n>`-suffixed sibling if that name is taken — see
+/// [`link_into`]). This composes the two stages: [`stage_clip`] assembles and
+/// fsyncs the clip in the capturing directory, then [`publish_clip`] moves it
+/// atomically into the final directory. Localized damage in the recording — an
+/// unparseable record body, a message on an unregistered channel, a chunk
+/// failing CRC or decompression — is skipped with an error log and counted in
+/// [`ClipStats`]; the clip keeps everything else. Errors that do surface are
+/// all-or-nothing: on success the clip is complete and durably in the final
+/// directory before this returns, so a caller may announce it as on disk; on
+/// error nothing partial reaches the final directory — cleanup is confined to
+/// the capturing directory.
 pub fn extract_clip(
     plan: &WindowPlan,
     out_path: &Path,
     start_ns: u64,
     end_ns: u64,
 ) -> Result<ClipStats> {
-    if let Some(parent) = out_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating output dir {}", parent.display()))?;
-    }
-    let (out_file, out_path) = create_clip_file(out_path)?;
-    copy_window(plan, out_file, out_path.clone(), start_ns, end_ns).inspect_err(|_| {
-        // A failed copy must not leave a half-written, footer-less file that
-        // looks like a clip; the error itself is what the caller reports.
-        if let Err(e) = std::fs::remove_file(&out_path) {
-            warn!("removing partial clip {}: {e}", out_path.display());
+    let staged = stage_clip(plan, out_path, start_ns, end_ns)?;
+    publish_clip(staged)
+}
+
+/// Stage one: assemble the clip in the capturing directory under
+/// `out_path`'s parent, fsync the file, and return it for publication. The
+/// final directory is never touched here, so an observer of it never sees the
+/// in-progress file. On copy failure the partial file is removed from the
+/// capturing directory only. `out_path`'s file name is carried as the desired
+/// final name; the capturing file may take a `_<n>` suffix to avoid an
+/// in-flight collision with a concurrent stage, independent of the final name.
+pub fn stage_clip(
+    plan: &WindowPlan,
+    out_path: &Path,
+    start_ns: u64,
+    end_ns: u64,
+) -> Result<StagedClip> {
+    let out_dir = out_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let desired_name = out_path
+        .file_name()
+        .context("clip path has no file name")?
+        .to_os_string();
+    let capturing = out_dir.join(CAPTURING_DIR);
+    std::fs::create_dir_all(&capturing)
+        .with_context(|| format!("creating capturing dir {}", capturing.display()))?;
+
+    let (file, staged_path) = create_new_file(&capturing.join(&desired_name))?;
+    let stats = copy_window(plan, file, start_ns, end_ns).inspect_err(|_| {
+        // A failed copy must not leave a half-written, footer-less file even in
+        // the capturing dir; the error itself is what the caller reports. No
+        // `StagedClip` is constructed on this path, so its `Drop` cannot do it.
+        if let Err(e) = std::fs::remove_file(&staged_path) {
+            warn!("removing partial clip {}: {e}", staged_path.display());
         }
+    })?;
+    Ok(StagedClip {
+        staged_path,
+        out_dir,
+        desired_name,
+        stats,
+        staged: true,
     })
+}
+
+/// Stage two: atomically move the staged clip into the final directory and
+/// fsync that directory so the new entry survives a crash. The move never
+/// replaces an existing clip — `std::fs::rename` would silently clobber one,
+/// so a hard link (atomic, failing with `AlreadyExists`) resolves collisions
+/// with the same `_<n>` suffix retry against the *desired* final name. The
+/// link is the commit point: once it succeeds the final directory holds a
+/// complete clip (the staged file was fsynced before this), so the staged name
+/// is unlinked and the directory fsynced, and the [`ClipStats`] carries the
+/// published path. A failed link (e.g. the suffix cap is exhausted) leaves the
+/// final directory untouched and the dropped [`StagedClip`] removes the staged
+/// file, so a failed publish leaves nothing behind in either directory.
+///
+/// The link and the staged-file unlink are two steps, not one: a crash between
+/// them leaves the published clip intact (the link is the durable copy) but
+/// strands the staged file in the capturing directory. That leftover is
+/// harmless — observers read only the final directory — and bounded to one run
+/// by [`reset_capturing_dir`] clearing the capturing directory at startup.
+pub fn publish_clip(mut staged: StagedClip) -> Result<ClipStats> {
+    let final_path = link_into(
+        &staged.staged_path,
+        &staged.out_dir.join(&staged.desired_name),
+    )?;
+    // The link committed a complete clip to the final directory; the staged
+    // file is no longer the live copy, so suppress the `Drop` cleanup and drop
+    // the capturing-dir name ourselves.
+    staged.staged = false;
+    if let Err(e) = std::fs::remove_file(&staged.staged_path) {
+        warn!("removing staged clip {}: {e}", staged.staged_path.display());
+    }
+    // fsync the directory so the new entry — not just the file's data —
+    // survives a crash. Opening a directory and `sync_all`ing it is the POSIX
+    // way to flush directory metadata; it works on Linux.
+    File::open(&staged.out_dir)
+        .and_then(|d| d.sync_all())
+        .with_context(|| format!("syncing output dir {}", staged.out_dir.display()))?;
+    let mut stats = std::mem::take(&mut staged.stats);
+    stats.out_path = final_path;
+    Ok(stats)
 }
 
 /// Assemble the clip into the freshly created `out_file`: register window
 /// channels from the registry on first use, stream the planned extents,
-/// finish and fsync. The caller removes `out_path` if this fails.
-fn copy_window(
-    plan: &WindowPlan,
-    out_file: File,
-    out_path: PathBuf,
-    start_ns: u64,
-    end_ns: u64,
-) -> Result<ClipStats> {
+/// finish and fsync the file. The caller removes the staged file if this fails.
+fn copy_window(plan: &WindowPlan, out_file: File, start_ns: u64, end_ns: u64) -> Result<ClipStats> {
     let mut clip = ClipWriter {
         writer: mcap::Writer::new(BufWriter::new(out_file)).context("opening mcap writer")?,
         channels: &plan.channels,
         out_ids: HashMap::new(),
         start_ns,
         end_ns,
-        stats: ClipStats {
-            out_path,
-            ..ClipStats::default()
-        },
+        stats: ClipStats::default(),
     };
 
     if let Some(file) = &plan.file {
@@ -122,8 +253,9 @@ fn copy_window(
         mut writer, stats, ..
     } = clip;
     writer.finish().context("finalising output mcap")?;
-    // `finish` can leave bytes in the BufWriter; flush them and fsync so the
-    // clip is durably on disk before the caller publishes `Recorded`.
+    // `finish` can leave bytes in the BufWriter; flush them and fsync the file
+    // so its contents are durable in the capturing dir before publication
+    // moves it into the final directory.
     writer
         .into_inner()
         .into_inner()
@@ -133,10 +265,44 @@ fn copy_window(
     Ok(stats)
 }
 
-/// Create the clip file, never opening an existing one: a duplicate trigger
-/// (same stamp and name) gets a `_<n>`-suffixed sibling instead of two
-/// writers interleaving bytes into one file.
-fn create_clip_file(desired: &Path) -> Result<(File, PathBuf)> {
+/// Create a fresh file at `desired`, never opening an existing one — two
+/// concurrent stages aiming at the same capturing name get distinct files
+/// (`_<n>`-suffixed) instead of interleaving bytes into one. Returns the open
+/// file and the path it landed at.
+fn create_new_file(desired: &Path) -> Result<(File, PathBuf)> {
+    let mut file = None;
+    let path = with_suffix_retry(desired, "creating", |candidate| {
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(candidate)
+            .map(|f| file = Some(f))
+    })?;
+    Ok((file.expect("a successful create yields the file"), path))
+}
+
+/// Hard-link `src` to `desired`, never replacing an existing file — a duplicate
+/// trigger (same stamp and name) publishes to a `_<n>`-suffixed sibling instead
+/// of clobbering the earlier clip. `rename` would replace silently;
+/// `hard_link` is equally atomic but fails with `AlreadyExists`, which the
+/// suffix retry resolves. Returns the path the link landed at.
+fn link_into(src: &Path, desired: &Path) -> Result<PathBuf> {
+    with_suffix_retry(desired, "publishing", |candidate| {
+        std::fs::hard_link(src, candidate)
+    })
+}
+
+/// Run `attempt` against `desired`, then `desired` with `_1`, `_2`, … inserted
+/// before the extension, until it succeeds — resolving a name collision the
+/// same way for both staging (`create_new`) and publishing (`hard_link`), the
+/// two operations that fail with `AlreadyExists` on a taken name. Gives up
+/// after 1000 suffixes so a directory wedged full of collisions cannot loop
+/// forever. `verb` names the operation for error context.
+fn with_suffix_retry(
+    desired: &Path,
+    verb: &str,
+    mut attempt: impl FnMut(&Path) -> std::io::Result<()>,
+) -> Result<PathBuf> {
     let stem = desired.file_stem().unwrap_or_default().to_string_lossy();
     let ext = desired
         .extension()
@@ -144,21 +310,21 @@ fn create_clip_file(desired: &Path) -> Result<(File, PathBuf)> {
         .unwrap_or_default();
     let mut path = desired.to_path_buf();
     for n in 1.. {
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(file) => {
+        match attempt(&path) {
+            Ok(()) => {
                 if path != desired {
                     warn!(
-                        "clip {} already exists; writing {}",
+                        "clip {} already exists; using {}",
                         desired.display(),
                         path.display()
                     );
                 }
-                return Ok((file, path));
+                return Ok(path);
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && n <= 1000 => {
                 path = desired.with_file_name(format!("{stem}_{n}{ext}"));
             }
-            Err(e) => return Err(e).with_context(|| format!("creating {}", path.display())),
+            Err(e) => return Err(e).with_context(|| format!("{verb} {}", path.display())),
         }
     }
     unreachable!("loop returns or errors within 1000 attempts");
@@ -359,6 +525,175 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn two_staged_publication_lands_a_valid_clip_and_drains_the_capturing_dir() -> Result<()> {
+        let root = test_dir("clip-staged")?;
+        let rec = root.join("rec.mcap");
+        write_recording(&rec, false, &[("/t", 10), ("/t", 20), ("/t", 30)])?;
+        let tailer = tail_whole(&rec)?;
+
+        let out = root.join("clip.mcap");
+        let plan = tailer.plan_window(0, 100);
+        let stats = extract_clip(&plan, &out, 0, 100)?;
+
+        // The final path is the published location, holding a complete clip.
+        assert_eq!(stats.out_path, out);
+        assert_eq!(
+            read_clip(&out)?,
+            vec![
+                ("/t".to_string(), 10),
+                ("/t".to_string(), 20),
+                ("/t".to_string(), 30),
+            ]
+        );
+        // The capturing area exists but holds nothing once publication moved
+        // the file out of it: no staged leftover survives a success.
+        let capturing = root.join(".capturing");
+        assert!(capturing.is_dir(), "the capturing dir is created");
+        assert_eq!(
+            std::fs::read_dir(&capturing)?.count(),
+            0,
+            "the staged file is moved out, not left behind"
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn staged_clip_is_invisible_in_the_final_dir_until_published() -> Result<()> {
+        let root = test_dir("clip-invisible")?;
+        let rec = root.join("rec.mcap");
+        write_recording(&rec, false, &[("/t", 10), ("/t", 20)])?;
+        let tailer = tail_whole(&rec)?;
+
+        let out = root.join("clip.mcap");
+        let plan = tailer.plan_window(0, 100);
+
+        // After stage 1 only: the final dir holds no clip, but the staged file
+        // in the capturing dir is already complete and read_clip-valid.
+        let staged = stage_clip(&plan, &out, 0, 100)?;
+        assert!(
+            !out.exists(),
+            "the clip is invisible in the final dir before publication"
+        );
+        assert_eq!(
+            read_clip(&staged.staged_path)?,
+            vec![("/t".to_string(), 10), ("/t".to_string(), 20)],
+            "the staged file is already a complete, valid clip"
+        );
+
+        // Publication makes it appear in the final dir.
+        let stats = publish_clip(staged)?;
+        assert_eq!(stats.out_path, out);
+        assert_eq!(
+            read_clip(&out)?,
+            vec![("/t".to_string(), 10), ("/t".to_string(), 20)]
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn dropping_a_staged_clip_unpublished_cleans_the_capturing_dir() -> Result<()> {
+        let root = test_dir("clip-dropped")?;
+        let rec = root.join("rec.mcap");
+        write_recording(&rec, false, &[("/t", 10)])?;
+        let tailer = tail_whole(&rec)?;
+
+        let out = root.join("clip.mcap");
+        let plan = tailer.plan_window(0, 100);
+
+        // A staged clip abandoned without publishing — an early return or a
+        // panic between the stages — must not strand the file in the capturing
+        // dir; its `Drop` removes it, and nothing ever reaches the final dir.
+        let staged = stage_clip(&plan, &out, 0, 100)?;
+        assert!(staged.staged_path.exists(), "the staged file exists");
+        drop(staged);
+
+        assert!(!out.exists(), "nothing reached the final dir");
+        assert_eq!(
+            std::fs::read_dir(root.join(".capturing"))?.count(),
+            0,
+            "the abandoned staged clip is cleaned up on drop"
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn reset_clears_a_stale_capturing_dir_and_leaves_it_empty() -> Result<()> {
+        let root = test_dir("clip-reset-stale")?;
+        let out = root.join("clips");
+        let capturing = out.join(".capturing");
+        std::fs::create_dir_all(&capturing)?;
+        // A leftover from a previous run — the crash-window stale link the
+        // reset exists to clear.
+        std::fs::write(capturing.join("stale.mcap"), b"leftover")?;
+
+        reset_capturing_dir(&out)?;
+
+        assert!(capturing.is_dir(), "the capturing dir exists after reset");
+        assert_eq!(
+            std::fs::read_dir(&capturing)?.count(),
+            0,
+            "the stale leftover is gone"
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn reset_creates_the_dirs_when_none_exist() -> Result<()> {
+        let root = test_dir("clip-reset-fresh")?;
+        // Neither the final dir nor its capturing subdir exists yet: a fresh
+        // run must end up with both, the capturing dir empty.
+        let out = root.join("nested").join("clips");
+        assert!(!out.exists(), "precondition: nothing exists");
+
+        reset_capturing_dir(&out)?;
+
+        assert!(out.is_dir(), "the final dir is created");
+        let capturing = out.join(".capturing");
+        assert!(capturing.is_dir(), "the capturing dir is created");
+        assert_eq!(std::fs::read_dir(&capturing)?.count(), 0);
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn staging_and_publishing_work_after_a_reset() -> Result<()> {
+        let root = test_dir("clip-reset-then-cut")?;
+        let rec = root.join("rec.mcap");
+        write_recording(&rec, false, &[("/t", 10), ("/t", 20)])?;
+        let tailer = tail_whole(&rec)?;
+
+        let out_dir = root.join("clips");
+        reset_capturing_dir(&out_dir)?;
+
+        let out = out_dir.join("clip.mcap");
+        let plan = tailer.plan_window(0, 100);
+        let stats = extract_clip(&plan, &out, 0, 100)?;
+
+        assert_eq!(stats.out_path, out);
+        assert_eq!(
+            read_clip(&out)?,
+            vec![("/t".to_string(), 10), ("/t".to_string(), 20)]
+        );
+        assert_eq!(
+            std::fs::read_dir(out_dir.join(".capturing"))?.count(),
+            0,
+            "the capturing dir is drained after publication"
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
     fn clip_keeps_only_the_window_and_terminates_properly() -> Result<()> {
         let root = test_dir("clip-window")?;
         let rec = root.join("rec.mcap");
@@ -439,20 +774,28 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn duplicate_out_path_gets_a_suffixed_sibling() -> Result<()> {
+    fn duplicate_desired_name_publishes_to_a_suffixed_sibling() -> Result<()> {
         let root = test_dir("clip-dup")?;
         let rec = root.join("rec.mcap");
         write_recording(&rec, false, &[("/t", 10), ("/t", 20)])?;
         let tailer = tail_whole(&rec)?;
         let plan = tailer.plan_window(0, 100);
 
+        // Two publications of the same desired name: the collision is resolved
+        // at the publish stage against the final dir, so the second lands as a
+        // `_1` sibling and both clips are complete.
         let out = root.join("clip.mcap");
         let first = extract_clip(&plan, &out, 0, 100)?;
         let second = extract_clip(&plan, &out, 0, 100)?;
 
         assert_eq!(first.out_path, out);
         assert_eq!(second.out_path, root.join("clip_1.mcap"));
-        assert_eq!(read_clip(&second.out_path)?, read_clip(&out)?);
+        assert_eq!(read_clip(&first.out_path)?, read_clip(&second.out_path)?);
+        assert_eq!(
+            std::fs::read_dir(root.join(".capturing"))?.count(),
+            0,
+            "both publications drain the capturing dir"
+        );
 
         std::fs::remove_dir_all(root)?;
         Ok(())
@@ -525,7 +868,12 @@ pub(crate) mod tests {
             format!("{err:#}").contains("reading extent"),
             "unexpected error: {err:#}"
         );
-        assert!(!out.exists(), "partial clip must be removed on failure");
+        assert!(!out.exists(), "nothing partial reaches the final dir");
+        assert_eq!(
+            std::fs::read_dir(root.join(".capturing"))?.count(),
+            0,
+            "the partial clip is cleaned out of the capturing dir"
+        );
 
         std::fs::remove_dir_all(root)?;
         Ok(())
@@ -579,7 +927,12 @@ pub(crate) mod tests {
             format!("{err:#}").contains("framing inconsistent"),
             "unexpected error: {err:#}"
         );
-        assert!(!out.exists(), "partial clip must be removed on failure");
+        assert!(!out.exists(), "nothing partial reaches the final dir");
+        assert_eq!(
+            std::fs::read_dir(root.join(".capturing"))?.count(),
+            0,
+            "the partial clip is cleaned out of the capturing dir"
+        );
 
         std::fs::remove_dir_all(root)?;
         Ok(())
@@ -681,7 +1034,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn suffix_search_gives_up_after_1000_and_touches_nothing() -> Result<()> {
+    fn publish_suffix_search_gives_up_after_1000_and_cleans_the_staged_file() -> Result<()> {
         let root = test_dir("clip-suffix-cap")?;
         let out = root.join("clip.mcap");
         std::fs::write(&out, b"existing")?;
@@ -691,14 +1044,22 @@ pub(crate) mod tests {
 
         let (tailer, _coverage) = Tailer::new();
         let plan = tailer.plan_window(0, 100);
+        // Staging succeeds — the capturing dir is empty, so the clip assembles
+        // there — and the collision only surfaces at publish, where 1000
+        // suffixes against the pre-filled final dir are exhausted.
         let err = extract_clip(&plan, &out, 0, 100).unwrap_err();
         assert!(
-            format!("{err:#}").contains("creating"),
+            format!("{err:#}").contains("publishing"),
             "unexpected error: {err:#}"
         );
-        // The failure happened before any file was created; the pre-existing
-        // files are not ours to delete.
+        // The pre-existing final files are not ours to disturb, and the staged
+        // file is cleaned out of the capturing dir on the failed publish.
         assert_eq!(std::fs::read(&out)?, b"existing");
+        assert_eq!(
+            std::fs::read_dir(root.join(".capturing"))?.count(),
+            0,
+            "the staged clip is removed when publish fails"
+        );
 
         std::fs::remove_dir_all(root)?;
         Ok(())

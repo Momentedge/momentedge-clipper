@@ -11,10 +11,12 @@
 //! window `[trigger_time - preroll, trigger_time + postroll]`: wait until the
 //! wall clock passes the window end, wait until the tail's coverage reaches it
 //! (the recording provably holds the window), then bulk-copy the in-window
-//! messages out of the planned extents into
+//! messages out of the planned extents into a clip published at
 //! `./triggered-cont/<trigger_ns>_<name>.mcap` (see [`clip`] — a raw-bytes
-//! copy, no CDR decode, finished with a proper summary + footer), and finally
-//! publish `/events/edgestream/recorded` (`edgestream_msgs/Recorded`).
+//! copy, no CDR decode, finished with a proper summary + footer, assembled in
+//! a capturing dir and moved atomically into place so observers never see a
+//! footer-less file), and finally publish `/events/edgestream/recorded`
+//! (`edgestream_msgs/Recorded`), which therefore always names a durable clip.
 //!
 //! Time base: MCAP `log_time`, the trigger stamp, and the wait clock are all
 //! treated as nanoseconds on the system (ROS) clock — this assumes the default
@@ -108,6 +110,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let cfg = Arc::new(load_config()?);
+
+    // Start each run with a clean capturing dir: a crash mid-publish can strand
+    // a stale staged file there, and clearing it at startup bounds that clutter
+    // to a single run. This also creates out_dir, so the first clip can be
+    // published without further setup. Fatal if it fails — a recorder that
+    // cannot prepare its output directory must not start.
+    clip::reset_capturing_dir(&cfg.out_dir)?;
 
     let ctx = r2r::Context::create()?;
     let mut node = r2r::Node::create(ctx, "edgestream_recorder_cont", "")?;
@@ -257,7 +266,9 @@ async fn handle_trigger(
 /// The decode-free, ROS-free core of [`handle_trigger`]: wait out the
 /// postroll on the wall clock, wait for the tail's coverage to reach the
 /// window end, then — holding an extraction permit — snapshot the window
-/// plan and run the blocking extraction.
+/// plan and run the blocking extraction. The extraction stages the clip and
+/// moves it atomically into `out_dir`, so the returned [`clip::ClipStats`]
+/// already names a durable file: the caller may announce it immediately.
 async fn record_clip(
     start_ns: u64,
     end_ns: u64,

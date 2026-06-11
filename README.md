@@ -201,12 +201,17 @@ disabled (`--storage-preset-profile fastwrite --max-cache-size 0`), so each
 message is visible to the tail as soon as it is written; the extractor also
 reads chunked recordings (override with the `STORAGE_PRESET` / `MAX_CACHE_SIZE`
 env vars, and size the extractor's `grace_secs` to the resulting flush
-latency). Clips have the same form as `edgestream-rec`'s and land in
-`./triggered-cont`, fsynced before the `/events/edgestream/recorded` announce
-(a clip whose name is already taken gets a `_<n>` suffix; localized damage in
-the recording — an unparseable record, a chunk failing its CRC — is skipped
-with a logged error rather than failing the clip; a failed extraction removes
-its partial file, so every clip on disk is complete). Coverage trusts the
+latency). Clips have the same form as `edgestream-rec`'s. A clip is assembled
+and fsynced in `./triggered-cont/.capturing`, then moved into `./triggered-cont`
+only once it is complete and durable (the directory entry fsynced), so any file
+visible in the output directory is a finished clip, and the
+`/events/edgestream/recorded` announce always names an already-moved, durable
+file (`.capturing` is deleted and recreated at startup, so a leftover from a
+crash mid-publish never outlives a run; a clip whose name is already taken gets
+a `_<n>` suffix; localized damage
+in the recording — an unparseable record, a chunk failing its CRC — is skipped
+with a logged error rather than failing the clip; a failed extraction leaves
+nothing in the output directory). Coverage trusts the
 recorder's approximately non-decreasing `log_time` order (rosbag2's single
 writer stamps `log_time` at receive): a message the recorder appends out of
 order, after its window has already been cut, is not guaranteed into the

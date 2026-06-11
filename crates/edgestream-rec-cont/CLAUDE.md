@@ -87,8 +87,9 @@ windows are cut concurrently against the one shared tail:
    `plan_window` snapshot (file handle, overlapping extents, channel
    registry) handed to `clip::extract_clip` (blocking IO, run on
    `spawn_blocking`).
-4. **Announce** by publishing `edgestream_msgs/Recorded` — after the clip is
-   fsynced, so the announce implies a durable file.
+4. **Announce** by publishing `edgestream_msgs/Recorded` — only after the
+   extraction has moved the clip into `out_dir` and fsynced that directory, so
+   the announce names an already-moved, crash-durable file.
 
 ## The copy is direct (`clip.rs`)
 
@@ -116,19 +117,45 @@ cached; `mcap::Writer` deduplicates schemas/channels by content. The clip ends
 with `Writer::finish()`, which writes the summary section, footer and closing
 magic — every clip is a complete, standalone MCAP of the same form as
 `edgestream-rec`'s (`mcap::MessageStream` over a clip is the validity check the
-unit tests use). The output file is created with `create_new` — a duplicate
-trigger (same stamp and name) writes a `_<n>`-suffixed sibling instead of two
-writers interleaving one file — and fsynced before `extract_clip` returns.
+unit tests use).
+
+**Two-staged atomic publication.** `extract_clip` composes two stages so the
+output directory only ever holds finished clips. `stage_clip` assembles the
+clip in a `.capturing` subdirectory of `out_dir`, `Writer::finish()`es it, and
+`sync_all`s the file; `publish_clip` then moves it into `out_dir` under the
+desired name. The capturing area is a *subdirectory* of the output directory
+rather than a sibling so the two always share a filesystem — the move is a true
+atomic link, never a cross-device copy. The move is `hard_link` + unlink of the
+staged path, not `rename`: a duplicate trigger (same stamp and name) must not
+clobber the earlier clip, and `rename` replaces an existing destination
+silently, whereas `hard_link` is equally atomic but fails with `AlreadyExists`,
+which the `_<n>`-suffix retry (`with_suffix_retry`, cap 1000) resolves against
+the *desired* final name. The link is the commit point: once it succeeds the
+output directory holds a complete clip (the staged file was already fsynced), so
+the staged name is unlinked and `out_dir` itself is fsynced to make the new
+directory entry crash-durable. A `StagedClip` is `#[must_use]` and its `Drop`
+unlinks an unpublished staged file, so an early return or panic between the
+stages — or a failed publish — strands nothing in `.capturing` and never
+reaches `out_dir`. The capturing-dir name may carry its own `_<n>` suffix to
+avoid colliding with a concurrent stage, independent of the final name a
+duplicate trigger resolves to at publish. The one leftover `Drop` cannot
+reclaim is a crash *between* the publish link and the staged-file unlink, which
+strands a stale link in `.capturing` (harmless — only `out_dir` is observed);
+`reset_capturing_dir`, called once at startup, deletes and recreates
+`.capturing` (and ensures `out_dir` exists) so that clutter never outlives a
+single run. Failing that reset is fatal: a recorder that cannot prepare its
+output directory must not start.
+
 Extraction degrades over localized damage and aborts on anything else.
 Skipped records and dropped chunks are counted in `ClipStats`
 (`records_skipped` / `chunks_dropped`) and surfaced as a warning by the
 trigger handler, so a degraded clip is announced but never silent. What stays
 fatal — the recording truncated under the plan, extent framing that no longer
 matches the tail's scan (the bytes changed since the scan, so there is no
-boundary to resync at), and output IO errors — removes the partly written
-file, so the clip directory never holds a footer-less file that could be
-mistaken for a clip. A *deleted* recording is not an error — the plan's
-`Arc<File>` keeps the inode readable, so extractions in flight across a
+boundary to resync at), and output IO errors — confines its cleanup to the
+capturing directory, so the output directory never holds a footer-less file
+that could be mistaken for a clip. A *deleted* recording is not an error — the
+plan's `Arc<File>` keeps the inode readable, so extractions in flight across a
 recorder restart still complete.
 
 **Detection limit:** the leniency applies to damage loud enough to break
