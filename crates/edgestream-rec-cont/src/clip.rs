@@ -9,13 +9,21 @@
 //! bodies are never decoded — the only thing inspected is each record's
 //! `log_time`.
 //!
-//! Each extent is read with `read_at` (no shared seek state with the tail),
-//! and its records are iterated with `mcap::read::LinearReader::sans_magic`,
-//! which accepts a mid-file slice. Chunk records are descended into either by
-//! the reader or by the explicit [`mcap::read::ChunkReader`] arm, so chunked
-//! and unchunked recordings extract through the same path. `Writer::finish`
-//! writes the summary section, footer and closing magic, so a clip is always a
-//! complete, standalone MCAP.
+//! Each extent is read with `read_at` (no shared seek state with the tail)
+//! and its records are walked with our own opcode + length framing — the same
+//! walk the tail performed to build the extent, so the boundaries are known
+//! to tile. That ownership of the framing is what makes extraction
+//! **damage-tolerant**, the way the MCAP format is designed to be (length
+//! prefixes delimit every record; chunk CRCs exist to detect and discard a
+//! damaged chunk): a record whose *body* fails to parse is skipped with an
+//! error log, and a chunk that fails decompression, CRC, or interior parsing
+//! is dropped whole — its messages are buffered and written only when the
+//! chunk completes cleanly, because a bad CRC cannot say which bytes are
+//! lying. Localized corruption costs the affected record or chunk, counted in
+//! [`ClipStats`], never the clip. Only framing inconsistencies (the extent no
+//! longer matches the tail's scan), recording IO errors, and output errors
+//! abort the clip. `Writer::finish` writes the summary section, footer and
+//! closing magic, so a clip is always a complete, standalone MCAP.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -23,11 +31,11 @@ use std::io::BufWriter;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
-use log::warn;
+use anyhow::{Context, Result, bail};
+use log::{error, warn};
 use mcap::records::Record;
 
-use crate::tail::{ChannelDef, WindowPlan};
+use crate::tail::{ChannelDef, MAX_RECORD_LEN, WindowPlan, op};
 
 /// Outcome of an extraction: where the clip actually landed (`out_path`
 /// carries a `_<n>` suffix when the desired name already existed) and the
@@ -38,15 +46,24 @@ pub struct ClipStats {
     pub extents_read: usize,
     pub messages_copied: u64,
     pub bytes_copied: u64,
+    /// Records skipped over localized damage: an unparseable body, or a
+    /// message on a channel with no Channel record.
+    pub records_skipped: u64,
+    /// Chunks dropped whole: decompression, CRC, or interior parse failure.
+    pub chunks_dropped: u64,
 }
 
 /// Copy every message in `[start_ns, end_ns]` (inclusive bounds, matching the
 /// split-based recorder) from the planned extents into a freshly created MCAP
 /// at `out_path` (or a `_<n>`-suffixed sibling if that name is taken — see
-/// [`create_clip_file`]). All-or-nothing: on success the clip is complete and
-/// fsynced before this returns, so a caller may announce it as durably on
-/// disk; on error the partly written file is removed, so a failed extraction
-/// leaves nothing that could be mistaken for a clip.
+/// [`create_clip_file`]). Localized damage in the recording — an unparseable
+/// record body, a message on an unregistered channel, a chunk failing CRC or
+/// decompression — is skipped with an error log and counted in [`ClipStats`];
+/// the clip keeps everything else. Errors that do surface are all-or-nothing:
+/// on success the clip is complete and fsynced before this returns, so a
+/// caller may announce it as durably on disk; on error the partly written
+/// file is removed, so a failed extraction leaves nothing that could be
+/// mistaken for a clip.
 pub fn extract_clip(
     plan: &WindowPlan,
     out_path: &Path,
@@ -97,29 +114,7 @@ fn copy_window(
                 .with_context(|| {
                     format!("reading extent at {} (+{} B)", extent.offset, extent.len)
                 })?;
-            for rec in mcap::read::LinearReader::sans_magic(&buf) {
-                match rec.context("parsing extent record")? {
-                    // Only messages are copied out of the extent bytes. The
-                    // clip's Schema/Channel records come from the registry
-                    // (`output_channel_id`), not from here: the recording
-                    // writes them where a topic first appears, which is
-                    // usually far before the window and outside every
-                    // planned extent.
-                    Record::Message { header, data } => clip.copy_message(&header, &data)?,
-                    Record::Chunk { header, data } => {
-                        for rec in
-                            mcap::read::ChunkReader::new(header, &data).context("opening chunk")?
-                        {
-                            if let Record::Message { header, data } =
-                                rec.context("reading record inside chunk")?
-                            {
-                                clip.copy_message(&header, &data)?;
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
+            clip.copy_extent(&buf)?;
         }
     }
 
@@ -176,19 +171,112 @@ struct ClipWriter<'a> {
     writer: mcap::Writer<BufWriter<File>>,
     channels: &'a HashMap<u16, ChannelDef>,
     /// Recording channel ID → output channel ID, filled on first use.
-    out_ids: HashMap<u16, u16>,
+    /// `None` caches a known-missing Channel record, so the miss is logged
+    /// once rather than per message.
+    out_ids: HashMap<u16, Option<u16>>,
     start_ns: u64,
     end_ns: u64,
     stats: ClipStats,
 }
 
 impl ClipWriter<'_> {
-    /// Write one message through if its `log_time` is in the window.
+    /// Walk one extent's records and write the in-window messages through.
+    /// Only messages are copied out of the extent bytes; the clip's
+    /// Schema/Channel records come from the registry ([`Self::output_channel_id`]),
+    /// not from here — the recording writes them where a topic first appears,
+    /// which is usually far before the window and outside every planned extent.
+    ///
+    /// The framing walk is our own (opcode + u64le length, the walk the tail
+    /// already performed to build this extent) rather than an mcap reader's:
+    /// owning the boundaries lets a record whose *body* fails to parse be
+    /// skipped — resyncing at the next boundary exactly, not heuristically —
+    /// where the library readers halt on the first error. Framing that no
+    /// longer matches the tail's scan (an oversized length, a record running
+    /// past or short of the extent) means the bytes changed since the scan,
+    /// and that aborts the clip.
+    fn copy_extent(&mut self, buf: &[u8]) -> Result<()> {
+        let mut offset = 0usize;
+        while offset + 9 <= buf.len() {
+            let opcode = buf[offset];
+            let len = u64::from_le_bytes(buf[offset + 1..offset + 9].try_into().unwrap());
+            if len > MAX_RECORD_LEN || offset + 9 + len as usize > buf.len() {
+                bail!(
+                    "record at extent offset {offset} declares {len} B; \
+                     extent framing inconsistent with the tail's scan"
+                );
+            }
+            let end = offset + 9 + len as usize;
+            let body = &buf[offset + 9..end];
+            match opcode {
+                op::MESSAGE => match mcap::parse_record(opcode, body) {
+                    Ok(Record::Message { header, data }) => self.copy_message(&header, &data)?,
+                    Ok(_) => unreachable!("a MESSAGE opcode parses to Record::Message"),
+                    Err(e) => {
+                        error!("skipping unparseable message at extent offset {offset}: {e}");
+                        self.stats.records_skipped += 1;
+                    }
+                },
+                op::CHUNK => self.copy_chunk(body, offset)?,
+                _ => {} // schemas/channels (registry covers them), indexes, …
+            }
+            offset = end;
+        }
+        if offset != buf.len() {
+            bail!(
+                "extent ends mid-record at offset {offset}; framing inconsistent with the tail's scan"
+            );
+        }
+        Ok(())
+    }
+
+    /// Copy a chunk's in-window messages — all of them or none. The messages
+    /// are buffered while the chunk iterates and written only once it
+    /// completes cleanly: the chunk CRC is verified at the end of iteration,
+    /// and a failure anywhere (decompression, CRC, an interior record) cannot
+    /// say which of the chunk's bytes are damaged, so the whole chunk is
+    /// dropped with an error log and counted. Output-side errors stay fatal.
+    fn copy_chunk(&mut self, body: &[u8], at: usize) -> Result<()> {
+        let (start_ns, end_ns) = (self.start_ns, self.end_ns);
+        let mut pending: Vec<(mcap::records::MessageHeader, Vec<u8>)> = Vec::new();
+        let salvage = (|| -> mcap::McapResult<()> {
+            let Record::Chunk { header, data } = mcap::parse_record(op::CHUNK, body)? else {
+                unreachable!("a CHUNK opcode parses to Record::Chunk");
+            };
+            for rec in mcap::read::ChunkReader::new(header, &data)? {
+                if let Record::Message { header, data } = rec?
+                    && header.log_time >= start_ns
+                    && header.log_time <= end_ns
+                {
+                    pending.push((header, data.into_owned()));
+                }
+            }
+            Ok(())
+        })();
+        match salvage {
+            Ok(()) => {
+                for (header, data) in pending {
+                    self.copy_message(&header, &data)?;
+                }
+            }
+            Err(e) => {
+                error!("dropping chunk at extent offset {at}: {e}");
+                self.stats.chunks_dropped += 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// Write one message through if its `log_time` is in the window. A
+    /// message on a channel the recording never declared is skipped and
+    /// counted — there is no Schema/Channel to emit for it.
     fn copy_message(&mut self, header: &mcap::records::MessageHeader, data: &[u8]) -> Result<()> {
         if header.log_time < self.start_ns || header.log_time > self.end_ns {
             return Ok(());
         }
-        let channel_id = self.output_channel_id(header.channel_id)?;
+        let Some(channel_id) = self.output_channel_id(header.channel_id)? else {
+            self.stats.records_skipped += 1;
+            return Ok(());
+        };
         self.writer
             .write_to_known_channel(
                 &mcap::records::MessageHeader {
@@ -205,14 +293,21 @@ impl ClipWriter<'_> {
 
     /// Map a recording channel ID into the output file and cache the result.
     /// The writer deduplicates schemas/channels by content, so the mapping
-    /// stays stable however often a definition is registered.
-    fn output_channel_id(&mut self, src_id: u16) -> Result<u16> {
-        if let Some(id) = self.out_ids.get(&src_id) {
-            return Ok(*id);
+    /// stays stable however often a definition is registered. `Ok(None)`
+    /// means the recording holds no Channel record for the ID (a
+    /// spec-violating file or a registry gap), logged once per ID; errors
+    /// are output-side failures.
+    fn output_channel_id(&mut self, src_id: u16) -> Result<Option<u16>> {
+        if let Some(cached) = self.out_ids.get(&src_id) {
+            return Ok(*cached);
         }
-        let def = self.channels.get(&src_id).with_context(|| {
-            format!("message on channel {src_id} with no Channel record in the recording")
-        })?;
+        let Some(def) = self.channels.get(&src_id) else {
+            error!(
+                "messages on channel {src_id} have no Channel record in the recording; skipping them"
+            );
+            self.out_ids.insert(src_id, None);
+            return Ok(None);
+        };
         let schema_id = match &def.schema {
             Some(schema) => self
                 .writer
@@ -224,8 +319,8 @@ impl ClipWriter<'_> {
             .writer
             .add_channel(schema_id, &def.topic, &def.message_encoding, &def.metadata)
             .with_context(|| format!("adding channel {}", def.topic))?;
-        self.out_ids.insert(src_id, channel_id);
-        Ok(channel_id)
+        self.out_ids.insert(src_id, Some(channel_id));
+        Ok(Some(channel_id))
     }
 }
 
@@ -437,21 +532,22 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn message_on_unknown_channel_fails_and_removes_the_partial_clip() -> Result<()> {
+    fn message_on_unknown_channel_is_skipped_and_counted() -> Result<()> {
         let root = test_dir("clip-nochannel")?;
         let rec = root.join("rec.mcap");
         write_recording(&rec, false, &[("/t", 10)])?;
         let tailer = tail_whole(&rec)?;
         let mut plan = tailer.plan_window(0, 100);
+        // No Channel record for the message's ID: nothing to emit a
+        // Schema/Channel from, so the message is skipped — the clip stays
+        // valid rather than failing.
         plan.channels.clear();
 
         let out = root.join("clip.mcap");
-        let err = extract_clip(&plan, &out, 0, 100).unwrap_err();
-        assert!(
-            format!("{err:#}").contains("no Channel record"),
-            "unexpected error: {err:#}"
-        );
-        assert!(!out.exists(), "partial clip must be removed on failure");
+        let stats = extract_clip(&plan, &out, 0, 100)?;
+        assert_eq!(stats.messages_copied, 0);
+        assert_eq!(stats.records_skipped, 1);
+        assert!(read_clip(&out)?.is_empty(), "a valid, empty clip");
 
         std::fs::remove_dir_all(root)?;
         Ok(())
@@ -464,7 +560,9 @@ pub(crate) mod tests {
         std::fs::write(&junk, [0xFFu8; 64])?;
 
         // A plan whose extent points at bytes that are not record-framed at
-        // all — the index is corrupt or reading the wrong file.
+        // all — the index is corrupt or reading the wrong file. Unlike a bad
+        // record *body* (skippable), bad framing leaves no boundary to
+        // resync at, so this must stay fatal.
         let plan = WindowPlan {
             file: Some(Arc::new(File::open(&junk)?)),
             extents: vec![Extent {
@@ -478,7 +576,7 @@ pub(crate) mod tests {
         let out = root.join("clip.mcap");
         let err = extract_clip(&plan, &out, 0, u64::MAX).unwrap_err();
         assert!(
-            format!("{err:#}").contains("parsing extent record"),
+            format!("{err:#}").contains("framing inconsistent"),
             "unexpected error: {err:#}"
         );
         assert!(!out.exists(), "partial clip must be removed on failure");
@@ -726,14 +824,100 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn malformed_record_inside_an_extent_fails_the_clip_cleanly() -> Result<()> {
+    fn highly_compressed_chunk_extracts_despite_small_extent() -> Result<()> {
+        let root = test_dir("clip-ratio")?;
+        let rec = root.join("rec.mcap");
+        // One 8 MiB zero-filled message in one zstd chunk: the chunk record on
+        // disk is a few KiB, so the extent holding it is far smaller than the
+        // decompressed interior record. The record length cap must be the
+        // framing bound, not the extent size, or this conformant recording
+        // fails extraction.
+        let payload = vec![0u8; 8 << 20];
+        write_recording_opts(
+            &rec,
+            mcap::WriteOptions::new()
+                .use_chunks(true)
+                .compression(Some(mcap::Compression::Zstd))
+                .chunk_size(Some(16 << 20)),
+            &payload,
+            &[("/big", 10)],
+        )?;
+        let tailer = tail_whole(&rec)?;
+        let plan = tailer.plan_window(0, 100);
+        assert!(
+            plan.extents.iter().map(|e| e.len).sum::<u64>() < (1 << 20),
+            "precondition: the chunk compressed far below the payload size"
+        );
+
+        let out = root.join("clip.mcap");
+        let stats = extract_clip(&plan, &out, 0, 100)?;
+        assert_eq!(stats.messages_copied, 1);
+        assert_eq!(stats.bytes_copied, 8 << 20);
+        assert_eq!(read_clip(&out)?, vec![("/big".to_string(), 10)]);
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn corrupt_chunk_is_dropped_and_the_other_chunks_survive() -> Result<()> {
+        let root = test_dir("clip-chunkcrc")?;
+        let rec = root.join("rec.mcap");
+        // An uncompressed chunk has no codec to notice corruption — only its
+        // CRC. Messages larger than the chunk size land one per chunk, so
+        // corrupting the last message's payload damages exactly one chunk.
+        let payload = vec![b'Z'; 200];
+        write_recording_opts(
+            &rec,
+            mcap::WriteOptions::new()
+                .use_chunks(true)
+                .compression(None)
+                .chunk_size(Some(128)),
+            &payload,
+            &[("/t", 10), ("/t", 20), ("/t", 30), ("/t", 40)],
+        )?;
+        let tailer = tail_whole(&rec)?;
+        let plan = tailer.plan_window(0, 100);
+
+        // Corrupt a payload byte *after* the tail scanned (and CRC-checked)
+        // the chunk: post-scan disk damage. Payload bytes exist only inside
+        // chunks, and the framing is untouched. Rewriting the path truncates
+        // the same inode, so the plan's handle sees the new bytes. The
+        // damaged chunk must be dropped whole — the CRC cannot say which of
+        // its bytes are lying — and every other chunk must come through.
+        let mut bytes = std::fs::read(&rec)?;
+        let pos = bytes
+            .iter()
+            .rposition(|&b| b == b'Z')
+            .expect("payload bytes present");
+        bytes[pos] ^= 0xFF;
+        std::fs::write(&rec, &bytes)?;
+
+        let out = root.join("clip.mcap");
+        let stats = extract_clip(&plan, &out, 0, 100)?;
+        assert_eq!(stats.chunks_dropped, 1);
+        assert_eq!(stats.messages_copied, 3);
+        assert_eq!(
+            read_clip(&out)?,
+            vec![
+                ("/t".to_string(), 10),
+                ("/t".to_string(), 20),
+                ("/t".to_string(), 30),
+            ]
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_record_inside_an_extent_is_skipped_and_the_rest_extracts() -> Result<()> {
         let root = test_dir("clip-poisoned")?;
         let rec = root.join("rec.mcap");
         // A runt Message (4-byte body) with intact framing, wedged between
-        // valid messages. The lenient tail consumes it with a warning and its
-        // bytes land in the extent; the strict extraction hits it and must
-        // fail the clip loudly and cleanly — not emit a silently incomplete
-        // one. Lenient skip-on-extract is tracked separately in beads.
+        // valid messages — disk corruption that still frames. The framing
+        // boundary is exact, so extraction skips just the damaged record and
+        // the clip keeps the messages around it.
         write_raw(
             &rec,
             &[
@@ -755,12 +939,13 @@ pub(crate) mod tests {
 
         let out = root.join("clip.mcap");
         let plan = tailer.plan_window(0, 100);
-        let err = extract_clip(&plan, &out, 0, 100).unwrap_err();
-        assert!(
-            format!("{err:#}").contains("parsing extent record"),
-            "unexpected error: {err:#}"
+        let stats = extract_clip(&plan, &out, 0, 100)?;
+        assert_eq!(stats.records_skipped, 1);
+        assert_eq!(stats.messages_copied, 2);
+        assert_eq!(
+            read_clip(&out)?,
+            vec![("/t".to_string(), 10), ("/t".to_string(), 30)]
         );
-        assert!(!out.exists(), "partial clip must be removed on failure");
 
         std::fs::remove_dir_all(root)?;
         Ok(())

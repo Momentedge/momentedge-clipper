@@ -93,9 +93,21 @@ windows are cut concurrently against the one shared tail:
 ## The copy is direct (`clip.rs`)
 
 Extraction reads each planned extent with `read_at` (no seek state shared with
-the tail), iterates its records with `mcap::read::LinearReader::sans_magic`
-(which accepts a mid-file slice), and descends into chunk records — so chunked
-and unchunked recordings extract through the same path. Messages whose
+the tail) and walks its records with **its own opcode + length framing** — the
+same walk the tail performed to build the extent, so the boundaries are known
+to tile. Owning the framing makes extraction damage-tolerant the way the MCAP
+format is designed to be (length prefixes delimit every record; chunk CRCs
+exist to detect and discard a damaged chunk — the format the official
+`mcap recover` tool salvages by): a record whose body fails to parse, or a
+message on a channel the recording never declared, is skipped with an error
+log; a chunk that fails decompression, CRC, or interior parsing is dropped
+whole — its messages are buffered and written only once the chunk iterates
+cleanly (`mcap::read::ChunkReader` verifies the CRC at the end of iteration),
+since a bad CRC cannot say which of the chunk's bytes are lying. The mcap
+library readers are unsuitable for this walk: they halt at the first error,
+and the `LinearReader::sans_magic` constructor additionally caps every
+record — including chunk-interior records after decompression — at the slice
+length, failing any conformant chunk whose contents out-compress it. Messages whose
 `log_time` falls in the inclusive window are written through with their **raw
 serialized bytes** (`write_to_known_channel`); CDR bodies are never decoded.
 
@@ -107,21 +119,23 @@ magic — every clip is a complete, standalone MCAP of the same form as
 unit tests use). The output file is created with `create_new` — a duplicate
 trigger (same stamp and name) writes a `_<n>`-suffixed sibling instead of two
 writers interleaving one file — and fsynced before `extract_clip` returns.
-Extraction is all-or-nothing: on any error (recording truncated under the
-plan, a message on an unregistered channel, unparseable extent bytes) the
-partly written file is removed, so the clip directory never holds a
-footer-less file that could be mistaken for a clip. A *deleted* recording is
-not an error — the plan's `Arc<File>` keeps the inode readable, so extractions
-in flight across a recorder restart still complete.
+Extraction degrades over localized damage and aborts on anything else.
+Skipped records and dropped chunks are counted in `ClipStats`
+(`records_skipped` / `chunks_dropped`) and surfaced as a warning by the
+trigger handler, so a degraded clip is announced but never silent. What stays
+fatal — the recording truncated under the plan, extent framing that no longer
+matches the tail's scan (the bytes changed since the scan, so there is no
+boundary to resync at), and output IO errors — removes the partly written
+file, so the clip directory never holds a footer-less file that could be
+mistaken for a clip. A *deleted* recording is not an error — the plan's
+`Arc<File>` keeps the inode readable, so extractions in flight across a
+recorder restart still complete.
 
-**Known limitation:** a record with intact framing but an unparseable body
-(disk corruption) fails every clip whose window overlaps its extent —
-`LinearReader` yields the parse error and halts, and the tail (which only
-frames records, never parsing message bodies) has already counted the region
-as covered. The failure is loud and clean (error logged, partial clip
-removed), and any linear-scanning MCAP reader breaks on the same byte, so
-this matches the ecosystem baseline; skipping such records via our own
-framing walk is tracked in beads as `ros2_subscribe-ba3`.
+**Detection limit:** the leniency applies to damage loud enough to break
+parsing or a CRC. The default fastwrite profile is unchunked and carries no
+CRCs, so corruption inside a message *body* that leaves the framing and the
+22-byte message header intact is invisible to every MCAP reader and is copied
+into clips as-is — only a CDR decode downstream would notice.
 
 ## Time base
 

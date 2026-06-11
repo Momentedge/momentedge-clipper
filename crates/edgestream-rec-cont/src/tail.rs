@@ -56,7 +56,9 @@ const EXTENT_CAP_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Upper bound on a plausible single record. A length beyond this means the
 /// scan is desynchronised from the record framing (or the file is corrupt).
-const MAX_RECORD_LEN: u64 = 1 << 31;
+/// [`crate::clip`] applies the same bound to the records it reads back out
+/// of extents, including chunk-interior records after decompression.
+pub(crate) const MAX_RECORD_LEN: u64 = 1 << 31;
 
 /// Sleep between scan passes when the file has not grown.
 const TAIL_POLL: Duration = Duration::from_millis(50);

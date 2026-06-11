@@ -203,8 +203,10 @@ reads chunked recordings (override with the `STORAGE_PRESET` / `MAX_CACHE_SIZE`
 env vars, and size the extractor's `grace_secs` to the resulting flush
 latency). Clips have the same form as `edgestream-rec`'s and land in
 `./triggered-cont`, fsynced before the `/events/edgestream/recorded` announce
-(a clip whose name is already taken gets a `_<n>` suffix; a failed extraction
-removes its partial file, so every clip on disk is complete). The single
+(a clip whose name is already taken gets a `_<n>` suffix; localized damage in
+the recording — an unparseable record, a chunk failing its CRC — is skipped
+with a logged error rather than failing the clip; a failed extraction removes
+its partial file, so every clip on disk is complete). The single
 recording file has no retention — it
 grows until you stop recording (hole-punch retention is tracked in beads:
 `ros2_subscribe-wkg`).

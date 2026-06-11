@@ -228,6 +228,15 @@ async fn handle_trigger(
         stats.extents_read,
         stats.bytes_copied as f64 / 1_048_576.0,
     );
+    if stats.records_skipped > 0 || stats.chunks_dropped > 0 {
+        warn!(
+            "clip {} is missing data over damage in the recording: \
+             {} records skipped, {} chunks dropped",
+            stats.out_path.display(),
+            stats.records_skipped,
+            stats.chunks_dropped,
+        );
+    }
 
     let filename = stats.out_path.to_string_lossy().into_owned();
     let recorded = r2r::edgestream_msgs::msg::Recorded {
