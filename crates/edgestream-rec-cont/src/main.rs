@@ -21,7 +21,9 @@
 //! Time base: MCAP `log_time`, the trigger stamp, and the wait clock are all
 //! treated as nanoseconds on the system (ROS) clock — this assumes the default
 //! (no `use_sim_time`). Each trigger is handled in its own task, so
-//! overlapping windows are cut concurrently against one shared tail.
+//! overlapping windows are cut concurrently against one shared tail — at most
+//! [`MAX_ACTIVE_TRIGGERS`] at once; a trigger beyond that limit is rejected,
+//! logged, and ignored.
 //!
 //! Configuration is layered (defaults → TOML file → environment, via
 //! config-rs); there are no CLI args. The TOML file is
@@ -59,6 +61,19 @@ use tail::{Coverage, Tailer};
 
 const TRIGGER_TOPIC: &str = "/events/edgestream/trigger";
 const RECORDED_TOPIC: &str = "/events/edgestream/recorded";
+
+/// How many trigger handlers may be active (admitted, waiting, or extracting)
+/// at once. Beyond this limit an arriving trigger is rejected at admission:
+/// `error!`-logged and ignored — no handler is spawned, no clip is cut, and no
+/// `Recorded` message is published.
+///
+/// An active handler is cheap: it is a green task sleeping out its postroll
+/// window and waiting on coverage, plus a clone of the coverage receiver. The
+/// heavy work — the bulk file copy — is already serialized by
+/// `extract_parallelism`. This constant is therefore a flood-sanity bound on
+/// task and announcement growth, not a resource budget; 16 comfortably exceeds
+/// any legitimate concurrent burst.
+const MAX_ACTIVE_TRIGGERS: usize = 16;
 
 #[derive(Debug, Deserialize)]
 struct Config {
@@ -159,8 +174,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // One permit per allowed concurrent clip copy; see Config::extract_parallelism.
     let extract_permits = Arc::new(Semaphore::new(cfg.extract_parallelism.max(1)));
 
+    // Admission gate for trigger handlers: MAX_ACTIVE_TRIGGERS permits bound
+    // how many may be active (admitted, waiting, or extracting) at once. Each
+    // handler task holds its permit for its whole life, so the permit returns
+    // when the handler finishes — panic included, since it returns on drop.
+    let active_triggers = Arc::new(Semaphore::new(MAX_ACTIVE_TRIGGERS));
+
     // Trigger consumer: drains the typed trigger stream for the process's
-    // lifetime, spawning one handler task per arriving trigger. The handle is
+    // lifetime, spawning one handler task per admitted trigger. A trigger
+    // arriving while all MAX_ACTIVE_TRIGGERS handlers are active is rejected
+    // with error! and ignored — no handler, no clip, no Recorded. The handle is
     // passed to supervise() so a dead consumer (stream closed or panic) is
     // caught and the process exits rather than silently stopping on triggers.
     let consumer_task = {
@@ -168,6 +191,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let tailer = tailer.clone();
         tokio::spawn(async move {
             while let Some(trig) = trigger_sub.next().await {
+                let permit = match active_triggers.clone().try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        error!(
+                            "trigger rejected: all {MAX_ACTIVE_TRIGGERS} trigger handlers are busy; \
+                             ignoring name={:?} trigger_time={}",
+                            trig.name,
+                            time_to_ns(&trig.trigger_time),
+                        );
+                        continue;
+                    }
+                };
                 let cfg = cfg.clone();
                 let recorded_pub = recorded_pub.clone();
                 let tailer = tailer.clone();
@@ -176,6 +211,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 // Per-trigger error isolation: a failed extraction is logged
                 // and counted but does not tear down the consumer loop.
                 tokio::spawn(async move {
+                    let _permit = permit;
                     if let Err(e) =
                         handle_trigger(trig, cfg, recorded_pub, tailer, coverage_rx, permits).await
                     {
@@ -892,6 +928,82 @@ mod tests {
         );
 
         std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// Admission at the limit, rejection above it, and slot reuse — the
+    /// acceptance test for MAX_ACTIVE_TRIGGERS. This is the exact scenario the
+    /// recorder must handle: 16 concurrent trigger handlers admitted, the 17th
+    /// rejected (flood-sanity bound), then a completed handler returns its
+    /// permit and a later trigger is admitted. Mirrors the consumer loop: a
+    /// permit is taken without waiting and rides in the handler task until it
+    /// finishes.
+    #[tokio::test]
+    async fn admission_at_the_limit_rejection_above_and_slot_reuse() -> anyhow::Result<()> {
+        let active = Arc::new(Semaphore::new(MAX_ACTIVE_TRIGGERS));
+        // Each handler parks on a watch receiver until released, as a real
+        // handler does while it waits out its window and extracts.
+        let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+
+        for i in 0..MAX_ACTIVE_TRIGGERS {
+            let permit = active
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| anyhow::anyhow!("trigger {i} rejected; expected admission"))?;
+            let mut release_rx = release_rx.clone();
+            tokio::spawn(async move {
+                let _permit = permit;
+                release_rx.wait_for(|&v| v).await.ok();
+            });
+        }
+
+        // Trigger 17: every permit is held by a pending handler — admission
+        // must fail immediately, without waiting.
+        assert!(
+            active.clone().try_acquire_owned().is_err(),
+            "trigger beyond the limit must be rejected"
+        );
+
+        // Handlers complete; their permits return, so a later trigger is
+        // admitted (acquire_owned waits for the first returned permit).
+        release_tx.send(true).unwrap();
+        let _readmitted = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            active.clone().acquire_owned(),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("a completed handler must free a slot"))??;
+
+        Ok(())
+    }
+
+    /// A panicking handler must return its permit: the admission bound would
+    /// otherwise ratchet down with every panic until every trigger is
+    /// rejected. The permit is held by the handler task and returns on drop,
+    /// which unwinding covers.
+    #[tokio::test]
+    async fn panicking_handler_returns_its_permit() -> anyhow::Result<()> {
+        // Suppress the panic backtrace noise in test output.
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+
+        let active = Arc::new(Semaphore::new(1));
+        let permit = active
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| anyhow::anyhow!("fresh semaphore must admit"))?;
+        let handler = tokio::spawn(async move {
+            let _permit = permit;
+            panic!("boom");
+        });
+        let joined = handler.await;
+        std::panic::set_hook(prev_hook);
+        assert!(joined.is_err(), "the handler must have panicked");
+
+        assert!(
+            active.try_acquire_owned().is_ok(),
+            "the panicked handler's permit must be free again"
+        );
         Ok(())
     }
 }

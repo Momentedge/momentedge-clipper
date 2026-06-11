@@ -107,8 +107,12 @@ hold their own `Arc<File>` and finish safely against the deleted inode.
 
 ## Per-trigger flow (`handle_trigger`)
 
-Each `edgestream_msgs/Trigger` is handled in its own tokio task, so overlapping
-windows are cut concurrently against the one shared tail:
+Each admitted `edgestream_msgs/Trigger` is handled in its own tokio task, so
+overlapping windows are cut concurrently against the one shared tail. Admission
+is bounded: at most `MAX_ACTIVE_TRIGGERS` (16) handlers may be active at once,
+and a trigger that arrives while all of them are is rejected — logged with
+`error!` and otherwise ignored: no handler runs, no clip is extracted, and no
+`edgestream_msgs/Recorded` is published.
 
 1. **Wait out the postroll.** Sleep until the system clock passes
    `trigger_time + postroll`.
@@ -226,6 +230,21 @@ spins the node, the typed trigger stream is consumed on a tokio task, the
 `spawn_blocking` thread runs the tail loop for the process's lifetime; it
 talks to handlers only through the mutex-guarded index and the coverage watch.
 Clip copies are gated by a FIFO semaphore (`extract_parallelism`, default 1).
+
+Trigger admission is gated by a second semaphore: `MAX_ACTIVE_TRIGGERS` (16)
+permits bound how many handlers may be active (admitted, waiting, or
+extracting) at once. The consumer takes a permit without waiting before
+spawning a handler task; the permit rides in the task and returns when the
+handler finishes — panic included, since it returns on drop — so the bound
+never ratchets down. A trigger arriving while no permit is free is rejected
+with `error!` and otherwise ignored (no handler, no clip, no announcement).
+The cap is a flood-sanity bound rather than a resource necessity: an active
+handler is a cheap tokio green task that sleeps through the postroll and then
+awaits the coverage watch — the heavy copy stage is already serialized by the
+FIFO `extract_parallelism` semaphore. 16 comfortably exceeds any legitimate
+concurrent trigger burst. Per-trigger failures stay isolated inside each
+handler task — logged and counted, never propagated to the consumer.
+
 `supervise()` `select!`s on all three long-lived task handles — tail thread,
 node spin thread, and trigger consumer — plus a SIGINT (`ctrl_c`) future, and
 returns as soon as any branch resolves. SIGINT resolves to `Ok(())`, which
@@ -247,8 +266,7 @@ torn down with `shutdown_background()` after `supervise()` resolves; without
 it the blocking threads would hold the process open indefinitely. In-flight
 extraction tasks die with the runtime — safe because the capturing-dir startup
 reset reclaims any stranded staged file, and `out_dir` only ever holds complete
-clips. Per-trigger failures stay isolated inside the consumer loop — logged and
-counted, never propagated to the consumer itself.
+clips.
 
 ## Retention
 

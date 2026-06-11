@@ -198,6 +198,11 @@ grace_secs = 30                # wait past the window end for coverage before cu
 extract_parallelism = 1        # concurrent clip copies (1 = one at a time, FIFO)
 ```
 
+At most 16 triggers are handled concurrently — a fixed bound, not a config key.
+A trigger that arrives while all 16 handler slots are occupied is rejected: a
+logged error is emitted and the trigger produces no clip and no
+`/events/edgestream/recorded` announcement.
+
 `record-continuous.sh` records unchunked with the rosbag2 message cache
 disabled (`--storage-preset-profile fastwrite --max-cache-size 0`), so each
 message is visible to the tail as soon as it is written; the extractor also
