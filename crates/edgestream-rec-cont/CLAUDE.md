@@ -188,9 +188,24 @@ spins the node, the typed trigger stream is consumed on a tokio task, the
 `spawn_blocking` thread runs the tail loop for the process's lifetime; it
 talks to handlers only through the mutex-guarded index and the coverage watch.
 Clip copies are gated by a FIFO semaphore (`extract_parallelism`, default 1).
-`main` `select!`s on the tail and spin thread handles and exits non-zero if
-either dies, for a supervisor to restart — with a dead tailer the process
-would otherwise limp on, cutting every clip at the grace timeout.
+`supervise()` `select!`s on all three long-lived task handles — tail thread,
+node spin thread, and trigger consumer — plus a SIGINT (`ctrl_c`) future, and
+returns as soon as any branch resolves. SIGINT resolves to `Ok(())`, which
+`main` treats as a requested, orderly stop: it logs the shutdown and exits
+zero. Any task resolving instead returns `Err` (clean exit or panic, with the
+`JoinError` panic payload carried in the error chain), and the process exits
+non-zero so a supervisor can restart it — a dead tailer silently degrades every
+clip to a grace-timeout cut, a dead spin thread silently stops delivering
+triggers, and a dead consumer silently stops acting on them. A failure to
+install the signal handler itself surfaces as an error naming "signal handler"
+so it is never mistaken for a dead task. Because the spin and tail loops run
+inside `spawn_blocking` and never return on their own, the tokio runtime is
+torn down with `shutdown_background()` after `supervise()` resolves; without
+it the blocking threads would hold the process open indefinitely. In-flight
+extraction tasks die with the runtime — safe because the capturing-dir startup
+reset reclaims any stranded staged file, and `out_dir` only ever holds complete
+clips. Per-trigger failures stay isolated inside the consumer loop — logged and
+counted, never propagated to the consumer itself.
 
 ## Retention
 

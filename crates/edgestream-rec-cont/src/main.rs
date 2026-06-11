@@ -102,8 +102,24 @@ fn load_config() -> Result<Config, config::ConfigError> {
         .try_deserialize()
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// Entry point: build an explicit multi-thread runtime, run the async body,
+/// then call shutdown_background() before returning. The tail and spin threads
+/// are immortal spawn_blocking loops; dropping the runtime (what #[tokio::main]
+/// does) waits for all blocking tasks to finish, which hangs the process forever
+/// on any exit path. shutdown_background() detaches those threads immediately so
+/// the process exits via normal return with the correct status. In-flight
+/// extraction threads die with the process — the capturing-dir reset at startup
+/// ensures out_dir never sees a partial clip from a previous run.
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = rt.block_on(run());
+    rt.shutdown_background();
+    result
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     pretty_env_logger::formatted_builder()
         .filter_level(log::LevelFilter::Info)
         .parse_default_env()
@@ -131,9 +147,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (tailer, coverage_rx) = Tailer::new();
 
     // The tail thread: discovers and scans the recording for the process's
-    // lifetime (blocking IO, so off the async runtime). The handle is watched
-    // at the bottom of main: with a dead tailer every clip degrades to a
-    // grace-timeout cut, so the process exits instead.
+    // lifetime (blocking IO, so off the async runtime). Its handle is passed
+    // to supervise(): with a dead tailer every clip degrades to a grace-timeout
+    // cut, so the process exits rather than limping on silently.
     let tail_task = {
         let tailer = tailer.clone();
         let record_dir = cfg.record_dir.clone();
@@ -143,8 +159,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // One permit per allowed concurrent clip copy; see Config::extract_parallelism.
     let extract_permits = Arc::new(Semaphore::new(cfg.extract_parallelism.max(1)));
 
-    // trigger consumer: spawn one handler per trigger.
-    {
+    // Trigger consumer: drains the typed trigger stream for the process's
+    // lifetime, spawning one handler task per arriving trigger. The handle is
+    // passed to supervise() so a dead consumer (stream closed or panic) is
+    // caught and the process exits rather than silently stopping on triggers.
+    let consumer_task = {
         let cfg = cfg.clone();
         let tailer = tailer.clone();
         tokio::spawn(async move {
@@ -154,6 +173,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let tailer = tailer.clone();
                 let coverage_rx = coverage_rx.clone();
                 let permits = extract_permits.clone();
+                // Per-trigger error isolation: a failed extraction is logged
+                // and counted but does not tear down the consumer loop.
                 tokio::spawn(async move {
                     if let Err(e) =
                         handle_trigger(trig, cfg, recorded_pub, tailer, coverage_rx, permits).await
@@ -162,8 +183,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 });
             }
-        });
-    }
+        })
+    };
 
     info!(
         "edgestream-rec-cont up: triggers on {TRIGGER_TOPIC}, tailing {}, writing clips to {}",
@@ -179,23 +200,74 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // The node's single owner: spin continuously to feed the streams.
+    // Its handle is passed to supervise() alongside the tail and consumer
+    // handles; any of the three exiting is an error.
     let spin_task = tokio::task::spawn_blocking(move || {
         loop {
             node.spin_once(Duration::from_millis(10));
         }
     });
 
-    // Neither thread returns, so either handle resolving means a panic (or an
-    // impossible clean exit). Exit non-zero so a supervisor restarts the
-    // recorder rather than letting it limp on with a dead tail or node.
-    tokio::select! {
-        res = tail_task => {
-            res?;
-            Err("tail thread exited unexpectedly".into())
+    // All three long-lived tasks must run for the recorder's lifetime.
+    // supervise() returns Ok(()) on SIGINT (requested shutdown) or Err on any
+    // task exit or signal handler failure. Either way main() calls
+    // shutdown_background() before returning, so the process never hangs.
+    match supervise(tail_task, spin_task, consumer_task, tokio::signal::ctrl_c()).await {
+        Ok(()) => {
+            info!("SIGINT received; shutting down");
+            Ok(())
         }
-        res = spin_task => {
-            res?;
-            Err("node spin thread exited unexpectedly".into())
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Watch the three critical long-lived tasks and a shutdown signal; return
+/// when any of them resolves.
+///
+/// Returns `Ok(())` when `shutdown` resolves `Ok(())` — that is the requested,
+/// orderly stop path (SIGINT / ctrl_c). The caller logs the shutdown and exits
+/// zero. Every other arm returns `Err`: a task exiting (clean or panic) is a
+/// fault that a supervisor must respond to by restarting the process; a signal
+/// handler installation failure (`shutdown` resolves `Err`) must not be silent
+/// either, since it means SIGINT could never trigger a clean shutdown.
+///
+/// All three tasks must run for the lifetime of the process:
+/// the tail thread feeds coverage and the extent index (a dead tailer silently
+/// degrades every clip to a grace-timeout cut); the spin thread pumps the ROS
+/// node (a dead spin thread silently stops delivering triggers); the trigger
+/// consumer drains the typed stream (a dead consumer silently stops acting on
+/// triggers).
+async fn supervise(
+    tail: tokio::task::JoinHandle<()>,
+    spin: tokio::task::JoinHandle<()>,
+    consumer: tokio::task::JoinHandle<()>,
+    shutdown: impl std::future::Future<Output = std::io::Result<()>>,
+) -> anyhow::Result<()> {
+    tokio::select! {
+        res = tail => {
+            match res {
+                Ok(()) => anyhow::bail!("tail thread exited unexpectedly"),
+                Err(e) => Err(anyhow::Error::new(e).context("tail thread exited unexpectedly")),
+            }
+        }
+        res = spin => {
+            match res {
+                Ok(()) => anyhow::bail!("node spin thread exited unexpectedly"),
+                Err(e) => Err(anyhow::Error::new(e).context("node spin thread exited unexpectedly")),
+            }
+        }
+        res = consumer => {
+            match res {
+                Ok(()) => anyhow::bail!("trigger consumer exited unexpectedly"),
+                Err(e) => Err(anyhow::Error::new(e).context("trigger consumer exited unexpectedly")),
+            }
+        }
+        res = shutdown => {
+            match res {
+                // Requested shutdown — not a fault; the caller exits zero.
+                Ok(()) => Ok(()),
+                Err(e) => Err(anyhow::Error::new(e).context("signal handler failed to install")),
+            }
         }
     }
 }
@@ -410,6 +482,126 @@ mod tests {
             .unwrap()
             .try_deserialize::<Config>();
         assert!(res.is_err());
+    }
+
+    // ── supervise() tests ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn supervise_reports_consumer_end() -> anyhow::Result<()> {
+        // A consumer task that exits cleanly (stream ended or explicit return)
+        // is an error: the recorder stops receiving triggers with no noise. The
+        // other two tasks and the shutdown signal are parked as "pending forever"
+        // to isolate the consumer signal.
+        let tail = tokio::spawn(std::future::pending::<()>());
+        let spin = tokio::spawn(std::future::pending::<()>());
+        let consumer = tokio::spawn(async {});   // completes immediately
+
+        let err = supervise(tail, spin, consumer, std::future::pending::<std::io::Result<()>>())
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("trigger consumer"),
+            "error must name the trigger consumer, got: {err:#}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn supervise_reports_consumer_panic() -> anyhow::Result<()> {
+        // A panicking consumer wraps its JoinError; the formatted chain must
+        // carry the panic payload so the operator knows what went wrong.
+        let tail = tokio::spawn(std::future::pending::<()>());
+        let spin = tokio::spawn(std::future::pending::<()>());
+        let consumer = tokio::spawn(async { panic!("boom") });
+
+        let err = supervise(tail, spin, consumer, std::future::pending::<std::io::Result<()>>())
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("trigger consumer"),
+            "error must name the trigger consumer, got: {msg}"
+        );
+        assert!(
+            msg.contains("boom") || msg.contains("panic"),
+            "error must carry the panic context, got: {msg}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn supervise_reports_tail_end() -> anyhow::Result<()> {
+        // The tail thread exiting is an error: clips would degrade to grace-
+        // timeout cuts silently if not caught.
+        let tail = tokio::spawn(async {});       // completes immediately
+        let spin = tokio::spawn(std::future::pending::<()>());
+        let consumer = tokio::spawn(std::future::pending::<()>());
+
+        let err = supervise(tail, spin, consumer, std::future::pending::<std::io::Result<()>>())
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("tail thread"),
+            "error must name the tail thread, got: {err:#}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn supervise_reports_spin_end() -> anyhow::Result<()> {
+        // The spin thread exiting means the node is no longer pumping messages:
+        // triggers silently stop arriving.
+        let tail = tokio::spawn(std::future::pending::<()>());
+        let spin = tokio::spawn(async {});       // completes immediately
+        let consumer = tokio::spawn(std::future::pending::<()>());
+
+        let err = supervise(tail, spin, consumer, std::future::pending::<std::io::Result<()>>())
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("node spin thread"),
+            "error must name the node spin thread, got: {err:#}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn supervise_returns_ok_on_shutdown_signal() -> anyhow::Result<()> {
+        // A clean shutdown signal (SIGINT / ctrl_c) is a requested, orderly
+        // stop — not a fault. supervise() must return Ok(()) so main can log
+        // the shutdown and exit zero, distinguishing it from a dead task.
+        let tail = tokio::spawn(std::future::pending::<()>());
+        let spin = tokio::spawn(std::future::pending::<()>());
+        let consumer = tokio::spawn(std::future::pending::<()>());
+        let shutdown = std::future::ready(Ok(()) as std::io::Result<()>);
+
+        let result = supervise(tail, spin, consumer, shutdown).await;
+        assert!(result.is_ok(), "SIGINT must return Ok(()), got: {result:?}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn supervise_reports_signal_handler_failure() -> anyhow::Result<()> {
+        // A failure to install the signal handler must surface as an error
+        // naming the signal handler — a silent failure here would mean SIGINT
+        // could never trigger a clean shutdown.
+        let tail = tokio::spawn(std::future::pending::<()>());
+        let spin = tokio::spawn(std::future::pending::<()>());
+        let consumer = tokio::spawn(std::future::pending::<()>());
+        let shutdown =
+            std::future::ready(Err(std::io::Error::other("install failed")) as std::io::Result<()>);
+
+        let err = supervise(tail, spin, consumer, shutdown).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("signal handler"),
+            "error must name the signal handler, got: {msg}"
+        );
+        assert!(
+            msg.contains("install failed"),
+            "error must carry the io error, got: {msg}"
+        );
+        Ok(())
     }
 
     use crate::clip::tests::read_clip;

@@ -184,6 +184,8 @@ nix develop --command ./scripts/record-continuous.sh   # optional: config/cam_si
 nix develop --command cargo run -p edgestream-rec-cont
 ```
 
+Ctrl-C stops the extractor cleanly (exit zero); any internal fault exits non-zero for a supervisor to restart.
+
 The extractor takes no CLI args. It reads `edgestream-rec-cont.toml` from the
 working directory (or the path in `$EDGESTREAM_CONFIG`; no file is
 needed), overridable per key by `EDGESTREAM_*` environment variables
