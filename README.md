@@ -203,30 +203,18 @@ A trigger that arrives while all 16 handler slots are occupied is rejected: a
 logged error is emitted and the trigger produces no clip and no
 `/events/edgestream/recorded` announcement.
 
-`record-continuous.sh` records unchunked with the rosbag2 message cache
-disabled (`--storage-preset-profile fastwrite --max-cache-size 0`), so each
-message is visible to the tail as soon as it is written; the extractor also
-reads chunked recordings (override with the `STORAGE_PRESET` / `MAX_CACHE_SIZE`
-env vars, and size the extractor's `grace_secs` to the resulting flush
-latency). Clips have the same form as `edgestream-rec`'s. A clip is assembled
-and fsynced in `./triggered-cont/.capturing`, then moved into `./triggered-cont`
-only once it is complete and durable (the directory entry fsynced), so any file
-visible in the output directory is a finished clip, and the
-`/events/edgestream/recorded` announce always names an already-moved, durable
-file (`.capturing` is deleted and recreated at startup, so a leftover from a
-crash mid-publish never outlives a run; a clip whose name is already taken gets
-a `_<n>` suffix; localized damage
-in the recording — an unparseable record, a chunk failing its CRC — is skipped
-with a logged error rather than failing the clip; a failed extraction leaves
-nothing in the output directory). Coverage trusts the
-recorder's approximately non-decreasing `log_time` order (rosbag2's single
-writer stamps `log_time` at receive): a message the recorder appends out of
-order, after its window has already been cut, is not guaranteed into the
-clip — `grace_secs` is the knob that absorbs flush latency, not arbitrary
-reordering. The single
-recording file has no retention — it
-grows until you stop recording (hole-punch retention is tracked in beads:
-`ros2_subscribe-wkg`).
+`record-continuous.sh` uses the fastwrite storage profile (`--storage-preset-profile
+fastwrite --max-cache-size 0`) so each message is visible to the tail immediately
+after the recorder writes it. The extractor also reads chunked recordings (override
+`STORAGE_PRESET` / `MAX_CACHE_SIZE`), but `grace_secs` must then be sized to the
+resulting flush latency (roughly chunk size / aggregate data rate). Every file
+visible in `out_dir` is a complete, crash-durable clip; the
+`/events/edgestream/recorded` announce always names an already-written file. The
+single recording file has no retention — it grows until you stop recording.
+
+For the internal design — thread model, tailing mechanics, atomic clip publication,
+recorder restart handling, and damage tolerance — see
+[`crates/edgestream-rec-cont/ARCHITECTURE.md`](crates/edgestream-rec-cont/ARCHITECTURE.md).
 
 ## Tests and coverage
 
