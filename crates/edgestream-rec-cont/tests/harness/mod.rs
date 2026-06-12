@@ -98,6 +98,12 @@ impl TestEnv {
         env
     }
 
+    /// The test's temp root — a scratch home for files that must survive a
+    /// recorder relaunch (the record script wipes `record/` on start).
+    pub fn root(&self) -> &Path {
+        self.root.path()
+    }
+
     pub fn record_dir(&self) -> PathBuf {
         self.root.path().join("record")
     }
@@ -192,6 +198,35 @@ impl TestEnv {
             );
             std::thread::sleep(Duration::from_millis(200));
         }
+    }
+
+    /// Delete the recording file out from under the live recorder — the
+    /// external-cleanup fault the deletion tests inject. The recorder keeps
+    /// appending to the unlinked inode; the tail sees the path vanish.
+    pub fn delete_recording(&self) {
+        std::fs::remove_file(self.newest_recording().expect("the recording exists"))
+            .expect("deleting the recording");
+    }
+
+    /// The production recorder-restart protocol: stop the recorder cleanly,
+    /// relaunch it (the record script wipes the bag dir), and gate on the
+    /// extractor noticing the replacement and the new recording existing on
+    /// disk. Returns the new recorder and the instant between the two
+    /// recorders' lifetimes — every message in the new recording is stamped
+    /// at receive and therefore at/after it.
+    pub fn restart_recorder(
+        &self,
+        recorder: &mut Proc,
+        extractor: &Proc,
+        preset: &str,
+        cache: u64,
+    ) -> (Proc, u64) {
+        recorder.stop(libc::SIGINT, Duration::from_secs(30));
+        let restart_ns = now_ns();
+        let recorder2 = self.start_recorder(preset, cache);
+        extractor.expect_log("replaced; re-discovering", Duration::from_secs(60));
+        self.wait_for_recording(Duration::from_secs(60));
+        (recorder2, restart_ns)
     }
 
     /// Newest `*.mcap` under `record/` by mtime — the same discovery rule the
@@ -388,6 +423,27 @@ impl Proc {
             panic!("{}: {needle:?} not logged within {timeout:?}", self.name);
         }
     }
+
+    /// [`Self::expect_log`] for a line that repeats: poll until `needle` has
+    /// appeared at least `count` times — e.g. the tail's "tailing <path>"
+    /// attach line, whose second occurrence proves the replacement recording
+    /// is attached (the path is identical across a restart, so presence alone
+    /// cannot). The needle must be specific enough that no other line
+    /// contributes a substring match toward the count — qualify it with the
+    /// full path rather than a bare prefix another log line shares.
+    pub fn expect_log_count(&self, needle: &str, count: usize, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while self.log_text().matches(needle).count() < count {
+            if Instant::now() >= deadline {
+                self.dump_log();
+                panic!(
+                    "{}: {needle:?} not logged {count} times within {timeout:?}",
+                    self.name
+                );
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
 }
 
 impl Drop for Proc {
@@ -478,6 +534,34 @@ pub fn assert_clip_within_window(msgs: &[(String, u64)], start_ns: u64, end_ns: 
             "message on {topic} at {log_time} outside window [{start_ns}, {end_ns}]"
         );
     }
+}
+
+/// Walk the top-level record framing of a possibly unfinished (footer-less)
+/// recording and return the `log_time` of every complete top-level `Message`
+/// record — the 14-byte prefix read the extractor's tail performs, so this
+/// works on a live-copied file [`read_clip`] would reject. A torn final
+/// record ends the walk. Top-level only: messages inside `Chunk` records are
+/// not seen, which suffices for the suite's unchunked fastwrite recordings.
+pub fn partial_recording_stamps(path: &Path) -> Vec<u64> {
+    let buf = std::fs::read(path).expect("reading recording");
+    let mut stamps = Vec::new();
+    let mut off = 8usize; // past the opening magic
+    while off + 9 <= buf.len() {
+        let opcode = buf[off];
+        let len = u64::from_le_bytes(buf[off + 1..off + 9].try_into().unwrap()) as usize;
+        let end = off + 9 + len;
+        if end > buf.len() {
+            break; // still being appended when the file was copied
+        }
+        if opcode == 0x05 && len >= 14 {
+            // Message body: channel_id u16, sequence u32, log_time u64 (LE).
+            stamps.push(u64::from_le_bytes(
+                buf[off + 15..off + 23].try_into().unwrap(),
+            ));
+        }
+        off = end;
+    }
+    stamps
 }
 
 /// Walk the top-level record framing (1-byte opcode + u64le length) and

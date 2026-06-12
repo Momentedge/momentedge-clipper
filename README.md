@@ -259,8 +259,12 @@ the all-topic indexers and their r2r/rclrs codegen.
 real `ros2 bag record` (the production `scripts/record-continuous.sh`
 invocation), CLI-published triggers, and a `ros2 topic echo` listener for the
 `Recorded` announcements. The matrix covers the fastwrite and zstd_fast
-storage profiles, a recorder restart during operation, two grace-timeout
-degraded paths, and offline/live corruption of the recording.
+storage profiles; recorder restarts both between and inside an open trigger
+window; deletion of the recording with and without a subsequent restart;
+grace-timeout degraded paths; offline/live corruption of the recording; and
+the most-recent-file-only semantics — when a recording is replaced, data from
+the previous file is never recovered into a clip, even if that file still
+exists on disk.
 
 The suite is gated on `EDGESTREAM_E2E`: unset (plain `cargo test`,
 `cargo llvm-cov`) every e2e test prints a skip notice and passes, so the

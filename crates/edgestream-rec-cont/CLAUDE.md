@@ -99,12 +99,16 @@ budget exists to prevent.
 under `record_dir`; when that path stops resolving to the tailed inode (the
 record script wipes the bag dir on restart), the index resets and the new file
 is tailed from scratch. This is the one path that re-attaches and resets
-everything — distinct from a scan fault, which keeps the index. A `NotFound`
-when opening the discovered path is the same race resolved the same way: the
-file vanished between discovery and open, so it is treated as a replacement and
-re-discovery loops. A magic mismatch stays fatal — an append-only file whose
-first eight bytes are wrong can never become a valid MCAP. In-flight extractions
-hold their own `Arc<File>` and finish safely against the deleted inode.
+everything — distinct from a scan fault, which keeps the index. Clips are cut
+from the most recent recording only; a previous file's data is never recovered
+into a clip, even when that file still exists on disk. Recovery across a
+recording replacement is an explicit non-feature, tracked as out of scope in
+beads `ros2_subscribe-gl2`. A `NotFound` when opening the discovered path is
+the same race resolved the same way: the file vanished between discovery and
+open, so it is treated as a replacement and re-discovery loops. A magic
+mismatch stays fatal — an append-only file whose first eight bytes are wrong
+can never become a valid MCAP. In-flight extractions hold their own `Arc<File>`
+and finish safely against the deleted inode.
 
 ## Per-trigger flow (`handle_trigger`)
 
@@ -341,6 +345,12 @@ rationale.
   closed file. Only `corrupt_tail_health_live` races the scan by design (the
   closest test to real corruption) and is the one case with extra nextest
   retries.
+- **Restart and deletion scenarios are exercised live** against a real
+  `ros2 bag record`: restarts inside an open trigger window (clean restart,
+  deletion-then-restart, deletion before the trigger), deletion without a
+  restart (mid-window and pre-trigger), a restart that lands after the window
+  ends (producing a valid empty clip), and the no-recovery guarantee — a file
+  still on disk after replacement contributes nothing to any subsequent clip.
 
 ## Retention
 
