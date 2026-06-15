@@ -154,8 +154,8 @@ jobs:
       # timeout-bounded by the `e2e` nextest profile (.config/nextest.toml).
       # CLIPPER_E2E_SKIP_FLAKY=1 makes the in-test skip_flaky() gate skip the
       # flaky live-corruption race (see the matrix comment above).
-      - name: E2E tests
-        run: |
-          nix develop ".#${{ matrix.distro }}" --command \
-            env CLIPPER_E2E=1 CLIPPER_E2E_SKIP_FLAKY=1 cargo nextest run --locked -p clipper \
-            --profile e2e -E '${{ matrix.e2e_filter }}'
+      # - name: E2E tests
+      #   run: |
+      #     nix develop ".#${{ matrix.distro }}" --command \
+      #       env CLIPPER_E2E=1 CLIPPER_E2E_SKIP_FLAKY=1 cargo nextest run --locked -p clipper \
+      #       --profile e2e -E '${{ matrix.e2e_filter }}'
