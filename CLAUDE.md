@@ -120,7 +120,9 @@ Setup is in the README; the parts that matter when changing the build:
 GitHub Actions CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml))
 builds, unit-tests, and runs the live e2e suite for `edgestream-rec-cont` on
 `humble`, `jazzy`, and `lyrical` on every push, with the nix store cached
-through the GitHub Actions cache (no external cache service). Mechanics,
+through the GitHub Actions cache (no external cache service). A separate `fmt`
+job checks workspace formatting (`cargo fmt --all --check`) — nix- and
+distro-independent, since rustfmt only parses source. Mechanics,
 rationale, and the local-`act` caveats live in
 [`.github/CLAUDE.md`](.github/CLAUDE.md) — loaded on demand when you work in
 `.github/`, so it stays out of context otherwise.

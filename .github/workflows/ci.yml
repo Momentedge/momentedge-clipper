@@ -1,5 +1,6 @@
 # Builds, unit-tests, and runs the live ROS2 e2e suite for the recorder
-# (edgestream-rec-cont) against every working ROS2 distro, on each push.
+# (edgestream-rec-cont) against every working ROS2 distro, on each push. A
+# separate `fmt` job checks workspace formatting (rustfmt) in parallel.
 #
 # Each distro is one matrix leg. A leg enters that distro's nix dev shell
 # (`nix develop .#<distro>`) — which supplies the ROS2 closure, r2r codegen env,
@@ -39,6 +40,23 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  # Workspace formatting gate. rustfmt only parses source, so this needs neither
+  # the nix dev shell nor the ROS2 closure that the recorder matrix below sets up
+  # — just the stable toolchain's rustfmt component. One cheap job checks both
+  # crates (`--all`), runs in parallel with the recorder matrix, and is
+  # distro-independent.
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --all --check
+
   recorder:
     name: ${{ matrix.distro }}
     runs-on: ubuntu-latest

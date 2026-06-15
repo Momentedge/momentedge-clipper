@@ -2,9 +2,16 @@
 
 [`workflows/ci.yml`](workflows/ci.yml) is the GitHub Actions CI. It builds,
 unit-tests, and runs the live ROS2 e2e suite for `edgestream-rec-cont` against
-every working ROS2 distro on each push. The mechanics and the reasoning behind
-the choices:
+every working ROS2 distro on each push, plus a standalone formatting gate. The
+mechanics and the reasoning behind the choices:
 
+- **A standalone `fmt` job, distro- and nix-independent.** rustfmt only parses
+  source, so checking formatting needs neither the nix dev shell nor a ROS2
+  closure — only the stable toolchain's `rustfmt` component. One cheap job runs
+  `cargo fmt --all --check` over both workspace crates, in parallel with the
+  recorder matrix. It deliberately stays outside the matrix: format is identical
+  across distros, so running it per distro would be three redundant copies behind
+  a heavy nix realization.
 - **One job per working distro, three steps (build → unit → e2e).** A single
   matrix leg per distro shares one nix dev shell and one cargo target dir across
   all three steps, so the ROS closure is realized once and the crate compiled
