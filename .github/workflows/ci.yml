@@ -42,16 +42,20 @@ env:
 jobs:
   # Workspace formatting gate. rustfmt only parses source, so this needs neither
   # the nix dev shell nor the ROS2 closure that the recorder matrix below sets up
-  # — just the stable toolchain's rustfmt component. One cheap job checks both
-  # crates (`--all`), runs in parallel with the recorder matrix, and is
-  # distro-independent.
+  # — just a toolchain's rustfmt component. It must be a *nightly* one: rustfmt.toml
+  # carries unstable options (group_imports, imports_granularity) that only nightly
+  # rustfmt honours, and the dev box's system rustfmt is nightly too, so a stable
+  # rustfmt here would both reject the config and disagree with locally-formatted
+  # code. `components: rustfmt` keeps the install to rustfmt only — no full nightly
+  # std/clippy. One cheap job checks both crates (`--all`), runs in parallel with
+  # the recorder matrix, and is distro-independent.
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install nightly rustfmt
+        uses: dtolnay/rust-toolchain@nightly
         with:
           components: rustfmt
       - name: Check formatting

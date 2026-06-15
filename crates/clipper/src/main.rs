@@ -69,7 +69,6 @@ use log::{error, info, warn};
 use r2r::{Publisher, QosProfile};
 use serde::Deserialize;
 use signal_hook::consts::{SIGINT, SIGTERM};
-
 use tail::{Coverage, Tailer};
 use watch::Watch;
 
@@ -119,8 +118,7 @@ impl Config {
 /// the working directory, or `$CLIPPER_CONFIG`; missing is fine), then
 /// `CLIPPER_<KEY>` environment variables.
 fn load_config() -> Result<Config, config::ConfigError> {
-    let file = std::env::var("CLIPPER_CONFIG")
-        .unwrap_or_else(|_| "clipper.toml".to_string());
+    let file = std::env::var("CLIPPER_CONFIG").unwrap_or_else(|_| "clipper.toml".to_string());
     config::Config::builder()
         .set_default("record_dir", "./record-cont")?
         .set_default("out_dir", "./triggered-cont")?

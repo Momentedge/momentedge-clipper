@@ -63,10 +63,10 @@ impl<T: Clone> Watch<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use std::sync::Arc;
     use std::time::Instant;
+
+    use super::*;
 
     #[test]
     fn wait_returns_immediately_when_the_predicate_already_holds() {

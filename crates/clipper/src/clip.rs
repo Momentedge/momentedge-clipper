@@ -492,17 +492,15 @@ impl ClipWriter<'_> {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::*;
-
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
-    use crate::tail::op;
+    use super::*;
     use crate::tail::tests::{
         channel_body, message_body, raw_record, scan_to_end, test_dir, write_raw, write_recording,
         write_recording_opts,
     };
-    use crate::tail::{Extent, Tailer};
+    use crate::tail::{Extent, Tailer, op};
 
     /// Read a finished clip back; `MessageStream` insists on a complete
     /// summary/footer/magic, so this doubles as a validity check.

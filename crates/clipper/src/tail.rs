@@ -722,10 +722,10 @@ fn read_body(file: &File, offset: u64, len: u64) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::*;
-
     use std::io::BufWriter;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
 
     /// Write a finished recording with one message per `(topic, log_time)`.
     pub(crate) fn write_recording(
@@ -785,10 +785,8 @@ pub(crate) mod tests {
 
     pub(crate) fn test_dir(name: &str) -> Result<PathBuf> {
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "clipper-{name}-{}-{nanos}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("clipper-{name}-{}-{nanos}", std::process::id()));
         std::fs::create_dir_all(&path)?;
         Ok(path)
     }

@@ -122,7 +122,10 @@ builds, unit-tests, and runs the live e2e suite for `clipper` on
 `humble`, `jazzy`, and `lyrical` on every push, with the nix store cached
 through the GitHub Actions cache (no external cache service). A separate `fmt`
 job checks workspace formatting (`cargo fmt --all --check`) — nix- and
-distro-independent, since rustfmt only parses source. Mechanics,
+distro-independent, since rustfmt only parses source. It runs on **nightly**
+rustfmt (`dtolnay/rust-toolchain@nightly`, rustfmt component only): the
+workspace `rustfmt.toml` sets unstable options that only nightly honours, which
+also matches the dev box's nightly system rustfmt. Mechanics,
 rationale, and the local-`act` caveats live in
 [`.github/CLAUDE.md`](.github/CLAUDE.md) — loaded on demand when you work in
 `.github/`, so it stays out of context otherwise.

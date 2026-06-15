@@ -1,0 +1,18 @@
+# rustfmt configuration for the workspace.
+#
+# The import options below are *unstable*: rustfmt only honours them on a
+# nightly toolchain (stable rustfmt rejects an unstable key in this file). They
+# are what make the nightly toolchain a real requirement rather than a
+# preference — the CI `fmt` job (.github/workflows/ci.yml) installs nightly to
+# match the dev box's system rustfmt, which is also nightly.
+#
+# Run `cargo fmt --all` from a nightly shell to apply; `cargo fmt --all --check`
+# is the gate CI runs.
+
+edition = "2024"
+
+# Imports: keep the std / external-crate / own-crate three-group layout the
+# codebase already uses, and one `use` statement per module path. Both keys are
+# unstable (nightly-only).
+group_imports = "StdExternalCrate"
+imports_granularity = "Module"

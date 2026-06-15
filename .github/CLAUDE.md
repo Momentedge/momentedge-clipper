@@ -5,13 +5,18 @@ unit-tests, and runs the live ROS2 e2e suite for `clipper` against
 every working ROS2 distro on each push, plus a standalone formatting gate. The
 mechanics and the reasoning behind the choices:
 
-- **A standalone `fmt` job, distro- and nix-independent.** rustfmt only parses
-  source, so checking formatting needs neither the nix dev shell nor a ROS2
-  closure — only the stable toolchain's `rustfmt` component. One cheap job runs
-  `cargo fmt --all --check` over both workspace crates, in parallel with the
-  recorder matrix. It deliberately stays outside the matrix: format is identical
-  across distros, so running it per distro would be three redundant copies behind
-  a heavy nix realization.
+- **A standalone `fmt` job on nightly rustfmt, distro- and nix-independent.**
+  rustfmt only parses source, so checking formatting needs neither the nix dev
+  shell nor a ROS2 closure — only a toolchain's `rustfmt` component, installed
+  here via `dtolnay/rust-toolchain@nightly` (`components: rustfmt`, so nightly
+  rustfmt only — no full nightly std/clippy). It must be nightly: `rustfmt.toml`
+  at the workspace root sets unstable options (`group_imports`,
+  `imports_granularity`) that only nightly rustfmt honours, and the dev box's own
+  system rustfmt is nightly, so a stable rustfmt here would both reject the config
+  and reflow locally-clean code. One cheap job runs `cargo fmt --all --check` over
+  both workspace crates, in parallel with the recorder matrix. It deliberately
+  stays outside the matrix: format is identical across distros, so running it per
+  distro would be three redundant copies behind a heavy nix realization.
 - **One job per working distro, three steps (build → unit → e2e).** A single
   matrix leg per distro shares one nix dev shell and one cargo target dir across
   all three steps, so the ROS closure is realized once and the crate compiled
@@ -25,12 +30,13 @@ mechanics and the reasoning behind the choices:
   surface the push run's checks; add `pull_request:` if fork contributions ever
   need their own CI.
 - **System Rust inside the nix shell, exactly as locally.** The shell ships no
-  Rust, so each step runs `nix develop .#<distro> --command cargo …` with the
-  toolchain from `dtolnay/rust-toolchain@stable` on `PATH`. The crates carry no
-  feature gates, so stable builds them; the action tracks the `stable` channel
-  (the exact patch floats with it), matching the system-rust dev model without
-  adopting the dev box's nightly. `cargo --locked` holds the build to the
-  committed `Cargo.lock`.
+  Rust, so each build/unit/e2e step runs `nix develop .#<distro> --command cargo
+  …` with the toolchain from `dtolnay/rust-toolchain@stable` on `PATH`. The crates
+  carry no feature gates, so stable builds them; the action tracks the `stable`
+  channel (the exact patch floats with it). The build/test path deliberately
+  stays on stable — only the `fmt` job adopts the dev box's nightly, and only for
+  rustfmt (see above). `cargo --locked` holds the build to the committed
+  `Cargo.lock`.
 - **Nix store cached through the GitHub Actions cache, not an external service.**
   `cache-nix-action` saves and restores `/nix/store` keyed per distro on the
   flake inputs — "push and load the nix store" with no external dependency, the
@@ -52,7 +58,7 @@ mechanics and the reasoning behind the choices:
   `cachix/install-nix-action@v31`, `nix-community/cache-nix-action@v7`,
   `taiki-e/install-action@v2`, `Swatinem/rust-cache@v2`), so they pick up patch
   and security fixes without a manual bump; `dtolnay/rust-toolchain@stable`
-  tracks the channel.
+  (build/test) and `dtolnay/rust-toolchain@nightly` (fmt) track their channels.
 - **Every leg drops `corrupt_tail_health_live`; lyrical drops one more.** That
   test is the live-corruption race the project flags as its one inherently flaky
   case: after damaging the recording mid-write it waits 60 s for the mandatory
