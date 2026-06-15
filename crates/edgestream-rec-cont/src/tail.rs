@@ -1155,7 +1155,10 @@ pub(crate) mod tests {
 
         let plan = tailer.plan_window(0, 100);
         assert!(!plan.extents.is_empty(), "the good message is indexed");
-        let ch = plan.channels.get(&1).expect("channel after the chunk registered");
+        let ch = plan
+            .channels
+            .get(&1)
+            .expect("channel after the chunk registered");
         assert_eq!(ch.topic, "/t");
 
         std::fs::remove_dir_all(root)?;
@@ -1205,7 +1208,10 @@ pub(crate) mod tests {
         );
 
         let plan = tailer.plan_window(0, u64::MAX);
-        assert!(plan.channels.contains_key(&2), "the post-chunk channel registers");
+        assert!(
+            plan.channels.contains_key(&2),
+            "the post-chunk channel registers"
+        );
         assert!(
             !plan.channels.contains_key(&1),
             "the failed chunk's channel must not register"
@@ -1249,7 +1255,11 @@ pub(crate) mod tests {
         let (tailer, coverage) = Tailer::new();
         let file = File::open(&path)?;
         let progress = scan_to_end(&tailer, &file, MAGIC.len() as u64)?;
-        assert_eq!(progress.offset, file.metadata()?.len(), "all records consumed");
+        assert_eq!(
+            progress.offset,
+            file.metadata()?.len(),
+            "all records consumed"
+        );
         assert_eq!(coverage.get().high_water_ns, 300);
         assert!(
             tailer.plan_window(0, u64::MAX).channels.contains_key(&9),
@@ -1289,7 +1299,11 @@ pub(crate) mod tests {
         let (tailer, coverage) = Tailer::new();
         let file = File::open(&path)?;
         let progress = scan_to_end(&tailer, &file, MAGIC.len() as u64)?;
-        assert_eq!(progress.offset, file.metadata()?.len(), "all records consumed");
+        assert_eq!(
+            progress.offset,
+            file.metadata()?.len(),
+            "all records consumed"
+        );
         assert_eq!(coverage.get().high_water_ns, 55);
 
         let plan = tailer.plan_window(0, 100);

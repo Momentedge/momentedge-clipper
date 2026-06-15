@@ -91,7 +91,9 @@ fn trigger_produces_clip_and_announcement(
     assert!(
         msgs.iter().any(|(topic, _)| topic == SRC_TOPIC),
         "the source topic must be in the clip, got topics: {:?}",
-        msgs.iter().map(|(t, _)| t).collect::<std::collections::HashSet<_>>(),
+        msgs.iter()
+            .map(|(t, _)| t)
+            .collect::<std::collections::HashSet<_>>(),
     );
     env.assert_capturing_drained();
     assert!(extractor.is_running(), "the extractor must outlive the cut");
@@ -206,8 +208,7 @@ fn recorder_restart_inside_the_window_cuts_only_the_new_recording(#[case] deleti
     if deletion == Deletion::MidWindow {
         env.delete_recording();
     }
-    let (_recorder2, restart_ns) =
-        env.restart_recorder(&mut recorder, &extractor, "fastwrite", 0);
+    let (_recorder2, restart_ns) = env.restart_recorder(&mut recorder, &extractor, "fastwrite", 0);
     // On a machine slow enough that the restart ate the whole postroll, the
     // empty clip below would misread as a semantics regression — fail it as
     // the timing precondition it is.

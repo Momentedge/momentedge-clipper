@@ -95,7 +95,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let describe_roll = |fixed: Option<u64>| match fixed {
         Some(ns) => format!("{ns} ns"),
-        None => format!("random {}-{}s", RANDOM_ROLL_SECS.start(), RANDOM_ROLL_SECS.end()),
+        None => format!(
+            "random {}-{}s",
+            RANDOM_ROLL_SECS.start(),
+            RANDOM_ROLL_SECS.end()
+        ),
     };
     info!(
         "publishing /events/edgestream/trigger every {:.1}s  (preroll={}, postroll={})",

@@ -820,7 +820,10 @@ mod tests {
         sig_tx.send(SIGINT).unwrap();
 
         let result = supervise(pending(), pending(), pending(), sig_rx);
-        assert!(result.is_ok(), "a signal must return Ok(()), got: {result:?}");
+        assert!(
+            result.is_ok(),
+            "a signal must return Ok(()), got: {result:?}"
+        );
     }
 
     #[test]

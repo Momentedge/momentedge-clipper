@@ -174,8 +174,11 @@ impl TestEnv {
         preset: &str,
         cache: u64,
     ) -> Proc {
-        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/record-continuous.sh");
-        let script = script.canonicalize().expect("locating record-continuous.sh");
+        let script =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/record-continuous.sh");
+        let script = script
+            .canonicalize()
+            .expect("locating record-continuous.sh");
         let mut cmd = self.command(script);
         cmd.arg(config.map(Path::as_os_str).unwrap_or_default())
             .arg(self.record_dir())
@@ -345,7 +348,11 @@ impl TestEnv {
     /// (no finished clip ever lingers there).
     pub fn assert_capturing_drained(&self) {
         let capturing = self.out_dir().join(".capturing");
-        assert!(capturing.is_dir(), "the extractor creates {}", capturing.display());
+        assert!(
+            capturing.is_dir(),
+            "the extractor creates {}",
+            capturing.display()
+        );
         let leftover: Vec<_> = std::fs::read_dir(&capturing)
             .expect("reading .capturing")
             .flatten()
@@ -411,7 +418,10 @@ impl Proc {
         self.signal_group(signal);
         self.wait_exit(timeout).unwrap_or_else(|| {
             self.dump_log();
-            panic!("{} did not exit within {timeout:?} after signal {signal}", self.name);
+            panic!(
+                "{} did not exit within {timeout:?} after signal {signal}",
+                self.name
+            );
         })
     }
 
@@ -530,7 +540,12 @@ pub fn read_clip(path: &Path) -> Vec<(String, u64)> {
     let buf = std::fs::read(path)
         .unwrap_or_else(|e| panic!("reading announced clip {}: {e}", path.display()));
     mcap::MessageStream::new(&buf)
-        .unwrap_or_else(|e| panic!("announced clip {} is not a complete MCAP: {e}", path.display()))
+        .unwrap_or_else(|e| {
+            panic!(
+                "announced clip {} is not a complete MCAP: {e}",
+                path.display()
+            )
+        })
         .map(|msg| {
             let msg = msg.unwrap_or_else(|e| {
                 panic!("announced clip {} fails to parse: {e}", path.display())
