@@ -32,9 +32,13 @@ leading header stamp (such as `/tf`) are counted but not indexed.
 
 ## Prerequisites
 
-- **Nix** with flakes enabled. The dev shell provides ROS2 Jazzy via
+- **Nix** with flakes enabled. The dev shell provides ROS2 via
   [`nix-ros-overlay`](https://github.com/lopsided98/nix-ros-overlay) and pulls
-  prebuilt packages from `ros.cachix.org` (nixpkgs has no ROS2).
+  prebuilt packages from `ros.cachix.org` (nixpkgs has no ROS2). One distro per
+  shell, selected at the command line — `nix develop` is Jazzy (the default);
+  `nix develop .#humble`, `.#lyrical`, and `.#rolling` select the others. Every
+  `nix develop` and `cargo` command below works the same under any of them; pass
+  `.#<distro>` to pick one.
 - **System Rust** (`cargo`/`rustc` on your `PATH`). The flake intentionally does
   not provide a Rust toolchain.
 - **A data source** — the in-repo synthetic camera ([`sim/`](sim/README.md)),
@@ -275,6 +279,20 @@ dirs, so a recorder already running on the host's domain 0 is unaffected.
 Expect a few minutes of wall clock: the tests sleep out real trigger windows
 against a live recording.
 
+The suite is distro-agnostic — it builds only `edgestream-rec-cont` (r2r
+generates its bindings from `AMENT_PREFIX_PATH`) and drives the `ros2` CLI from
+the shell. Run it under any supported distro by selecting that distro's shell;
+give each distro its own target directory so the r2r build artifacts (which
+link that distro's `rcl`/`rmw`) don't collide:
+
+```bash
+for d in humble jazzy lyrical rolling; do
+  nix develop ".#$d" --command bash -c \
+    "CARGO_TARGET_DIR=target/e2e-$d EDGESTREAM_E2E=1 \
+     cargo nextest run -p edgestream-rec-cont --profile e2e -E 'binary(e2e)'"
+done
+```
+
 ## Deployment (Jetson / native build)
 
 The triggered recorder ships to an edge target — a Jetson running ROS2 Humble.
@@ -351,13 +369,18 @@ scripts/record-continuous.sh  # standalone `ros2 bag record`, one growing file (
 scripts/build-on-target.sh  # native target build (edgestream_msgs overlay + binaries)
 scripts/start_recorder.sh, start_demo_trigger_pub.sh  # run the deployed binaries natively
 scripts/prune-recordings/  # retention loop for the target
-flake.nix               # ROS2 Jazzy dev shell + nix-built binaries/images
+flake.nix               # per-distro ROS2 dev shells (humble/jazzy/lyrical/rolling) + nix-built binaries
 ```
 
 `rclrs-sub` depends on a fork of `ros2_rust` that adds a raw serialized
 subscription API (not yet available in any released rclrs) and corrects its type
 support handling. The fork is fetched over git during the build; the sibling
-checkout `../ros2_rust` is its working tree, needed only when changing it.
+checkout `../ros2_rust` is its working tree, needed only when changing it. It
+carries committed rcl bindings for `humble`, `jazzy`, `kilted`, and `rolling`,
+so `rclrs-sub` builds under those distros but not `lyrical` (no bindings
+committed yet) — `cargo build` it explicitly, or `cargo build --workspace` only
+under a distro it supports. The r2r-based crates (everything else, including the
+deployables and the e2e suite) build under every supported distro.
 
 ## For contributors and agents
 

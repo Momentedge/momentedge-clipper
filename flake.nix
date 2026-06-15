@@ -12,101 +12,153 @@
   # The aarch64 deployment closure additionally needs the @wentasah attic cache
   # (https://attic.iid.ciirc.cvut.cz/ros) — see nix/README.md.
   nixConfig = {
-    extra-substituters = [ "https://ros.cachix.org" ];
-    extra-trusted-public-keys = [ "ros.cachix.org-1:dSyZxI8geDCJrwgvCOHDoAfOm5sV1wCPjBkKL+38Rvo=" ];
+    extra-substituters = ["https://ros.cachix.org"];
+    extra-trusted-public-keys = ["ros.cachix.org-1:dSyZxI8geDCJrwgvCOHDoAfOm5sV1wCPjBkKL+38Rvo="];
   };
 
-  outputs = { nixpkgs, nix-ros-overlay, ... }:
-    nix-ros-overlay.inputs.flake-utils.lib.eachDefaultSystem (system:
-      let
-        pkgs = import nixpkgs {
-          inherit system;
-          overlays = [ nix-ros-overlay.overlays.default ];
-        };
-        # The single source of truth for the ROS2 distro the nix dev shell and
-        # nix-built binaries target. Drives the package set below and the
-        # ROS_DISTRO env (r2r's codegen is distro-agnostic, but rclrs's build.rs
-        # selects its committed rcl bindings by it). Switching distros is this
-        # line. The deployment target builds natively against its own apt ROS2
-        # (see README "Native build on the target"), independent of this.
-        rosDistro = "jazzy";
+  outputs = {
+    nixpkgs,
+    nix-ros-overlay,
+    ...
+  }:
+    nix-ros-overlay.inputs.flake-utils.lib.eachDefaultSystem (system: let
+      pkgs = import nixpkgs {
+        inherit system;
+        overlays = [nix-ros-overlay.overlays.default];
+      };
+      lib = pkgs.lib;
+
+      # The ROS2 distros this repo is built and tested against. nix-ros-overlay
+      # packages each one as `pkgs.rosPackages.<distro>`; everything below
+      # (dev shell, nix-built binaries, the recorder closure) is produced once
+      # per distro by `mkDistro`. Pick a distro at the command line:
+      #   nix develop .#humble        nix build .#edgestream-rec-rolling
+      # The overlay also ships `kilted`; add it here to build against it.
+      rosDistros = ["humble" "jazzy" "lyrical" "rolling"];
+
+      # The distro used when no selector is given — `nix develop` and the
+      # unsuffixed packages (`nix build .#edgestream-rec`). Jazzy is the LTS the
+      # bench is tuned on. The deployment target builds natively against its own
+      # apt ROS2 (Humble; see README "Native build on the target"), independent
+      # of this and of the nix-built outputs.
+      defaultDistro = "jazzy";
+
+      # r2r does no dependency resolution, so codegen must be handed every
+      # used message package explicitly. This single filter drives both the
+      # dev shell (system cargo) and the nix-built binaries, for every distro —
+      # keep it and nix/ros-env.nix's package list in step. The packages listed
+      # exist under all targeted distros, so one filter serves them all.
+      idlPackageFilter = "builtin_interfaces;std_msgs;sensor_msgs;geometry_msgs;nav_msgs;tf2_msgs;velodyne_msgs;rosgraph_msgs;action_msgs;unique_identifier_msgs;std_srvs;rosbag2_interfaces;edgestream_msgs";
+
+      # GStreamer plugin set the sim camera's gscam pipeline draws from
+      # (sim/cam_sim.sh). gscam's own closure carries only core +
+      # plugins-base (enough for videotestsrc and videoconvert); the rest
+      # cover encoders/parsers for manual gst-launch experimentation and any
+      # future pipeline element. Distro-independent, so built once.
+      gstPlugins = with pkgs.gst_all_1; [
+        gstreamer
+        gst-plugins-base
+        gst-plugins-good
+        gst-plugins-bad
+        gst-plugins-ugly
+        gst-libav
+      ];
+
+      # Everything anchored to one ROS2 distro. Package definitions live under
+      # ./nix; source paths are passed in from here so they stay anchored at the
+      # repo root. Flakes only see git-tracked files — a newly added file under
+      # nix/ or edgestream_msgs/ must be `git add`ed before the eval sees it.
+      mkDistro = rosDistro: let
         ros = pkgs.rosPackages.${rosDistro};
-
-        # r2r does no dependency resolution, so codegen must be handed every
-        # used message package explicitly. This single filter drives both the
-        # dev shell (system cargo) and the nix-built binaries — keep it and
-        # nix/ros-env.nix's package list in step.
-        idlPackageFilter =
-          "builtin_interfaces;std_msgs;sensor_msgs;geometry_msgs;nav_msgs;tf2_msgs;velodyne_msgs;rosgraph_msgs;action_msgs;unique_identifier_msgs;std_srvs;rosbag2_interfaces;edgestream_msgs";
-
-        # Package definitions live under ./nix; the source paths are passed in
-        # from here so they stay anchored at the repo root. Flakes only see
-        # git-tracked files — a newly added file under nix/ or edgestream_msgs/
-        # must be `git add`ed before the eval sees it.
         edgestream-msgs = import ./nix/edgestream-msgs.nix {
           inherit ros;
           src = ./edgestream_msgs;
         };
-        rosEnv = import ./nix/ros-env.nix { inherit ros edgestream-msgs; };
+        rosEnv = import ./nix/ros-env.nix {inherit ros edgestream-msgs;};
         binaries = import ./nix/binaries.nix {
           inherit pkgs rosEnv idlPackageFilter rosDistro;
           src = ./.;
           cargoLockFile = ./Cargo.lock;
         };
 
-        # GStreamer plugin set the sim camera's gscam pipeline draws from
-        # (sim/cam_sim.sh). gscam's own closure carries only core +
-        # plugins-base (enough for videotestsrc and videoconvert); the rest
-        # cover encoders/parsers for manual gst-launch experimentation and any
-        # future pipeline element.
-        gstPlugins = with pkgs.gst_all_1; [
-          gstreamer
-          gst-plugins-base
-          gst-plugins-good
-          gst-plugins-bad
-          gst-plugins-ugly
-          gst-libav
-        ];
-      in {
-        # rosEnv (the dev shell's ROS2 closure) and the two nix-built binaries
-        # are exposed mostly as build checks — `nix build .#edgestream-rec`
-        # compiles the deployable under nix without the system cargo. The target
-        # deploys native apt builds, not these (see README "Deployment").
-        packages = {
-          inherit rosEnv;
-          inherit (binaries) edgestream-rec edgestream-rec-cont trigger-pub;
-        };
-
-        devShells.default = pkgs.mkShell {
-          name = "ros2-rust-subscribe";
+        devShell = pkgs.mkShell {
+          name = "ros2-rust-subscribe-${rosDistro}";
           # Rust itself is intentionally NOT provided here — use the system
           # cargo/rustc (whatever is on PATH). The shell only supplies the ROS2
           # stack and the C toolchain r2r's build script needs.
-          packages = [
-            rosEnv
-            pkgs.clang        # r2r's build script invokes clang/bindgen
-            pkgs.pkg-config
-          ] ++ gstPlugins;    # the sim camera's GStreamer pipeline (sim/)
+          packages =
+            [
+              rosEnv
+              pkgs.clang # r2r's build script invokes clang/bindgen
+              pkgs.pkg-config
+            ]
+            ++ gstPlugins; # the sim camera's GStreamer pipeline (sim/)
 
           # bindgen (via r2r_common) needs to find libclang.
           LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
 
           # Restrict r2r codegen to just the bag's packages (shared with the
-          # nix-built binaries above). Keeps the first build fast.
+          # nix-built binaries below). Keeps the first build fast.
           IDL_PACKAGE_FILTER = idlPackageFilter;
 
-          # Match ../ros2_sources so discovery + SHM line up: same RMW, same domain.
-          # ROS_DISTRO is required by rclrs's build.rs (it selects the committed
-          # rcl bindings, e.g. rcl_bindings_generated_jazzy.rs, via a cfg flag and
-          # then aborts if unset); r2r does not need it but is unaffected.
+          # Match ../ros2_sources so discovery + SHM line up: same RMW, same
+          # domain. ROS_DISTRO is required by rclrs's build.rs (it selects the
+          # committed rcl bindings, e.g. rcl_bindings_generated_jazzy.rs, via a
+          # cfg flag and then aborts if unset); r2r does not need it but is
+          # unaffected.
           shellHook = ''
             export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
             export ROS_DOMAIN_ID=''${ROS_DOMAIN_ID:-0}
             export ROS_DISTRO=${rosDistro}
             # Let the GStreamer pipeline gscam spawns (sim/) find the plugins.
-            export GST_PLUGIN_SYSTEM_PATH_1_0="${pkgs.lib.makeSearchPathOutput "lib" "lib/gstreamer-1.0" gstPlugins}"
+            export GST_PLUGIN_SYSTEM_PATH_1_0="${lib.makeSearchPathOutput "lib" "lib/gstreamer-1.0" gstPlugins}"
             echo "ROS2 ${rosDistro} rust-subscribe shell — RMW=$RMW_IMPLEMENTATION  DOMAIN=$ROS_DOMAIN_ID  DISTRO=$ROS_DISTRO"
           '';
         };
-      });
+      in {
+        inherit rosEnv binaries devShell;
+      };
+
+      # One built attrset per distro, lazily — `nix develop .#humble` forces
+      # only humble's devShell, never the others.
+      distros = lib.genAttrs rosDistros mkDistro;
+
+      # Per-distro package outputs: rosEnv-<distro>, edgestream-rec-<distro>,
+      # edgestream-rec-cont-<distro>, trigger-pub-<distro>.
+      perDistroPackages =
+        lib.concatMapAttrs (distro: d: {
+          "rosEnv-${distro}" = d.rosEnv;
+          "edgestream-rec-${distro}" = d.binaries.edgestream-rec;
+          "edgestream-rec-cont-${distro}" = d.binaries.edgestream-rec-cont;
+          "trigger-pub-${distro}" = d.binaries.trigger-pub;
+        })
+        distros;
+
+      # Unsuffixed aliases for the default distro, so `nix build .#edgestream-rec`
+      # keeps working.
+      defaultPackages = {
+        rosEnv = distros.${defaultDistro}.rosEnv;
+        inherit
+          (distros.${defaultDistro}.binaries)
+          edgestream-rec
+          edgestream-rec-cont
+          trigger-pub
+          ;
+      };
+    in {
+      # rosEnv (the dev shell's ROS2 closure) and the nix-built binaries are
+      # exposed mostly as build checks — `nix build .#edgestream-rec-rolling`
+      # compiles the deployable under nix, against that distro, without the
+      # system cargo. The target deploys native apt builds, not these (see
+      # README "Deployment").
+      packages = perDistroPackages // defaultPackages;
+
+      # `nix develop .#<distro>` selects a distro; bare `nix develop` is the
+      # default (jazzy). Each shell pins ROS_DISTRO and the matching ROS2 closure.
+      devShells =
+        lib.mapAttrs (_distro: d: d.devShell) distros
+        // {
+          default = distros.${defaultDistro}.devShell;
+        };
+    });
 }

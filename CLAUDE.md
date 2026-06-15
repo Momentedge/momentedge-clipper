@@ -76,12 +76,28 @@ Setup is in the README; the parts that matter when changing the build:
   in particular `LLVM_COV`/`LLVM_PROFDATA` stay unset — they would override
   the sysroot tools with an LLVM whose major version then has to be kept
   **>= the system rustc's LLVM major** by hand.
+- **The flake targets one ROS2 distro per shell, chosen at the command line.**
+  `flake.nix` carries a `rosDistros` list (`humble`, `jazzy`, `lyrical`,
+  `rolling` — all packaged by `nix-ros-overlay`; `kilted` is available too) and a
+  `defaultDistro` (`jazzy`). A `mkDistro` function builds the whole per-distro
+  closure — `edgestream-msgs`, `rosEnv` ([`nix/ros-env.nix`](nix/ros-env.nix)),
+  the nix-built binaries, and the dev shell — once for each. So `nix develop`
+  (default) and `nix develop .#humble` / `.#lyrical` / `.#rolling` select the
+  distro; packages come both unsuffixed (default distro, e.g.
+  `nix build .#edgestream-rec`) and per-distro (`.#edgestream-rec-rolling`,
+  `.#rosEnv-humble`). The attrset is lazy: selecting one distro never forces the
+  others. Adding a distro is one entry in `rosDistros`.
 - The shellHook exports `RMW_IMPLEMENTATION=rmw_fastrtps_cpp`, `ROS_DOMAIN_ID=0`,
-  and `ROS_DISTRO=jazzy`.
+  and `ROS_DISTRO=<selected distro>` (the default shell is `jazzy`). The single
+  `IDL_PACKAGE_FILTER` and `nix/ros-env.nix` package list serve every distro
+  unchanged — every listed package exists under all of them.
 - The flake's message-package list serves **both** build models from one
   `AMENT_PREFIX_PATH`: r2r generates bindings at build time, gated by
   `IDL_PACKAGE_FILTER` + bindgen (`LIBCLANG_PATH`); rclrs uses pre-generated
-  bindings selected by `ROS_DISTRO` and needs neither. `example-interfaces` and
+  bindings selected by `ROS_DISTRO` and needs neither. This is why the r2r-based
+  crates (the deployables and the e2e suite) build under every distro, while
+  `rclrs-sub` builds only where its fork has committed bindings — `humble`,
+  `jazzy`, `kilted`, `rolling`, but not `lyrical`. `example-interfaces` and
   `test-msgs` are present only as an rclrs link requirement
   ([#557](https://github.com/ros2-rust/ros2_rust/issues/557)); the sim
   camera's stack (`ros-core`, `gscam`, the image_transport plugins,
