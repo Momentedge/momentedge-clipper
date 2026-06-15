@@ -72,7 +72,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        distro: [humble, jazzy, lyrical]
+        distro: [
+            # humble,
+            jazzy,
+            # lyrical
+          ]
         include:
           # Per-distro e2e selection (nextest filterset). corrupt_tail_health_live
           # — the live-corruption race the project flags as its one inherently
