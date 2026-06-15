@@ -36,15 +36,22 @@ leading header stamp (such as `/tf`) are counted but not indexed.
   [`nix-ros-overlay`](https://github.com/lopsided98/nix-ros-overlay) and pulls
   prebuilt packages from `ros.cachix.org` (nixpkgs has no ROS2). One distro per
   shell, selected at the command line — `nix develop` is Jazzy (the default);
-  `nix develop .#humble`, `.#lyrical`, and `.#rolling` select the others. Every
-  `nix develop` and `cargo` command below works the same under any of them; pass
-  `.#<distro>` to pick one.
+  `nix develop .#humble`, `.#lyrical`, and `.#rolling` select the others. The
+  `nix develop` and `cargo` commands below take a `.#<distro>` selector to pick
+  one. The recorder builds and the e2e suite pass fully on **humble** and
+  **jazzy**; **lyrical** builds and passes all but two recorder-restart tests;
+  **rolling** gets a working ROS2 shell but cannot yet build the Rust crates (an
+  `r2r` limitation — see "Integration tests" below).
 - **System Rust** (`cargo`/`rustc` on your `PATH`). The flake intentionally does
   not provide a Rust toolchain.
 - **A data source** — the in-repo synthetic camera ([`sim/`](sim/README.md)),
   which publishes a gscam test pattern raw + H.265, or the sibling repo
   `../ros2_sources`, which replays a bag of recorded sensor data onto live
-  ROS2 topics.
+  ROS2 topics. The sim camera rides in the Jazzy shell only; the overlay
+  packages its gscam/ffmpeg stack for Jazzy but not Humble, Lyrical, or Rolling,
+  whose shells carry the recorder/e2e core without it. Use `../ros2_sources`
+  replay as the data source under those distros. The recorder, the e2e suite,
+  and deployment never touch the sim camera, so they are unaffected.
 
 ## Quickstart
 
@@ -279,19 +286,31 @@ dirs, so a recorder already running on the host's domain 0 is unaffected.
 Expect a few minutes of wall clock: the tests sleep out real trigger windows
 against a live recording.
 
-The suite is distro-agnostic — it builds only `edgestream-rec-cont` (r2r
-generates its bindings from `AMENT_PREFIX_PATH`) and drives the `ros2` CLI from
-the shell. Run it under any supported distro by selecting that distro's shell;
-give each distro its own target directory so the r2r build artifacts (which
-link that distro's `rcl`/`rmw`) don't collide:
+The suite builds only `edgestream-rec-cont` and drives the `ros2` CLI from the
+shell, so it runs under any distro whose shell builds. Select the distro's shell
+and give each its own target directory, since the r2r build artifacts link that
+distro's `rcl`/`rmw` and must not collide:
 
 ```bash
-for d in humble jazzy lyrical rolling; do
+for d in humble jazzy lyrical; do
   nix develop ".#$d" --command bash -c \
     "CARGO_TARGET_DIR=target/e2e-$d EDGESTREAM_E2E=1 \
      cargo nextest run -p edgestream-rec-cont --profile e2e -E 'binary(e2e)'"
 done
 ```
+
+The suite passes 14/14 on **humble** and **jazzy**. **Lyrical** builds (the
+workspace pins [`r2r`](https://github.com/sequenceplanner/r2r) to its `0.9.6` git
+tag, which supports lyrical) and passes 12/14: two recorder-restart tests
+(`old_recording_on_disk_is_not_recovered_after_restart` and
+`corrupt_tail_health_live`) fail because lyrical's rosbag2 names bag files with a
+timestamp, breaking the test harness's stable-filename re-attach check — the
+recorder itself is unaffected (beads `ros2_subscribe-7ys`). **Rolling** selects
+and builds its ROS2 closure (`nix develop .#rolling` works) but cannot build the
+Rust crates: even r2r `0.9.6` references the `RMW_QOS_POLICY_LIVELINESS_MANUAL_BY_NODE`
+rmw enum variant that the current rolling has dropped (beads `ros2_subscribe-2xb`).
+The r2r pin returns to a crates.io release once `0.9.6` is published there (beads
+`ros2_subscribe-4rw`).
 
 ## Deployment (Jetson / native build)
 

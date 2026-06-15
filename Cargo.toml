@@ -19,7 +19,13 @@ edition = "2024"
 # Shared dependency versions; members inherit with `<crate>.workspace = true` and
 # keep their own role comment (and any crate-specific features) at the use site.
 [workspace.dependencies]
-r2r = "0.9.5"
+# Pinned to the 0.9.6 git tag rather than the 0.9.5 crates.io release: 0.9.6
+# adds `lyrical` to its supported-distro list and cfg-gates the
+# `RMW_QOS_POLICY_LIVELINESS_MANUAL_BY_NODE` rmw variant that lyrical dropped, so
+# the r2r crates build there. 0.9.6 is not yet on crates.io — swap back to a
+# version string once it is (beads ros2_subscribe-4rw). Rolling needs more than
+# 0.9.6 (beads ros2_subscribe-2xb).
+r2r = { git = "https://github.com/sequenceplanner/r2r.git", tag = "0.9.6" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "signal"] }
 futures = "0.3"
 crossbeam-channel = "0.5"

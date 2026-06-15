@@ -25,7 +25,12 @@ set -euo pipefail
 CONFIG="${1:-}"
 OUT_DIR="${2:-./record}"
 
-SELECT_ARGS=(--all-topics)
+# `--all` (not `--all-topics`) records every live topic on every supported
+# distro: Humble names this flag `-a`/`--all` and has no `--all-topics`, while
+# Jazzy and newer keep `--all` as a superset (topics + service-event topics, no
+# service events in this bench). The config-path flags below (`--topics`,
+# `--exclude-regex`, …) are Jazzy+ syntax used only by the Jazzy-only sim config.
+SELECT_ARGS=(--all)
 if [[ -n "$CONFIG" ]]; then
   [[ -f "$CONFIG" ]] || { echo "config not found: $CONFIG" >&2; exit 1; }
   selection="$(python3 - "$CONFIG" <<'EOF'
@@ -39,18 +44,28 @@ params = next(iter(doc.values()), {}).get("ros__parameters", {})
 rec = params.get("record", {})
 
 args = []
+selected = False
 if rec.get("all") or rec.get("all_topics"):
-    args.append("--all-topics")
+    args.append("--all")
+    selected = True
 if rec.get("topics"):
-    args += ["--topics", *rec["topics"]]
+    # An explicit topic list goes through --regex (anchored alternation), the
+    # only selection form ros2 bag record accepts on every supported distro:
+    # Humble has no --topics (positional only), Lyrical has no positional topics
+    # (--topics only), and --regex works on all of them.
+    import re
+    alt = "|".join(re.escape(t) for t in rec["topics"])
+    args += ["--regex", "^(" + alt + ")$"]
+    selected = True
 if rec.get("regex"):
     args += ["--regex", rec["regex"]]
+    selected = True
 if rec.get("exclude_regex"):
     args += ["--exclude-regex", rec["exclude_regex"]]
 if rec.get("exclude_topics"):
     args += ["--exclude-topics", *rec["exclude_topics"]]
 
-if not any(a in ("--all-topics", "--topics", "--regex") for a in args):
+if not selected:
     sys.exit("config selects no topics: set record.topics, record.regex "
              "or record.all_topics")
 print("\n".join(args))

@@ -297,7 +297,10 @@ impl TestEnv {
 
     /// Publish one `Trigger` and wait for the publication to complete.
     /// `-w 1` holds the publish until at least the extractor's subscription
-    /// is matched, closing the discovery race.
+    /// is matched, closing the discovery race; the wait is bounded by the
+    /// `wait_exit` timeout below rather than a CLI flag, since
+    /// `--max-wait-time-secs` is Jazzy+ syntax that Humble's `ros2 topic pub`
+    /// rejects.
     pub fn fire_trigger(&self, name: &str, trigger_ns: u64, preroll_ns: u64, postroll_ns: u64) {
         let sec = (trigger_ns / 1_000_000_000) as i64;
         let nanosec = trigger_ns % 1_000_000_000;
@@ -313,8 +316,6 @@ impl TestEnv {
             "--once",
             "-w",
             "1",
-            "--max-wait-time-secs",
-            "30",
             TRIGGER_TOPIC,
             "edgestream_msgs/msg/Trigger",
             &yaml,

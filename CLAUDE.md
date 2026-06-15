@@ -33,11 +33,22 @@ applies only to the first:
 
 `sim/` is the in-repo data source: a synthetic gscam camera (`videotestsrc` →
 raw + H.265 topics) driven by `sim/cam_sim.sh` (`run` / `record` / `stop`). It
-is a launch/config tree, not a Cargo crate. Its ROS packages (`ros-core`,
-`gscam`, the image_transport plugins, `rclcpp-components`) ride env-only in the
-shared `nix/ros-env.nix`, and the dev shell adds the GStreamer plugin set
-(`GST_PLUGIN_SYSTEM_PATH_1_0` exported by the shellHook). Overview and usage:
+is a launch/config tree, not a Cargo crate. Its ROS packages (`gscam`, the
+image_transport plugins, `ffmpeg-image-transport[-msgs]`, `rclcpp-components`)
+are the `simPaths` half of `nix/ros-env.nix`, gated by `withSim` and pulled into
+the closure only for the distros in the flake's `simDistros` list. The dev shell
+adds the GStreamer plugin set (`GST_PLUGIN_SYSTEM_PATH_1_0` exported by the
+shellHook) on those same distros. Overview and usage:
 [`sim/README.md`](sim/README.md); gotchas: [`sim/CLAUDE.md`](sim/CLAUDE.md).
+
+`simDistros` is `jazzy` only: the overlay packages gscam and
+`ffmpeg_image_transport` for Jazzy, but those derivations fail to configure
+under Humble, Lyrical, and Rolling (gscam misses `pkg-config`;
+`ffmpeg_image_transport[-msgs]` fails its rosidl build). The recorder, the e2e
+suite, and deployment use none of the sim stack, so the `corePaths` half — the
+recorder/CLI/rosbag2/message closure — builds and tests on every distro
+regardless. Extend `simDistros` when the overlay gains working sim packages for
+another distro.
 
 ## The shared recorder model
 
@@ -94,10 +105,21 @@ Setup is in the README; the parts that matter when changing the build:
 - The flake's message-package list serves **both** build models from one
   `AMENT_PREFIX_PATH`: r2r generates bindings at build time, gated by
   `IDL_PACKAGE_FILTER` + bindgen (`LIBCLANG_PATH`); rclrs uses pre-generated
-  bindings selected by `ROS_DISTRO` and needs neither. This is why the r2r-based
-  crates (the deployables and the e2e suite) build under every distro, while
-  `rclrs-sub` builds only where its fork has committed bindings — `humble`,
-  `jazzy`, `kilted`, `rolling`, but not `lyrical`. `example-interfaces` and
+  bindings selected by `ROS_DISTRO` and needs neither. r2r support gates which
+  distros the r2r-based crates (the deployables and the e2e suite) build under,
+  because r2r references the `RMW_QOS_POLICY_LIVELINESS_MANUAL_BY_NODE` rmw enum
+  variant that distros after jazzy have removed. The workspace pins r2r to its
+  `0.9.6` git tag (`Cargo.toml`), which adds `lyrical` and cfg-gates that variant
+  for it, so the crates build on `humble`, `jazzy`, and `lyrical` — but not
+  `rolling`, which r2r `0.9.6` still references the variant for (beads
+  `ros2_subscribe-2xb`); the pin returns to crates.io once `0.9.6` ships there
+  (beads `ros2_subscribe-4rw`). Independently, `rclrs-sub` builds only where its
+  fork has committed bindings — `humble`, `jazzy`, `kilted`, `rolling`, but not
+  `lyrical`. So the live e2e suite passes fully on `humble` and `jazzy`, and
+  12/14 on `lyrical` (two recorder-restart tests trip over lyrical's timestamped
+  rosbag2 bag filenames — a harness assumption, not a recorder bug, beads
+  `ros2_subscribe-7ys`); `rolling` still gets a working ROS2 shell for everything
+  but the Rust build. `example-interfaces` and
   `test-msgs` are present only as an rclrs link requirement
   ([#557](https://github.com/ros2-rust/ros2_rust/issues/557)); the sim
   camera's stack (`ros-core`, `gscam`, the image_transport plugins,

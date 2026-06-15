@@ -15,9 +15,11 @@ let
     version = "0.0.1";
     cargoLock = {
       lockFile = cargoLockFile;
-      # rclrs comes from a git fork used only by rclrs-sub, but the workspace
-      # lock references it so the vendor step needs its hash.
+      # Git-sourced workspace dependencies need their vendor hash here. rclrs is
+      # the fork used only by rclrs-sub; r2r is pinned to its 0.9.6 git tag (for
+      # lyrical support — see Cargo.toml) until 0.9.6 reaches crates.io.
       outputHashes."rclrs-0.7.0" = "sha256-8wg0Qyems0XlFLh4gFUHFSAc0xaXNWY4nB+PvM36fmw=";
+      outputHashes."r2r-0.9.6" = "sha256-1DQPrRQOYzxTckzyH0p6pnyEy1lOw/OmU0sDAMNzHpg=";
     };
     # Build only the deployable crate (not r2r-sub/rclrs-sub).
     cargoBuildFlags = [ "-p" pname ];

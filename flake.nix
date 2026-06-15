@@ -43,6 +43,15 @@
       # of this and of the nix-built outputs.
       defaultDistro = "jazzy";
 
+      # Distros whose dev shell carries the synthetic gscam camera (sim/). The
+      # overlay packages the sim stack (gscam, ffmpeg_image_transport) only for
+      # Jazzy; on Humble/Lyrical/Rolling those derivations fail to configure, so
+      # their shells ship the recorder/e2e core without it (nix/ros-env.nix
+      # `withSim`). The recorder, the e2e suite, and deployment use none of the
+      # sim packages, so this gates off cleanly. Extend this list as the overlay
+      # gains sim support for more distros.
+      simDistros = [ "jazzy" ];
+
       # r2r does no dependency resolution, so codegen must be handed every
       # used message package explicitly. This single filter drives both the
       # dev shell (system cargo) and the nix-built binaries, for every distro —
@@ -70,11 +79,12 @@
       # nix/ or edgestream_msgs/ must be `git add`ed before the eval sees it.
       mkDistro = rosDistro: let
         ros = pkgs.rosPackages.${rosDistro};
+        withSim = lib.elem rosDistro simDistros;
         edgestream-msgs = import ./nix/edgestream-msgs.nix {
           inherit ros;
           src = ./edgestream_msgs;
         };
-        rosEnv = import ./nix/ros-env.nix {inherit ros edgestream-msgs;};
+        rosEnv = import ./nix/ros-env.nix {inherit ros edgestream-msgs lib withSim;};
         binaries = import ./nix/binaries.nix {
           inherit pkgs rosEnv idlPackageFilter rosDistro;
           src = ./.;
@@ -92,7 +102,9 @@
               pkgs.clang # r2r's build script invokes clang/bindgen
               pkgs.pkg-config
             ]
-            ++ gstPlugins; # the sim camera's GStreamer pipeline (sim/)
+            # the sim camera's GStreamer pipeline (sim/) — only where the sim
+            # stack is in the closure (see simDistros).
+            ++ lib.optionals withSim gstPlugins;
 
           # bindgen (via r2r_common) needs to find libclang.
           LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
@@ -110,8 +122,10 @@
             export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
             export ROS_DOMAIN_ID=''${ROS_DOMAIN_ID:-0}
             export ROS_DISTRO=${rosDistro}
-            # Let the GStreamer pipeline gscam spawns (sim/) find the plugins.
-            export GST_PLUGIN_SYSTEM_PATH_1_0="${lib.makeSearchPathOutput "lib" "lib/gstreamer-1.0" gstPlugins}"
+            ${lib.optionalString withSim ''
+              # Let the GStreamer pipeline gscam spawns (sim/) find the plugins.
+              export GST_PLUGIN_SYSTEM_PATH_1_0="${lib.makeSearchPathOutput "lib" "lib/gstreamer-1.0" gstPlugins}"
+            ''}
             echo "ROS2 ${rosDistro} rust-subscribe shell — RMW=$RMW_IMPLEMENTATION  DOMAIN=$ROS_DOMAIN_ID  DISTRO=$ROS_DISTRO"
           '';
         };
