@@ -22,6 +22,6 @@ recorder:
     storage:
       storage_id: "mcap"
       # uri is set by the launch file (out:= argument).
-      # For 5 s splits compatible with this repo's edgestream-rec
-      # (WriteSplitEvent on /events/write_split at each boundary):
+      # For 5 s splits (rosbag2 publishes a WriteSplitEvent on
+      # /events/write_split at each boundary):
       # max_bagfile_duration: 5

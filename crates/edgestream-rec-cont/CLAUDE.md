@@ -1,12 +1,10 @@
 # edgestream-rec-cont
 
-A *triggered* clip recorder over **one continuous MCAP file** — the
-no-splits sibling of [`edgestream-rec`](../edgestream-rec/CLAUDE.md). Where
-that crate waits for rosbag2 split boundaries (`/events/write_split`) and reads
-closed split files, this one keeps the single growing recording open and
-**tails it**, so a clip can be cut as soon as the data is physically on disk:
-clip latency is bounded by the recorder's write-through latency, not a split
-duration. Built on [r2r](https://github.com/sequenceplanner/r2r) over plain OS threads — there is no async runtime.
+A *triggered* clip recorder over **one continuous MCAP file**. It keeps the
+single growing recording open and **tails it**, so a clip can be cut as soon as
+the data is physically on disk: clip latency is bounded by the recorder's
+write-through latency. Built on [r2r](https://github.com/sequenceplanner/r2r)
+over plain OS threads — there is no async runtime.
 
 ## The pipeline it sits in
 
@@ -121,9 +119,9 @@ and a trigger that arrives while all of them are is rejected — logged with
 
 1. **Wait out the postroll.** Sleep until the system clock passes
    `trigger_time + postroll`.
-2. **Wait for coverage.** Block on the coverage watch until a message with
-   `log_time` at/after the window end is on disk (or the recording ended).
-   This replaces `edgestream-rec`'s split rendezvous. A grace timeout
+2. **Wait for coverage.** Block on the coverage watch until the recording
+   covers the window end — a message with `log_time` at/after the window end is
+   on disk (or the recording ended). A grace timeout
    (`grace_secs`, default 30 s) bounds the wait; on timeout the clip is cut
    from what exists, with a warning. The grace must exceed the recorder's
    flush latency: near zero for the fastwrite profile, roughly one chunk fill
@@ -164,8 +162,8 @@ serialized bytes** (`write_to_known_channel`); CDR bodies are never decoded.
 Output channels are registered from the registry per source channel ID and
 cached; `mcap::Writer` deduplicates schemas/channels by content. The clip ends
 with `Writer::finish()`, which writes the summary section, footer and closing
-magic — every clip is a complete, standalone MCAP of the same form as
-`edgestream-rec`'s (`mcap::MessageStream` over a clip is the validity check the
+magic — every clip is a complete, standalone MCAP file
+(`mcap::MessageStream` over a clip is the validity check the
 unit tests use).
 
 **Two-staged atomic publication.** `extract_clip` composes two stages so the
@@ -216,9 +214,9 @@ into clips as-is — only a CDR decode downstream would notice.
 ## Time base
 
 `log_time`, the trigger stamp, and the wait clock are all nanoseconds on the
-system clock — this assumes the default (no `use_sim_time`), matching
-`edgestream-rec`. The `time_to_ns` / `sanitize` helpers are kept in step with
-that crate's identical copies.
+system clock — this assumes the default (no `use_sim_time`). `time_to_ns`
+flattens a `builtin_interfaces/Time` stamp to that scale (`sec * 1e9 +
+nanosec`).
 
 ## Topics and types
 
@@ -378,4 +376,4 @@ The TOML file is `edgestream-rec-cont.toml` in the working directory unless
 `$EDGESTREAM_CONFIG` names another path; a missing file is fine, so
 the binary runs with no setup. The keys (`record_dir`, `out_dir`,
 `grace_secs`, `extract_parallelism`) and their defaults are listed in the
-[README](../../README.md#continuous-single-file-variant).
+[README](../../README.md#configuration).

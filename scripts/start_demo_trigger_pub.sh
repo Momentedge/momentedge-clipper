@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Demo trigger publisher (trigger-pub) for the native Humble target — a stand-in
 # that publishes edgestream_msgs/Trigger on /events/edgestream/trigger ~1/s so
-# edgestream-rec produces clips. A real trigger source replaces it in production;
-# the recorder stack (start_recorder.sh) does not depend on it.
+# edgestream-rec-cont produces clips. A real trigger source replaces it in
+# production; the recorder (edgestream-rec-cont) does not depend on this demo
+# publisher.
 #
 # Runs in the foreground (Ctrl-C to stop). Extra args are forwarded; the
 # preroll/postroll windows are in nanoseconds, e.g. a 2 s / 3 s window:

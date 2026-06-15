@@ -4,11 +4,9 @@
 # cargo-llvm-cov output (README "Tests and coverage")
 /lcov.info
 
-# Continuous rosbag2 recordings (5 s splits for edgestream-rec, one growing
-# file for edgestream-rec-cont) and the clips the triggered recorders cut out
-# of them — all local runtime data.
+# Local rosbag2 recordings (5 s splits and one growing continuous file) and
+# the clips the recorder cuts out of them — runtime data, not source.
 /record/
-/triggered/
 /record-cont/
 /triggered-cont/
 

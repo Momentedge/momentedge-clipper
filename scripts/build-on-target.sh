@@ -15,8 +15,9 @@
 #
 # Produces, under the repo root:
 #   install/                  colcon overlay carrying edgestream_msgs typesupport
-#   target/release/edgestream-rec, target/release/trigger-pub
-# Both are consumed by start_recorder.sh and start_demo_trigger_pub.sh.
+#   target/release/edgestream-rec-cont, target/release/trigger-pub
+# trigger-pub is run by start_demo_trigger_pub.sh; edgestream-rec-cont is run
+# with scripts/record-continuous.sh per deployment.
 #
 # Override the ROS install with ROS_SETUP=/opt/ros/<distro>/setup.bash.
 set -euo pipefail
@@ -38,13 +39,15 @@ source install/setup.bash
 
 # 2. Build the two binaries. r2r regenerates its Rust bindings from the message
 #    IDL on AMENT_PREFIX_PATH at build time; restrict codegen to exactly the
-#    packages the deployables reference (r2r does no dependency resolution).
+#    packages the deployables reference — builtin_interfaces and edgestream_msgs
+#    (r2r does no dependency resolution).
 export LIBCLANG_PATH="${LIBCLANG_PATH:-$(llvm-config --libdir 2>/dev/null || echo /usr/lib/llvm-14/lib)}"
-export IDL_PACKAGE_FILTER="builtin_interfaces;rosbag2_interfaces;edgestream_msgs"
-cargo build --release -p edgestream-rec -p trigger-pub
+export IDL_PACKAGE_FILTER="builtin_interfaces;edgestream_msgs"
+cargo build --release -p edgestream-rec-cont -p trigger-pub
 
 echo
 echo "built:"
-echo "  $REPO_ROOT/target/release/edgestream-rec"
+echo "  $REPO_ROOT/target/release/edgestream-rec-cont"
 echo "  $REPO_ROOT/target/release/trigger-pub"
-echo "run with scripts/start_recorder.sh (+ scripts/start_demo_trigger_pub.sh)"
+echo "run the recorder: scripts/record-continuous.sh + target/release/edgestream-rec-cont"
+echo "run the demo trigger: scripts/start_demo_trigger_pub.sh"

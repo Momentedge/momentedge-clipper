@@ -1,9 +1,10 @@
 # The ROS2 closure for the whole repo, in two halves:
 #
 #   corePaths  what r2r builds and links against (dev shell + nix-built
-#              binaries) and what the live e2e suite drives — the recorder, the
-#              ros2 CLI, rosbag2 with the mcap backend, and the message packages
-#              the bag carries. Builds under every distro this repo targets.
+#              binaries) and what the live e2e suite drives — the triggered
+#              recorder, the ros2 CLI, rosbag2 with the mcap backend, and the
+#              message packages the bag carries. Builds under every distro this
+#              repo targets.
 #   simPaths   the synthetic gscam camera stack (sim/) — gscam, the
 #              image_transport plugins, the ffmpeg H.265 leg, and the component
 #              container. Pulled in only where `withSim` is set, because the
@@ -35,8 +36,9 @@ let
     ros2bag
     rosbag2-transport
     rosbag2-storage-mcap
-    # WriteSplitEvent on /events/write_split, published by rosbag2 each
-    # time it finalises a split; the extractor waits on it.
+    # rosbag2 publishes WriteSplitEvent on /events/write_split at each split
+    # boundary of scripts/record.sh's split recording; this package carries
+    # that type. Part of the rosbag2 stack.
     rosbag2-interfaces
     # message packages carried by the UGV bag (see ../ros2_sources/REPLAY.md)
     builtin-interfaces
@@ -52,12 +54,6 @@ let
     action-msgs
     unique-identifier-msgs
     std-srvs
-    # rclrs's vendored interfaces (rclrs/src/vendor) unconditionally link
-    # their typesupport C libs, so these must be on the link path even
-    # though no bag topic uses them — see ros2-rust/ros2_rust#557. r2r
-    # ignores them.
-    example-interfaces
-    test-msgs
     # local edgestream Trigger/Recorded interfaces
     edgestream-msgs
   ];

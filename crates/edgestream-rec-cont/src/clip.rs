@@ -118,8 +118,8 @@ impl Drop for StagedClip {
     }
 }
 
-/// Copy every message in `[start_ns, end_ns]` (inclusive bounds, matching the
-/// split-based recorder) from the planned extents into a clip published at
+/// Copy every message in `[start_ns, end_ns]` (inclusive bounds) from the
+/// planned extents into a clip published at
 /// `out_path` (or a `_<n>`-suffixed sibling if that name is taken — see
 /// [`link_into`]). This composes the two stages: [`stage_clip`] assembles and
 /// fsyncs the clip in the capturing directory, then [`publish_clip`] moves it

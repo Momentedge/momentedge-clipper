@@ -1,33 +1,23 @@
 # ros2_subscribe — contributor notes
 
 [README.md](README.md) is the canonical overview: what this testing pad is, the
-`r2r-sub` vs `rclrs-sub` comparison, the triggered-recording workflow,
-prerequisites, and the build/run/replay quickstart. Start there. This file covers
-what a contributor or agent needs *beyond* the README — the shared recorder
-internals, build mechanics, and conventions — without repeating it. Each crate
-has its own CLAUDE.md: [`r2r-sub`](crates/r2r-sub/CLAUDE.md),
-[`rclrs-sub`](crates/rclrs-sub/CLAUDE.md),
-[`edgestream-rec`](crates/edgestream-rec/CLAUDE.md),
+triggered-recording workflow, prerequisites, and the build/run/replay quickstart.
+Start there. This file covers what a contributor or agent needs *beyond* the
+README — build mechanics and conventions — without repeating it. Each crate has
+its own CLAUDE.md:
 [`edgestream-rec-cont`](crates/edgestream-rec-cont/CLAUDE.md),
 [`trigger-pub`](crates/trigger-pub/CLAUDE.md); the sim camera (`sim/`) has
 [`sim/CLAUDE.md`](sim/CLAUDE.md).
 
-## Two recorder families
+## The recorders
 
-The crates split into two unrelated models, and the "shared recorder model" below
-applies only to the first:
-
-- **All-topic indexers** — `r2r-sub` and `rclrs-sub`. Subscribe to every live
-  topic, take raw CDR, index by header stamp. The section below is about these.
-- **Triggered clip recorders** — `edgestream-rec` and `edgestream-rec-cont`
-  (+ `trigger-pub`). They own no sensor subscriptions and no message index;
-  they cut clips out of a continuous on-disk `ros2 bag record` on ROS2 trigger
-  events, copying MCAP messages straight through. `edgestream-rec` reads
-  closed 5 s bag splits, gated on `/events/write_split`;
-  `edgestream-rec-cont` tails one growing MCAP file and needs no split events.
-  Internals live in [`edgestream-rec`](crates/edgestream-rec/CLAUDE.md) and
-  [`edgestream-rec-cont`](crates/edgestream-rec-cont/CLAUDE.md); the only
-  shared idea is decoding nothing but the timestamp.
+`edgestream-rec-cont` is a triggered clip recorder, and `trigger-pub` is the
+periodic `Trigger` publisher that drives it. The recorder owns no sensor
+subscriptions and no message index; it cuts clips out of a continuous on-disk
+`ros2 bag record` on ROS2 trigger events, copying MCAP messages straight through.
+It tails one growing MCAP file, decoding nothing but each message's MCAP log
+time. Internals live in
+[`edgestream-rec-cont`](crates/edgestream-rec-cont/CLAUDE.md).
 
 ## The sim camera (`sim/`)
 
@@ -49,28 +39,6 @@ suite, and deployment use none of the sim stack, so the `corePaths` half — the
 recorder/CLI/rosbag2/message closure — builds and tests on every distro
 regardless. Extend `simDistros` when the overlay gains working sim packages for
 another distro.
-
-## The shared recorder model
-
-Both binaries do the same three things per message; these design choices are the
-point of the bench:
-
-1. **Take raw CDR, never decode the body.** A message arrives as a `Vec<u8>` of
-   serialized CDR.
-2. **Decode only the header stamp.** A 4-byte CDR encapsulation header precedes
-   the body; byte 1's low bit selects endianness. For a message whose first field
-   is a `std_msgs/Header` (or a bare `builtin_interfaces/Time`), `sec` (`i32`) is
-   at offset 4 and `nanosec` (`u32`) at offset 8. The index key is
-   `sec * 1e9 + nanosec`, nanoseconds since the Unix epoch. Both crates carry an
-   identical `cdr_header_stamp_ns` helper — keep them in step.
-3. **Index per topic, keyed by stamp.** A header-less message (e.g.
-   `tf2_msgs/TFMessage`, first field a sequence) fails the sanity gate
-   (`sec >= 0`, `nanosec < 1e9`) and is counted but not indexed.
-
-`rosbag2_interfaces` is on the env and the `IDL_PACKAGE_FILTER`, so the split
-event types have type support: the indexers subscribe to `/events/read_split`
-(replay) and `/events/write_split` (record) rather than skipping them. Both
-events are header-less, so like `/tf` they are counted but not indexed.
 
 ## Build and environment mechanics
 
@@ -95,39 +63,35 @@ Setup is in the README; the parts that matter when changing the build:
   the nix-built binaries, and the dev shell — once for each. So `nix develop`
   (default) and `nix develop .#humble` / `.#lyrical` / `.#rolling` select the
   distro; packages come both unsuffixed (default distro, e.g.
-  `nix build .#edgestream-rec`) and per-distro (`.#edgestream-rec-rolling`,
-  `.#rosEnv-humble`). The attrset is lazy: selecting one distro never forces the
-  others. Adding a distro is one entry in `rosDistros`.
+  `nix build .#edgestream-rec-cont`) and per-distro
+  (`.#edgestream-rec-cont-rolling`, `.#rosEnv-humble`). The attrset is lazy:
+  selecting one distro never forces the others. Adding a distro is one entry in
+  `rosDistros`.
 - The shellHook exports `RMW_IMPLEMENTATION=rmw_fastrtps_cpp`, `ROS_DOMAIN_ID=0`,
   and `ROS_DISTRO=<selected distro>` (the default shell is `jazzy`). The single
   `IDL_PACKAGE_FILTER` and `nix/ros-env.nix` package list serve every distro
   unchanged — every listed package exists under all of them.
-- The flake's message-package list serves **both** build models from one
-  `AMENT_PREFIX_PATH`: r2r generates bindings at build time, gated by
-  `IDL_PACKAGE_FILTER` + bindgen (`LIBCLANG_PATH`); rclrs uses pre-generated
-  bindings selected by `ROS_DISTRO` and needs neither. r2r support gates which
-  distros the r2r-based crates (the deployables and the e2e suite) build under,
-  because r2r references the `RMW_QOS_POLICY_LIVELINESS_MANUAL_BY_NODE` rmw enum
-  variant that distros after jazzy have removed. The workspace pins r2r to its
-  `0.9.6` git tag (`Cargo.toml`), which adds `lyrical` and cfg-gates that variant
-  for it, so the crates build on `humble`, `jazzy`, and `lyrical` — but not
-  `rolling`, which r2r `0.9.6` still references the variant for (beads
-  `ros2_subscribe-2xb`); the pin returns to crates.io once `0.9.6` ships there
-  (beads `ros2_subscribe-4rw`). Independently, `rclrs-sub` builds only where its
-  fork has committed bindings — `humble`, `jazzy`, `kilted`, `rolling`, but not
-  `lyrical`. So the live e2e suite passes fully on `humble` and `jazzy`, and
-  12/14 on `lyrical` (two recorder-restart tests trip over lyrical's timestamped
-  rosbag2 bag filenames — a harness assumption, not a recorder bug, beads
+- The crates use a single build model: r2r generates bindings at build time from
+  the `AMENT_PREFIX_PATH`, gated by `IDL_PACKAGE_FILTER` + bindgen
+  (`LIBCLANG_PATH`). `IDL_PACKAGE_FILTER` is `builtin_interfaces;edgestream_msgs`
+  — the only packages the crates decode via r2r. r2r support gates which distros
+  the crates (the deployables and the e2e suite) build under, because r2r
+  references the `RMW_QOS_POLICY_LIVELINESS_MANUAL_BY_NODE` rmw enum variant that
+  distros after jazzy have removed. The workspace pins r2r to its `0.9.6` git tag
+  (`Cargo.toml`), which adds `lyrical` and cfg-gates that variant for it, so the
+  crates build on `humble`, `jazzy`, and `lyrical` — but not `rolling`, which
+  r2r `0.9.6` still references the variant for (beads `ros2_subscribe-2xb`); the
+  pin returns to crates.io once `0.9.6` ships there (beads `ros2_subscribe-4rw`).
+  So the live e2e suite passes fully on `humble` and `jazzy`, and 12/14 on
+  `lyrical` (two recorder-restart tests trip over lyrical's timestamped rosbag2
+  bag filenames — a harness assumption, not a recorder bug, beads
   `ros2_subscribe-7ys`); `rolling` still gets a working ROS2 shell for everything
-  but the Rust build. `example-interfaces` and
-  `test-msgs` are present only as an rclrs link requirement
-  ([#557](https://github.com/ros2-rust/ros2_rust/issues/557)); the sim
-  camera's stack (`ros-core`, `gscam`, the image_transport plugins,
-  `rclcpp-components`) serves only `sim/`, with `ffmpeg-image-transport-msgs`
-  doubling as the type support `ros2 bag record` needs to capture the H.265
-  topic (`config/cam_sim.yaml`). Env-only packages like these stay out of
-  `IDL_PACKAGE_FILTER` — no Rust crate decodes them. Each crate's CLAUDE.md has
-  the details.
+  but the Rust build. The sim camera's stack (`ros-core`, `gscam`, the
+  image_transport plugins, `rclcpp-components`) serves only `sim/`, with
+  `ffmpeg-image-transport-msgs` doubling as the type support `ros2 bag record`
+  needs to capture the H.265 topic (`config/cam_sim.yaml`). Env-only packages
+  like these stay out of `IDL_PACKAGE_FILTER` — no Rust crate decodes them. Each
+  crate's CLAUDE.md has the details.
 - `edgestream_msgs/` is a **local ament_cmake interface package** built by the
   flake via `ros.buildRosPackage` (mirroring upstream `example-interfaces`) and
   added to both the env and `IDL_PACKAGE_FILTER`, so its `Trigger`/`Recorded`
@@ -136,22 +100,25 @@ Setup is in the README; the parts that matter when changing the build:
   be `git add`ed before `nix develop`/`cargo build`, or the eval fails with "Path
   … is not tracked by Git".
 - `ros2bag` + `rosbag2-transport` + `rosbag2-storage-mcap` provide the standalone
-  `ros2 bag record` (`scripts/record.sh`) the triggered recorder reads from;
-  `rosbag2-interfaces` provides `WriteSplitEvent` on `/events/write_split`.
+  `ros2 bag record`. `scripts/record-continuous.sh` runs it as the one growing
+  MCAP file `edgestream-rec-cont` tails; `scripts/record.sh` is the general
+  standalone recorder (also used for the sim camera). rosbag2 publishes
+  `WriteSplitEvent` on `/events/write_split` when a bag splits, but the recorder
+  tails a continuous file and consumes no split events.
 
 ## Deployment build model
 
 The nix flake above is for **development** (the dev shell, and `nix build
-.#edgestream-rec`/`trigger-pub` as build checks). **Deployment is a native build
-on the target**, not nix or Docker — see README "Deployment". The reasoning that
-shapes it:
+.#edgestream-rec-cont`/`trigger-pub` as build checks). **Deployment is a native
+build on the target**, not nix or Docker — see README "Deployment". The reasoning
+that shapes it:
 
 - The edge target runs a full ROS2 install (Humble) of the **same distro** the
-  recorder is built against, so `rosbag2` (MCAP storage + `WriteSplitEvent`),
-  `rcl`, `rmw_fastrtps_cpp`, and the standard message packages all come from the
-  host. Only `edgestream-rec` + `trigger-pub` (which link just `rcl`/`rmw` + the
-  `builtin_interfaces`/`rosbag2_interfaces`/`edgestream_msgs` types) and the
-  `edgestream_msgs` overlay are built — `scripts/build-on-target.sh` does both.
+  recorder is built against, so `rosbag2` (MCAP storage), `rcl`,
+  `rmw_fastrtps_cpp`, and the standard message packages all come from the host.
+  Only `edgestream-rec-cont` + `trigger-pub` (which link just `rcl`/`rmw` + the
+  `builtin_interfaces`/`edgestream_msgs` types) and the `edgestream_msgs` overlay
+  are built — `scripts/build-on-target.sh` does both.
 - They are built **against the host's own ROS2 libraries** for ABI compatibility:
   a nix-built binary bakes `/nix/store` RPATHs and would load the nix closure
   rather than the host's ROS, defeating the point. So the build runs on the
@@ -166,17 +133,14 @@ shapes it:
 A virtual workspace (no root package), so `resolver = "3"` (the edition-2024
 resolver) is set explicitly — a virtual workspace does not infer the resolver
 from member editions and otherwise falls back to `"1"` with a warning. Members
-are the five crates (`r2r-sub`, `rclrs-sub`, `edgestream-rec`,
-`edgestream-rec-cont`, `trigger-pub`);
-shared metadata is in `[workspace.package]`. `edgestream_msgs/` (ROS2 interface
-package) and `sim/` (the sim camera's launch/config tree) are not Cargo members.
+are the two crates (`edgestream-rec-cont`, `trigger-pub`); shared metadata is in
+`[workspace.package]`. `edgestream_msgs/` (ROS2 interface package) and `sim/`
+(the sim camera's launch/config tree) are not Cargo members.
 
 ## Sibling repositories
 
-- `../ros2_sources` — the bag replay that feeds the recorders (README has the
+- `../ros2_sources` — the bag replay that feeds the recorder (README has the
   workflow).
-- `../ros2_rust` — the working tree of the rclrs fork `rclrs-sub` depends on;
-  relevant only when changing that fork (see [`rclrs-sub`](crates/rclrs-sub/CLAUDE.md)).
 
 ## Keeping docs in sync
 

@@ -1,9 +1,10 @@
 # trigger-pub
 
 A development stand-in that publishes `edgestream_msgs/Trigger` on
-`/events/edgestream/trigger` at a fixed interval, so `edgestream-rec` has
-something to react to without a real trigger source. Built on
-[r2r](https://github.com/sequenceplanner/r2r); no async runtime.
+`/events/edgestream/trigger` at a fixed interval, so the triggered recorder
+(`edgestream-rec-cont`) has something to react to without a real trigger
+source. Built on [r2r](https://github.com/sequenceplanner/r2r); no async
+runtime.
 
 ## Behaviour
 
@@ -20,8 +21,8 @@ and post independently, so the recorder sees varied clip lengths. Passing either
 flag pins that side to a fixed nanosecond value instead.
 
 `trigger_time` being the publish-time stamp is the point: it is the "original
-timestamp" the recorder centres its `[t-preroll, t+postroll]` window on, the same
-idea as the other recorders keying off a message's own stamp.
+timestamp" the recorder centres its `[t-preroll, t+postroll]` window on, rather
+than the trigger's arrival time.
 
 Flags: `--period <secs>`, `--preroll <ns>`, `--postroll <ns>`, `--name <prefix>`,
 `--description <text>` (all optional; see the module doc for defaults and the
@@ -29,9 +30,9 @@ random-roll behaviour).
 
 ## Build
 
-Pure r2r: the build generates bindings for `edgestream_msgs` (and the rest of the
-`IDL_PACKAGE_FILTER` set) at `cargo build`, exactly like `r2r-sub`. Needs the
-flake's `LIBCLANG_PATH`; does not need `ROS_DISTRO`.
+Pure r2r: the build generates r2r bindings for `edgestream_msgs` (and the rest
+of the `IDL_PACKAGE_FILTER` set) at `cargo build`, gated by `IDL_PACKAGE_FILTER`.
+Needs the flake's `LIBCLANG_PATH`; does not need `ROS_DISTRO`.
 
 ## Run
 
@@ -39,5 +40,6 @@ flake's `LIBCLANG_PATH`; does not need `ROS_DISTRO`.
 nix develop --command cargo run -p trigger-pub -- --period 5 --preroll 2000000000 --postroll 2000000000
 ```
 
-Pair with a running `edgestream-rec` and `scripts/record.sh`. Logging uses the
-`log` facade with a `pretty_env_logger` backend; `RUST_LOG` controls verbosity.
+Pair with a running `edgestream-rec-cont` and `scripts/record-continuous.sh`.
+Logging uses the `log` facade with a `pretty_env_logger` backend; `RUST_LOG`
+controls verbosity.

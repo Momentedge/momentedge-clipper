@@ -1,11 +1,11 @@
 //! Periodic `/events/edgestream/trigger` publisher.
 //!
 //! Emits an `edgestream_msgs/Trigger` every `--period` seconds (5 s by default)
-//! so the triggered recorder (`edgestream-rec`) has something to react to during
+//! so the triggered recorder (`edgestream-rec-cont`) has something to react to during
 //! development. Each trigger's `trigger_time` is stamped with the current
 //! RosTime at publish — the "original timestamp" the pre/post-roll window is cut
-//! around — mirroring how the other recorders in this workspace key off a
-//! message's own stamp rather than its arrival time.
+//! around, the stamp the recorder centres its window on rather than the
+//! trigger's arrival time.
 //!
 //! Flags (all optional):
 //!   --period <secs>       seconds between triggers          (default 1)

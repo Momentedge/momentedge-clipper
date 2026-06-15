@@ -614,15 +614,14 @@ fn now_ns() -> u64 {
         .unwrap_or(0)
 }
 
-/// Flatten a `builtin_interfaces/Time` to nanoseconds since the epoch.
-/// Keep in step with the identical helper in `edgestream-rec`.
+/// Flatten a `builtin_interfaces/Time` to nanoseconds since the epoch on the
+/// system clock (no `use_sim_time`).
 fn time_to_ns(t: &r2r::builtin_interfaces::msg::Time) -> u64 {
     t.sec.max(0) as u64 * 1_000_000_000 + t.nanosec as u64
 }
 
 /// Make a trigger name safe to embed in a filename: keep alphanumerics, `-`,
-/// `_` and `.`; everything else (notably `/`) becomes `_`. Keep in step with
-/// the identical helper in `edgestream-rec`.
+/// `_` and `.`; everything else (notably `/`) becomes `_`.
 fn sanitize(name: &str) -> String {
     let s: String = name
         .chars()

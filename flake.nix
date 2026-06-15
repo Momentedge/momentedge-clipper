@@ -32,12 +32,12 @@
       # packages each one as `pkgs.rosPackages.<distro>`; everything below
       # (dev shell, nix-built binaries, the recorder closure) is produced once
       # per distro by `mkDistro`. Pick a distro at the command line:
-      #   nix develop .#humble        nix build .#edgestream-rec-rolling
+      #   nix develop .#humble        nix build .#edgestream-rec-cont-rolling
       # The overlay also ships `kilted`; add it here to build against it.
       rosDistros = ["humble" "jazzy" "lyrical" "rolling"];
 
       # The distro used when no selector is given — `nix develop` and the
-      # unsuffixed packages (`nix build .#edgestream-rec`). Jazzy is the LTS the
+      # unsuffixed packages (`nix build .#edgestream-rec-cont`). Jazzy is the LTS the
       # bench is tuned on. The deployment target builds natively against its own
       # apt ROS2 (Humble; see README "Native build on the target"), independent
       # of this and of the nix-built outputs.
@@ -53,11 +53,13 @@
       simDistros = [ "jazzy" ];
 
       # r2r does no dependency resolution, so codegen must be handed every
-      # used message package explicitly. This single filter drives both the
-      # dev shell (system cargo) and the nix-built binaries, for every distro —
-      # keep it and nix/ros-env.nix's package list in step. The packages listed
-      # exist under all targeted distros, so one filter serves them all.
-      idlPackageFilter = "builtin_interfaces;std_msgs;sensor_msgs;geometry_msgs;nav_msgs;tf2_msgs;velodyne_msgs;rosgraph_msgs;action_msgs;unique_identifier_msgs;std_srvs;rosbag2_interfaces;edgestream_msgs";
+      # used message package explicitly. This filter covers the two packages
+      # the kept crates decode: edgestream_msgs (Trigger/Recorded) and its
+      # builtin_interfaces dependency (Time). It drives both the dev shell
+      # (system cargo) and the nix-built binaries, for every distro. The
+      # packages listed exist under all targeted distros, so one filter serves
+      # them all.
+      idlPackageFilter = "builtin_interfaces;edgestream_msgs";
 
       # GStreamer plugin set the sim camera's gscam pipeline draws from
       # (sim/cam_sim.sh). gscam's own closure carries only core +
@@ -114,10 +116,8 @@
           IDL_PACKAGE_FILTER = idlPackageFilter;
 
           # Match ../ros2_sources so discovery + SHM line up: same RMW, same
-          # domain. ROS_DISTRO is required by rclrs's build.rs (it selects the
-          # committed rcl bindings, e.g. rcl_bindings_generated_jazzy.rs, via a
-          # cfg flag and then aborts if unset); r2r does not need it but is
-          # unaffected.
+          # domain. ROS_DISTRO is the standard ROS variable exported alongside
+          # them; r2r does not need it but is unaffected.
           shellHook = ''
             export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
             export ROS_DOMAIN_ID=''${ROS_DOMAIN_ID:-0}
@@ -137,31 +137,29 @@
       # only humble's devShell, never the others.
       distros = lib.genAttrs rosDistros mkDistro;
 
-      # Per-distro package outputs: rosEnv-<distro>, edgestream-rec-<distro>,
+      # Per-distro package outputs: rosEnv-<distro>,
       # edgestream-rec-cont-<distro>, trigger-pub-<distro>.
       perDistroPackages =
         lib.concatMapAttrs (distro: d: {
           "rosEnv-${distro}" = d.rosEnv;
-          "edgestream-rec-${distro}" = d.binaries.edgestream-rec;
           "edgestream-rec-cont-${distro}" = d.binaries.edgestream-rec-cont;
           "trigger-pub-${distro}" = d.binaries.trigger-pub;
         })
         distros;
 
-      # Unsuffixed aliases for the default distro, so `nix build .#edgestream-rec`
-      # keeps working.
+      # Unsuffixed aliases for the default distro, so
+      # `nix build .#edgestream-rec-cont` keeps working.
       defaultPackages = {
         rosEnv = distros.${defaultDistro}.rosEnv;
         inherit
           (distros.${defaultDistro}.binaries)
-          edgestream-rec
           edgestream-rec-cont
           trigger-pub
           ;
       };
     in {
       # rosEnv (the dev shell's ROS2 closure) and the nix-built binaries are
-      # exposed mostly as build checks — `nix build .#edgestream-rec-rolling`
+      # exposed mostly as build checks — `nix build .#edgestream-rec-cont-rolling`
       # compiles the deployable under nix, against that distro, without the
       # system cargo. The target deploys native apt builds, not these (see
       # README "Deployment").

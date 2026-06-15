@@ -1,17 +1,15 @@
 #!/usr/bin/env bash
-# Continuous rosbag2 recorder feeding the triggered extractor (edgestream-rec).
-#
-# Records into 5-second MCAP splits under ./record. Each split boundary makes
-# rosbag2 publish a rosbag2_interfaces/WriteSplitEvent on /events/write_split,
-# which edgestream-rec waits on before cutting a clip.
+# Standalone ros2 bag record writing 5-second MCAP splits under ./record. Each
+# split boundary makes rosbag2 publish a rosbag2_interfaces/WriteSplitEvent on
+# /events/write_split. General-purpose recorder — used for the sim camera
+# (config/cam_sim.yaml) and any other recording that benefits from fixed-size
+# splits.
 #
 # Topic selection comes from an optional rosbag2 recorder-parameters YAML — the
 # rosbag2_transport Recorder node schema, the same file a composable Recorder
 # node accepts (see config/cam_sim.yaml). Only the record.* topic-selection keys
 # are read: topics, all/all_topics, regex, exclude_regex, exclude_topics.
-# Storage settings (mcap, 5 s splits, output dir) stay fixed here because
-# edgestream-rec depends on them. Without a config, every live topic is
-# recorded.
+# Without a config, every live topic is recorded.
 #
 # rosbag2 refuses to record into an existing bag directory, so OUT_DIR is wiped
 # on start. ./record is gitignored. There is no automatic retention — the splits

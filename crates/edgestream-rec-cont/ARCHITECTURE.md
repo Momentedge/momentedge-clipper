@@ -2,7 +2,7 @@
 
 For the business rationale and value proposition see [OVERVIEW.md](OVERVIEW.md).
 For the user-facing quickstart, configuration reference, and pipeline setup see
-[README § Continuous single-file variant](../../README.md#continuous-single-file-variant).
+[README § Triggered recording](../../README.md#triggered-recording).
 For deep implementation rationale and concurrency invariants see [CLAUDE.md](CLAUDE.md).
 
 ## Module map
