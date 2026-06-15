@@ -43,16 +43,19 @@
       # of this and of the nix-built outputs.
       defaultDistro = "jazzy";
 
-      # Distros whose dev shell carries the synthetic gscam camera (sim/). Jazzy
-      # builds the sim stack (gscam, ffmpeg_image_transport) from source as
-      # packaged; Humble builds it via the `simOverlays` packaging fix below.
-      # Lyrical/Rolling are still out — ffmpeg-image-transport-msgs fails its
-      # rosidl build there (beads ros2_subscribe-lyx), so their shells ship the
-      # recorder/e2e core without sim (nix/ros-env.nix `withSim`). The recorder,
-      # the e2e suite, and deployment use none of the sim packages, so this
-      # gates off cleanly. Extend this list (and `simOverlays` if the distro
-      # needs the fix) as the overlay gains sim support for more distros.
-      simDistros = [ "jazzy" "humble" ];
+      # Distros whose dev shell carries the synthetic gscam camera (sim/). Jazzy,
+      # Lyrical, and Rolling build the sim stack (gscam, ffmpeg_image_transport,
+      # ffmpeg_image_transport_msgs) from source as packaged — all ament-2.x, so
+      # pkg-config is on the build PATH. Humble builds it via the `simOverlays`
+      # packaging fix below (its older ament-1.x closure omits pkg-config).
+      # Rolling's sim shell is camera-only: its recorder Rust crates don't build
+      # (r2r references an rmw QoS variant rolling removed, beads
+      # ros2_subscribe-2xb), but the sim stack is env-only and unaffected. The
+      # recorder, the e2e suite, and deployment use none of the sim packages, so
+      # a distro left off this list still gets the full recorder/e2e core
+      # (nix/ros-env.nix `withSim`). Add a distro here (and a `simOverlays` entry
+      # only if its closure needs the pkg-config fix) to put sim in its shell.
+      simDistros = [ "jazzy" "humble" "lyrical" "rolling" ];
 
       # Distro-specific overlays correcting upstream sim-stack packaging.
       # nix-ros-overlay's gscam and ffmpeg_image_transport omit pkg-config from

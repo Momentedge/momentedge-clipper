@@ -31,19 +31,21 @@ adds the GStreamer plugin set (`GST_PLUGIN_SYSTEM_PATH_1_0` exported by the
 shellHook) on those same distros. Overview and usage:
 [`sim/README.md`](sim/README.md); gotchas: [`sim/CLAUDE.md`](sim/CLAUDE.md).
 
-`simDistros` is `jazzy` and `humble`. Jazzy builds the sim stack (gscam,
-`ffmpeg_image_transport`) from source as packaged; Humble needs a packaging fix,
-carried by `simOverlays` in `flake.nix`. Humble's older ament closure leaves
-`pkg-config` off the build `PATH`, so the overlay adds `pkg-config` to the
-`nativeBuildInputs` of `gscam` and `ffmpeg_image_transport`, plus a
-`-DFFMPEG_PKGCONFIG=…` flag on the latter (its `ffmpeg_encoder_decoder`
-dependency exports an extras.cmake that clobbers `PKG_CONFIG_PATH`). Lyrical and
-Rolling stay out: their `ffmpeg_image_transport_msgs` fails its rosidl build
-(beads `ros2_subscribe-lyx`). The recorder, the e2e suite, and deployment use
-none of the sim stack, so the `corePaths` half — the
-recorder/CLI/rosbag2/message closure — builds and tests on every distro
-regardless. Extend `simDistros` (and `simOverlays`, if the distro needs the fix)
-when the overlay gains working sim packages for another distro.
+`simDistros` is `jazzy`, `humble`, `lyrical`, and `rolling`. Jazzy, Lyrical, and
+Rolling build the sim stack (gscam, `ffmpeg_image_transport`,
+`ffmpeg_image_transport_msgs`) from source as packaged — all ament-2.x, with
+`pkg-config` on the build `PATH`. Humble needs a packaging fix, carried by
+`simOverlays` in `flake.nix`: its older ament-1.x closure leaves `pkg-config`
+off the build `PATH`, so the overlay adds `pkg-config` to the `nativeBuildInputs`
+of `gscam` and `ffmpeg_image_transport`, plus a `-DFFMPEG_PKGCONFIG=…` flag on
+the latter (its `ffmpeg_encoder_decoder` dependency exports an extras.cmake that
+clobbers `PKG_CONFIG_PATH`). Rolling's sim shell is camera-only: its recorder
+crates don't build (r2r references an rmw QoS variant rolling removed, beads
+`ros2_subscribe-2xb`), but the sim stack is env-only and unaffected. The
+recorder, the e2e suite, and deployment use none of the sim stack, so the
+`corePaths` half — the recorder/CLI/rosbag2/message closure — builds and tests on
+every distro regardless. Extend `simDistros` (and `simOverlays`, only if the
+distro's closure needs the pkg-config fix) to put sim in another distro's shell.
 
 ## Build and environment mechanics
 
