@@ -31,14 +31,19 @@ adds the GStreamer plugin set (`GST_PLUGIN_SYSTEM_PATH_1_0` exported by the
 shellHook) on those same distros. Overview and usage:
 [`sim/README.md`](sim/README.md); gotchas: [`sim/CLAUDE.md`](sim/CLAUDE.md).
 
-`simDistros` is `jazzy` only: the overlay packages gscam and
-`ffmpeg_image_transport` for Jazzy, but those derivations fail to configure
-under Humble, Lyrical, and Rolling (gscam misses `pkg-config`;
-`ffmpeg_image_transport[-msgs]` fails its rosidl build). The recorder, the e2e
-suite, and deployment use none of the sim stack, so the `corePaths` half — the
+`simDistros` is `jazzy` and `humble`. Jazzy builds the sim stack (gscam,
+`ffmpeg_image_transport`) from source as packaged; Humble needs a packaging fix,
+carried by `simOverlays` in `flake.nix`. Humble's older ament closure leaves
+`pkg-config` off the build `PATH`, so the overlay adds `pkg-config` to the
+`nativeBuildInputs` of `gscam` and `ffmpeg_image_transport`, plus a
+`-DFFMPEG_PKGCONFIG=…` flag on the latter (its `ffmpeg_encoder_decoder`
+dependency exports an extras.cmake that clobbers `PKG_CONFIG_PATH`). Lyrical and
+Rolling stay out: their `ffmpeg_image_transport_msgs` fails its rosidl build
+(beads `ros2_subscribe-lyx`). The recorder, the e2e suite, and deployment use
+none of the sim stack, so the `corePaths` half — the
 recorder/CLI/rosbag2/message closure — builds and tests on every distro
-regardless. Extend `simDistros` when the overlay gains working sim packages for
-another distro.
+regardless. Extend `simDistros` (and `simOverlays`, if the distro needs the fix)
+when the overlay gains working sim packages for another distro.
 
 ## Build and environment mechanics
 

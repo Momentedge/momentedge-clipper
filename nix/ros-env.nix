@@ -7,11 +7,12 @@
 #              repo targets.
 #   simPaths   the synthetic gscam camera stack (sim/) — gscam, the
 #              image_transport plugins, the ffmpeg H.265 leg, and the component
-#              container. Pulled in only where `withSim` is set, because the
-#              overlay packages these for Jazzy but not for Humble, Lyrical, or
-#              Rolling (gscam and ffmpeg_image_transport fail to configure
-#              there). The recorder, the e2e suite, and deployment use none of
-#              it, so gating it off elsewhere costs the bench nothing.
+#              container. Pulled in only where `withSim` is set: Jazzy and
+#              Humble (Humble through the `simOverlays` packaging fix in
+#              flake.nix). Lyrical and Rolling are excluded —
+#              ffmpeg_image_transport_msgs fails its rosidl build there. The
+#              recorder, the e2e suite, and deployment use none of it, so gating
+#              it off elsewhere costs the bench nothing.
 #
 # r2r generates Rust bindings (at build time) for every message package on
 # AMENT_PREFIX_PATH; the IDL_PACKAGE_FILTER in flake.nix restricts codegen to

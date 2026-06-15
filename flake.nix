@@ -43,14 +43,38 @@
       # of this and of the nix-built outputs.
       defaultDistro = "jazzy";
 
-      # Distros whose dev shell carries the synthetic gscam camera (sim/). The
-      # overlay packages the sim stack (gscam, ffmpeg_image_transport) only for
-      # Jazzy; on Humble/Lyrical/Rolling those derivations fail to configure, so
-      # their shells ship the recorder/e2e core without it (nix/ros-env.nix
-      # `withSim`). The recorder, the e2e suite, and deployment use none of the
-      # sim packages, so this gates off cleanly. Extend this list as the overlay
-      # gains sim support for more distros.
-      simDistros = [ "jazzy" ];
+      # Distros whose dev shell carries the synthetic gscam camera (sim/). Jazzy
+      # builds the sim stack (gscam, ffmpeg_image_transport) from source as
+      # packaged; Humble builds it via the `simOverlays` packaging fix below.
+      # Lyrical/Rolling are still out — ffmpeg-image-transport-msgs fails its
+      # rosidl build there (beads ros2_subscribe-lyx), so their shells ship the
+      # recorder/e2e core without sim (nix/ros-env.nix `withSim`). The recorder,
+      # the e2e suite, and deployment use none of the sim packages, so this
+      # gates off cleanly. Extend this list (and `simOverlays` if the distro
+      # needs the fix) as the overlay gains sim support for more distros.
+      simDistros = [ "jazzy" "humble" ];
+
+      # Distro-specific overlays correcting upstream sim-stack packaging.
+      # nix-ros-overlay's gscam and ffmpeg_image_transport omit pkg-config from
+      # nativeBuildInputs, and ffmpeg_encoder_decoder's extras.cmake clobbers
+      # PKG_CONFIG_PATH (sets it to an empty default before pkg_check_modules).
+      # On Humble's ament-1.x closure that breaks configure ("pkg-config tool
+      # not found", then libav* not found). Jazzy's newer ament-2.x closure
+      # already puts pkg-config on the build PATH and builds the same
+      # derivations from source unmodified, so it needs no overlay. `mkDistro`
+      # applies the matching entry via `rosPackages.<distro>.overrideScope`;
+      # keys must be a subset of simDistros.
+      simOverlays = {
+        humble = _final: prev: {
+          gscam = prev.gscam.overrideAttrs (old: {
+            nativeBuildInputs = (old.nativeBuildInputs or []) ++ [ pkgs.pkg-config ];
+          });
+          ffmpeg-image-transport = prev.ffmpeg-image-transport.overrideAttrs (old: {
+            nativeBuildInputs = (old.nativeBuildInputs or []) ++ [ pkgs.pkg-config ];
+            cmakeFlags = (old.cmakeFlags or []) ++ [ "-DFFMPEG_PKGCONFIG=${pkgs.ffmpeg.dev}/lib/pkgconfig" ];
+          });
+        };
+      };
 
       # r2r does no dependency resolution, so codegen must be handed every
       # used message package explicitly. This filter covers the two packages
@@ -80,7 +104,12 @@
       # repo root. Flakes only see git-tracked files — a newly added file under
       # nix/ or edgestream_msgs/ must be `git add`ed before the eval sees it.
       mkDistro = rosDistro: let
-        ros = pkgs.rosPackages.${rosDistro};
+        # Apply the distro's sim packaging fix (if any) so the patched gscam /
+        # ffmpeg-image-transport flow through to every consumer of `ros`.
+        ros = let base = pkgs.rosPackages.${rosDistro};
+        in if simOverlays ? ${rosDistro}
+           then base.overrideScope simOverlays.${rosDistro}
+           else base;
         withSim = lib.elem rosDistro simDistros;
         edgestream-msgs = import ./nix/edgestream-msgs.nix {
           inherit ros;

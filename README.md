@@ -33,11 +33,12 @@ It is a testing pad, not a finished tool.
 - **A data source** — the in-repo synthetic camera ([`sim/`](sim/README.md)),
   which publishes a gscam test pattern raw + H.265, or the sibling repo
   `../ros2_sources`, which replays a bag of recorded sensor data onto live
-  ROS2 topics. The sim camera rides in the Jazzy shell only; the overlay
-  packages its gscam/ffmpeg stack for Jazzy but not Humble, Lyrical, or Rolling,
-  whose shells carry the recorder/e2e core without it. Use `../ros2_sources`
-  replay as the data source under those distros. The recorder, the e2e suite,
-  and deployment never touch the sim camera, so they are unaffected.
+  ROS2 topics. The sim camera rides in the Jazzy and Humble shells (under
+  `nix develop` or `nix develop .#humble`); its gscam/ffmpeg stack is not
+  available under Lyrical or Rolling, whose shells carry the recorder/e2e core
+  without it. Use `../ros2_sources` replay as the data source under those
+  distros. The recorder, the e2e suite, and deployment never touch the sim
+  camera, so they are unaffected.
 
 ## Quickstart
 
