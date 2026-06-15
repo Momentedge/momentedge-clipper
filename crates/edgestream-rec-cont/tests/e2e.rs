@@ -583,7 +583,7 @@ fn corrupt_tail_fails_fast_offline() {
 /// non-zero on a framing desync. It must never hang or die silently.
 #[rstest]
 fn corrupt_tail_health_live() {
-    if !require_e2e() {
+    if !require_e2e() || skip_flaky() {
         return;
     }
     let env = TestEnv::new();

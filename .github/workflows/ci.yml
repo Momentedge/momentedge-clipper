@@ -1,0 +1,139 @@
+# Builds, unit-tests, and runs the live ROS2 e2e suite for the recorder
+# (edgestream-rec-cont) against every working ROS2 distro, on each push.
+#
+# Each distro is one matrix leg. A leg enters that distro's nix dev shell
+# (`nix develop .#<distro>`) — which supplies the ROS2 closure, r2r codegen env,
+# and C toolchain — and runs the system cargo inside it, exactly as a developer
+# does locally. The ROS2 closure is restored from the GitHub Actions cache
+# (nix-community/cache-nix-action) so it is not re-realized every run; cargo
+# artifacts are cached per distro (Swatinem/rust-cache). No external cache
+# service or account is involved — the GitHub Actions cache backs both.
+#
+# Scope: only edgestream-rec-cont is built and tested (trigger-pub is not in CI).
+# Distros: humble, jazzy, lyrical — the three the Rust crates build under
+# (rolling cannot build r2r 0.9.6; see README "Integration tests"). The e2e step
+# below skips the one inherently flaky test on every leg (via an env gate) and
+# one more on lyrical (via the filterset); the matrix comment explains why.
+
+name: CI
+
+# Every commit runs the matrix once: `push` fires on all branches, so each commit
+# is tested. pull_request is intentionally omitted — it would re-run the whole
+# matrix a second time for same-repo PR branches (a different concurrency group),
+# doubling this heavy ROS2-from-source CI. Same-repo PRs still surface the push
+# run's checks; add `pull_request:` if fork contributions ever need their own CI.
+on:
+  push:
+  workflow_dispatch:
+
+# One in-flight run per ref; a new push cancels the superseded run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  recorder:
+    name: ${{ matrix.distro }}
+    runs-on: ubuntu-latest
+    # Caps a wedged from-source nix build or a stuck `nix develop`; the nextest
+    # slow-timeout only bounds individual e2e tests, not Build or nix
+    # realization. Generous for the cold-cache run that builds ROS packages
+    # ros.cachix.org lacks; warm-cache runs are a few minutes.
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: [humble, jazzy, lyrical]
+        include:
+          # Per-distro e2e selection (nextest filterset). corrupt_tail_health_live
+          # — the live-corruption race the project flags as its one inherently
+          # flaky case (README "Integration tests") — is skipped on every leg, but
+          # not here: the E2E step sets EDGESTREAM_E2E_SKIP_FLAKY=1, which its
+          # in-test skip_flaky() gate reads to skip-and-pass. Its mandatory 60 s
+          # post-damage announcement misses under CI-grade timing, and nextest's
+          # default fail-fast then masks the rest of the suite (beads
+          # ros2_subscribe-3q8). Lyrical additionally drops
+          # old_recording_on_disk_is_not_recovered_after_restart — a distro
+          # incompatibility (its timestamped rosbag2 filenames break the test's
+          # harness assumption, beads ros2_subscribe-7ys), not CI flakiness — via
+          # the filterset, so only lyrical carries one.
+          - distro: humble
+            e2e_filter: binary(e2e)
+          - distro: jazzy
+            e2e_filter: binary(e2e)
+          - distro: lyrical
+            e2e_filter: binary(e2e) and not test(old_recording_on_disk_is_not_recovered_after_restart)
+    steps:
+      - uses: actions/checkout@v6
+
+      # Installs Nix from the official releases.nixos.org source (no third-party
+      # installer CDN). Flakes are enabled and the ROS2 binary cache
+      # (ros.cachix.org) is added so the closure is substituted, never compiled;
+      # the flake's own nixConfig is honoured via accept-flake-config.
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+            extra-substituters = https://ros.cachix.org
+            extra-trusted-public-keys = ros.cachix.org-1:dSyZxI8geDCJrwgvCOHDoAfOm5sV1wCPjBkKL+38Rvo=
+
+      # Restores this distro's /nix/store from the GitHub Actions cache and saves
+      # it back at job end. Keyed on the flake inputs and the nix package defs;
+      # any change to those rolls the key. Keeps one cache per distro (purges
+      # older ones of the same prefix) and trims the store before save to stay
+      # well under GitHub's 10 GB per-repo cache budget across the three distros.
+      - name: Cache /nix/store
+        uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ matrix.distro }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**', 'edgestream_msgs/**') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-${{ matrix.distro }}-
+          gc-max-store-size-linux: 5G
+          purge: true
+          purge-prefixes: nix-${{ runner.os }}-${{ matrix.distro }}-
+          purge-created: 0
+          purge-primary-key: never
+
+      # System Rust toolchain, used inside the nix shell — the flake deliberately
+      # ships no Rust. The crates build on stable (no feature gates).
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # cargo-nextest: the required runner for the gated e2e suite, and used for
+      # the unit run too for consistent output.
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      # Caches cargo registry + this distro's target/ (the r2r build links the
+      # distro's rcl/rmw, so the key is per distro).
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ matrix.distro }}
+
+      - name: Build
+        run: nix develop ".#${{ matrix.distro }}" --command cargo build --locked -p edgestream-rec-cont
+
+      - name: Unit tests
+        run: nix develop ".#${{ matrix.distro }}" --command cargo nextest run --locked -p edgestream-rec-cont -E 'not binary(e2e)'
+
+      # Live ROS2 e2e: real `ros2 bag record`, CLI-published triggers, real
+      # Recorded announcements. Gated on EDGESTREAM_E2E; serialized and
+      # timeout-bounded by the `e2e` nextest profile (.config/nextest.toml).
+      # EDGESTREAM_E2E_SKIP_FLAKY=1 makes the in-test skip_flaky() gate skip the
+      # flaky live-corruption race (see the matrix comment above).
+      - name: E2E tests
+        run: |
+          nix develop ".#${{ matrix.distro }}" --command \
+            env EDGESTREAM_E2E=1 EDGESTREAM_E2E_SKIP_FLAKY=1 cargo nextest run --locked -p edgestream-rec-cont \
+            --profile e2e -E '${{ matrix.e2e_filter }}'

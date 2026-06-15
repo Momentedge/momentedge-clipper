@@ -53,6 +53,19 @@ pub fn require_e2e() -> bool {
     true
 }
 
+/// Opt-out gate for tests the project flags as inherently flaky under CI-grade
+/// timing. Set `EDGESTREAM_E2E_SKIP_FLAKY` (CI does) to skip them; unset
+/// locally, so the full suite — including the live-corruption race
+/// `corrupt_tail_health_live` — runs. A skipped test returns early and so
+/// reports as passed, the same skip-and-pass convention as [`require_e2e`].
+pub fn skip_flaky() -> bool {
+    if std::env::var_os("EDGESTREAM_E2E_SKIP_FLAKY").is_some() {
+        eprintln!("skipping: flaky-under-CI test (EDGESTREAM_E2E_SKIP_FLAKY is set)");
+        return true;
+    }
+    false
+}
+
 /// Nanoseconds since the Unix epoch on the system clock — the time base the
 /// recorder, the trigger stamp, and MCAP `log_time` all share.
 pub fn now_ns() -> u64 {

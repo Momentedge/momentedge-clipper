@@ -7,7 +7,9 @@ README — build mechanics and conventions — without repeating it. Each crate 
 its own CLAUDE.md:
 [`edgestream-rec-cont`](crates/edgestream-rec-cont/CLAUDE.md),
 [`trigger-pub`](crates/trigger-pub/CLAUDE.md); the sim camera (`sim/`) has
-[`sim/CLAUDE.md`](sim/CLAUDE.md).
+[`sim/CLAUDE.md`](sim/CLAUDE.md), and the GitHub Actions CI has
+[`.github/CLAUDE.md`](.github/CLAUDE.md). The nested files load on demand when
+you work in their directory, keeping their detail out of context otherwise.
 
 ## The recorders
 
@@ -112,6 +114,16 @@ Setup is in the README; the parts that matter when changing the build:
   standalone recorder (also used for the sim camera). rosbag2 publishes
   `WriteSplitEvent` on `/events/write_split` when a bag splits, but the recorder
   tails a continuous file and consumes no split events.
+
+## Continuous integration
+
+GitHub Actions CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml))
+builds, unit-tests, and runs the live e2e suite for `edgestream-rec-cont` on
+`humble`, `jazzy`, and `lyrical` on every push, with the nix store cached
+through the GitHub Actions cache (no external cache service). Mechanics,
+rationale, and the local-`act` caveats live in
+[`.github/CLAUDE.md`](.github/CLAUDE.md) — loaded on demand when you work in
+`.github/`, so it stays out of context otherwise.
 
 ## Deployment build model
 

@@ -234,6 +234,10 @@ rmw enum variant that the current rolling has dropped (beads `ros2_subscribe-2xb
 The r2r pin returns to a crates.io release once `0.9.6` is published there (beads
 `ros2_subscribe-4rw`).
 
+CI runs this suite — build, unit tests, and the gated e2e — on every push across
+the three working distros; the mechanics and the local-`act` notes live in
+[`.github/CLAUDE.md`](.github/CLAUDE.md).
+
 ## Deployment (Jetson / native build)
 
 The recorder ships to an edge target — a Jetson running ROS2 Humble. The target
