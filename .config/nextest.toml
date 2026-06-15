@@ -1,5 +1,5 @@
 # Repo-wide cargo-nextest configuration. The `e2e` profile is the required
-# runner for the live ROS2 suite (crates/edgestream-rec-cont/tests/e2e.rs) —
+# runner for the live ROS2 suite (crates/clipper/tests/e2e.rs) —
 # see README "Integration tests (live ROS2 e2e)".
 
 # One live test at a time: every e2e test drives a real `ros2 bag record`
@@ -9,7 +9,7 @@
 [test-groups.ros-e2e]
 max-threads = 1
 
-# The e2e binary serializes under every profile: gated off (EDGESTREAM_E2E
+# The e2e binary serializes under every profile: gated off (CLIPPER_E2E
 # unset) its tests skip in microseconds, gated on they must never overlap.
 [[profile.default.overrides]]
 filter = "binary(e2e)"

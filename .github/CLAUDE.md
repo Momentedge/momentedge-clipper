@@ -1,7 +1,7 @@
 # CI — contributor/agent notes
 
 [`workflows/ci.yml`](workflows/ci.yml) is the GitHub Actions CI. It builds,
-unit-tests, and runs the live ROS2 e2e suite for `edgestream-rec-cont` against
+unit-tests, and runs the live ROS2 e2e suite for `clipper` against
 every working ROS2 distro on each push, plus a standalone formatting gate. The
 mechanics and the reasoning behind the choices:
 
@@ -15,7 +15,7 @@ mechanics and the reasoning behind the choices:
 - **One job per working distro, three steps (build → unit → e2e).** A single
   matrix leg per distro shares one nix dev shell and one cargo target dir across
   all three steps, so the ROS closure is realized once and the crate compiled
-  once per distro. Only `edgestream-rec-cont` is built; `trigger-pub` is out of
+  once per distro. Only `clipper` is built; `trigger-pub` is out of
   CI. The distro set is the r2r-buildable three — `humble`, `jazzy`, `lyrical`
   (rolling cannot build the crates; see the root CLAUDE.md "Build and
   environment mechanics" and README "Integration tests").
@@ -59,7 +59,7 @@ mechanics and the reasoning behind the choices:
   post-damage announcement, which misses under CI-grade timing — observed in
   `act`, where it fails all retries and (nextest's default fail-fast) masks the
   rest of the suite, so only 2/14 run. The E2E step sets
-  `EDGESTREAM_E2E_SKIP_FLAKY=1`, which the test's own `skip_flaky()` gate
+  `CLIPPER_E2E_SKIP_FLAKY=1`, which the test's own `skip_flaky()` gate
   (`tests/harness/mod.rs`, mirroring `require_e2e()`) reads to skip-and-pass — so
   the skip lives in the test, the reason next to it, and a local run (env unset)
   still exercises the corruption race. Skipping it on every distro keeps the

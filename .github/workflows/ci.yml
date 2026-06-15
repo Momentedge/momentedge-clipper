@@ -1,5 +1,5 @@
 # Builds, unit-tests, and runs the live ROS2 e2e suite for the recorder
-# (edgestream-rec-cont) against every working ROS2 distro, on each push. A
+# (clipper) against every working ROS2 distro, on each push. A
 # separate `fmt` job checks workspace formatting (rustfmt) in parallel.
 #
 # Each distro is one matrix leg. A leg enters that distro's nix dev shell
@@ -10,7 +10,7 @@
 # artifacts are cached per distro (Swatinem/rust-cache). No external cache
 # service or account is involved — the GitHub Actions cache backs both.
 #
-# Scope: only edgestream-rec-cont is built and tested (trigger-pub is not in CI).
+# Scope: only clipper is built and tested (trigger-pub is not in CI).
 # Distros: humble, jazzy, lyrical — the three the Rust crates build under
 # (rolling cannot build r2r 0.9.6; see README "Integration tests"). The e2e step
 # below skips the one inherently flaky test on every leg (via an env gate) and
@@ -73,7 +73,7 @@ jobs:
           # Per-distro e2e selection (nextest filterset). corrupt_tail_health_live
           # — the live-corruption race the project flags as its one inherently
           # flaky case (README "Integration tests") — is skipped on every leg, but
-          # not here: the E2E step sets EDGESTREAM_E2E_SKIP_FLAKY=1, which its
+          # not here: the E2E step sets CLIPPER_E2E_SKIP_FLAKY=1, which its
           # in-test skip_flaky() gate reads to skip-and-pass. Its mandatory 60 s
           # post-damage announcement misses under CI-grade timing, and nextest's
           # default fail-fast then masks the rest of the suite (beads
@@ -112,7 +112,7 @@ jobs:
       - name: Cache /nix/store
         uses: nix-community/cache-nix-action@v7
         with:
-          primary-key: nix-${{ runner.os }}-${{ matrix.distro }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**', 'edgestream_msgs/**') }}
+          primary-key: nix-${{ runner.os }}-${{ matrix.distro }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**', 'momentedge_msgs/**') }}
           restore-prefixes-first-match: nix-${{ runner.os }}-${{ matrix.distro }}-
           gc-max-store-size-linux: 5G
           purge: true
@@ -140,18 +140,18 @@ jobs:
           shared-key: ${{ matrix.distro }}
 
       - name: Build
-        run: nix develop ".#${{ matrix.distro }}" --command cargo build --locked -p edgestream-rec-cont
+        run: nix develop ".#${{ matrix.distro }}" --command cargo build --locked -p clipper
 
       - name: Unit tests
-        run: nix develop ".#${{ matrix.distro }}" --command cargo nextest run --locked -p edgestream-rec-cont -E 'not binary(e2e)'
+        run: nix develop ".#${{ matrix.distro }}" --command cargo nextest run --locked -p clipper -E 'not binary(e2e)'
 
       # Live ROS2 e2e: real `ros2 bag record`, CLI-published triggers, real
-      # Recorded announcements. Gated on EDGESTREAM_E2E; serialized and
+      # Recorded announcements. Gated on CLIPPER_E2E; serialized and
       # timeout-bounded by the `e2e` nextest profile (.config/nextest.toml).
-      # EDGESTREAM_E2E_SKIP_FLAKY=1 makes the in-test skip_flaky() gate skip the
+      # CLIPPER_E2E_SKIP_FLAKY=1 makes the in-test skip_flaky() gate skip the
       # flaky live-corruption race (see the matrix comment above).
       - name: E2E tests
         run: |
           nix develop ".#${{ matrix.distro }}" --command \
-            env EDGESTREAM_E2E=1 EDGESTREAM_E2E_SKIP_FLAKY=1 cargo nextest run --locked -p edgestream-rec-cont \
+            env CLIPPER_E2E=1 CLIPPER_E2E_SKIP_FLAKY=1 cargo nextest run --locked -p clipper \
             --profile e2e -E '${{ matrix.e2e_filter }}'

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Continuous single-file rosbag2 recorder feeding the tailing extractor
-# (edgestream-rec-cont).
+# (clipper).
 #
 # Records ONE growing MCAP file under ./record-cont — no splits, no
 # WriteSplitEvent. The extractor keeps the file open and tails it, so the

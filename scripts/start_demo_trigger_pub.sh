@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Demo trigger publisher (trigger-pub) for the native Humble target — a stand-in
-# that publishes edgestream_msgs/Trigger on /events/edgestream/trigger ~1/s so
-# edgestream-rec-cont produces clips. A real trigger source replaces it in
-# production; the recorder (edgestream-rec-cont) does not depend on this demo
+# that publishes momentedge_msgs/Trigger on /events/clipper/trigger ~1/s so
+# clipper produces clips. A real trigger source replaces it in
+# production; the recorder (clipper) does not depend on this demo
 # publisher.
 #
 # Runs in the foreground (Ctrl-C to stop). Extra args are forwarded; the
@@ -19,6 +19,6 @@ BIN_DIR="${BIN_DIR:-$REPO_ROOT/target/release}"
 # shellcheck disable=SC1090
 source "$ROS_SETUP"
 # shellcheck disable=SC1091
-source "$REPO_ROOT/install/setup.bash"   # edgestream_msgs typesupport
+source "$REPO_ROOT/install/setup.bash"   # momentedge_msgs typesupport
 
 exec "$BIN_DIR/trigger-pub" "$@"

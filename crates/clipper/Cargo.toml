@@ -1,7 +1,11 @@
 [package]
-name = "edgestream-rec-cont"
+name = "clipper"
 version.workspace = true
 edition.workspace = true
+
+[[bin]]
+name = "clipper"
+path = "src/main.rs"
 
 [dependencies]
 # r2r: ROS2 client bindings. Typed subscription to the Trigger topic and a typed
@@ -22,7 +26,7 @@ signal-hook.workspace = true
 mcap.workspace = true
 # Error plumbing for the tail and extraction paths.
 anyhow.workspace = true
-# Layered configuration: defaults -> optional TOML file -> EDGESTREAM_*
+# Layered configuration: defaults -> optional TOML file -> CLIPPER_*
 # environment variables, deserialized into `Config` (no CLI args).
 config.workspace = true
 # Derives `Deserialize` for `Config`.

@@ -1,7 +1,7 @@
-//! Periodic `/events/edgestream/trigger` publisher.
+//! Periodic `/events/clipper/trigger` publisher.
 //!
-//! Emits an `edgestream_msgs/Trigger` every `--period` seconds (5 s by default)
-//! so the triggered recorder (`edgestream-rec-cont`) has something to react to during
+//! Emits a `momentedge_msgs/Trigger` every `--period` seconds (5 s by default)
+//! so the triggered recorder (`clipper`) has something to react to during
 //! development. Each trigger's `trigger_time` is stamped with the current
 //! RosTime at publish — the "original timestamp" the pre/post-roll window is cut
 //! around, the stamp the recorder centres its window on rather than the
@@ -85,9 +85,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_args();
 
     let ctx = r2r::Context::create()?;
-    let mut node = r2r::Node::create(ctx, "edgestream_trigger_pub", "")?;
-    let publisher = node.create_publisher::<r2r::edgestream_msgs::msg::Trigger>(
-        "/events/edgestream/trigger",
+    let mut node = r2r::Node::create(ctx, "clipper_trigger_pub", "")?;
+    let publisher = node.create_publisher::<r2r::momentedge_msgs::msg::Trigger>(
+        "/events/clipper/trigger",
         QosProfile::default(),
     )?;
     // RosTime clock: the trigger_time stamp the recorder centres its window on.
@@ -102,7 +102,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
     };
     info!(
-        "publishing /events/edgestream/trigger every {:.1}s  (preroll={}, postroll={})",
+        "publishing /events/clipper/trigger every {:.1}s  (preroll={}, postroll={})",
         args.period.as_secs_f64(),
         describe_roll(args.preroll),
         describe_roll(args.postroll),
@@ -115,7 +115,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let name = format!("{}-{counter}", args.name);
         let preroll = resolve_roll(args.preroll);
         let postroll = resolve_roll(args.postroll);
-        let msg = r2r::edgestream_msgs::msg::Trigger {
+        let msg = r2r::momentedge_msgs::msg::Trigger {
             name: name.clone(),
             description: args.description.clone(),
             trigger_time: trigger_time.clone(),

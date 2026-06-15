@@ -25,28 +25,28 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-pub const TRIGGER_TOPIC: &str = "/events/edgestream/trigger";
-pub const RECORDED_TOPIC: &str = "/events/edgestream/recorded";
+pub const TRIGGER_TOPIC: &str = "/events/clipper/trigger";
+pub const RECORDED_TOPIC: &str = "/events/clipper/recorded";
 
-/// Gate for the whole suite. Unset `EDGESTREAM_E2E` means skip-and-pass, so
+/// Gate for the whole suite. Unset `CLIPPER_E2E` means skip-and-pass, so
 /// plain `cargo test` / `cargo llvm-cov` stay green without ROS. Set, a
 /// missing prerequisite is a loud panic — a misconfigured "enabled" run must
 /// fail, never silently skip.
 pub fn require_e2e() -> bool {
-    if std::env::var_os("EDGESTREAM_E2E").is_none() {
+    if std::env::var_os("CLIPPER_E2E").is_none() {
         eprintln!(
-            "skipping: EDGESTREAM_E2E is unset \
-             (run inside the dev shell: EDGESTREAM_E2E=1 cargo nextest run --profile e2e)"
+            "skipping: CLIPPER_E2E is unset \
+             (run inside the dev shell: CLIPPER_E2E=1 cargo nextest run --profile e2e)"
         );
         return false;
     }
     let out = Command::new("ros2")
-        .args(["pkg", "prefix", "edgestream_msgs"])
+        .args(["pkg", "prefix", "momentedge_msgs"])
         .output()
-        .expect("EDGESTREAM_E2E is set but `ros2` is not on PATH — run inside `nix develop`");
+        .expect("CLIPPER_E2E is set but `ros2` is not on PATH — run inside `nix develop`");
     assert!(
         out.status.success(),
-        "EDGESTREAM_E2E is set but `edgestream_msgs` does not resolve from \
+        "CLIPPER_E2E is set but `momentedge_msgs` does not resolve from \
          AMENT_PREFIX_PATH — run inside `nix develop`: {}",
         String::from_utf8_lossy(&out.stderr),
     );
@@ -54,13 +54,13 @@ pub fn require_e2e() -> bool {
 }
 
 /// Opt-out gate for tests the project flags as inherently flaky under CI-grade
-/// timing. Set `EDGESTREAM_E2E_SKIP_FLAKY` (CI does) to skip them; unset
+/// timing. Set `CLIPPER_E2E_SKIP_FLAKY` (CI does) to skip them; unset
 /// locally, so the full suite — including the live-corruption race
 /// `corrupt_tail_health_live` — runs. A skipped test returns early and so
 /// reports as passed, the same skip-and-pass convention as [`require_e2e`].
 pub fn skip_flaky() -> bool {
-    if std::env::var_os("EDGESTREAM_E2E_SKIP_FLAKY").is_some() {
-        eprintln!("skipping: flaky-under-CI test (EDGESTREAM_E2E_SKIP_FLAKY is set)");
+    if std::env::var_os("CLIPPER_E2E_SKIP_FLAKY").is_some() {
+        eprintln!("skipping: flaky-under-CI test (CLIPPER_E2E_SKIP_FLAKY is set)");
         return true;
     }
     false
@@ -95,7 +95,7 @@ pub struct TestEnv {
 impl TestEnv {
     pub fn new() -> Self {
         let root = tempfile::Builder::new()
-            .prefix("edgestream-e2e-")
+            .prefix("clipper-e2e-")
             .tempdir()
             .expect("creating the test temp dir");
         let env = TestEnv {
@@ -263,7 +263,7 @@ impl TestEnv {
     /// A steady message stream so the bag has content and the tail's coverage
     /// high-water advances. Runs until dropped.
     pub fn start_source(&self, topic: &str, rate: u32) -> Proc {
-        let payload = "edgestream-e2e-payload ".repeat(10);
+        let payload = "clipper-e2e-payload ".repeat(10);
         let mut cmd = self.command("ros2");
         cmd.args([
             "topic",
@@ -277,15 +277,15 @@ impl TestEnv {
         self.spawn("source", cmd)
     }
 
-    /// The binary under test, configured purely via `EDGESTREAM_*` env onto
+    /// The binary under test, configured purely via `CLIPPER_*` env onto
     /// this test's temp tree. Blocks until its "up" line is logged.
     pub fn start_extractor(&self, grace_secs: u64) -> Proc {
-        let mut cmd = self.command(env!("CARGO_BIN_EXE_edgestream-rec-cont"));
-        cmd.env("EDGESTREAM_RECORD_DIR", self.record_dir())
-            .env("EDGESTREAM_OUT_DIR", self.out_dir())
-            .env("EDGESTREAM_GRACE_SECS", grace_secs.to_string());
+        let mut cmd = self.command(env!("CARGO_BIN_EXE_clipper"));
+        cmd.env("CLIPPER_RECORD_DIR", self.record_dir())
+            .env("CLIPPER_OUT_DIR", self.out_dir())
+            .env("CLIPPER_GRACE_SECS", grace_secs.to_string());
         let proc = self.spawn("extractor", cmd);
-        proc.expect_log("edgestream-rec-cont up", Duration::from_secs(30));
+        proc.expect_log("clipper up", Duration::from_secs(30));
         proc
     }
 
@@ -301,7 +301,7 @@ impl TestEnv {
             "--no-daemon",
             "--once",
             RECORDED_TOPIC,
-            "edgestream_msgs/msg/Recorded",
+            "momentedge_msgs/msg/Recorded",
         ]);
         let proc = self.spawn(&format!("recorded-{tag}"), cmd);
         // No readiness signal exists for the echo's subscription; the python
@@ -333,7 +333,7 @@ impl TestEnv {
             "-w",
             "1",
             TRIGGER_TOPIC,
-            "edgestream_msgs/msg/Trigger",
+            "momentedge_msgs/msg/Trigger",
             &yaml,
         ]);
         let mut proc = self.spawn(&format!("trigger-{name}"), cmd);

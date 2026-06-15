@@ -2,20 +2,20 @@
 # Continuously delete recordings older than one day from a captured directory.
 #
 # Loops forever: prune, sleep 1 min, repeat. The directory to prune is taken from
-# $PRUNE_DIR, then the first positional argument, then ~/edgestream-rec/captured.
+# $PRUNE_DIR, then the first positional argument, then ~/clipper-rec/captured.
 # Each pruned path and a summary count are logged to stdout — redirect it to a
 # file when running detached. A missing directory is skipped, not fatal — the
 # loop keeps running so it picks up once the first recording lands.
 #
 # Run it directly; for a persistent background run on a host:
-#   setsid nohup ~/.local/bin/edgestream-prune.sh >> ~/edgestream-rec/prune.log 2>&1 &
+#   setsid nohup ~/.local/bin/clipper-prune.sh >> ~/clipper-rec/prune.log 2>&1 &
 #
-# On start it writes its own PID to $PRUNE_PIDFILE (default ~/edgestream-rec/
+# On start it writes its own PID to $PRUNE_PIDFILE (default ~/clipper-rec/
 # prune.pid) so a redeploy can stop the previous run with `kill $(cat …)`.
 set -euo pipefail
 
-PRUNE_DIR="${PRUNE_DIR:-${1:-$HOME/edgestream-rec/captured}}"
-PRUNE_PIDFILE="${PRUNE_PIDFILE:-$HOME/edgestream-rec/prune.pid}"
+PRUNE_DIR="${PRUNE_DIR:-${1:-$HOME/clipper-rec/captured}}"
+PRUNE_PIDFILE="${PRUNE_PIDFILE:-$HOME/clipper-rec/prune.pid}"
 
 echo "$$" > "$PRUNE_PIDFILE"
 

@@ -5,7 +5,7 @@ triggered-recording workflow, prerequisites, and the build/run/replay quickstart
 Start there. This file covers what a contributor or agent needs *beyond* the
 README — build mechanics and conventions — without repeating it. Each crate has
 its own CLAUDE.md:
-[`edgestream-rec-cont`](crates/edgestream-rec-cont/CLAUDE.md),
+[`clipper`](crates/clipper/CLAUDE.md),
 [`trigger-pub`](crates/trigger-pub/CLAUDE.md); the sim camera (`sim/`) has
 [`sim/CLAUDE.md`](sim/CLAUDE.md), and the GitHub Actions CI has
 [`.github/CLAUDE.md`](.github/CLAUDE.md). The nested files load on demand when
@@ -13,13 +13,13 @@ you work in their directory, keeping their detail out of context otherwise.
 
 ## The recorders
 
-`edgestream-rec-cont` is a triggered clip recorder, and `trigger-pub` is the
+`clipper` is a triggered clip recorder, and `trigger-pub` is the
 periodic `Trigger` publisher that drives it. The recorder owns no sensor
 subscriptions and no message index; it cuts clips out of a continuous on-disk
 `ros2 bag record` on ROS2 trigger events, copying MCAP messages straight through.
 It tails one growing MCAP file, decoding nothing but each message's MCAP log
 time. Internals live in
-[`edgestream-rec-cont`](crates/edgestream-rec-cont/CLAUDE.md).
+[`clipper`](crates/clipper/CLAUDE.md).
 
 ## The sim camera (`sim/`)
 
@@ -68,12 +68,12 @@ Setup is in the README; the parts that matter when changing the build:
   `flake.nix` carries a `rosDistros` list (`humble`, `jazzy`, `lyrical`,
   `rolling` — all packaged by `nix-ros-overlay`; `kilted` is available too) and a
   `defaultDistro` (`jazzy`). A `mkDistro` function builds the whole per-distro
-  closure — `edgestream-msgs`, `rosEnv` ([`nix/ros-env.nix`](nix/ros-env.nix)),
+  closure — `momentedge-msgs`, `rosEnv` ([`nix/ros-env.nix`](nix/ros-env.nix)),
   the nix-built binaries, and the dev shell — once for each. So `nix develop`
   (default) and `nix develop .#humble` / `.#lyrical` / `.#rolling` select the
   distro; packages come both unsuffixed (default distro, e.g.
-  `nix build .#edgestream-rec-cont`) and per-distro
-  (`.#edgestream-rec-cont-rolling`, `.#rosEnv-humble`). The attrset is lazy:
+  `nix build .#clipper`) and per-distro
+  (`.#clipper-rolling`, `.#rosEnv-humble`). The attrset is lazy:
   selecting one distro never forces the others. Adding a distro is one entry in
   `rosDistros`.
 - The shellHook exports `RMW_IMPLEMENTATION=rmw_fastrtps_cpp`, `ROS_DOMAIN_ID=0`,
@@ -82,7 +82,7 @@ Setup is in the README; the parts that matter when changing the build:
   unchanged — every listed package exists under all of them.
 - The crates use a single build model: r2r generates bindings at build time from
   the `AMENT_PREFIX_PATH`, gated by `IDL_PACKAGE_FILTER` + bindgen
-  (`LIBCLANG_PATH`). `IDL_PACKAGE_FILTER` is `builtin_interfaces;edgestream_msgs`
+  (`LIBCLANG_PATH`). `IDL_PACKAGE_FILTER` is `builtin_interfaces;momentedge_msgs`
   — the only packages the crates decode via r2r. r2r support gates which distros
   the crates (the deployables and the e2e suite) build under, because r2r
   references the `RMW_QOS_POLICY_LIVELINESS_MANUAL_BY_NODE` rmw enum variant that
@@ -101,16 +101,16 @@ Setup is in the README; the parts that matter when changing the build:
   needs to capture the H.265 topic (`config/cam_sim.yaml`). Env-only packages
   like these stay out of `IDL_PACKAGE_FILTER` — no Rust crate decodes them. Each
   crate's CLAUDE.md has the details.
-- `edgestream_msgs/` is a **local ament_cmake interface package** built by the
+- `momentedge_msgs/` is a **local ament_cmake interface package** built by the
   flake via `ros.buildRosPackage` (mirroring upstream `example-interfaces`) and
   added to both the env and `IDL_PACKAGE_FILTER`, so its `Trigger`/`Recorded`
   types get r2r bindings like any other message package. Flakes only see
-  git-tracked files: a newly added or renamed file under `edgestream_msgs/` must
+  git-tracked files: a newly added or renamed file under `momentedge_msgs/` must
   be `git add`ed before `nix develop`/`cargo build`, or the eval fails with "Path
   … is not tracked by Git".
 - `ros2bag` + `rosbag2-transport` + `rosbag2-storage-mcap` provide the standalone
   `ros2 bag record`. `scripts/record-continuous.sh` runs it as the one growing
-  MCAP file `edgestream-rec-cont` tails; `scripts/record.sh` is the general
+  MCAP file `clipper` tails; `scripts/record.sh` is the general
   standalone recorder (also used for the sim camera). rosbag2 publishes
   `WriteSplitEvent` on `/events/write_split` when a bag splits, but the recorder
   tails a continuous file and consumes no split events.
@@ -118,7 +118,7 @@ Setup is in the README; the parts that matter when changing the build:
 ## Continuous integration
 
 GitHub Actions CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml))
-builds, unit-tests, and runs the live e2e suite for `edgestream-rec-cont` on
+builds, unit-tests, and runs the live e2e suite for `clipper` on
 `humble`, `jazzy`, and `lyrical` on every push, with the nix store cached
 through the GitHub Actions cache (no external cache service). A separate `fmt`
 job checks workspace formatting (`cargo fmt --all --check`) — nix- and
@@ -130,15 +130,15 @@ rationale, and the local-`act` caveats live in
 ## Deployment build model
 
 The nix flake above is for **development** (the dev shell, and `nix build
-.#edgestream-rec-cont`/`trigger-pub` as build checks). **Deployment is a native
+.#clipper`/`trigger-pub` as build checks). **Deployment is a native
 build on the target**, not nix or Docker — see README "Deployment". The reasoning
 that shapes it:
 
 - The edge target runs a full ROS2 install (Humble) of the **same distro** the
   recorder is built against, so `rosbag2` (MCAP storage), `rcl`,
   `rmw_fastrtps_cpp`, and the standard message packages all come from the host.
-  Only `edgestream-rec-cont` + `trigger-pub` (which link just `rcl`/`rmw` + the
-  `builtin_interfaces`/`edgestream_msgs` types) and the `edgestream_msgs` overlay
+  Only `clipper` + `trigger-pub` (which link just `rcl`/`rmw` + the
+  `builtin_interfaces`/`momentedge_msgs` types) and the `momentedge_msgs` overlay
   are built — `scripts/build-on-target.sh` does both.
 - They are built **against the host's own ROS2 libraries** for ABI compatibility:
   a nix-built binary bakes `/nix/store` RPATHs and would load the nix closure
@@ -154,8 +154,8 @@ that shapes it:
 A virtual workspace (no root package), so `resolver = "3"` (the edition-2024
 resolver) is set explicitly — a virtual workspace does not infer the resolver
 from member editions and otherwise falls back to `"1"` with a warning. Members
-are the two crates (`edgestream-rec-cont`, `trigger-pub`); shared metadata is in
-`[workspace.package]`. `edgestream_msgs/` (ROS2 interface package) and `sim/`
+are the two crates (`clipper`, `trigger-pub`); shared metadata is in
+`[workspace.package]`. `momentedge_msgs/` (ROS2 interface package) and `sim/`
 (the sim camera's launch/config tree) are not Cargo members.
 
 ## Sibling repositories

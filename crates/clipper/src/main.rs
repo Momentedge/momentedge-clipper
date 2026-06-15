@@ -7,7 +7,7 @@
 //! schema/channel registry, and a coverage watch (the highest `log_time` on
 //! disk). There are no bag splits and no `/events/write_split` dependency.
 //!
-//! On `/events/edgestream/trigger` (`edgestream_msgs/Trigger`) it cuts the
+//! On `/events/clipper/trigger` (`momentedge_msgs/Trigger`) it cuts the
 //! window `[trigger_time - preroll, trigger_time + postroll]`: wait until the
 //! wall clock passes the window end, wait until the tail's coverage reaches it
 //! (the recording provably holds the window), then bulk-copy the in-window
@@ -15,8 +15,8 @@
 //! `./triggered-cont/<trigger_ns>_<name>.mcap` (see [`clip`] — a raw-bytes
 //! copy, no CDR decode, finished with a proper summary + footer, assembled in
 //! a capturing dir and moved atomically into place so observers never see a
-//! footer-less file), and finally publish `/events/edgestream/recorded`
-//! (`edgestream_msgs/Recorded`), which therefore always names a durable clip.
+//! footer-less file), and finally publish `/events/clipper/recorded`
+//! (`momentedge_msgs/Recorded`), which therefore always names a durable clip.
 //!
 //! Time base: MCAP `log_time`, the trigger stamp, and the wait clock are all
 //! treated as nanoseconds on the system (ROS) clock — this assumes the default
@@ -35,9 +35,9 @@
 //!
 //! Configuration is layered (defaults → TOML file → environment, via
 //! config-rs); there are no CLI args. The TOML file is
-//! `edgestream-rec-cont.toml` in the working directory, or the path in
-//! `$EDGESTREAM_CONFIG`; each key also reads from an
-//! `EDGESTREAM_<KEY>` environment variable. Keys (all optional):
+//! `clipper.toml` in the working directory, or the path in
+//! `$CLIPPER_CONFIG`; each key also reads from an
+//! `CLIPPER_<KEY>` environment variable. Keys (all optional):
 //!   record_dir   bag directory of the continuous recording (default ./record-cont)
 //!   out_dir      where clips are written                   (default ./triggered-cont)
 //!   grace_secs   how long past the window end to wait for coverage
@@ -73,8 +73,8 @@ use signal_hook::consts::{SIGINT, SIGTERM};
 use tail::{Coverage, Tailer};
 use watch::Watch;
 
-const TRIGGER_TOPIC: &str = "/events/edgestream/trigger";
-const RECORDED_TOPIC: &str = "/events/edgestream/recorded";
+const TRIGGER_TOPIC: &str = "/events/clipper/trigger";
+const RECORDED_TOPIC: &str = "/events/clipper/recorded";
 
 /// How many trigger handlers may be active (admitted, waiting, or extracting)
 /// at once. Beyond this limit an arriving trigger is rejected at admission:
@@ -115,19 +115,19 @@ impl Config {
     }
 }
 
-/// Layered load: defaults, then the TOML file (`edgestream-rec-cont.toml` in
-/// the working directory, or `$EDGESTREAM_CONFIG`; missing is fine), then
-/// `EDGESTREAM_<KEY>` environment variables.
+/// Layered load: defaults, then the TOML file (`clipper.toml` in
+/// the working directory, or `$CLIPPER_CONFIG`; missing is fine), then
+/// `CLIPPER_<KEY>` environment variables.
 fn load_config() -> Result<Config, config::ConfigError> {
-    let file = std::env::var("EDGESTREAM_CONFIG")
-        .unwrap_or_else(|_| "edgestream-rec-cont.toml".to_string());
+    let file = std::env::var("CLIPPER_CONFIG")
+        .unwrap_or_else(|_| "clipper.toml".to_string());
     config::Config::builder()
         .set_default("record_dir", "./record-cont")?
         .set_default("out_dir", "./triggered-cont")?
         .set_default("grace_secs", 30_u64)?
         .set_default("extract_parallelism", 1_u64)?
         .add_source(config::File::with_name(&file).required(false))
-        .add_source(config::Environment::with_prefix("EDGESTREAM"))
+        .add_source(config::Environment::with_prefix("CLIPPER"))
         .build()?
         .try_deserialize()
 }
@@ -325,11 +325,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     clip::reset_capturing_dir(&cfg.out_dir)?;
 
     let ctx = r2r::Context::create()?;
-    let mut node = r2r::Node::create(ctx, "edgestream_recorder_cont", "")?;
+    let mut node = r2r::Node::create(ctx, "clipper", "")?;
 
     let mut trigger_sub =
-        node.subscribe::<r2r::edgestream_msgs::msg::Trigger>(TRIGGER_TOPIC, QosProfile::default())?;
-    let recorded_pub = node.create_publisher::<r2r::edgestream_msgs::msg::Recorded>(
+        node.subscribe::<r2r::momentedge_msgs::msg::Trigger>(TRIGGER_TOPIC, QosProfile::default())?;
+    let recorded_pub = node.create_publisher::<r2r::momentedge_msgs::msg::Recorded>(
         RECORDED_TOPIC,
         QosProfile::default(),
     )?;
@@ -397,7 +397,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     info!(
-        "edgestream-rec-cont up: triggers on {TRIGGER_TOPIC}, tailing {}, writing clips to {}",
+        "clipper up: triggers on {TRIGGER_TOPIC}, tailing {}, writing clips to {}",
         cfg.record_dir.display(),
         cfg.out_dir.display(),
     );
@@ -497,9 +497,9 @@ fn supervise(
 
 /// Run one trigger's wait-then-extract-then-announce flow.
 fn handle_trigger(
-    trig: r2r::edgestream_msgs::msg::Trigger,
+    trig: r2r::momentedge_msgs::msg::Trigger,
     cfg: Arc<Config>,
-    recorded_pub: Publisher<r2r::edgestream_msgs::msg::Recorded>,
+    recorded_pub: Publisher<r2r::momentedge_msgs::msg::Recorded>,
     coverage: Arc<Watch<Coverage>>,
     extract_tx: Sender<ExtractJob>,
 ) -> anyhow::Result<()> {
@@ -540,7 +540,7 @@ fn handle_trigger(
     }
 
     let filename = stats.out_path.to_string_lossy().into_owned();
-    let recorded = r2r::edgestream_msgs::msg::Recorded {
+    let recorded = r2r::momentedge_msgs::msg::Recorded {
         name: trig.name.clone(),
         filename: filename.clone(),
         description: trig.description.clone(),

@@ -1,4 +1,4 @@
-# edgestream-rec-cont — Architecture
+# clipper — Architecture
 
 For the business rationale and value proposition see [OVERVIEW.md](OVERVIEW.md).
 For the user-facing quickstart, configuration reference, and pipeline setup see
@@ -30,7 +30,7 @@ ros2 bag record ──▶ <record_dir>/<bag>_0.mcap   (one growing file, append-
                │              │              │
                └──────────────┴──────────────┘
                                     │
-                       [trigger-<ns> thread]  ◀── /events/edgestream/trigger
+                       [trigger-<ns> thread]  ◀── /events/clipper/trigger
                          1. sleep postroll
                          2. wait coverage
                          3. ──▶ ExtractJob ──▶ [extract-N thread]
@@ -38,7 +38,7 @@ ros2 bag record ──▶ <record_dir>/<bag>_0.mcap   (one growing file, append-
                                                  read extents (read_at)
                                                  assemble clip in .capturing/
                                                  move atomically ──▶ out_dir/
-                         4. publish /events/edgestream/recorded
+                         4. publish /events/clipper/recorded
 ```
 
 ## Thread model
@@ -80,7 +80,7 @@ Each admitted trigger spawns a `trigger-<ns>` thread that runs four steps:
 1. **Postroll sleep.** Suspend until the system clock passes `trigger_time + postroll`.
 2. **Coverage wait.** Block on the coverage watch until `high_water_ns ≥ end_ns` (or `ended`). The `grace_secs` timeout fires when recorded topics go quiet, cutting the clip from what exists.
 3. **Extraction.** Enqueue an `ExtractJob` on the FIFO worker channel and block on the reply. The worker snapshots `plan_window` at dequeue time (ensuring the freshest index), reads the planned extents with `read_at` (no shared seek state with the tail), and assembles the clip.
-4. **Announce.** Publish `/events/edgestream/recorded` — only after the clip is in `out_dir` and `out_dir` is fsynced, so the announced path is always crash-durable.
+4. **Announce.** Publish `/events/clipper/recorded` — only after the clip is in `out_dir` and `out_dir` is fsynced, so the announced path is always crash-durable.
 
 ## Clip assembly and atomic publication
 

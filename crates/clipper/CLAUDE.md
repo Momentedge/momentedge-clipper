@@ -1,4 +1,4 @@
-# edgestream-rec-cont
+# clipper
 
 A *triggered* clip recorder over **one continuous MCAP file**. It keeps the
 single growing recording open and **tails it**, so a clip can be cut as soon as
@@ -11,10 +11,10 @@ over plain OS threads — there is no async runtime.
 ```
 ros2 bag record (scripts/record-continuous.sh) ──▶ ./record-cont/<bag>_0.mcap   (one growing file)
         ▲ kept open + tailed (incremental scan, persistent offsets)
-edgestream-rec-cont ◀── /events/edgestream/trigger ── trigger-pub (or any publisher)
+clipper ◀── /events/clipper/trigger ── trigger-pub (or any publisher)
         │ cuts [trigger_time-preroll, trigger_time+postroll]
         ├──▶ ./triggered-cont/<trigger_ns>_<name>.mcap
-        └──▶ /events/edgestream/recorded
+        └──▶ /events/clipper/recorded
 ```
 
 `record-continuous.sh` is a standalone `ros2 bag record` — this binary never
@@ -110,12 +110,12 @@ and finish safely against the deleted inode.
 
 ## Per-trigger flow (`handle_trigger`)
 
-Each admitted `edgestream_msgs/Trigger` is handled on its own thread, so
+Each admitted `momentedge_msgs/Trigger` is handled on its own thread, so
 overlapping windows are cut concurrently against the one shared tail. Admission
 is bounded: at most `MAX_ACTIVE_TRIGGERS` (16) handlers may be active at once,
 and a trigger that arrives while all of them are is rejected — logged with
 `error!` and otherwise ignored: no handler runs, no clip is extracted, and no
-`edgestream_msgs/Recorded` is published.
+`momentedge_msgs/Recorded` is published.
 
 1. **Wait out the postroll.** Sleep until the system clock passes
    `trigger_time + postroll`.
@@ -134,7 +134,7 @@ and a trigger that arrives while all of them are is rejected — logged with
    `clip::extract_clip`, and sends the result back. With the default single
    worker the bulk copies serialize FIFO; the waits in steps 1–2 are always
    concurrent.
-4. **Announce** by publishing `edgestream_msgs/Recorded` — only after the
+4. **Announce** by publishing `momentedge_msgs/Recorded` — only after the
    extraction has moved the clip into `out_dir` and fsynced that directory, so
    the announce names an already-moved, crash-durable file.
 
@@ -222,8 +222,8 @@ nanosec`).
 
 | Direction | Topic | Type |
 |---|---|---|
-| in | `/events/edgestream/trigger` | `edgestream_msgs/Trigger` |
-| out | `/events/edgestream/recorded` | `edgestream_msgs/Recorded` |
+| in | `/events/clipper/trigger` | `momentedge_msgs/Trigger` |
+| out | `/events/clipper/recorded` | `momentedge_msgs/Recorded` |
 
 No `rosbag2_interfaces` subscription — coverage comes from the file itself.
 
@@ -316,9 +316,9 @@ cargo-nextest prerequisite, the exact command) is in the
 rationale.
 
 - **Everything is a child process; the test owns no ROS node.** The ros2 CLI
-  resolves `edgestream_msgs` types from `AMENT_PREFIX_PATH`, so the test
+  resolves `momentedge_msgs` types from `AMENT_PREFIX_PATH`, so the test
   binary needs no r2r dependency and carries no process-global DDS state.
-  The binary under test is located via `CARGO_BIN_EXE_edgestream-rec-cont`.
+  The binary under test is located via `CARGO_BIN_EXE_clipper`.
 - **nextest is the required runner, not launch_testing**: process-per-test
   isolation, per-test slow-timeouts, leak detection for orphaned children,
   and the `ros-e2e` test group (`.config/nextest.toml`) serializing the suite
@@ -361,7 +361,7 @@ losing access, st_size growth, punch/extraction coordination).
 ## Run
 
 ```bash
-nix develop --command cargo run -p edgestream-rec-cont
+nix develop --command cargo run -p clipper
 ```
 
 Needs `scripts/record-continuous.sh` running (for `./record-cont`) and a
@@ -370,10 +370,10 @@ trigger publisher (`trigger-pub`). `RUST_LOG=debug` raises verbosity.
 ## Configuration
 
 There are no CLI args. `load_config` in `main.rs` layers config-rs sources —
-defaults → optional TOML file → `EDGESTREAM_*` environment variables
+defaults → optional TOML file → `CLIPPER_*` environment variables
 (later wins) — and deserializes the merged result into `Config` via serde.
-The TOML file is `edgestream-rec-cont.toml` in the working directory unless
-`$EDGESTREAM_CONFIG` names another path; a missing file is fine, so
+The TOML file is `clipper.toml` in the working directory unless
+`$CLIPPER_CONFIG` names another path; a missing file is fine, so
 the binary runs with no setup. The keys (`record_dir`, `out_dir`,
 `grace_secs`, `extract_parallelism`) and their defaults are listed in the
 [README](../../README.md#configuration).

@@ -32,12 +32,12 @@
       # packages each one as `pkgs.rosPackages.<distro>`; everything below
       # (dev shell, nix-built binaries, the recorder closure) is produced once
       # per distro by `mkDistro`. Pick a distro at the command line:
-      #   nix develop .#humble        nix build .#edgestream-rec-cont-rolling
+      #   nix develop .#humble        nix build .#clipper-rolling
       # The overlay also ships `kilted`; add it here to build against it.
       rosDistros = ["humble" "jazzy" "lyrical" "rolling"];
 
       # The distro used when no selector is given — `nix develop` and the
-      # unsuffixed packages (`nix build .#edgestream-rec-cont`). Jazzy is the LTS the
+      # unsuffixed packages (`nix build .#clipper`). Jazzy is the LTS the
       # bench is tuned on. The deployment target builds natively against its own
       # apt ROS2 (Humble; see README "Native build on the target"), independent
       # of this and of the nix-built outputs.
@@ -81,12 +81,12 @@
 
       # r2r does no dependency resolution, so codegen must be handed every
       # used message package explicitly. This filter covers the two packages
-      # the kept crates decode: edgestream_msgs (Trigger/Recorded) and its
+      # the kept crates decode: momentedge_msgs (Trigger/Recorded) and its
       # builtin_interfaces dependency (Time). It drives both the dev shell
       # (system cargo) and the nix-built binaries, for every distro. The
       # packages listed exist under all targeted distros, so one filter serves
       # them all.
-      idlPackageFilter = "builtin_interfaces;edgestream_msgs";
+      idlPackageFilter = "builtin_interfaces;momentedge_msgs";
 
       # GStreamer plugin set the sim camera's gscam pipeline draws from
       # (sim/cam_sim.sh). gscam's own closure carries only core +
@@ -105,7 +105,7 @@
       # Everything anchored to one ROS2 distro. Package definitions live under
       # ./nix; source paths are passed in from here so they stay anchored at the
       # repo root. Flakes only see git-tracked files — a newly added file under
-      # nix/ or edgestream_msgs/ must be `git add`ed before the eval sees it.
+      # nix/ or momentedge_msgs/ must be `git add`ed before the eval sees it.
       mkDistro = rosDistro: let
         # Apply the distro's sim packaging fix (if any) so the patched gscam /
         # ffmpeg-image-transport flow through to every consumer of `ros`.
@@ -114,11 +114,11 @@
            then base.overrideScope simOverlays.${rosDistro}
            else base;
         withSim = lib.elem rosDistro simDistros;
-        edgestream-msgs = import ./nix/edgestream-msgs.nix {
+        momentedge-msgs = import ./nix/momentedge-msgs.nix {
           inherit ros;
-          src = ./edgestream_msgs;
+          src = ./momentedge_msgs;
         };
-        rosEnv = import ./nix/ros-env.nix {inherit ros edgestream-msgs lib withSim;};
+        rosEnv = import ./nix/ros-env.nix {inherit ros momentedge-msgs lib withSim;};
         binaries = import ./nix/binaries.nix {
           inherit pkgs rosEnv idlPackageFilter rosDistro;
           src = ./.;
@@ -170,28 +170,28 @@
       distros = lib.genAttrs rosDistros mkDistro;
 
       # Per-distro package outputs: rosEnv-<distro>,
-      # edgestream-rec-cont-<distro>, trigger-pub-<distro>.
+      # clipper-<distro>, trigger-pub-<distro>.
       perDistroPackages =
         lib.concatMapAttrs (distro: d: {
           "rosEnv-${distro}" = d.rosEnv;
-          "edgestream-rec-cont-${distro}" = d.binaries.edgestream-rec-cont;
+          "clipper-${distro}" = d.binaries.clipper;
           "trigger-pub-${distro}" = d.binaries.trigger-pub;
         })
         distros;
 
       # Unsuffixed aliases for the default distro, so
-      # `nix build .#edgestream-rec-cont` keeps working.
+      # `nix build .#clipper` keeps working.
       defaultPackages = {
         rosEnv = distros.${defaultDistro}.rosEnv;
         inherit
           (distros.${defaultDistro}.binaries)
-          edgestream-rec-cont
+          clipper
           trigger-pub
           ;
       };
     in {
       # rosEnv (the dev shell's ROS2 closure) and the nix-built binaries are
-      # exposed mostly as build checks — `nix build .#edgestream-rec-cont-rolling`
+      # exposed mostly as build checks — `nix build .#clipper-rolling`
       # compiles the deployable under nix, against that distro, without the
       # system cargo. The target deploys native apt builds, not these (see
       # README "Deployment").

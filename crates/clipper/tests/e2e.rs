@@ -7,7 +7,7 @@
 //! the required runner. Inside the dev shell:
 //!
 //! ```text
-//! EDGESTREAM_E2E=1 cargo nextest run -p edgestream-rec-cont --profile e2e -E 'binary(e2e)'
+//! CLIPPER_E2E=1 cargo nextest run -p clipper --profile e2e -E 'binary(e2e)'
 //! ```
 //!
 //! Each test brings up its own recorder/source/extractor stack in its own

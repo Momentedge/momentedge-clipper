@@ -18,7 +18,7 @@
 # exactly the recorder's set, since r2r does no dependency resolution and must
 # be handed every used package explicitly. Everything in simPaths is env-only —
 # present for the sim pipeline, invisible to the Rust builds.
-{ ros, edgestream-msgs, lib, withSim ? true }:
+{ ros, momentedge-msgs, lib, withSim ? true }:
 
 let
   corePaths = with ros; [
@@ -54,8 +54,8 @@ let
     action-msgs
     unique-identifier-msgs
     std-srvs
-    # local edgestream Trigger/Recorded interfaces
-    edgestream-msgs
+    # local clipper Trigger/Recorded interfaces
+    momentedge-msgs
   ];
 
   # ---- the sim camera (sim/) ----

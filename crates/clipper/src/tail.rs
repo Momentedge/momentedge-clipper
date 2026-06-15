@@ -786,7 +786,7 @@ pub(crate) mod tests {
     pub(crate) fn test_dir(name: &str) -> Result<PathBuf> {
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "edgestream-rec-cont-{name}-{}-{nanos}",
+            "clipper-{name}-{}-{nanos}",
             std::process::id()
         ));
         std::fs::create_dir_all(&path)?;

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the edgestream recorder natively on the deployment target, against the
+# Build the clipper recorder natively on the deployment target, against the
 # host's own ROS2 (apt). No nix, no Docker: when the target runs the same ROS2
 # distro we build against, the two Rust binaries link the exact rcl/rmw/message
 # libraries that load them at runtime, so they are ABI-compatible with the rest
@@ -14,9 +14,9 @@
 #   # plus a Rust toolchain (rustup, or the distro cargo/rustc) on PATH
 #
 # Produces, under the repo root:
-#   install/                  colcon overlay carrying edgestream_msgs typesupport
-#   target/release/edgestream-rec-cont, target/release/trigger-pub
-# trigger-pub is run by start_demo_trigger_pub.sh; edgestream-rec-cont is run
+#   install/                  colcon overlay carrying momentedge_msgs typesupport
+#   target/release/clipper, target/release/trigger-pub
+# trigger-pub is run by start_demo_trigger_pub.sh; clipper is run
 # with scripts/record-continuous.sh per deployment.
 #
 # Override the ROS install with ROS_SETUP=/opt/ros/<distro>/setup.bash.
@@ -30,24 +30,24 @@ ROS_SETUP="${ROS_SETUP:-/opt/ros/humble/setup.bash}"
 source "$ROS_SETUP"
 echo "building against ROS2 ${ROS_DISTRO} ($ROS_SETUP)"
 
-# 1. Build the local interface package into a colcon overlay. edgestream_msgs is
+# 1. Build the local interface package into a colcon overlay. momentedge_msgs is
 #    not in apt, so its Trigger/Recorded typesupport must be generated here; the
 #    overlay feeds both r2r's codegen below and the binaries at runtime.
-colcon build --packages-select edgestream_msgs
+colcon build --packages-select momentedge_msgs
 # shellcheck disable=SC1091
 source install/setup.bash
 
 # 2. Build the two binaries. r2r regenerates its Rust bindings from the message
 #    IDL on AMENT_PREFIX_PATH at build time; restrict codegen to exactly the
-#    packages the deployables reference — builtin_interfaces and edgestream_msgs
+#    packages the deployables reference — builtin_interfaces and momentedge_msgs
 #    (r2r does no dependency resolution).
 export LIBCLANG_PATH="${LIBCLANG_PATH:-$(llvm-config --libdir 2>/dev/null || echo /usr/lib/llvm-14/lib)}"
-export IDL_PACKAGE_FILTER="builtin_interfaces;edgestream_msgs"
-cargo build --release -p edgestream-rec-cont -p trigger-pub
+export IDL_PACKAGE_FILTER="builtin_interfaces;momentedge_msgs"
+cargo build --release -p clipper -p trigger-pub
 
 echo
 echo "built:"
-echo "  $REPO_ROOT/target/release/edgestream-rec-cont"
+echo "  $REPO_ROOT/target/release/clipper"
 echo "  $REPO_ROOT/target/release/trigger-pub"
-echo "run the recorder: scripts/record-continuous.sh + target/release/edgestream-rec-cont"
+echo "run the recorder: scripts/record-continuous.sh + target/release/clipper"
 echo "run the demo trigger: scripts/start_demo_trigger_pub.sh"
