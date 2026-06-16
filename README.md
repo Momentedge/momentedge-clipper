@@ -40,6 +40,30 @@ It is a testing pad, not a finished tool.
   workflow. The recorder, the e2e suite, and deployment never touch the sim
   camera, so they are unaffected.
 
+## Binary cache
+
+The flake registers two substituters (`nixConfig` in `flake.nix`):
+`ros.cachix.org` for the upstream ROS2 packages, and
+`https://cache.stfl.dev/momentedge` — a self-hosted
+[attic](https://github.com/zhaofengli/attic) cache (backed by Cloudflare R2)
+that holds the project's ROS2 closure. Both are public: **pulling needs no
+credentials**, so a fresh checkout substitutes the ROS2 closure instead of
+compiling it from source.
+
+The substituters apply only once nix accepts the flake's `nixConfig`. Trusted
+users get this automatically; everyone else passes `--accept-flake-config` (or
+adds the two substituters and their public keys to `nix.conf`).
+
+Pushing to momentedge is for maintainers and CI and needs an attic token:
+
+```bash
+attic login momentedge https://cache.stfl.dev <token>
+attic push momentedge <store-path>
+```
+
+CI populates it automatically — the token lives in the `ATTIC_TOKEN` repository
+secret.
+
 ## Quickstart
 
 ```bash

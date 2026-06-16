@@ -12,8 +12,14 @@
   # The aarch64 deployment closure additionally needs the @wentasah attic cache
   # (https://attic.iid.ciirc.cvut.cz/ros) — see nix/README.md.
   nixConfig = {
-    extra-substituters = ["https://ros.cachix.org"];
-    extra-trusted-public-keys = ["ros.cachix.org-1:dSyZxI8geDCJrwgvCOHDoAfOm5sV1wCPjBkKL+38Rvo="];
+    extra-substituters = [
+      "https://ros.cachix.org"
+      "https://cache.stfl.dev/momentedge"
+    ];
+    extra-trusted-public-keys = [
+      "ros.cachix.org-1:dSyZxI8geDCJrwgvCOHDoAfOm5sV1wCPjBkKL+38Rvo="
+      "momentedge:VjgN2bnApwKu8fHARuBUUwyXo6sLktiJ1tZdYUpjS+4="
+    ];
   };
 
   outputs = {

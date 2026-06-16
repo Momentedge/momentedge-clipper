@@ -127,19 +127,20 @@ jobs:
           purge-created: 0
           purge-primary-key: never
 
-      # Registers the self-hosted momentedge attic cache (cache.stfl.dev) as a
-      # substituter for this job and installs the attic client. Its post step —
-      # which GitHub runs even when an earlier build or test step fails — pushes
-      # every store path realised during the run back to the cache. So the
-      # expensive ROS2 closure is fetched from momentedge when present and
-      # repopulated when absent, surviving flake-input changes across runs and
-      # branches. The push authenticates with the ATTIC_TOKEN repo secret.
+      # Installs the attic client, logs in with the ATTIC_TOKEN repo secret, and
+      # registers the self-hosted momentedge cache (cache.stfl.dev) as a
+      # substituter for this job. skip-push disables the action's built-in push,
+      # which only uploads paths realised *after* this step — empty on a full
+      # GitHub-cache restore, since the store is already populated by then. The
+      # "Push entire store to attic" step at the end uploads the whole store
+      # instead, so momentedge is populated even when nothing is rebuilt.
       - name: Set up momentedge attic cache
         uses: ryanccn/attic-action@v0.5
         with:
           endpoint: https://cache.stfl.dev
           cache: momentedge
           token: ${{ secrets.ATTIC_TOKEN }}
+          skip-push: true
 
       # System Rust toolchain, used inside the nix shell — the flake deliberately
       # ships no Rust. The crates build on stable (no feature gates).
@@ -176,3 +177,14 @@ jobs:
       #     nix develop ".#${{ matrix.distro }}" --command \
       #       env CLIPPER_E2E=1 CLIPPER_E2E_SKIP_FLAKY=1 cargo nextest run --locked -p clipper \
       #       --profile e2e -E '${{ matrix.e2e_filter }}'
+
+      # Pushes the entire /nix/store to momentedge so the full ROS2 closure lands
+      # in the cache even on a complete GitHub-cache restore when nothing is
+      # rebuilt — the migration target is to serve the whole closure from attic
+      # alone. atticd skips paths already in its upstream (cache.nixos.org), so
+      # only the ROS2 and project-specific paths are actually stored. The attic
+      # client and its login come from the setup step above; runs on failure too.
+      - name: Push entire store to attic
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: nix path-info --all | grep -vE '\.(drv|drv\.chroot|check|lock)$' | attic push --stdin momentedge
