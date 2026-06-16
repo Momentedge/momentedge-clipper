@@ -1,14 +1,15 @@
-# Builds, unit-tests, and runs the live ROS2 e2e suite for the recorder
-# (clipper) against every working ROS2 distro, on each push. A
-# separate `fmt` job checks workspace formatting (rustfmt) in parallel.
+# Builds and unit-tests the recorder (clipper) against every working ROS2
+# distro on each push. A separate `fmt` job checks workspace formatting
+# (rustfmt) in parallel.
 #
 # Each distro is one matrix leg. A leg enters that distro's nix dev shell
-# (`nix develop .#<distro>`) — which supplies the ROS2 closure, r2r codegen env,
-# and C toolchain — and runs the system cargo inside it, exactly as a developer
-# does locally. The ROS2 closure is restored from the GitHub Actions cache
-# (nix-community/cache-nix-action) so it is not re-realized every run; cargo
-# artifacts are cached per distro (Swatinem/rust-cache). No external cache
-# service or account is involved — the GitHub Actions cache backs both.
+# (`nix develop .#<distro>`) — which supplies the ROS2 closure, r2r codegen
+# env, and C toolchain — and runs the system cargo inside it, exactly as a
+# developer does locally. The ROS2 closure is substituted from the self-hosted
+# attic binary cache (cache.stfl.dev/momentedge, backed by Cloudflare R2) and
+# pushed back at the end of each run so later legs substitute the closure
+# instead of realising it from source. Cargo artifacts are cached per distro
+# via Swatinem/rust-cache, which is orthogonal and remains.
 #
 # Scope: only clipper is built and tested (trigger-pub is not in CI).
 # Distros: humble, jazzy, lyrical — the three the Rust crates build under
@@ -72,11 +73,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        distro: [
-            # humble,
-            jazzy,
-            # lyrical
-          ]
+        distro: [humble, jazzy, lyrical]
         include:
           # Per-distro e2e selection (nextest filterset). corrupt_tail_health_live
           # — the live-corruption race the project flags as its one inherently
@@ -101,8 +98,10 @@ jobs:
 
       # Installs Nix from the official releases.nixos.org source (no third-party
       # installer CDN). Flakes are enabled and the ROS2 binary cache
-      # (ros.cachix.org) is added so the closure is substituted, never compiled;
-      # the flake's own nixConfig is honoured via accept-flake-config.
+      # (ros.cachix.org) is added as a substituter so the upstream ROS2 packages
+      # are substituted rather than compiled; the flake's own nixConfig is honoured
+      # via accept-flake-config. The momentedge attic cache is wired up separately
+      # by the next step.
       - name: Install Nix
         uses: cachix/install-nix-action@v31
         with:
@@ -112,21 +111,19 @@ jobs:
             extra-substituters = https://ros.cachix.org
             extra-trusted-public-keys = ros.cachix.org-1:dSyZxI8geDCJrwgvCOHDoAfOm5sV1wCPjBkKL+38Rvo=
 
-      # Restores this distro's /nix/store from the GitHub Actions cache and saves
-      # it back at job end. Keyed on the flake inputs and the nix package defs;
-      # any change to those rolls the key. Keeps one cache per distro (purges
-      # older ones of the same prefix) and trims the store before save to stay
-      # well under GitHub's 10 GB per-repo cache budget across the three distros.
-      - name: Cache /nix/store
-        uses: nix-community/cache-nix-action@v7
+      # Registers the self-hosted momentedge attic cache (cache.stfl.dev) as a
+      # substituter for this job and installs the attic client. Its post step —
+      # which GitHub runs even when an earlier build or test step fails — pushes
+      # every store path realised during the run back to the cache. So the
+      # expensive ROS2 closure is fetched from momentedge when present and
+      # repopulated when absent, surviving flake-input changes across runs and
+      # branches. The push authenticates with the ATTIC_TOKEN repo secret.
+      - name: Set up momentedge attic cache
+        uses: ryanccn/attic-action@v0.5
         with:
-          primary-key: nix-${{ runner.os }}-${{ matrix.distro }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**', 'momentedge_msgs/**') }}
-          restore-prefixes-first-match: nix-${{ runner.os }}-${{ matrix.distro }}-
-          gc-max-store-size-linux: 5G
-          purge: true
-          purge-prefixes: nix-${{ runner.os }}-${{ matrix.distro }}-
-          purge-created: 0
-          purge-primary-key: never
+          endpoint: https://cache.stfl.dev
+          cache: momentedge
+          token: ${{ secrets.ATTIC_TOKEN }}
 
       # System Rust toolchain, used inside the nix shell — the flake deliberately
       # ships no Rust. The crates build on stable (no feature gates).
