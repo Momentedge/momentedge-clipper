@@ -259,8 +259,8 @@ The r2r pin returns to a crates.io release once `0.9.6` is published there (bead
 `clipper-4rw`).
 
 CI runs this suite — build, unit tests, and the gated e2e — on every push across
-the three working distros; the mechanics and the local-`act` notes live in
-[`.github/CLAUDE.md`](.github/CLAUDE.md).
+the three working distros; the mechanics and the local-`act` notes live in the
+`/ci` repo skill (`.claude/skills/ci/SKILL.md`).
 
 ## Deployment (Jetson / native build)
 

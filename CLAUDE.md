@@ -7,8 +7,7 @@ README — build mechanics and conventions — without repeating it. Each crate 
 its own CLAUDE.md:
 [`clipper`](crates/clipper/CLAUDE.md),
 [`trigger-pub`](crates/trigger-pub/CLAUDE.md); the sim camera (`sim/`) has
-[`sim/CLAUDE.md`](sim/CLAUDE.md), and the GitHub Actions CI has
-[`.github/CLAUDE.md`](.github/CLAUDE.md). The nested files load on demand when
+[`sim/CLAUDE.md`](sim/CLAUDE.md), and CI mechanics live in the `/ci` repo skill (`.claude/skills/ci/SKILL.md`). The nested files load on demand when
 you work in their directory, keeping their detail out of context otherwise.
 
 ## The recorders
@@ -126,9 +125,7 @@ distro-independent, since rustfmt only parses source. It runs on **nightly**
 rustfmt (`dtolnay/rust-toolchain@nightly`, rustfmt component only): the
 workspace `rustfmt.toml` sets unstable options that only nightly honours, which
 also matches the dev box's nightly system rustfmt. Mechanics,
-rationale, and the local-`act` caveats live in
-[`.github/CLAUDE.md`](.github/CLAUDE.md) — loaded on demand when you work in
-`.github/`, so it stays out of context otherwise.
+rationale, and the local-`act` caveats live in the `/ci` repo skill.
 
 ## Deployment build model
 
@@ -197,7 +194,7 @@ artifacts but does not publish by default (`publish` input, default `false`),
 so the packaging pipeline can be exercised — including locally under `act` —
 without touching any release. Workflow mechanics — the separate build,
 unit-test, and package steps, the `setup-ros` + `libclang` install split, and
-the `act` recipe — live in [`.github/CLAUDE.md`](.github/CLAUDE.md).
+the `act` recipe — live in the `/ci` repo skill.
 
 ## Workspace layout
 

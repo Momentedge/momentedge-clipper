@@ -12,7 +12,7 @@
 # A version tag (v*) publishes: the .deb files are attached to the GitHub release
 # for that tag. workflow_dispatch only builds and uploads artifacts (publish is
 # off by default), so the packaging can be exercised — and run locally under
-# `act` — without creating a release. See .github/CLAUDE.md for the act recipe.
+# `act` — without creating a release. See .claude/skills/ci/SKILL.md for the act recipe.
 
 name: release
 
