@@ -338,12 +338,17 @@ sudo apt install ./momentedge-clipper_<ver>_ubuntu22.04-humble_arm64.deb
 `apt` resolves the declared runtime dependencies (`ros-<distro>-ros-base`,
 `ros-<distro>-rmw-fastrtps-cpp`) automatically.
 
-The package installs the recorder as a wrapper command that sources ROS and the
-bundled `momentedge_msgs` overlay before exec:
+The package installs the recorder under `/opt/momentedge-clipper`. Following ROS
+convention it ships no launcher wrapper — source the matching ROS distro and the
+bundled overlay, then run `clipper`:
 
 ```bash
-momentedge-clipper   # maps to /opt/momentedge-clipper/bin/clipper
+source /opt/ros/humble/setup.bash            # the matching distro
+source /opt/momentedge-clipper/setup.bash    # bundled momentedge_msgs; puts clipper on PATH
+clipper --help
 ```
+
+(A systemd unit deploys it the same way: source those two files in `ExecStart`.)
 
 The package ships only the `clipper` recorder (plus its bundled `momentedge_msgs`
 typesupport under `/opt/momentedge-clipper`); the continuous recording it tails

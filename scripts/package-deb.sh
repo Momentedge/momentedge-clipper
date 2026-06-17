@@ -3,16 +3,16 @@
 # build. Build first with scripts/build-on-target.sh (against the host's apt ROS2
 # — on, or in a container matching, the deployment target: Ubuntu 22.04/Humble or
 # 24.04/Jazzy). This script then lays the built clipper binary and the
-# momentedge_msgs typesupport overlay out under /opt/momentedge-clipper with a
-# thin /usr/bin/momentedge-clipper wrapper, and writes a DEBIAN/control that
-# declares clipper's ROS2 runtime packages as Depends so apt pulls them on
-# install.
+# momentedge_msgs typesupport overlay out under /opt/momentedge-clipper, and
+# writes a DEBIAN/control that declares clipper's ROS2 runtime packages as Depends
+# so apt pulls them on install.
 #
 # clipper is the only binary packaged: trigger-pub is a dev stand-in and the
-# record scripts run from the host's ROS2, so neither ships here. The binary
-# carries RUNPATHs to the target ROS lib dir and the package's own lib dir, and
-# the wrapper sources the ROS and overlay environments so AMENT_PREFIX_PATH and
-# LD_LIBRARY_PATH are set for the dlopen'd typesupport.
+# record scripts run from the host's ROS2, so neither ships here. Following ROS
+# convention the package ships no launcher wrapper: to run the recorder, source
+# /opt/ros/<distro>/setup.bash and then /opt/momentedge-clipper/setup.bash (which
+# adds the bundled momentedge_msgs to AMENT_PREFIX_PATH / LD_LIBRARY_PATH for the
+# dlopen'd typesupport and puts clipper on PATH), then run clipper.
 #
 # Inputs (env):
 #   ROS_DISTRO   humble | jazzy            (default: derived from the sourced ROS)
@@ -47,16 +47,16 @@ echo "packaging momentedge-clipper $VERSION for $ROS_DISTRO (ubuntu $UBUNTU_VERS
 # 1. Require the build outputs this package is assembled from (produced by
 #    scripts/build-on-target.sh). The RUNPATHs the binary carries point at the
 #    installed locations, so it resolves rcl/rmw and the directly-linked
-#    momentedge_msgs typesupport even without a sourced environment; the wrapper
-#    adds AMENT_PREFIX_PATH and LD_LIBRARY_PATH on top for the dlopen'd
-#    rmw-specific typesupport.
+#    momentedge_msgs typesupport even without a sourced environment; sourcing the
+#    overlay setup.bash adds AMENT_PREFIX_PATH and LD_LIBRARY_PATH on top for the
+#    dlopen'd rmw-specific typesupport.
 [[ -x target/release/clipper ]] || { echo "missing target/release/clipper — run scripts/build-on-target.sh first" >&2; exit 1; }
 [[ -d install/momentedge_msgs/lib ]] || { echo "missing install/momentedge_msgs overlay — run scripts/build-on-target.sh first" >&2; exit 1; }
 
 # 2. Stage the package tree.
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
-install -d "$STAGE$PREFIX/bin" "$STAGE/usr/bin" "$STAGE/DEBIAN"
+install -d "$STAGE$PREFIX/bin" "$STAGE/DEBIAN"
 
 # The clipper binary — the only binary packaged.
 install -m 0755 target/release/clipper "$STAGE$PREFIX/bin/clipper"
@@ -69,33 +69,22 @@ cp -a install/momentedge_msgs/lib   "$STAGE$PREFIX/"
 cp -a install/momentedge_msgs/share "$STAGE$PREFIX/"
 
 # Relocatable overlay environment: put the bundled overlay on the ament/library
-# search paths. The literal ${VAR:+...} forms are expanded on the target at
-# source time; $PREFIX is baked in here.
+# search paths and clipper on PATH. The literal ${VAR:+...} forms are expanded on
+# the target at source time; $PREFIX is baked in here.
 cat > "$STAGE$PREFIX/setup.bash" <<EOF
 # momentedge-clipper overlay environment. Source the matching ROS2 distro setup
-# (/opt/ros/$ROS_DISTRO/setup.bash) first; this adds the bundled momentedge_msgs
-# typesupport.
+# (/opt/ros/$ROS_DISTRO/setup.bash) first, then this file, then run clipper. This
+# adds the bundled momentedge_msgs typesupport and puts clipper on PATH.
 export AMENT_PREFIX_PATH="$PREFIX\${AMENT_PREFIX_PATH:+:\$AMENT_PREFIX_PATH}"
 export LD_LIBRARY_PATH="$PREFIX/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
+export PATH="$PREFIX/bin\${PATH:+:\$PATH}"
 EOF
-
-# /usr/bin/momentedge-clipper wrapper: source ROS + the overlay, then exec the
-# binary. The binary carries RUNPATHs too, but the wrapper's LD_LIBRARY_PATH and
-# AMENT_PREFIX_PATH are what the dlopen'd rmw-specific typesupport needs. It
-# forwards its args to clipper.
-cat > "$STAGE/usr/bin/momentedge-clipper" <<EOF
-#!/bin/bash
-source /opt/ros/$ROS_DISTRO/setup.bash
-source $PREFIX/setup.bash
-exec $PREFIX/bin/clipper "\$@"
-EOF
-chmod 0755 "$STAGE/usr/bin/momentedge-clipper"
 
 # 3. DEBIAN/control with clipper's ROS2 runtime packages as Depends, so apt pulls
 #    them on `apt install ./momentedge-clipper_*.deb`. rmw_fastrtps_cpp is named
 #    explicitly: it is the RMW the clipper binary and the bundled typesupport
 #    load, so naming it directly does not rely on ros-base keeping it the default.
-INSTALLED_SIZE="$(du -sk "$STAGE$PREFIX" "$STAGE/usr" | awk '{s+=$1} END {print s}')"
+INSTALLED_SIZE="$(du -sk "$STAGE$PREFIX" | awk '{s+=$1} END {print s}')"
 cat > "$STAGE/DEBIAN/control" <<EOF
 Package: momentedge-clipper
 Version: $VERSION

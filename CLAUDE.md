@@ -155,20 +155,25 @@ that shapes it:
 build: `build-on-target.sh` produces the `clipper` binary and the `momentedge_msgs`
 overlay, then `package-deb.sh` stages and builds the `.deb` (it does not build the
 binary itself — the release pipeline runs build, unit-test, and package as
-separate steps). The build runs through `scripts/ros-cargo.sh`, which sets up the
-ROS + r2r-codegen environment — the colcon overlay, `libclang`,
-`IDL_PACKAGE_FILTER`, and the `MOMENTEDGE_RPATH` RUNPATHs — in one place shared by
-`build-on-target.sh` and the CI unit-test step. The baked RUNPATHs let the
+separate steps). The build splits across three small scripts:
+`scripts/ros-setup.sh` is sourced to put the ROS distro and the momentedge_msgs
+overlay on the environment (the one place that sourcing lives, honouring
+`ROS_SETUP` / `ROS_DISTRO`); `scripts/ros-build-messages.sh` builds the
+momentedge_msgs colcon overlay; and `scripts/ros-cargo.sh` sources the env and
+adds the r2r-codegen environment — `IDL_PACKAGE_FILTER` and the
+`MOMENTEDGE_RPATH` RUNPATHs — before exec-ing cargo. `build-on-target.sh` runs
+the latter two in order; the CI unit-test step calls `ros-cargo.sh` directly. The baked RUNPATHs let the
 `clipper` binary resolve `rcl`/`rmw` and the directly-linked `momentedge_msgs`
 typesupport without a sourced environment. The package tree is rooted at `/opt/momentedge-clipper`
-(`bin/clipper`, `lib/`, `share/`, `setup.bash`) with a thin
-`/usr/bin/momentedge-clipper` wrapper that sources `/opt/ros/<distro>/setup.bash`
-and the package's own `setup.bash` (which extends `AMENT_PREFIX_PATH` and
-`LD_LIBRARY_PATH` with the bundled overlay) before exec-ing the binary — the
-wrapper's `LD_LIBRARY_PATH` is what the dlopen'd rmw-specific typesupport needs;
-the RUNPATHs cover only the directly-linked libraries. `clipper` is the only
-binary packaged: `trigger-pub` is a dev stand-in and the recording is produced by
-the host's own `ros2 bag record`, so neither ships in the `.deb`.
+(`bin/clipper`, `lib/`, `share/`, `setup.bash`). Following ROS convention it ships
+no launcher wrapper: to run the recorder, source `/opt/ros/<distro>/setup.bash`
+then `/opt/momentedge-clipper/setup.bash` (which extends `AMENT_PREFIX_PATH` and
+`LD_LIBRARY_PATH` with the bundled overlay and puts `clipper` on `PATH`), then run
+`clipper` — or have a systemd unit source the same two files in its `ExecStart`.
+The overlay's `LD_LIBRARY_PATH` is what the dlopen'd rmw-specific typesupport
+needs; the RUNPATHs cover only the directly-linked libraries. `clipper` is the
+only binary packaged: `trigger-pub` is a dev stand-in and the recording is
+produced by the host's own `ros2 bag record`, so neither ships in the `.deb`.
 
 `momentedge_msgs` is not in apt, so the package bundles the compiled typesupport
 (`lib/`, `share/`) from the colcon overlay produced by `build-on-target.sh`.

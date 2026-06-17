@@ -24,30 +24,22 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
-ROS_SETUP="${ROS_SETUP:-/opt/ros/${ROS_DISTRO:-humble}/setup.bash}"
 
-# ROS2's setup.bash references unset vars (AMENT_TRACE_SETUP_FILES, …); it is not
-# nounset-clean, so relax -u only around sourcing it.
-set +u
-# shellcheck disable=SC1090
-source "$ROS_SETUP"
-set -u
-echo "building against ROS2 ${ROS_DISTRO} ($ROS_SETUP)"
+# 1. Build the momentedge_msgs interface package into a colcon overlay.
+#    momentedge_msgs is not in apt, so its Trigger/Recorded typesupport is
+#    generated here; the overlay feeds both r2r's codegen and the binaries at
+#    runtime. (Both sub-scripts source the ROS env via scripts/ros-setup.sh, which
+#    honours ROS_SETUP / ROS_DISTRO.)
+"$REPO_ROOT/scripts/ros-build-messages.sh"
 
-# 1. Build the local interface package into a colcon overlay. momentedge_msgs is
-#    not in apt, so its Trigger/Recorded typesupport must be generated here; the
-#    overlay feeds both r2r's codegen below and the binaries at runtime.
-colcon build --packages-select momentedge_msgs
-
-# 2. Build the binaries through scripts/ros-cargo.sh, which re-sources ROS and the
-#    just-built overlay and sets the r2r codegen env (libclang, IDL_PACKAGE_FILTER)
-#    and any MOMENTEDGE_RPATH — the one place that environment is defined.
-#    Which crates to build: both deployables by default; the .deb build sets
+# 2. Build the binaries through scripts/ros-cargo.sh, which sources ROS + the
+#    just-built overlay and adds the r2r codegen env (IDL_PACKAGE_FILTER) and any
+#    MOMENTEDGE_RPATH. Both deployables by default; the .deb build sets
 #    BUILD_PACKAGES=clipper, the only binary it packages.
 read -ra _build_pkgs <<< "${BUILD_PACKAGES:-clipper trigger-pub}"
 _pkg_flags=()
 for _p in "${_build_pkgs[@]}"; do _pkg_flags+=(-p "$_p"); done
-ROS_SETUP="$ROS_SETUP" "$REPO_ROOT/scripts/ros-cargo.sh" build --release "${_pkg_flags[@]}"
+"$REPO_ROOT/scripts/ros-cargo.sh" build --release "${_pkg_flags[@]}"
 
 echo
 echo "built:"
