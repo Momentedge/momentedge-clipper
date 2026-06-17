@@ -59,6 +59,11 @@ dolt-pprof/
 # Backup data (auto-exported JSONL, local-only)
 backup/
 
+# Auto-exported issue/interaction JSONL — a passive export of the Dolt DB, which
+# is the source of truth (synced via sync.remote). Not tracked in git.
+issues.jsonl
+interactions.jsonl
+
 # Per-project environment file (Dolt connection config, GH#2520)
 .env
 
