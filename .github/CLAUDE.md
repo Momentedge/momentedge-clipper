@@ -69,10 +69,10 @@ mechanics and the reasoning behind the choices:
   (`tests/harness/mod.rs`, mirroring `require_e2e()`) reads to skip-and-pass — so
   the skip lives in the test, the reason next to it, and a local run (env unset)
   still exercises the corruption race. Skipping it on every distro keeps the
-  suite green and the other 13 as coverage (beads `ros2_subscribe-3q8`). Lyrical
+  suite green and the other 13 as coverage (beads `clipper-3q8`). Lyrical
   additionally drops `old_recording_on_disk_is_not_recovered_after_restart` — a
   distro incompatibility (its timestamped rosbag2 filenames break the test's
-  harness assumption, beads `ros2_subscribe-7ys`), not CI flakiness, so it stays
+  harness assumption, beads `clipper-7ys`), not CI flakiness, so it stays
   a nextest filterset (`not test(...)`) on lyrical's leg rather than an env gate.
   humble/jazzy run 13 and lyrical 12.
 

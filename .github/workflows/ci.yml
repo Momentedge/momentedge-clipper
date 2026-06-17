@@ -86,7 +86,7 @@ jobs:
           # in-test skip_flaky() gate reads to skip-and-pass. Its mandatory 60 s
           # post-damage announcement misses under CI-grade timing, and nextest's
           # default fail-fast then masks the rest of the suite (beads
-          # ros2_subscribe-3q8).
+          # clipper-3q8).
           - distro: humble
             e2e_filter: binary(e2e)
           - distro: jazzy

@@ -101,7 +101,7 @@ everything — distinct from a scan fault, which keeps the index. Clips are cut
 from the most recent recording only; a previous file's data is never recovered
 into a clip, even when that file still exists on disk. Recovery across a
 recording replacement is an explicit non-feature, tracked as out of scope in
-beads `ros2_subscribe-gl2`. A `NotFound` when opening the discovered path is
+beads `clipper-gl2`. A `NotFound` when opening the discovered path is
 the same race resolved the same way: the file vanished between discovery and
 open, so it is treated as a replacement and re-discovery loops. A magic
 mismatch stays fatal — an append-only file whose first eight bytes are wrong
@@ -355,7 +355,7 @@ rationale.
 None. The single file grows until the recording stops. Punching holes below a
 retention horizon with `fallocate(FALLOC_FL_PUNCH_HOLE)` — keeping offsets
 stable under the live writer — is the designed follow-up, tracked in beads as
-`ros2_subscribe-wkg` (constraints: schema/channel custody, standard readers
+`clipper-wkg` (constraints: schema/channel custody, standard readers
 losing access, st_size growth, punch/extraction coordination).
 
 ## Run

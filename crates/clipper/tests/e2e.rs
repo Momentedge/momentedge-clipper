@@ -148,7 +148,7 @@ fn recorder_restart_recovers_and_keeps_extracting() {
 /// the replacement recording and the index resets, so the clip is cut from
 /// the most recent recording only — the pre-restart data is accepted as lost
 /// (recovering it from a still-readable old file is explicitly out of scope:
-/// beads ros2_subscribe-gl2). The announcement must still go out and every
+/// beads clipper-gl2). The announcement must still go out and every
 /// message in the clip must postdate the restart.
 ///
 /// The cases vary when the recording file is deleted relative to the trigger
@@ -417,7 +417,7 @@ fn restart_after_the_window_ended_announces_an_empty_clip() {
 /// again: the tail follows the newest file only, and a window lying entirely
 /// inside the old file's data cuts an empty clip even though that data is
 /// still on disk and readable. Recovering a previous recording's data is an
-/// explicit non-feature (beads ros2_subscribe-gl2): a rotation means the old
+/// explicit non-feature (beads clipper-gl2): a rotation means the old
 /// file's data is gone as far as clips are concerned — later windows over
 /// the live recording keep working.
 #[rstest]

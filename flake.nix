@@ -56,7 +56,7 @@
       # packaging fix below (its older ament-1.x closure omits pkg-config).
       # Rolling's sim shell is camera-only: its recorder Rust crates don't build
       # (r2r references an rmw QoS variant rolling removed, beads
-      # ros2_subscribe-2xb), but the sim stack is env-only and unaffected. The
+      # clipper-2xb), but the sim stack is env-only and unaffected. The
       # recorder, the e2e suite, and deployment use none of the sim packages, so
       # a distro left off this list still gets the full recorder/e2e core
       # (nix/ros-env.nix `withSim`). Add a distro here (and a `simOverlays` entry

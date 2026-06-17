@@ -32,7 +32,7 @@
 # rosbag2 refuses to record into an existing bag directory, so OUT_DIR is wiped
 # on start. ./record-cont is gitignored. There is no retention — the single
 # file grows until you stop recording (hole-punch retention is tracked in
-# beads: ros2_subscribe-wkg).
+# beads: clipper-wkg).
 #
 # Run inside the dev shell (provides ros2bag + the mcap storage plugin):
 #   nix develop --command ./scripts/record-continuous.sh                       # all topics

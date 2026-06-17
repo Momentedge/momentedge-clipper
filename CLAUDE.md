@@ -43,7 +43,7 @@ of `gscam` and `ffmpeg_image_transport`, plus a `-DFFMPEG_PKGCONFIG=…` flag on
 the latter (its `ffmpeg_encoder_decoder` dependency exports an extras.cmake that
 clobbers `PKG_CONFIG_PATH`). Rolling's sim shell is camera-only: its recorder
 crates don't build (r2r references an rmw QoS variant rolling removed, beads
-`ros2_subscribe-2xb`), but the sim stack is env-only and unaffected. The
+`clipper-2xb`), but the sim stack is env-only and unaffected. The
 recorder, the e2e suite, and deployment use none of the sim stack, so the
 `corePaths` half — the recorder/CLI/rosbag2/message closure — builds and tests on
 every distro regardless. Extend `simDistros` (and `simOverlays`, only if the
@@ -89,12 +89,12 @@ Setup is in the README; the parts that matter when changing the build:
   distros after jazzy have removed. The workspace pins r2r to its `0.9.6` git tag
   (`Cargo.toml`), which adds `lyrical` and cfg-gates that variant for it, so the
   crates build on `humble`, `jazzy`, and `lyrical` — but not `rolling`, which
-  r2r `0.9.6` still references the variant for (beads `ros2_subscribe-2xb`); the
-  pin returns to crates.io once `0.9.6` ships there (beads `ros2_subscribe-4rw`).
+  r2r `0.9.6` still references the variant for (beads `clipper-2xb`); the
+  pin returns to crates.io once `0.9.6` ships there (beads `clipper-4rw`).
   So the live e2e suite passes fully on `humble` and `jazzy`, and 12/14 on
   `lyrical` (two recorder-restart tests trip over lyrical's timestamped rosbag2
   bag filenames — a harness assumption, not a recorder bug, beads
-  `ros2_subscribe-7ys`); `rolling` still gets a working ROS2 shell for everything
+  `clipper-7ys`); `rolling` still gets a working ROS2 shell for everything
   but the Rust build. The sim camera's stack (`ros-core`, `gscam`, the
   image_transport plugins, `rclcpp-components`) serves only `sim/`, with
   `ffmpeg-image-transport-msgs` doubling as the type support `ros2 bag record`

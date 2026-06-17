@@ -26,7 +26,7 @@ It is a testing pad, not a finished tool.
   one. The recorder builds and the e2e suite pass fully on **humble** and
   **jazzy**; **lyrical** builds and passes 12/14 (two recorder-restart tests
   trip lyrical's timestamped rosbag2 filenames — a harness assumption, beads
-  `ros2_subscribe-7ys`); **rolling** gets a working ROS2 shell but cannot build
+  `clipper-7ys`); **rolling** gets a working ROS2 shell but cannot build
   the Rust crates (an `r2r` limitation — see "Integration tests" below).
 - **System Rust** (`cargo`/`rustc` on your `PATH`). The flake intentionally does
   not provide a Rust toolchain.
@@ -251,12 +251,12 @@ tag, which supports lyrical) and passes 12/14: two recorder-restart tests
 (`old_recording_on_disk_is_not_recovered_after_restart` and
 `corrupt_tail_health_live`) fail because lyrical's rosbag2 names bag files with a
 timestamp, breaking the test harness's stable-filename re-attach check — the
-recorder itself is unaffected (beads `ros2_subscribe-7ys`). **Rolling** selects
+recorder itself is unaffected (beads `clipper-7ys`). **Rolling** selects
 and builds its ROS2 closure (`nix develop .#rolling` works) but cannot build the
 Rust crates: even r2r `0.9.6` references the `RMW_QOS_POLICY_LIVELINESS_MANUAL_BY_NODE`
-rmw enum variant that the current rolling has dropped (beads `ros2_subscribe-2xb`).
+rmw enum variant that the current rolling has dropped (beads `clipper-2xb`).
 The r2r pin returns to a crates.io release once `0.9.6` is published there (beads
-`ros2_subscribe-4rw`).
+`clipper-4rw`).
 
 CI runs this suite — build, unit tests, and the gated e2e — on every push across
 the three working distros; the mechanics and the local-`act` notes live in

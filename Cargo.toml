@@ -20,8 +20,8 @@ edition = "2024"
 # adds `lyrical` to its supported-distro list and cfg-gates the
 # `RMW_QOS_POLICY_LIVELINESS_MANUAL_BY_NODE` rmw variant that lyrical dropped, so
 # the r2r crates build there. 0.9.6 is not yet on crates.io — swap back to a
-# version string once it is (beads ros2_subscribe-4rw). Rolling needs more than
-# 0.9.6 (beads ros2_subscribe-2xb).
+# version string once it is (beads clipper-4rw). Rolling needs more than
+# 0.9.6 (beads clipper-2xb).
 r2r = { git = "https://github.com/sequenceplanner/r2r.git", tag = "0.9.6" }
 futures = "0.3"
 crossbeam-channel = "0.5"
