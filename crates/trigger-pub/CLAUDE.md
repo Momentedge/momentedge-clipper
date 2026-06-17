@@ -1,7 +1,7 @@
 # trigger-pub
 
 A development stand-in that publishes `momentedge_msgs/Trigger` on
-`/events/clipper/trigger` at a fixed interval, so the triggered recorder
+`/events/momentedge/trigger` at a fixed interval, so the triggered recorder
 (`clipper`) has something to react to without a real trigger
 source. Built on [r2r](https://github.com/sequenceplanner/r2r); no async
 runtime.

@@ -7,7 +7,7 @@
 //! schema/channel registry, and a coverage watch (the highest `log_time` on
 //! disk). There are no bag splits and no `/events/write_split` dependency.
 //!
-//! On `/events/clipper/trigger` (`momentedge_msgs/Trigger`) it cuts the
+//! On `/events/momentedge/trigger` (`momentedge_msgs/Trigger`) it cuts the
 //! window `[trigger_time - preroll, trigger_time + postroll]`: wait until the
 //! wall clock passes the window end, wait until the tail's coverage reaches it
 //! (the recording provably holds the window), then bulk-copy the in-window
@@ -15,7 +15,7 @@
 //! `./triggered-cont/<trigger_ns>_<name>.mcap` (see [`clip`] — a raw-bytes
 //! copy, no CDR decode, finished with a proper summary + footer, assembled in
 //! a capturing dir and moved atomically into place so observers never see a
-//! footer-less file), and finally publish `/events/clipper/recorded`
+//! footer-less file), and finally publish `/events/momentedge/recorded`
 //! (`momentedge_msgs/Recorded`), which therefore always names a durable clip.
 //!
 //! Time base: MCAP `log_time`, the trigger stamp, and the wait clock are all
@@ -72,8 +72,8 @@ use signal_hook::consts::{SIGINT, SIGTERM};
 use tail::{Coverage, Tailer};
 use watch::Watch;
 
-const TRIGGER_TOPIC: &str = "/events/clipper/trigger";
-const RECORDED_TOPIC: &str = "/events/clipper/recorded";
+const TRIGGER_TOPIC: &str = "/events/momentedge/trigger";
+const RECORDED_TOPIC: &str = "/events/momentedge/recorded";
 
 /// How many trigger handlers may be active (admitted, waiting, or extracting)
 /// at once. Beyond this limit an arriving trigger is rejected at admission:

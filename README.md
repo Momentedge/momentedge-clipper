@@ -98,7 +98,7 @@ repo's dev shell sets these for you.
 
 A healthy run drops a clip into `./triggered-cont` for each trigger
 (`<trigger_ns>_<name>.mcap`) and publishes an `momentedge_msgs/Recorded`
-announcement on `/events/clipper/recorded` naming the file just written.
+announcement on `/events/momentedge/recorded` naming the file just written.
 Inspect a clip with `ros2 bag info triggered-cont/<file>.mcap`.
 
 ## Triggered recording
@@ -111,9 +111,9 @@ latency rather than any split duration.
 ```
 ros2 bag record ──one growing mcap──▶ ./record-cont/<bag>_0.mcap
        ▲ kept open + tailed
-clipper ◀── /events/clipper/trigger ── trigger-pub
+clipper ◀── /events/momentedge/trigger ── trigger-pub
        ├──▶ ./triggered-cont/<trigger_ns>_<name>.mcap
-       └──▶ /events/clipper/recorded
+       └──▶ /events/momentedge/recorded
 ```
 
 - **`ros2 bag record`** (via `scripts/record-continuous.sh`) records into one
@@ -127,13 +127,13 @@ clipper ◀── /events/clipper/trigger ── trigger-pub
   The script uses the **fastwrite** storage profile (`--storage-preset-profile
   fastwrite --max-cache-size 0`) so each message is visible to the tail
   immediately after the recorder writes it.
-- **`clipper`** listens on `/events/clipper/trigger`
+- **`clipper`** listens on `/events/momentedge/trigger`
   (`momentedge_msgs/Trigger`: `name`, `description`, `trigger_time`, and the
   `preroll`/`postroll` windows in nanoseconds). For each trigger it waits until
   the recording covers the window `[trigger_time - preroll, trigger_time +
   postroll]` (or the grace timeout elapses), then bulk-copies every message in
   that window into `./triggered-cont/<trigger_ns>_<name>.mcap` and publishes
-  `momentedge_msgs/Recorded` on `/events/clipper/recorded`. The copy re-emits
+  `momentedge_msgs/Recorded` on `/events/momentedge/recorded`. The copy re-emits
   raw MCAP message bytes — channels and schemas are carried over, message bodies
   are never decoded.
 - **`trigger-pub`** publishes a trigger every 1 s (configurable), stamping
@@ -161,13 +161,13 @@ extract_parallelism = 1        # concurrent clip copies (1 = one at a time, FIFO
 At most 16 triggers are handled concurrently — a fixed bound, not a config key.
 A trigger that arrives while all 16 handler slots are occupied is rejected: a
 logged error is emitted and the trigger produces no clip and no
-`/events/clipper/recorded` announcement.
+`/events/momentedge/recorded` announcement.
 
 The recorder also reads chunked recordings (override `STORAGE_PRESET` /
 `MAX_CACHE_SIZE` on `record-continuous.sh`), but `grace_secs` must then be sized
 to the resulting flush latency (roughly chunk size / aggregate data rate). Every
 file visible in `out_dir` is a complete, crash-durable clip; the
-`/events/clipper/recorded` announce always names an already-written file. The
+`/events/momentedge/recorded` announce always names an already-written file. The
 single recording file has no retention — it grows until you stop recording.
 
 For the internal design — thread model, tailing mechanics, atomic clip

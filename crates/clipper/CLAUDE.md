@@ -11,10 +11,10 @@ over plain OS threads — there is no async runtime.
 ```
 ros2 bag record (scripts/record-continuous.sh) ──▶ ./record-cont/<bag>_0.mcap   (one growing file)
         ▲ kept open + tailed (incremental scan, persistent offsets)
-clipper ◀── /events/clipper/trigger ── trigger-pub (or any publisher)
+clipper ◀── /events/momentedge/trigger ── trigger-pub (or any publisher)
         │ cuts [trigger_time-preroll, trigger_time+postroll]
         ├──▶ ./triggered-cont/<trigger_ns>_<name>.mcap
-        └──▶ /events/clipper/recorded
+        └──▶ /events/momentedge/recorded
 ```
 
 `record-continuous.sh` is a standalone `ros2 bag record` — this binary never
@@ -222,8 +222,8 @@ nanosec`).
 
 | Direction | Topic | Type |
 |---|---|---|
-| in | `/events/clipper/trigger` | `momentedge_msgs/Trigger` |
-| out | `/events/clipper/recorded` | `momentedge_msgs/Recorded` |
+| in | `/events/momentedge/trigger` | `momentedge_msgs/Trigger` |
+| out | `/events/momentedge/recorded` | `momentedge_msgs/Recorded` |
 
 No `rosbag2_interfaces` subscription — coverage comes from the file itself.
 

@@ -25,8 +25,8 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-pub const TRIGGER_TOPIC: &str = "/events/clipper/trigger";
-pub const RECORDED_TOPIC: &str = "/events/clipper/recorded";
+pub const TRIGGER_TOPIC: &str = "/events/momentedge/trigger";
+pub const RECORDED_TOPIC: &str = "/events/momentedge/recorded";
 
 /// Gate for the whole suite. Unset `CLIPPER_E2E` means skip-and-pass, so
 /// plain `cargo test` / `cargo llvm-cov` stay green without ROS. Set, a

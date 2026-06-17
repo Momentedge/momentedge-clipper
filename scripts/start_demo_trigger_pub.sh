@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Demo trigger publisher (trigger-pub) for the native Humble target — a stand-in
-# that publishes momentedge_msgs/Trigger on /events/clipper/trigger ~1/s so
+# that publishes momentedge_msgs/Trigger on /events/momentedge/trigger ~1/s so
 # clipper produces clips. A real trigger source replaces it in
 # production; the recorder (clipper) does not depend on this demo
 # publisher.

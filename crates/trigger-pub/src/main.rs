@@ -1,4 +1,4 @@
-//! Periodic `/events/clipper/trigger` publisher.
+//! Periodic `/events/momentedge/trigger` publisher.
 //!
 //! Emits a `momentedge_msgs/Trigger` every `--period` seconds (5 s by default)
 //! so the triggered recorder (`clipper`) has something to react to during
@@ -87,7 +87,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ctx = r2r::Context::create()?;
     let mut node = r2r::Node::create(ctx, "clipper_trigger_pub", "")?;
     let publisher = node.create_publisher::<r2r::momentedge_msgs::msg::Trigger>(
-        "/events/clipper/trigger",
+        "/events/momentedge/trigger",
         QosProfile::default(),
     )?;
     // RosTime clock: the trigger_time stamp the recorder centres its window on.
@@ -102,7 +102,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
     };
     info!(
-        "publishing /events/clipper/trigger every {:.1}s  (preroll={}, postroll={})",
+        "publishing /events/momentedge/trigger every {:.1}s  (preroll={}, postroll={})",
         args.period.as_secs_f64(),
         describe_roll(args.preroll),
         describe_roll(args.postroll),
