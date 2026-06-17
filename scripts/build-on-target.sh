@@ -24,7 +24,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
-ROS_SETUP="${ROS_SETUP:-/opt/ros/humble/setup.bash}"
+ROS_SETUP="${ROS_SETUP:-/opt/ros/${ROS_DISTRO:-humble}/setup.bash}"
 
 # ROS2's setup.bash references unset vars (AMENT_TRACE_SETUP_FILES, …); it is not
 # nounset-clean, so relax -u only around sourcing it.
@@ -38,49 +38,16 @@ echo "building against ROS2 ${ROS_DISTRO} ($ROS_SETUP)"
 #    not in apt, so its Trigger/Recorded typesupport must be generated here; the
 #    overlay feeds both r2r's codegen below and the binaries at runtime.
 colcon build --packages-select momentedge_msgs
-# The colcon overlay's setup is likewise not nounset-clean.
-set +u
-# shellcheck disable=SC1091
-source install/setup.bash
-set -u
 
-# 2. Build the two binaries. r2r regenerates its Rust bindings from the message
-#    IDL on AMENT_PREFIX_PATH at build time; restrict codegen to exactly the
-#    packages the deployables reference — builtin_interfaces and momentedge_msgs
-#    (r2r does no dependency resolution).
-# bindgen (r2r's build script) needs libclang. Ubuntu's libclang-dev installs it
-# under a versioned llvm dir whose number tracks the release (llvm-14 on 22.04,
-# llvm-18 on 24.04), so prefer llvm-config and fall back to a search rather than
-# pinning one version.
-if [[ -z "${LIBCLANG_PATH:-}" ]]; then
-  LIBCLANG_PATH="$(llvm-config --libdir 2>/dev/null || true)"
-  if [[ -z "$LIBCLANG_PATH" ]]; then
-    libclang="$(find /usr/lib /usr/lib64 -name 'libclang.so*' 2>/dev/null | head -n1)"
-    [[ -n "$libclang" ]] && LIBCLANG_PATH="$(dirname "$libclang")"
-  fi
-fi
-export LIBCLANG_PATH
-export IDL_PACKAGE_FILTER="builtin_interfaces;momentedge_msgs"
-
-# Optional: bake RUNPATHs into the binaries so they resolve rcl/rmw and the
-# momentedge_msgs typesupport at their *installed* locations, independent of any
-# sourced environment. scripts/package-deb.sh sets this to the target ROS lib dir
-# and the package's own lib dir; left unset (the default native on-target build)
-# the binaries resolve via the sourced overlay as before.
-if [[ -n "${MOMENTEDGE_RPATH:-}" ]]; then
-  IFS=':' read -ra _rpath_dirs <<< "$MOMENTEDGE_RPATH"
-  for _d in "${_rpath_dirs[@]}"; do
-    [[ -n "$_d" ]] && RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-Wl,-rpath,$_d"
-  done
-  export RUSTFLAGS
-fi
-
-# Which workspace crates to build. Default: both deployables. scripts/package-deb.sh
-# sets BUILD_PACKAGES=clipper, the only binary it packages.
+# 2. Build the binaries through scripts/ros-cargo.sh, which re-sources ROS and the
+#    just-built overlay and sets the r2r codegen env (libclang, IDL_PACKAGE_FILTER)
+#    and any MOMENTEDGE_RPATH — the one place that environment is defined.
+#    Which crates to build: both deployables by default; the .deb build sets
+#    BUILD_PACKAGES=clipper, the only binary it packages.
 read -ra _build_pkgs <<< "${BUILD_PACKAGES:-clipper trigger-pub}"
 _pkg_flags=()
 for _p in "${_build_pkgs[@]}"; do _pkg_flags+=(-p "$_p"); done
-cargo build --release "${_pkg_flags[@]}"
+ROS_SETUP="$ROS_SETUP" "$REPO_ROOT/scripts/ros-cargo.sh" build --release "${_pkg_flags[@]}"
 
 echo
 echo "built:"

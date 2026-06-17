@@ -18,6 +18,7 @@
 #   ROS_DISTRO   humble | jazzy            (default: derived from the sourced ROS)
 #   VERSION      package version           (default: workspace version, Cargo.toml)
 #   OUT_DIR      where the .deb is written (default: ./dist)
+#   BUILD        1 builds first, 0 packages a pre-built tree   (default: 1)
 # Tools required on PATH: dpkg-deb, colcon, cargo, a C/Rust toolchain.
 set -euo pipefail
 
@@ -43,15 +44,24 @@ UBUNTU_VERSION="$(. /etc/os-release && echo "$VERSION_ID")"
 
 echo "packaging momentedge-clipper $VERSION for $ROS_DISTRO (ubuntu $UBUNTU_VERSION, $ARCH)"
 
-# 1. Native build of the clipper binary with RUNPATHs pointing at the installed
-#    locations, so it resolves rcl/rmw and the directly-linked momentedge_msgs
-#    typesupport even without a sourced environment. The wrapper adds
-#    AMENT_PREFIX_PATH and LD_LIBRARY_PATH on top, which the dlopen'd rmw-specific
-#    typesupport still needs. BUILD_PACKAGES=clipper builds only what is packaged.
-MOMENTEDGE_RPATH="/opt/ros/${ROS_DISTRO}/lib:${PREFIX}/lib" \
-ROS_SETUP="$ROS_SETUP" \
-BUILD_PACKAGES="clipper" \
-  "$REPO_ROOT/scripts/build-on-target.sh"
+# 1. Build the clipper binary + momentedge_msgs overlay, unless BUILD=0 — the
+#    release pipeline builds and unit-tests in earlier steps, then packages with
+#    BUILD=0. The RUNPATHs point at the installed locations so the binary resolves
+#    rcl/rmw and the directly-linked momentedge_msgs typesupport even without a
+#    sourced environment; the wrapper adds AMENT_PREFIX_PATH and LD_LIBRARY_PATH on
+#    top for the dlopen'd rmw-specific typesupport. BUILD_PACKAGES=clipper builds
+#    only what is packaged.
+if [[ "${BUILD:-1}" != "0" ]]; then
+  MOMENTEDGE_RPATH="/opt/ros/${ROS_DISTRO}/lib:${PREFIX}/lib" \
+  ROS_SETUP="$ROS_SETUP" \
+  BUILD_PACKAGES="clipper" \
+    "$REPO_ROOT/scripts/build-on-target.sh"
+fi
+
+# The package is assembled from these build outputs; fail clearly if a BUILD=0 run
+# was pointed at a tree that was never built.
+[[ -x target/release/clipper ]] || { echo "missing target/release/clipper — run scripts/build-on-target.sh first" >&2; exit 1; }
+[[ -d install/momentedge_msgs/lib ]] || { echo "missing install/momentedge_msgs overlay — run scripts/build-on-target.sh first" >&2; exit 1; }
 
 # 2. Stage the package tree.
 STAGE="$(mktemp -d)"

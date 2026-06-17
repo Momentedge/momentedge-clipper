@@ -47,6 +47,12 @@ jobs:
           - distro: jazzy
             ubuntu: '24.04'
             runner: ubuntu-24.04-arm
+    # Shared across the build and unit-test steps so their RUSTFLAGS match and
+    # cargo reuses the compiled artifacts. The rpath dirs are the package's
+    # install prefix (must match PREFIX in scripts/package-deb.sh).
+    env:
+      ROS_DISTRO: ${{ matrix.distro }}
+      MOMENTEDGE_RPATH: /opt/ros/${{ matrix.distro }}/lib:/opt/momentedge-clipper/lib
     steps:
       - uses: actions/checkout@v6
 
@@ -92,10 +98,23 @@ jobs:
         if: ${{ github.ref_type == 'tag' }}
         run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
 
-      - name: Build and package the .deb
-        run: ./scripts/package-deb.sh
+      # Build: the momentedge_msgs colcon overlay + the clipper binary, RUNPATHs
+      # baked for the installed layout (ROS_DISTRO + MOMENTEDGE_RPATH come from the
+      # job env, so this matches the unit-test step's RUSTFLAGS).
+      - name: Build
+        run: ./scripts/build-on-target.sh
         env:
-          ROS_DISTRO: ${{ matrix.distro }}
+          BUILD_PACKAGES: clipper
+
+      # Unit tests: clipper's inline suite only — `--bins` excludes the live-ROS
+      # e2e integration tests (tests/e2e.rs). `--release` reuses the build step's
+      # artifacts via the shared RUSTFLAGS.
+      - name: Unit tests
+        run: ./scripts/ros-cargo.sh test --release -p clipper --bins
+
+      # Package: assemble the .deb from the build outputs without rebuilding.
+      - name: Package the .deb
+        run: BUILD=0 ./scripts/package-deb.sh
 
       # Skipped under act (its artifact backend is absent): the act run's
       # verification is the successful build plus package-deb.sh's

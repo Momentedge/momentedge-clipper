@@ -154,12 +154,16 @@ that shapes it:
 
 ### Debian packaging and CI release
 
-`scripts/package-deb.sh` assembles a `momentedge-clipper` `.deb` from a native
-build. It invokes `build-on-target.sh` (with `BUILD_PACKAGES=clipper` and
-`MOMENTEDGE_RPATH` set to `/opt/ros/<distro>/lib:/opt/momentedge-clipper/lib`), so
-the `clipper` binary carries RUNPATHs to its installed locations and resolves
-`rcl`/`rmw` and the directly-linked `momentedge_msgs` typesupport without a
-sourced environment. The package tree is rooted at `/opt/momentedge-clipper`
+`scripts/package-deb.sh` assembles a `momentedge-clipper` `.deb`. By default it
+first builds via `build-on-target.sh` (`BUILD_PACKAGES=clipper`,
+`MOMENTEDGE_RPATH=/opt/ros/<distro>/lib:/opt/momentedge-clipper/lib`); `BUILD=0`
+packages an already-built tree instead, which the release pipeline uses after its
+separate build and unit-test steps. The build runs through `scripts/ros-cargo.sh`,
+which sets up the ROS + r2r-codegen environment — the colcon overlay, `libclang`,
+`IDL_PACKAGE_FILTER`, and the `MOMENTEDGE_RPATH` RUNPATHs — in one place shared by
+`build-on-target.sh` and the CI unit-test step. The baked RUNPATHs let the
+`clipper` binary resolve `rcl`/`rmw` and the directly-linked `momentedge_msgs`
+typesupport without a sourced environment. The package tree is rooted at `/opt/momentedge-clipper`
 (`bin/clipper`, `lib/`, `share/`, `setup.bash`) with a thin
 `/usr/bin/momentedge-clipper` wrapper that sources `/opt/ros/<distro>/setup.bash`
 and the package's own `setup.bash` (which extends `AMENT_PREFIX_PATH` and
@@ -191,9 +195,9 @@ by construction. A version tag (`v*`) publishes: the job attaches the `.deb`
 files to the GitHub release for that tag. `workflow_dispatch` builds and uploads
 artifacts but does not publish by default (`publish` input, default `false`),
 so the packaging pipeline can be exercised — including locally under `act` —
-without touching any release. Workflow mechanics, the `setup-ros` + `libclang`
-install split, and the `act` recipe live in
-[`.github/CLAUDE.md`](.github/CLAUDE.md).
+without touching any release. Workflow mechanics — the separate build,
+unit-test, and package steps, the `setup-ros` + `libclang` install split, and
+the `act` recipe — live in [`.github/CLAUDE.md`](.github/CLAUDE.md).
 
 ## Workspace layout
 

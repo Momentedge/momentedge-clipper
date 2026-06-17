@@ -97,6 +97,16 @@ GitHub release.
   and the `ament_cmake`/`rosidl` generators that build `momentedge_msgs`. The
   only thing it omits is `libclang` (for r2r's bindgen codegen), which an inline
   `apt install clang libclang-dev` step adds.
+- **Separate build, unit-test, and package steps.** `Build` runs
+  `scripts/build-on-target.sh` (the `momentedge_msgs` colcon overlay + the
+  `clipper` binary); `Unit tests` runs `scripts/ros-cargo.sh test --release -p
+  clipper --bins` — clipper's inline suite only, `--bins` excluding the live-ROS
+  e2e integration tests; `Package` runs `BUILD=0 scripts/package-deb.sh`, which
+  assembles the `.deb` from those outputs without rebuilding. The ROS +
+  r2r-codegen environment lives once in `scripts/ros-cargo.sh`, and `ROS_DISTRO` +
+  `MOMENTEDGE_RPATH` are job-level env so build and test share `RUSTFLAGS` and
+  cargo reuses the compiled artifacts — cached per distro by `Swatinem/rust-cache`
+  (key `release-<distro>`, separate from CI's nix-shell cache).
 - **Tag-gated publish; `workflow_dispatch` never publishes by default.** On a
   `v*` tag push the job attaches the `.deb` files to the GitHub release for that
   tag (`softprops/action-gh-release@v2`). `workflow_dispatch` has a `publish`
