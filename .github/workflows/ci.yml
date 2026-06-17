@@ -109,29 +109,13 @@ jobs:
             extra-substituters = https://ros.cachix.org
             extra-trusted-public-keys = ros.cachix.org-1:dSyZxI8geDCJrwgvCOHDoAfOm5sV1wCPjBkKL+38Rvo=
 
-      # Restores this distro's /nix/store from the GitHub Actions cache and saves
-      # it back at job end. Keyed on the flake inputs and the nix package defs;
-      # any change to those rolls the key. Keeps one cache per distro (purges
-      # older ones of the same prefix) and trims the store before save to stay
-      # well under GitHub's 10 GB per-repo cache budget across the three distros.
-      - name: Cache /nix/store
-        uses: nix-community/cache-nix-action@v7
-        with:
-          primary-key: nix-${{ runner.os }}-${{ matrix.distro }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**', 'momentedge_msgs/**') }}
-          restore-prefixes-first-match: nix-${{ runner.os }}-${{ matrix.distro }}-
-          gc-max-store-size-linux: 5G
-          purge: true
-          purge-prefixes: nix-${{ runner.os }}-${{ matrix.distro }}-
-          purge-created: 0
-          purge-primary-key: never
-
       # Installs the attic client, logs in with the ATTIC_TOKEN repo secret, and
       # registers the self-hosted momentedge cache (cache.stfl.dev) as a
-      # substituter for this job. skip-push disables the action's built-in push,
-      # which only uploads paths realised *after* this step — empty on a full
-      # GitHub-cache restore, since the store is already populated by then. The
-      # "Push entire store to attic" step at the end uploads the whole store
-      # instead, so momentedge is populated even when nothing is rebuilt.
+      # substituter for this job — the sole source of the project's ROS2 closure,
+      # so a run is a true test of whether that closure is cached in attic.
+      # skip-push disables the action's built-in diff push; the "Push entire
+      # store to attic" step at the end uploads the whole store, which keeps the
+      # cache complete even across flake-input changes.
       - name: Set up momentedge attic cache
         uses: ryanccn/attic-action@v0.5
         with:
@@ -158,6 +142,13 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: ${{ matrix.distro }}
+
+      # Realise the distro's dev shell on its own, so the ROS2 closure is
+      # substituted (from momentedge / ros.cachix.org) as a distinct step. A full
+      # cache hit makes this fast; a miss shows up here as a from-source build
+      # rather than being hidden inside the cargo step.
+      - name: Realise the ROS2 dev shell
+        run: nix develop ".#${{ matrix.distro }}" --command true
 
       - name: Build
         run: nix develop ".#${{ matrix.distro }}" --command cargo build --locked -p clipper
