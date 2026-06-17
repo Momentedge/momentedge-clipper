@@ -18,7 +18,8 @@ periodic `Trigger` publisher that drives it. The recorder owns no sensor
 subscriptions and no message index; it cuts clips out of a continuous on-disk
 `ros2 bag record` on ROS2 trigger events, copying MCAP messages straight through.
 It tails one growing MCAP file, decoding nothing but each message's MCAP log
-time. Internals live in
+time and — on channels whose schema leads with a header stamp — that leading
+capture stamp, which is what the clip window is cut on. Internals live in
 [`clipper`](crates/clipper/CLAUDE.md).
 
 ## The sim camera (`sim/`)

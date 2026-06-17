@@ -133,9 +133,12 @@ clipper ◀── /events/momentedge/trigger ── trigger-pub
   the recording covers the window `[trigger_time - preroll, trigger_time +
   postroll]` (or the grace timeout elapses), then bulk-copies every message in
   that window into `./triggered-cont/<trigger_ns>_<name>.mcap` and publishes
-  `momentedge_msgs/Recorded` on `/events/momentedge/recorded`. The copy re-emits
-  raw MCAP message bytes — channels and schemas are carried over, message bodies
-  are never decoded.
+  `momentedge_msgs/Recorded` on `/events/momentedge/recorded`. The window is cut on
+  **capture time** — the message header stamp — for channels whose schema leads
+  with one, falling back to the MCAP `log_time` for unstamped channels; the
+  written messages keep their original `log_time`. The copy re-emits raw MCAP
+  message bytes — channels and schemas are carried over, message bodies are
+  never decoded beyond that leading stamp.
 - **`trigger-pub`** publishes a trigger every 1 s (configurable), stamping
   `trigger_time` with the current time — a development stand-in for a real
   trigger source. With no `--preroll`/`--postroll` flags it draws each side a

@@ -307,6 +307,31 @@ impl TestEnv {
         self.spawn("source", cmd)
     }
 
+    /// A steady stream of header-stamped messages (`geometry_msgs/PointStamped`)
+    /// whose capture stamp is fixed at `stamp_ns` — deliberately decoupled from
+    /// the receive (`log_time`) clock — so a test can prove the clip windows on
+    /// the capture stamp. `ros2 topic pub` republishes one literal message, so
+    /// every sample carries the same `stamp_ns`. Runs until dropped.
+    pub fn start_stamped_source(&self, topic: &str, rate: u32, stamp_ns: u64) -> Proc {
+        let sec = (stamp_ns / 1_000_000_000) as i64;
+        let nanosec = stamp_ns % 1_000_000_000;
+        let yaml = format!(
+            "{{header: {{stamp: {{sec: {sec}, nanosec: {nanosec}}}, frame_id: cam}}, \
+             point: {{x: 1.0, y: 2.0, z: 3.0}}}}"
+        );
+        let mut cmd = self.command("ros2");
+        cmd.args([
+            "topic",
+            "pub",
+            "-r",
+            &rate.to_string(),
+            topic,
+            "geometry_msgs/msg/PointStamped",
+            &yaml,
+        ]);
+        self.spawn("stamped-source", cmd)
+    }
+
     /// The binary under test, configured purely via `CLIPPER_*` env onto
     /// this test's temp tree. Blocks until its "up" line is logged.
     pub fn start_extractor(&self, grace_secs: u64) -> Proc {

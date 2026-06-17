@@ -38,9 +38,9 @@ The tail keeps the recording open and never re-reads consumed bytes. Each pass
 yields three artefacts, shared with the per-trigger handlers:
 
 - **Extent index** — contiguous byte ranges (closed at 4 MiB) with the min/max
-  message `log_time` they hold. Extraction reads only the extents overlapping
-  its window; the overlap test is exact (real min/max, not a heuristic), so no
-  in-window message can be missed.
+  message `effective_time` (capture time) they hold. Extraction reads only the
+  extents overlapping its window; the overlap test is exact (real min/max, not a
+  heuristic), so no in-window message can be missed.
 - **Schema/channel registry** — owned copies of every `Schema`/`Channel`
   record, keyed by channel ID (unique within one continuous file). The MCAP
   spec puts a Schema before any Channel referencing it, so resolution always
@@ -50,15 +50,19 @@ yields three artefacts, shared with the per-trigger handlers:
   (zstd, lz4 and uncompressed chunks all work — mcap's default features);
   the default fastwrite profile is unchunked and skips that cost entirely.
 - **Coverage watch** — a `Watch<Coverage>` (`Mutex` + `Condvar`, `src/watch.rs`)
-  holding the highest `log_time` on disk plus an `ended` flag
-  (DataEnd/Footer scanned). Sound because messages land in the file in
-  (approximately) non-decreasing `log_time` order — rosbag2's single writer
-  stamps `log_time` at receive.
+  holding the highest `effective_time` (capture time) on disk plus an `ended`
+  flag (DataEnd/Footer scanned). Sound because messages land in the file in
+  (approximately) non-decreasing `effective_time` order — the monotonicity
+  precondition coverage relies on holds for capture time under the assumption
+  that all channels share roughly one transport delay, so a single window cuts
+  them all at ~one instant.
 
-Per top-level `Message` record only the 14-byte prefix is read (channel id,
-sequence, `log_time`); bodies are first touched at extraction. The same
-"decode only the timestamp" discipline as the rest of the workspace, applied
-to file tailing.
+Per top-level `Message` record the tail reads the 22-byte fixed header (channel
+id, sequence, `log_time`, `publish_time`) plus — on a stamped channel — up to 12
+leading payload bytes to decode the capture stamp; the rest of each body is
+first touched at extraction. Chunked recordings decode the stamp from the
+chunk-interior message payload. The same "decode only the timestamp" discipline
+as the rest of the workspace, applied to file tailing.
 
 **Damage in the recording is survivable up to the point of framing desync.**
 The scan tolerates localized damage the same way extraction does (see "The copy
@@ -120,8 +124,9 @@ and a trigger that arrives while all of them are is rejected — logged with
 1. **Wait out the postroll.** Sleep until the system clock passes
    `trigger_time + postroll`.
 2. **Wait for coverage.** Block on the coverage watch until the recording
-   covers the window end — a message with `log_time` at/after the window end is
-   on disk (or the recording ended). A grace timeout
+   covers the window end — the `effective_time` (capture time) high-water has
+   reached the window end, so a message captured at/after the window end is on
+   disk (or the recording ended). A grace timeout
    (`grace_secs`, default 30 s) bounds the wait; on timeout the clip is cut
    from what exists, with a warning. The grace must exceed the recorder's
    flush latency: near zero for the fastwrite profile, roughly one chunk fill
@@ -155,9 +160,10 @@ since a bad CRC cannot say which of the chunk's bytes are lying. The mcap
 library readers are unsuitable for this walk: they halt at the first error,
 and the `LinearReader::sans_magic` constructor additionally caps every
 record — including chunk-interior records after decompression — at the slice
-length, failing any conformant chunk whose contents out-compress it. Messages whose
-`log_time` falls in the inclusive window are written through with their **raw
-serialized bytes** (`write_to_known_channel`); CDR bodies are never decoded.
+length, failing any conformant chunk whose contents out-compress it. Messages
+whose `effective_time` (capture time) falls in the inclusive window are written
+through with their **raw serialized bytes** (`write_to_known_channel`), their
+original `log_time` and `publish_time` preserved; CDR bodies are never decoded.
 
 Output channels are registered from the registry per source channel ID and
 cached; `mcap::Writer` deduplicates schemas/channels by content. The clip ends
@@ -213,10 +219,31 @@ into clips as-is — only a CDR decode downstream would notice.
 
 ## Time base
 
-`log_time`, the trigger stamp, and the wait clock are all nanoseconds on the
-system clock — this assumes the default (no `use_sim_time`). `time_to_ns`
-flattens a `builtin_interfaces/Time` stamp to that scale (`sec * 1e9 +
-nanosec`).
+The clip window is cut on **capture time** — the ROS2 message header stamp —
+rather than the MCAP `log_time`. The window spans `[trigger_time - preroll,
+trigger_time + postroll]`, with `trigger_time` treated as being in the same
+clock domain as the capture stamp. One merged timeline, `effective_time`, drives message
+selection (`clip.rs`), the coverage high-water mark, and the extent time-bounds
+(`tail.rs`): `effective_time` is the decoded header capture stamp for a stamped
+channel, and the MCAP `log_time` otherwise.
+
+A channel is stamped when a schema gate (`schema_is_stamped`) finds its registry
+schema's top-level first field to be `std_msgs/Header` or
+`builtin_interfaces/Time`. For those channels the stamp is read straight from
+the CDR payload — `sec` (int32) at offset 4, `nanosec` (uint32) at offset 8,
+after the 4-byte encapsulation header. A decoded value that is implausible
+(`sec < 0`, `nanosec >= 1e9`) or the unset `(0, 0)` sentinel is rejected, and
+that message falls back to `log_time`. Channels with no leading stamp
+(`tf2_msgs/TFMessage`, `std_msgs` primitives, …) are recorded and clipped fine —
+they simply window on `log_time`. If no channel in the recording is stamped, the
+whole thing windows on `log_time` end to end.
+
+`log_time` is copied through to the output MCAP untouched: only message
+*selection* keys on capture time; the written records keep their original
+`log_time` and `publish_time`. `log_time`, the trigger stamp, and the wait clock
+are all nanoseconds on the system clock — this assumes the default (no
+`use_sim_time`). `time_to_ns` flattens a `builtin_interfaces/Time` stamp to that
+scale (`sec * 1e9 + nanosec`).
 
 ## Topics and types
 

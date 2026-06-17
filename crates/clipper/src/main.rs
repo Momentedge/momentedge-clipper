@@ -4,7 +4,7 @@
 //! `scripts/record-continuous.sh`) writes a single growing MCAP file. This
 //! binary keeps that file open and tails it ([`tail`]): an incremental scan
 //! over the record framing that maintains a byte-extent index, a
-//! schema/channel registry, and a coverage watch (the highest `log_time` on
+//! schema/channel registry, and a coverage watch (the highest capture time on
 //! disk). There are no bag splits and no `/events/write_split` dependency.
 //!
 //! On `/events/momentedge/trigger` (`momentedge_msgs/Trigger`) it cuts the
@@ -13,14 +13,19 @@
 //! (the recording provably holds the window), then bulk-copy the in-window
 //! messages out of the planned extents into a clip published at
 //! `./triggered-cont/<trigger_ns>_<name>.mcap` (see [`clip`] — a raw-bytes
-//! copy, no CDR decode, finished with a proper summary + footer, assembled in
-//! a capturing dir and moved atomically into place so observers never see a
+//! copy that decodes only each stamped message's leading capture stamp for the
+//! window decision, finished with a proper summary + footer, assembled in a
+//! capturing dir and moved atomically into place so observers never see a
 //! footer-less file), and finally publish `/events/momentedge/recorded`
 //! (`momentedge_msgs/Recorded`), which therefore always names a durable clip.
 //!
-//! Time base: MCAP `log_time`, the trigger stamp, and the wait clock are all
-//! treated as nanoseconds on the system (ROS) clock — this assumes the default
-//! (no `use_sim_time`). Each trigger is handled on its own thread, so
+//! Time base: the clip window is cut on each message's capture time — the
+//! `builtin_interfaces/Time` header stamp, falling back to MCAP `log_time` for
+//! a channel that carries no stamp ([`stamp`]). The trigger stamp, the capture
+//! stamps, and the wait clock are all nanoseconds on the system (ROS) clock —
+//! this assumes the default (no `use_sim_time`); `log_time` is copied through
+//! to the clip unchanged, only selection keys on capture time. Each trigger is
+//! handled on its own thread, so
 //! overlapping windows are cut concurrently against one shared tail — at most
 //! [`MAX_ACTIVE_TRIGGERS`] at once; a trigger beyond that limit is rejected,
 //! logged, and ignored.
@@ -52,6 +57,7 @@
 //! controls verbosity.
 
 mod clip;
+mod stamp;
 mod tail;
 mod watch;
 
@@ -576,7 +582,8 @@ fn record_clip(
     }
 
     // 2. Wait until the recording provably covers the window end: a message
-    //    with log_time at/after it is on disk (or the recording ended). The
+    //    whose capture time is at/after it is on disk (or the recording
+    //    ended). The
     //    grace timeout bounds the wait when the recorded topics go quiet —
     //    and bounds every other stall the same way (a dead tail thread
     //    already exits the process through supervision).
@@ -842,7 +849,9 @@ mod tests {
     }
 
     use crate::clip::tests::read_clip;
-    use crate::tail::tests::{scan_to_end, test_dir, write_recording, write_unfinished_recording};
+    use crate::tail::tests::{
+        scan_to_end, test_dir, write_recording, write_stamped_recording, write_unfinished_recording,
+    };
 
     #[test]
     fn record_clip_grace_timeout_cuts_what_is_on_disk() -> anyhow::Result<()> {
@@ -902,6 +911,52 @@ mod tests {
         assert_eq!(
             read_clip(&stats.out_path)?,
             vec![("/t".to_string(), 100), ("/t".to_string(), 900)]
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn record_clip_completes_once_capture_coverage_arrives() -> anyhow::Result<()> {
+        let root = test_dir("cov-capture")?;
+        let rec = root.join("rec.mcap");
+        // Capture stamps reach past the window end (2_000 >= 1_000) while every
+        // message was received late (one constant log_time). Coverage must key
+        // on the capture stamp to release the wait, and the cut must keep the
+        // messages whose capture stamp is in the window.
+        write_stamped_recording(
+            &rec,
+            false,
+            &[
+                ("/cam", 9_000_000, 100),
+                ("/cam", 9_000_000, 900),
+                ("/cam", 9_000_000, 2_000),
+            ],
+        )?;
+
+        let (tailer, coverage) = Tailer::new();
+        let scanner = tailer.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            let file = Arc::new(std::fs::File::open(&rec).unwrap());
+            scanner.attach(file.clone());
+            scan_to_end(&scanner, &file, 8).unwrap();
+        });
+
+        let extract_tx = spawn_extract_workers(1, tailer);
+        let stats = record_clip(
+            100,
+            1_000,
+            root.join("clip.mcap"),
+            &coverage,
+            Duration::from_secs(10),
+            &extract_tx,
+        )?;
+
+        assert_eq!(
+            stats.messages_copied, 2,
+            "capture stamps 100 and 900 are in the window; 2_000 is not"
         );
 
         std::fs::remove_dir_all(root)?;

@@ -2,12 +2,15 @@
 //!
 //! Given a [`WindowPlan`] snapshot from the tail — the open recording, the
 //! byte extents overlapping the window, and the channel registry — this
-//! assembles one output MCAP holding every message whose `log_time` falls in
-//! `[start_ns, end_ns]`. It is a **direct copy** of message payload bytes:
-//! registry schemas/channels are registered in the output writer by content,
-//! then each message is emitted with its raw serialized body. The CDR message
-//! bodies are never decoded — the only thing inspected is each record's
-//! `log_time`.
+//! assembles one output MCAP holding every message whose **capture-time
+//! position** falls in `[start_ns, end_ns]`: the header stamp decoded from the
+//! payload on a channel whose schema is Header-/Time-first, the MCAP
+//! `log_time` otherwise (see [`crate::stamp::effective_time`]). It is a
+//! **direct copy** of message payload bytes: registry schemas/channels are
+//! registered in the output writer by content, then each message is emitted
+//! with its raw serialized body and its original `log_time` intact. Only the
+//! leading 12-byte `builtin_interfaces/Time` of a stamped message is read for
+//! the window decision; the rest of the CDR body is never decoded.
 //!
 //! Each extent is read with `read_at` (no shared seek state with the tail)
 //! and its records are walked with our own opcode + length framing — the same
@@ -35,6 +38,7 @@ use anyhow::{Context, Result, bail};
 use log::{error, warn};
 use mcap::records::Record;
 
+use crate::stamp::{effective_time, schema_is_stamped};
 use crate::tail::{ChannelDef, MAX_RECORD_LEN, WindowPlan, op};
 
 /// Outcome of an extraction: where the clip actually landed (`out_path`
@@ -232,6 +236,7 @@ fn copy_window(plan: &WindowPlan, out_file: File, start_ns: u64, end_ns: u64) ->
         writer: mcap::Writer::new(BufWriter::new(out_file)).context("opening mcap writer")?,
         channels: &plan.channels,
         out_ids: HashMap::new(),
+        stamped: HashMap::new(),
         start_ns,
         end_ns,
         stats: ClipStats::default(),
@@ -340,6 +345,9 @@ struct ClipWriter<'a> {
     /// `None` caches a known-missing Channel record, so the miss is logged
     /// once rather than per message.
     out_ids: HashMap<u16, Option<u16>>,
+    /// Recording channel ID → whether its messages carry a capture stamp
+    /// (schema is Header-/Time-first), cached so the schema is parsed once.
+    stamped: HashMap<u16, bool>,
     start_ns: u64,
     end_ns: u64,
     stats: ClipStats,
@@ -395,24 +403,21 @@ impl ClipWriter<'_> {
         Ok(())
     }
 
-    /// Copy a chunk's in-window messages — all of them or none. The messages
-    /// are buffered while the chunk iterates and written only once it
+    /// Copy a chunk's in-window messages — all of them or none. Every message
+    /// is buffered while the chunk iterates and written (window-filtered in
+    /// [`Self::copy_message`], which keys on capture time) only once it
     /// completes cleanly: the chunk CRC is verified at the end of iteration,
     /// and a failure anywhere (decompression, CRC, an interior record) cannot
     /// say which of the chunk's bytes are damaged, so the whole chunk is
     /// dropped with an error log and counted. Output-side errors stay fatal.
     fn copy_chunk(&mut self, body: &[u8], at: usize) -> Result<()> {
-        let (start_ns, end_ns) = (self.start_ns, self.end_ns);
         let mut pending: Vec<(mcap::records::MessageHeader, Vec<u8>)> = Vec::new();
         let salvage = (|| -> mcap::McapResult<()> {
             let Record::Chunk { header, data } = mcap::parse_record(op::CHUNK, body)? else {
                 unreachable!("a CHUNK opcode parses to Record::Chunk");
             };
             for rec in mcap::read::ChunkReader::new(header, &data)? {
-                if let Record::Message { header, data } = rec?
-                    && header.log_time >= start_ns
-                    && header.log_time <= end_ns
-                {
+                if let Record::Message { header, data } = rec? {
                     pending.push((header, data.into_owned()));
                 }
             }
@@ -432,11 +437,20 @@ impl ClipWriter<'_> {
         Ok(())
     }
 
-    /// Write one message through if its `log_time` is in the window. A
-    /// message on a channel the recording never declared is skipped and
-    /// counted — there is no Schema/Channel to emit for it.
+    /// Write one message through if its capture-time position is in the
+    /// window: the header stamp decoded from the payload on a stamped channel,
+    /// the MCAP `log_time` otherwise (see [`effective_time`]). The message is
+    /// written with its raw bytes and its original `log_time` intact — only
+    /// the *selection* keys on capture time. A message on a channel the
+    /// recording never declared is skipped and counted — there is no
+    /// Schema/Channel to emit for it.
     fn copy_message(&mut self, header: &mcap::records::MessageHeader, data: &[u8]) -> Result<()> {
-        if header.log_time < self.start_ns || header.log_time > self.end_ns {
+        let when = effective_time(
+            self.channel_is_stamped(header.channel_id),
+            data,
+            header.log_time,
+        );
+        if when < self.start_ns || when > self.end_ns {
             return Ok(());
         }
         let Some(channel_id) = self.output_channel_id(header.channel_id)? else {
@@ -455,6 +469,19 @@ impl ClipWriter<'_> {
         self.stats.messages_copied += 1;
         self.stats.bytes_copied += data.len() as u64;
         Ok(())
+    }
+
+    /// Whether the recording's channel `src_id` carries a capture stamp
+    /// (its schema is Header-/Time-first), cached after the first lookup. A
+    /// channel with no Channel record or no schema is unstamped, so its
+    /// messages window on `log_time`.
+    fn channel_is_stamped(&mut self, src_id: u16) -> bool {
+        if let Some(&cached) = self.stamped.get(&src_id) {
+            return cached;
+        }
+        let stamped = schema_is_stamped(self.channels.get(&src_id).and_then(|c| c.schema.as_ref()));
+        self.stamped.insert(src_id, stamped);
+        stamped
     }
 
     /// Map a recording channel ID into the output file and cache the result.
@@ -498,7 +525,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::tail::tests::{
         channel_body, message_body, raw_record, scan_to_end, test_dir, write_raw, write_recording,
-        write_recording_opts,
+        write_recording_opts, write_stamped_recording,
     };
     use crate::tail::{Extent, Tailer, op};
 
@@ -720,6 +747,184 @@ pub(crate) mod tests {
                 ("/t".to_string(), 150),
                 ("/t".to_string(), 200),
             ]
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn clip_windows_stamped_messages_by_capture_time_not_log_time() -> Result<()> {
+        let root = test_dir("clip-capture")?;
+        let rec = root.join("rec.mcap");
+        // Every message shares one late log_time (as if received in a burst);
+        // the capture stamps step 100..500. Selection must key on the capture
+        // stamp — log_time-based selection (all at 10_000, outside the window)
+        // would keep none of them.
+        write_stamped_recording(
+            &rec,
+            false,
+            &[
+                ("/cam", 10_000, 100),
+                ("/cam", 10_000, 200),
+                ("/cam", 10_000, 300),
+                ("/cam", 10_000, 400),
+                ("/cam", 10_000, 500),
+            ],
+        )?;
+        let tailer = tail_whole(&rec)?;
+
+        // Plan over everything (by the log_time index), but cut the
+        // capture-time window [200, 400]: this isolates clip selection from
+        // the tail's extent planning.
+        let plan = tailer.plan_window(0, u64::MAX);
+        let out = root.join("clip.mcap");
+        let stats = extract_clip(&plan, &out, 200, 400)?;
+
+        assert_eq!(
+            stats.messages_copied, 3,
+            "capture stamps 200, 300, 400 are in the window"
+        );
+        // log_time is copied through unchanged on every kept message...
+        assert_eq!(
+            read_clip(&out)?,
+            vec![
+                ("/cam".to_string(), 10_000),
+                ("/cam".to_string(), 10_000),
+                ("/cam".to_string(), 10_000),
+            ]
+        );
+        // ...and the messages kept are exactly those whose capture stamp lies
+        // in the window, in order.
+        let buf = std::fs::read(&out)?;
+        let captures: Vec<u64> = mcap::MessageStream::new(&buf)?
+            .map(|m| crate::stamp::cdr_header_stamp_ns(&m.unwrap().data).unwrap())
+            .collect();
+        assert_eq!(captures, vec![200, 300, 400]);
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn clip_windows_chunked_stamped_input_by_capture_time() -> Result<()> {
+        let root = test_dir("clip-capture-chunked")?;
+        let rec = root.join("rec.mcap");
+        // Chunked input exercises a separate decode path (the stamp comes from
+        // the chunk-interior message's payload, both in the tail and the cut).
+        write_stamped_recording(
+            &rec,
+            true,
+            &[
+                ("/cam", 10_000, 100),
+                ("/cam", 10_000, 200),
+                ("/cam", 10_000, 300),
+                ("/cam", 10_000, 400),
+                ("/cam", 10_000, 500),
+            ],
+        )?;
+        let tailer = tail_whole(&rec)?;
+
+        let plan = tailer.plan_window(200, 400);
+        assert!(
+            !plan.extents.is_empty(),
+            "the capture window plans the chunked extent"
+        );
+        let out = root.join("clip.mcap");
+        let stats = extract_clip(&plan, &out, 200, 400)?;
+
+        assert_eq!(stats.messages_copied, 3);
+        let buf = std::fs::read(&out)?;
+        let captures: Vec<u64> = mcap::MessageStream::new(&buf)?
+            .map(|m| crate::stamp::cdr_header_stamp_ns(&m.unwrap().data).unwrap())
+            .collect();
+        assert_eq!(captures, vec![200, 300, 400]);
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn zero_capture_stamp_falls_back_to_log_time() -> Result<()> {
+        let root = test_dir("clip-zerostamp")?;
+        let rec = root.join("rec.mcap");
+        // A Header-first (stamped) channel whose stamp is the unset (0,0)
+        // sentinel: each message windows on its log_time, never pinned to 0.
+        write_stamped_recording(&rec, false, &[("/cam", 300, 0), ("/cam", 10_000, 0)])?;
+        let tailer = tail_whole(&rec)?;
+
+        let plan = tailer.plan_window(200, 400);
+        let out = root.join("clip.mcap");
+        let stats = extract_clip(&plan, &out, 200, 400)?;
+
+        assert_eq!(
+            stats.messages_copied, 1,
+            "only the log_time-300 message is in the window"
+        );
+        assert_eq!(read_clip(&out)?, vec![("/cam".to_string(), 300)]);
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn mixed_stamped_and_unstamped_channels_window_on_their_own_clock() -> Result<()> {
+        let root = test_dir("clip-mixed")?;
+        let rec = root.join("rec.mcap");
+        // One stamped channel (/cam, Header-first) and one headerless channel
+        // (/tf, sequence-first): the cut keys /cam on its capture stamp and
+        // /tf on its log_time — the headline "record non-timestamped channels
+        // alongside a stamped one" case.
+        {
+            let mut writer = mcap::WriteOptions::new()
+                .use_chunks(false)
+                .compression(None)
+                .create(BufWriter::new(File::create(&rec)?))?;
+            let cam_schema = writer.add_schema(
+                "test_msgs/msg/Stamped",
+                "ros2msg",
+                b"std_msgs/Header header",
+            )?;
+            let cam = writer.add_channel(cam_schema, "/cam", "cdr", &BTreeMap::new())?;
+            let tf_schema = writer.add_schema(
+                "tf2_msgs/msg/TFMessage",
+                "ros2msg",
+                b"geometry_msgs/TransformStamped[] transforms",
+            )?;
+            let tf = writer.add_channel(tf_schema, "/tf", "cdr", &BTreeMap::new())?;
+            let mut put = |ch: u16, seq: u32, log: u64, payload: &[u8]| {
+                writer
+                    .write_to_known_channel(
+                        &mcap::records::MessageHeader {
+                            channel_id: ch,
+                            sequence: seq,
+                            log_time: log,
+                            publish_time: log,
+                        },
+                        payload,
+                    )
+                    .unwrap();
+            };
+            // /cam: capture 300 in window, capture 999 out — both received late.
+            put(cam, 0, 10_000, &crate::stamp::tests::payload_for_ns(300));
+            // /tf: windowed on log_time — 300 in window, 10_000 out.
+            put(tf, 1, 300, b"\x00\x01\x00\x00tfdata");
+            put(cam, 2, 10_000, &crate::stamp::tests::payload_for_ns(999));
+            put(tf, 3, 10_000, b"\x00\x01\x00\x00tfdata");
+            writer.finish()?;
+        }
+        let tailer = tail_whole(&rec)?;
+
+        let plan = tailer.plan_window(200, 400);
+        let out = root.join("clip.mcap");
+        let stats = extract_clip(&plan, &out, 200, 400)?;
+
+        assert_eq!(stats.messages_copied, 2, "/cam@capture300 and /tf@log300");
+        let mut got = read_clip(&out)?;
+        got.sort();
+        assert_eq!(
+            got,
+            vec![("/cam".to_string(), 10_000), ("/tf".to_string(), 300)]
         );
 
         std::fs::remove_dir_all(root)?;

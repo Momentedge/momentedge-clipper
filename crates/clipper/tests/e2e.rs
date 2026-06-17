@@ -25,6 +25,7 @@ use harness::*;
 use rstest::rstest;
 
 const SRC_TOPIC: &str = "/e2e/chatter";
+const STAMPED_TOPIC: &str = "/e2e/stamped";
 const SRC_RATE: u32 = 20;
 const SEC: u64 = 1_000_000_000;
 
@@ -94,6 +95,62 @@ fn trigger_produces_clip_and_announcement(
         msgs.iter()
             .map(|(t, _)| t)
             .collect::<std::collections::HashSet<_>>(),
+    );
+    env.assert_capturing_drained();
+    assert!(extractor.is_running(), "the extractor must outlive the cut");
+}
+
+/// Clips are cut on the message header **capture stamp**, not the MCAP
+/// `log_time`. The source publishes a header stamped far in the past while
+/// every sample is received (and so `log_time`-stamped) now; a trigger whose
+/// window sits at that past stamp must still capture those messages. A
+/// `log_time` cut could not — its window lies ~1000 s before any message was
+/// ever recorded — so a non-empty clip on the stamped topic, holding messages
+/// whose `log_time` postdates the window end by a wide margin, is proof the
+/// window keys on capture time.
+#[rstest]
+fn clips_window_on_capture_stamp_not_log_time() {
+    if !require_e2e() {
+        return;
+    }
+    let env = TestEnv::new();
+    let _recorder = env.start_recorder("fastwrite", 0);
+    // Capture stamp 1000 s in the past; every sample is received (logged) now.
+    let capture_ns = now_ns() - 1000 * SEC;
+    let _source = env.start_stamped_source(STAMPED_TOPIC, SRC_RATE, capture_ns);
+    env.wait_for_recording(Duration::from_secs(60));
+    let mut extractor = env.start_extractor(10);
+    std::thread::sleep(Duration::from_secs(3));
+
+    let mut listener = env.start_recorded_listener("capture");
+    // The window sits at the capture stamp; postroll 0 so the capture-time
+    // high-water (at least the stamp itself) covers the end without a grace
+    // wait. preroll widens it so the constant stamp lands strictly inside.
+    env.fire_trigger("capture", capture_ns, 2 * SEC, 0);
+
+    let recorded = wait_for_recorded(&mut listener, Duration::from_secs(60));
+    assert_eq!(recorded.name, "capture");
+    let msgs = read_clip(Path::new(&recorded.filename));
+    let stamped: Vec<u64> = msgs
+        .iter()
+        .filter(|(topic, _)| topic == STAMPED_TOPIC)
+        .map(|(_, log_time)| *log_time)
+        .collect();
+    assert!(
+        !stamped.is_empty(),
+        "the capture-stamped topic must be in the clip, got topics: {:?}",
+        msgs.iter()
+            .map(|(t, _)| t)
+            .collect::<std::collections::HashSet<_>>(),
+    );
+    // The discriminator: those messages were logged ~now, ~1000 s past the
+    // window end (capture_ns) — a log_time cut could never have included them.
+    assert!(
+        stamped
+            .iter()
+            .all(|log_time| *log_time > capture_ns + 100 * SEC),
+        "stamped messages must carry a log_time far past the window end, proving \
+         capture-time selection; window end {capture_ns}, got log_times {stamped:?}",
     );
     env.assert_capturing_drained();
     assert!(extractor.is_running(), "the extractor must outlive the cut");

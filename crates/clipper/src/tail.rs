@@ -12,22 +12,25 @@
 //! extraction ([`crate::clip`]):
 //!
 //! * **Extent index** — contiguous byte ranges of the file (closed at
-//!   [`EXTENT_CAP_BYTES`]) with the min/max `log_time` of the messages they
-//!   hold. A clip reads only the extents overlapping its window, so cutting a
-//!   clip never rescans the file.
+//!   [`EXTENT_CAP_BYTES`]) with the min/max [`effective_time`] (capture time)
+//!   of the messages they hold. A clip reads only the extents overlapping its
+//!   window, so cutting a clip never rescans the file.
 //! * **Schema/channel registry** — every `Schema`/`Channel` record seen, keyed
 //!   by the file's channel ID (unique within one continuous file). Chunked
 //!   recordings carry these *inside* chunks, so chunks are decompressed during
 //!   the tail; the default `record-continuous.sh` profile (fastwrite) is
 //!   unchunked and pays no such cost.
-//! * **Coverage watch** — the highest `log_time` seen plus an "ended" flag
-//!   ([`Coverage`]); a trigger handler waits on it until the recording provably
-//!   covers its window end.
+//! * **Coverage watch** — the highest [`effective_time`] (capture time) seen
+//!   plus an "ended" flag ([`Coverage`]); a trigger handler waits on it until
+//!   the recording provably covers its window end.
 //!
-//! Only the 14-byte prefix of each top-level `Message` record is read during
-//! the tail (channel id, sequence, `log_time`); message bodies are first
-//! touched by the extraction. The same "decode only the timestamp" discipline
-//! as the rest of the workspace, applied to file tailing.
+//! Per top-level `Message` the tail reads the 22-byte fixed header (channel id,
+//! sequence, `log_time`, `publish_time`) and, for a channel whose schema leads
+//! with a header stamp, the leading bytes of the payload holding that
+//! `builtin_interfaces/Time` ([`crate::stamp`]); the rest of the body is first
+//! touched by the extraction. That capture stamp — or `log_time` where the
+//! channel carries none — is the message's [`effective_time`], the timeline the
+//! window is cut on.
 //!
 //! The recording is discovered as the newest `*.mcap` under the record dir and
 //! re-discovered when the path stops pointing at the tailed inode (the record
@@ -59,6 +62,7 @@ use anyhow::{Context, Result, bail};
 use log::{info, warn};
 use mcap::records::Record;
 
+use crate::stamp::{effective_time, ros2msg_is_stamped, schema_is_stamped};
 use crate::watch::Watch;
 
 /// The 8 magic bytes opening (and, after `finish`, closing) every MCAP file.
@@ -147,16 +151,19 @@ impl Extent {
     }
 }
 
-/// How far the recording provably reaches: the highest message `log_time` the
-/// tail has seen on disk, and whether the recording has ended (DataEnd/Footer
-/// scanned — nothing more will ever appear).
+/// How far the recording provably reaches: the highest message
+/// [`effective_time`] (capture time, or `log_time` for an unstamped channel)
+/// the tail has seen on disk, and whether the recording has ended
+/// (DataEnd/Footer scanned — nothing more will ever appear).
 ///
 /// "Provably" rests on an ordering assumption: messages land in the file in
-/// (approximately) non-decreasing `log_time` order. rosbag2 has that shape —
-/// one writer, `log_time` stamped at receive — up to millisecond-scale
-/// interleaving between concurrent subscription callbacks, which the flush
-/// and extraction latency in front of every cut dwarfs. A high-water mark at
-/// or past a window end therefore implies the window's messages are on disk.
+/// (approximately) non-decreasing `effective_time` order. rosbag2 stamps
+/// `log_time` at receive in that shape, and capture stamps track it under the
+/// assumption that all channels share roughly one transport delay — so a single
+/// window cuts every channel at ~one instant — up to millisecond-scale
+/// interleaving between concurrent subscription callbacks, which the flush and
+/// extraction latency in front of every cut dwarfs. A high-water mark at or
+/// past a window end therefore implies the window's messages are on disk.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Coverage {
     pub high_water_ns: u64,
@@ -208,7 +215,7 @@ pub(crate) struct ScanProgress {
 struct ScanDelta {
     closed: Vec<Extent>,
     open: Option<Extent>,
-    /// min/max log_time of records absorbed since the last extent extension.
+    /// min/max effective_time of records absorbed since the last extent extension.
     pending_time: Option<(u64, u64)>,
     schemas: Vec<(u16, SchemaDef)>,
     channels: Vec<RawChannel>,
@@ -224,35 +231,97 @@ struct RawChannel {
     metadata: BTreeMap<String, String>,
 }
 
+/// Per-scan-pass resolver for whether a channel carries a capture stamp, so a
+/// message's [`effective_time`] can be computed as it is scanned. Seeded from
+/// the committed registry and updated as the pass discovers schema and channel
+/// records: MCAP orders a Schema before any Channel referencing it, and a
+/// Channel before its Messages, so a message's channel is resolvable by the
+/// time the message is read. A channel never seen is treated as unstamped —
+/// its messages fall back to `log_time` — which is also the whole behaviour
+/// when no channel in the recording is stamped.
+#[derive(Default)]
+struct StampGate {
+    /// Channel id → its messages carry a leading capture stamp.
+    channels: HashMap<u16, bool>,
+    /// Schema id → that schema is Header-/Time-first, for resolving a channel
+    /// against a schema seen earlier in the same pass.
+    schemas: HashMap<u16, bool>,
+}
+
+impl StampGate {
+    /// Seed from the committed registry: every channel and schema already on
+    /// disk, so a message whose channel was registered in an earlier pass
+    /// resolves without re-reading it.
+    fn from_state(st: &IndexState) -> Self {
+        StampGate {
+            channels: st
+                .channels
+                .iter()
+                .map(|(id, c)| (*id, schema_is_stamped(c.schema.as_ref())))
+                .collect(),
+            schemas: st
+                .schemas
+                .iter()
+                .map(|(id, s)| (*id, ros2msg_is_stamped(&s.encoding, &s.data)))
+                .collect(),
+        }
+    }
+
+    fn observe_schema(&mut self, id: u16, encoding: &str, data: &[u8]) {
+        self.schemas.insert(id, ros2msg_is_stamped(encoding, data));
+    }
+
+    fn observe_channel(&mut self, id: u16, schema_id: u16) {
+        let stamped = schema_id != 0 && self.schemas.get(&schema_id).copied().unwrap_or(false);
+        self.channels.insert(id, stamped);
+    }
+
+    fn is_stamped(&self, channel_id: u16) -> bool {
+        self.channels.get(&channel_id).copied().unwrap_or(false)
+    }
+}
+
 impl ScanDelta {
-    fn absorb_time(&mut self, log_time: u64) {
-        self.high_water_ns = self.high_water_ns.max(log_time);
+    /// Fold one message's timeline position — its [`effective_time`] — into the
+    /// coverage high-water mark and the open extent's time bounds.
+    fn absorb_time(&mut self, time: u64) {
+        self.high_water_ns = self.high_water_ns.max(time);
         self.pending_time = Some(match self.pending_time {
-            Some((min, max)) => (min.min(log_time), max.max(log_time)),
-            None => (log_time, log_time),
+            Some((min, max)) => (min.min(time), max.max(time)),
+            None => (time, time),
         });
     }
 
     /// Fold one parsed record into the delta: schema/channel definitions into
     /// the registry, message times into the pending extent bounds.
-    fn absorb_parsed(&mut self, rec: Record<'_>) {
+    fn absorb_parsed(&mut self, rec: Record<'_>, gate: &mut StampGate) {
         match rec {
-            Record::Schema { header, data } => self.schemas.push((
-                header.id,
-                SchemaDef {
-                    name: header.name,
-                    encoding: header.encoding,
-                    data: data.into_owned(),
-                },
-            )),
-            Record::Channel(ch) => self.channels.push(RawChannel {
-                id: ch.id,
-                schema_id: ch.schema_id,
-                topic: ch.topic,
-                message_encoding: ch.message_encoding,
-                metadata: ch.metadata,
-            }),
-            Record::Message { header, .. } => self.absorb_time(header.log_time),
+            Record::Schema { header, data } => {
+                gate.observe_schema(header.id, &header.encoding, &data);
+                self.schemas.push((
+                    header.id,
+                    SchemaDef {
+                        name: header.name,
+                        encoding: header.encoding,
+                        data: data.into_owned(),
+                    },
+                ));
+            }
+            Record::Channel(ch) => {
+                gate.observe_channel(ch.id, ch.schema_id);
+                self.channels.push(RawChannel {
+                    id: ch.id,
+                    schema_id: ch.schema_id,
+                    topic: ch.topic,
+                    message_encoding: ch.message_encoding,
+                    metadata: ch.metadata,
+                });
+            }
+            Record::Message { header, data } => {
+                let when =
+                    effective_time(gate.is_stamped(header.channel_id), &data, header.log_time);
+                self.absorb_time(when);
+            }
             _ => {}
         }
     }
@@ -270,13 +339,13 @@ impl ScanDelta {
     /// claims data the cut would silently leave out. Only the registry and
     /// time bounds move; the extent fields (`closed`/`open`) belong to
     /// [`Self::extend_extent`] and the chunk's own record offset, untouched here.
-    fn absorb_chunk(&mut self, body: &[u8]) -> Result<()> {
+    fn absorb_chunk(&mut self, body: &[u8], gate: &mut StampGate) -> Result<()> {
         let Record::Chunk { header, data } = mcap::parse_record(op::CHUNK, body)? else {
             bail!("chunk opcode did not parse as a chunk record");
         };
         let mut sub = ScanDelta::default();
         for rec in mcap::read::ChunkReader::new(header, &data).context("opening chunk")? {
-            sub.absorb_parsed(rec.context("reading record inside chunk")?);
+            sub.absorb_parsed(rec.context("reading record inside chunk")?, gate);
         }
         self.schemas.extend(sub.schemas);
         self.channels.extend(sub.channels);
@@ -514,9 +583,15 @@ impl Tailer {
         mut offset: u64,
         file_len: u64,
     ) -> ScanProgress {
-        let mut delta = ScanDelta {
-            open: self.state.lock().unwrap().open,
-            ..ScanDelta::default()
+        let (mut delta, mut gate) = {
+            let st = self.state.lock().unwrap();
+            (
+                ScanDelta {
+                    open: st.open,
+                    ..ScanDelta::default()
+                },
+                StampGate::from_state(&st),
+            )
         };
         let mut ended = false;
         // The offset of the faulted record is `offset` (left unadvanced) when
@@ -560,23 +635,37 @@ impl Tailer {
                     // intact, so the scan skips the record and keeps indexing
                     // the rest, as the CHUNK arm does for a damaged chunk.
                     match mcap::parse_record(opcode, &body) {
-                        Ok(rec) => delta.absorb_parsed(rec),
+                        Ok(rec) => delta.absorb_parsed(rec, &mut gate),
                         Err(e) => warn!("parsing record at {offset}: {e:#}; skipping it"),
                     }
                 }
                 op::MESSAGE => {
-                    // Decode only the 14-byte prefix: channel_id u16,
-                    // sequence u32, log_time u64 (all LE). The body stays
+                    // The Message body opens with 22 fixed bytes — channel_id
+                    // u16, sequence u32, log_time u64, publish_time u64 (all
+                    // LE) — then the CDR payload. Read those fixed fields and,
+                    // for a stamped channel, the leading bytes of the payload
+                    // that hold the capture stamp — at most STAMP_SPAN more,
+                    // covered by one read. The rest of the body stays
                     // untouched until extraction.
                     if len >= 14 {
-                        let mut prefix = [0u8; 14];
-                        if let Err(e) = file.read_exact_at(&mut prefix, offset + 9) {
+                        const FIXED: usize = 22;
+                        const HEAD: usize = FIXED + crate::stamp::STAMP_SPAN;
+                        let want = len.min(HEAD as u64) as usize;
+                        let mut head = [0u8; HEAD];
+                        if let Err(e) = file.read_exact_at(&mut head[..want], offset + 9) {
                             fault = Some(anyhow::Error::new(e).context(format!(
                                 "reading message prefix at {offset}; framing desynchronised?"
                             )));
                             break;
                         }
-                        delta.absorb_time(u64::from_le_bytes(prefix[6..14].try_into().unwrap()));
+                        let channel_id = u16::from_le_bytes(head[0..2].try_into().unwrap());
+                        let log_time = u64::from_le_bytes(head[6..14].try_into().unwrap());
+                        // The payload (and its leading stamp) sits past the
+                        // fixed fields; a runt body short of them yields an
+                        // empty slice and falls back to log_time.
+                        let payload = head.get(FIXED..want).unwrap_or(&[]);
+                        let when = effective_time(gate.is_stamped(channel_id), payload, log_time);
+                        delta.absorb_time(when);
                     } else {
                         // A conformant Message body is >= 22 bytes (its fixed
                         // fields alone); below 14 not even log_time exists.
@@ -597,7 +686,7 @@ impl Tailer {
                             break;
                         }
                     };
-                    if let Err(e) = delta.absorb_chunk(&body) {
+                    if let Err(e) = delta.absorb_chunk(&body, &mut gate) {
                         // A chunk that fails to decompress, fails its CRC, or
                         // holds an unparseable interior record cannot say which
                         // of its bytes are lying, so its whole contribution is
@@ -783,6 +872,58 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// Write a finished recording of **stamped** messages: each
+    /// `(topic, log_time, capture_ns)` becomes a message on a Header-first
+    /// channel (`ros2msg` schema `std_msgs/Header header`), whose CDR payload
+    /// carries `capture_ns` as its header stamp and whose MCAP `log_time` is
+    /// `log_time`. The two are deliberately independent so a test can prove
+    /// the window keys on the capture stamp, not `log_time`.
+    pub(crate) fn write_stamped_recording(
+        path: &Path,
+        chunked: bool,
+        msgs: &[(&str, u64, u64)],
+    ) -> Result<()> {
+        let opts = if chunked {
+            mcap::WriteOptions::new()
+                .use_chunks(true)
+                .compression(Some(mcap::Compression::Zstd))
+                .chunk_size(Some(128))
+        } else {
+            mcap::WriteOptions::new()
+                .use_chunks(false)
+                .compression(None)
+        };
+        let mut writer = opts.create(BufWriter::new(File::create(path)?))?;
+        let mut ids: HashMap<&str, u16> = HashMap::new();
+        for (seq, (topic, log_time, capture_ns)) in msgs.iter().enumerate() {
+            let id = match ids.get(topic) {
+                Some(id) => *id,
+                None => {
+                    let schema = writer.add_schema(
+                        "test_msgs/msg/Stamped",
+                        "ros2msg",
+                        b"std_msgs/Header header\nint32 value",
+                    )?;
+                    let id = writer.add_channel(schema, topic, "cdr", &BTreeMap::new())?;
+                    ids.insert(topic, id);
+                    id
+                }
+            };
+            let payload = crate::stamp::tests::payload_for_ns(*capture_ns);
+            writer.write_to_known_channel(
+                &mcap::records::MessageHeader {
+                    channel_id: id,
+                    sequence: seq as u32,
+                    log_time: *log_time,
+                    publish_time: *log_time,
+                },
+                &payload,
+            )?;
+        }
+        writer.finish()?;
+        Ok(())
+    }
+
     pub(crate) fn test_dir(name: &str) -> Result<PathBuf> {
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let path =
@@ -903,6 +1044,46 @@ pub(crate) mod tests {
         assert!(tailer.plan_window(201, 500).extents.is_empty());
         assert!(!tailer.plan_window(0, 100).extents.is_empty());
         assert!(tailer.plan_window(0, 99).extents.is_empty());
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn coverage_and_extents_track_capture_time_for_stamped_channels() -> Result<()> {
+        let root = test_dir("tail-capture")?;
+        let rec = root.join("rec.mcap");
+        // log_time is a constant late burst (10_000); the capture stamps step
+        // 100..500. Coverage and the extent index must follow the capture
+        // stamp, the timeline the window is cut on.
+        write_stamped_recording(
+            &rec,
+            false,
+            &[
+                ("/cam", 10_000, 100),
+                ("/cam", 10_000, 300),
+                ("/cam", 10_000, 500),
+            ],
+        )?;
+
+        let (tailer, coverage) = Tailer::new();
+        let file = Arc::new(File::open(&rec)?);
+        tailer.attach(file.clone());
+        scan_to_end(&tailer, &file, MAGIC.len() as u64)?;
+
+        // The high-water mark is the max CAPTURE time (500), not log_time.
+        assert_eq!(coverage.get().high_water_ns, 500);
+
+        // Extents are planned by capture-time overlap: a capture-range window
+        // plans the extent; a window only over the log_time plans nothing.
+        assert!(
+            !tailer.plan_window(200, 400).extents.is_empty(),
+            "a capture-time window plans the extent"
+        );
+        assert!(
+            tailer.plan_window(9_000, 11_000).extents.is_empty(),
+            "a window only over the log_time plans nothing"
+        );
 
         std::fs::remove_dir_all(root)?;
         Ok(())
