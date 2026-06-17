@@ -73,7 +73,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        distro: [humble, jazzy, lyrical]
+        # lyrical is intentionally excluded from CI: a cold from-source build of
+        # its closure does not finish within GitHub's 60-minute job limit. It
+        # still builds and is tested locally (see README); CI covers humble and
+        # jazzy.
+        distro: [humble, jazzy]
         include:
           # Per-distro e2e selection (nextest filterset). corrupt_tail_health_live
           # — the live-corruption race the project flags as its one inherently
@@ -82,17 +86,11 @@ jobs:
           # in-test skip_flaky() gate reads to skip-and-pass. Its mandatory 60 s
           # post-damage announcement misses under CI-grade timing, and nextest's
           # default fail-fast then masks the rest of the suite (beads
-          # ros2_subscribe-3q8). Lyrical additionally drops
-          # old_recording_on_disk_is_not_recovered_after_restart — a distro
-          # incompatibility (its timestamped rosbag2 filenames break the test's
-          # harness assumption, beads ros2_subscribe-7ys), not CI flakiness — via
-          # the filterset, so only lyrical carries one.
+          # ros2_subscribe-3q8).
           - distro: humble
             e2e_filter: binary(e2e)
           - distro: jazzy
             e2e_filter: binary(e2e)
-          - distro: lyrical
-            e2e_filter: binary(e2e) and not test(old_recording_on_disk_is_not_recovered_after_restart)
     steps:
       - uses: actions/checkout@v6
 
