@@ -67,4 +67,4 @@
 
 export.auto: true
 
-sync.remote: "git+ssh://git@github.com/Momentedge/momentedge-clipper.git"
+# sync.remote: "git+ssh://git@github.com/Momentedge/momentedge-clipper.git"
