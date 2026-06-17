@@ -152,6 +152,49 @@ that shapes it:
   FastDDS shared-memory transport works and DDS interop with the host's other
   nodes is direct — no per-container `/dev/shm` split and no UDP-only workaround.
 
+### Debian packaging and CI release
+
+`scripts/package-deb.sh` assembles a `momentedge-clipper` `.deb` from a native
+build. It invokes `build-on-target.sh` (with `BUILD_PACKAGES=clipper` and
+`MOMENTEDGE_RPATH` set to `/opt/ros/<distro>/lib:/opt/momentedge-clipper/lib`), so
+the `clipper` binary carries RUNPATHs to its installed locations and resolves
+`rcl`/`rmw` and the directly-linked `momentedge_msgs` typesupport without a
+sourced environment. The package tree is rooted at `/opt/momentedge-clipper`
+(`bin/clipper`, `lib/`, `share/`, `setup.bash`) with a thin
+`/usr/bin/momentedge-clipper` wrapper that sources `/opt/ros/<distro>/setup.bash`
+and the package's own `setup.bash` (which extends `AMENT_PREFIX_PATH` and
+`LD_LIBRARY_PATH` with the bundled overlay) before exec-ing the binary — the
+wrapper's `LD_LIBRARY_PATH` is what the dlopen'd rmw-specific typesupport needs;
+the RUNPATHs cover only the directly-linked libraries. `clipper` is the only
+binary packaged: `trigger-pub` is a dev stand-in and the recording is produced by
+the host's own `ros2 bag record`, so neither ships in the `.deb`.
+
+`momentedge_msgs` is not in apt, so the package bundles the compiled typesupport
+(`lib/`, `share/`) from the colcon overlay produced by `build-on-target.sh`.
+Everything else `clipper` needs at runtime is declared as Debian `Depends` —
+`ros-<distro>-ros-base` and `ros-<distro>-rmw-fastrtps-cpp` — so `apt install
+./momentedge-clipper_*.deb` pulls the host ROS2 stack automatically on a fresh
+machine. The distro name is embedded in the filename
+(`ubuntu<ver>-<distro>_arm64.deb`), so the Humble and Jazzy packages can attach
+to the same release without colliding.
+
+The build environment comes almost entirely from `ros-tooling/setup-ros` with
+`required-ros-distributions: <distro>`: its desktop variant carries `ros-base`,
+`rmw_fastrtps_cpp`, and the `ament_cmake`/`rosidl` generators that build
+`momentedge_msgs`. The one build dependency it omits is `libclang` (for r2r's
+bindgen codegen), which `release.yml` adds in a one-line `apt install` step.
+
+`.github/workflows/release.yml` builds one `.deb` per distro on native arm64
+GitHub-hosted runners (`ubuntu-22.04-arm` / `ubuntu-24.04-arm`) that match the
+deployment targets, producing binaries that are ABI-compatible with those hosts
+by construction. A version tag (`v*`) publishes: the job attaches the `.deb`
+files to the GitHub release for that tag. `workflow_dispatch` builds and uploads
+artifacts but does not publish by default (`publish` input, default `false`),
+so the packaging pipeline can be exercised — including locally under `act` —
+without touching any release. Workflow mechanics, the `setup-ros` + `libclang`
+install split, and the `act` recipe live in
+[`.github/CLAUDE.md`](.github/CLAUDE.md).
+
 ## Workspace layout
 
 A virtual workspace (no root package), so `resolver = "3"` (the edition-2024

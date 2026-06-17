@@ -31,3 +31,6 @@ __pycache__/
 
 # nix build output symlink
 /result
+
+# Debian packages assembled by scripts/package-deb.sh
+/dist/

@@ -76,6 +76,39 @@ mechanics and the reasoning behind the choices:
   a nextest filterset (`not test(...)`) on lyrical's leg rather than an env gate.
   humble/jazzy run 13 and lyrical 12.
 
+## Release workflow (`release.yml`)
+
+[`workflows/release.yml`](workflows/release.yml) builds a `momentedge-clipper`
+`.deb` for each supported target and, on a version tag, attaches them to the
+GitHub release.
+
+- **Native arm64 runners matching the targets.** Each matrix leg runs on a
+  GitHub-hosted arm64 runner (`ubuntu-22.04-arm` for Humble, `ubuntu-24.04-arm`
+  for Jazzy). The binaries are compiled against the host's own apt ROS2, so they
+  are ABI-compatible with the deployment targets by construction — the same
+  rationale as the manual `build-on-target.sh` build (see root CLAUDE.md
+  "Deployment build model").
+- **`setup-ros` (desktop) then a one-line `libclang` install.**
+  `ros-tooling/setup-ros@v0.7` with `required-ros-distributions: <distro>`
+  registers `packages.ros.org` (arch-agnostic repo line, so apt resolves arm64 on
+  these runners), installs the ROS dev tools (colcon, build-essential, cmake,
+  git), and installs the matrix distro's desktop variant — which already carries
+  what the build and the package's runtime use: `ros-base`, `rmw_fastrtps_cpp`,
+  and the `ament_cmake`/`rosidl` generators that build `momentedge_msgs`. The
+  only thing it omits is `libclang` (for r2r's bindgen codegen), which an inline
+  `apt install clang libclang-dev` step adds.
+- **Tag-gated publish; `workflow_dispatch` never publishes by default.** On a
+  `v*` tag push the job attaches the `.deb` files to the GitHub release for that
+  tag (`softprops/action-gh-release@v2`). `workflow_dispatch` has a `publish`
+  boolean input (default `false`) so the packaging pipeline can be exercised
+  without creating or modifying a release. Running under `act` also never
+  publishes — both the artifact upload and the release step are gated on
+  `!env.ACT`.
+- **Version from tag.** When triggered by a tag, the job strips the leading `v`
+  from `GITHUB_REF_NAME` and passes it as `VERSION` to `package-deb.sh`; on any
+  other trigger `package-deb.sh` falls back to the workspace version in
+  `Cargo.toml`.
+
 ## Verifying locally with `act`
 
 ```bash
@@ -88,6 +121,22 @@ The larger `/dev/shm` matches a GitHub-hosted runner; the live e2e tests'
 FastDDS shared-memory transport needs more than act's Docker default of 64 MB.
 act copies the working tree honouring `.gitignore`, so the local `target/` and
 `.omc/` never enter the container.
+
+To verify the Debian packaging pipeline (`release.yml`) locally on amd64, map
+the arm runner labels to standard act images and run the `deb` job:
+
+```bash
+act workflow_dispatch -j deb --matrix distro:humble \
+  -P ubuntu-22.04-arm=catthehacker/ubuntu:act-22.04 \
+  -P ubuntu-24.04-arm=catthehacker/ubuntu:act-24.04
+```
+
+This exercises the full `setup-ros` → `libclang` → `package-deb.sh` pipeline on
+amd64 (not arm64); the resulting `.deb` is amd64, not arm64, but
+the packaging logic and dependency resolution are exercised end to end. The
+artifact upload and release-attach steps are skipped (`!env.ACT`), so a local
+run never touches GitHub releases. Successful completion plus `dpkg-deb --info`
+/ `--contents` output in the log confirms the package assembled correctly.
 
 **humble** and **jazzy** substitute almost their whole closure prebuilt from
 `ros.cachix.org` and run end to end under act. **lyrical** is the exception: its

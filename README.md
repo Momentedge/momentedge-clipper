@@ -315,6 +315,39 @@ Running natively, every ROS2 process shares the host `/dev/shm`, so FastDDS
 shared-memory transport works and discovery + data interop with the host's other
 Humble nodes is direct.
 
+### Install from a Debian package
+
+Each [GitHub release](../../releases) attaches two `.deb` files — one per
+target — built by CI on native arm64 runners:
+
+| Target | File |
+|---|---|
+| Ubuntu 22.04 / ROS2 Humble | `momentedge-clipper_<ver>_ubuntu22.04-humble_arm64.deb` |
+| Ubuntu 24.04 / ROS2 Jazzy  | `momentedge-clipper_<ver>_ubuntu24.04-jazzy_arm64.deb`  |
+
+Install on the target (the matching target only — Humble package on a Humble
+host, Jazzy on a Jazzy host):
+
+```bash
+sudo apt install ./momentedge-clipper_<ver>_ubuntu22.04-humble_arm64.deb
+```
+
+`apt` resolves the declared runtime dependencies (`ros-<distro>-ros-base`,
+`ros-<distro>-rmw-fastrtps-cpp`) automatically.
+
+The package installs the recorder as a wrapper command that sources ROS and the
+bundled `momentedge_msgs` overlay before exec:
+
+```bash
+momentedge-clipper   # maps to /opt/momentedge-clipper/bin/clipper
+```
+
+The package ships only the `clipper` recorder (plus its bundled `momentedge_msgs`
+typesupport under `/opt/momentedge-clipper`); the continuous recording it tails
+comes from the host's own `ros2 bag record` (see "Triggered recording" above).
+It is built natively against the matching apt ROS2 for ABI compatibility; see
+"Build on the target" above for the rationale.
+
 ### Retention
 
 The continuous recording has no built-in retention, so the data directory grows
@@ -352,6 +385,29 @@ recorder-parameters YAML to select topics:
 ./scripts/record.sh config/cam_sim.yaml   # only the sim camera topics (sim/)
 ./scripts/record.sh my.yaml /tmp/record   # optional 2nd arg: output dir
 ```
+
+## Issue tracking
+
+This repo tracks issues with [beads](https://github.com/steveyegge/beads)
+(`bd`). Issues live in a Dolt database that syncs through a **dedicated private
+remote** (`github.com/Momentedge/momentedge-clipper-dolt`), kept out of this
+code repo. The `.beads/` directory here holds only the beads configuration and
+the remote pointer (`sync.remote` in `.beads/config.yaml`); the database itself
+is local to each clone (gitignored), and the git-hook wiring that keeps it in
+sync is per-clone local config that `git clone` does not carry. A fresh clone
+therefore starts with no issues until you hydrate it:
+
+```bash
+bd dolt pull        # create the local DB and pull every issue from the remote
+bd hooks install    # wire the beads git hooks so git pull/push auto-sync issues
+```
+
+`bd dolt pull` builds the local Dolt database from scratch on first run, so a
+clone needs neither a pre-existing database nor the `.beads/issues.jsonl`
+export to recover its issues. After hydrating, `bd ready` / `bd list` work and
+the hooks keep the local database in step with the remote on every `git pull`
+and `git push`. The `bd` workflow and conventions are in
+[`CLAUDE.md`](CLAUDE.md).
 
 ## For contributors and agents
 

@@ -1,0 +1,108 @@
+# Builds the per-distro Debian packages for the clipper recorder and, on a
+# version tag, attaches them to the GitHub release.
+#
+# Native aarch64 build, matching the deployment targets: each matrix leg runs on
+# a GitHub-hosted arm64 runner (ubuntu-22.04-arm / ubuntu-24.04-arm), installs
+# the matching ROS2 distro from apt (scripts/ci-install-ros.sh), builds the two
+# binaries + the momentedge_msgs overlay natively against it, and assembles a
+# .deb (scripts/package-deb.sh). The binaries link the host's own rcl/rmw, so
+# they are ABI-compatible with the target's ROS graph — the same reason the
+# deployment build is native rather than nix or cross.
+#
+# A version tag (v*) publishes: the .deb files are attached to the GitHub release
+# for that tag. workflow_dispatch only builds and uploads artifacts (publish is
+# off by default), so the packaging can be exercised — and run locally under
+# `act` — without creating a release. See .github/CLAUDE.md for the act recipe.
+
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Attach the .deb files to a GitHub release for this ref'
+        type: boolean
+        default: false
+
+# Creating a release and uploading assets needs write access to repo contents.
+permissions:
+  contents: write
+
+jobs:
+  deb:
+    name: ${{ matrix.distro }} (ubuntu ${{ matrix.ubuntu }})
+    runs-on: ${{ matrix.runner }}
+    # Native arm64 compile of the two crates against an apt ROS2; generous so a
+    # cold apt + cargo build finishes without tripping the limit.
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: humble
+            ubuntu: '22.04'
+            runner: ubuntu-22.04-arm
+          - distro: jazzy
+            ubuntu: '24.04'
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v6
+
+      # ros-tooling/setup-ros registers the packages.ros.org apt repository (its
+      # repo line carries no hardcoded arch, so apt resolves arm64 on these
+      # runners), installs the ROS dev tools (colcon, build-essential, cmake,
+      # git), and installs the matrix distro's desktop variant via
+      # required-ros-distributions — which carries the whole ROS stack this build
+      # and the package's runtime use: ros-base, rosbag2 + the MCAP storage
+      # plugin, ros2bag, rmw_fastrtps_cpp, and the ament_cmake / rosidl
+      # generators that build momentedge_msgs.
+      - name: Set up ROS2
+        uses: ros-tooling/setup-ros@v0.7
+        with:
+          required-ros-distributions: ${{ matrix.distro }}
+
+      # The one build dependency the desktop variant lacks: libclang, for r2r's
+      # bindgen codegen. Everything else the build and the .deb need comes from
+      # setup-ros above or is declared as the package's Depends.
+      - name: Install libclang (r2r bindgen)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang libclang-dev
+
+      # System Rust toolchain on stable, exactly as the dev shell / native build
+      # uses (the crates carry no feature gates).
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # On a tag, version the package from the tag (v0.0.1 -> 0.0.1); otherwise
+      # package-deb.sh falls back to the workspace version in Cargo.toml.
+      - name: Resolve version from tag
+        if: ${{ github.ref_type == 'tag' }}
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
+      - name: Build and package the .deb
+        run: ./scripts/package-deb.sh
+        env:
+          ROS_DISTRO: ${{ matrix.distro }}
+
+      # Skipped under act (its artifact backend is absent): the act run's
+      # verification is the successful build plus package-deb.sh's
+      # `dpkg-deb --info`/`--contents` output in the log.
+      - name: Upload build artifact
+        if: ${{ !env.ACT }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: momentedge-clipper-${{ matrix.distro }}-${{ matrix.ubuntu }}
+          path: dist/*.deb
+          if-no-files-found: error
+
+      # Publish only for a real tag push, or a dispatch that opted in. Never under
+      # act, so local runs never touch releases.
+      - name: Attach .deb to the GitHub release
+        if: ${{ (github.ref_type == 'tag' || inputs.publish) && !env.ACT }}
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.deb
+          fail_on_unmatched_files: true
