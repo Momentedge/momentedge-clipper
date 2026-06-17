@@ -76,6 +76,16 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      # Cache the cargo registry + this distro's target/. The r2r build links the
+      # distro's rcl/rmw, so the key is per distro. A distinct `release-` prefix
+      # keeps it separate from the CI workflow's cache: that build runs in the nix
+      # dev shell against the nix ROS closure, this one against the host's apt
+      # ROS2, so their target/ artifacts are not interchangeable.
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ matrix.distro }}
+
       # On a tag, version the package from the tag (v0.0.1 -> 0.0.1); otherwise
       # package-deb.sh falls back to the workspace version in Cargo.toml.
       - name: Resolve version from tag
