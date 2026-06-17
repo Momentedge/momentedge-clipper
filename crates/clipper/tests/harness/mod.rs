@@ -22,7 +22,7 @@
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const TRIGGER_TOPIC: &str = "/events/clipper/trigger";
@@ -66,6 +66,25 @@ pub fn skip_flaky() -> bool {
     false
 }
 
+/// Poll `path` until it contains `needle`, or `timeout` elapses. Used to
+/// confirm a child logged an expected line when only its log file (not its
+/// [`Proc`]) is in scope.
+fn wait_for_file_contains(path: &Path, needle: &str, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .contains(needle)
+        {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// Nanoseconds since the Unix epoch on the system clock — the time base the
 /// recorder, the trigger stamp, and MCAP `log_time` all share.
 pub fn now_ns() -> u64 {
@@ -90,6 +109,11 @@ fn unique_domain() -> u32 {
 pub struct TestEnv {
     pub domain: u32,
     root: tempfile::TempDir,
+    /// Whether the running recorder subscribes to the trigger topic (it does
+    /// when recording `--all`), so [`Self::fire_trigger`] knows whether to wait
+    /// for one matched subscriber (the extractor) or two (the extractor and the
+    /// recorder). Set by [`Self::start_recorder_with_config`].
+    records_trigger_topic: AtomicBool,
 }
 
 impl TestEnv {
@@ -101,6 +125,7 @@ impl TestEnv {
         let env = TestEnv {
             domain: unique_domain(),
             root,
+            records_trigger_topic: AtomicBool::new(false),
         };
         std::fs::create_dir_all(env.log_dir()).expect("creating the log dir");
         eprintln!(
@@ -184,6 +209,11 @@ impl TestEnv {
             .arg(self.record_dir())
             .env("STORAGE_PRESET", preset)
             .env("MAX_CACHE_SIZE", cache.to_string());
+        // A configless recorder records `--all` and so subscribes to the
+        // trigger topic; the configs the suite passes select only the source
+        // topic, so they do not. `fire_trigger` waits for the matching count.
+        self.records_trigger_topic
+            .store(config.is_none(), Ordering::Relaxed);
         self.spawn("recorder", cmd)
     }
 
@@ -311,12 +341,25 @@ impl TestEnv {
         proc
     }
 
-    /// Publish one `Trigger` and wait for the publication to complete.
-    /// `-w 1` holds the publish until at least the extractor's subscription
-    /// is matched, closing the discovery race; the wait is bounded by the
-    /// `wait_exit` timeout below rather than a CLI flag, since
-    /// `--max-wait-time-secs` is Jazzy+ syntax that Humble's `ros2 topic pub`
-    /// rejects.
+    /// Publish one `Trigger` and confirm the extractor actually received it.
+    ///
+    /// A bare `ros2 topic pub --once -w 1` waits for *one* matched subscription
+    /// before its single publish. But the `--all` recorder also subscribes to
+    /// the trigger topic, so that one match can be the recorder's, not the
+    /// extractor's — the one-shot trigger then fires before the extractor is
+    /// matched and is lost to it. The race is invisible on a fast host that
+    /// matches the extractor first and brutal on a slow one that does not.
+    ///
+    /// Wait for every subscriber instead: `-w 2` when the recorder records the
+    /// trigger topic (so the publish cannot fire until the extractor is matched
+    /// too), `-w 1` when a topic-restricted recorder leaves the extractor the
+    /// sole subscriber (as `quiet_topics` does, where `-w 2` would never be
+    /// satisfied). One publish settles it — no extra `ros2 topic pub` round
+    /// trips, whose ~1 s startup each would skew the deletion-timing tests.
+    /// Receipt is still confirmed in the extractor log, with a rare-miss
+    /// republish; re-firing is idempotent, since only a trigger the extractor
+    /// receives cuts a clip. The wait is bounded by `wait_exit` rather than
+    /// `--max-wait-time-secs`, Jazzy+ syntax Humble's `ros2 topic pub` rejects.
     pub fn fire_trigger(&self, name: &str, trigger_ns: u64, preroll_ns: u64, postroll_ns: u64) {
         let sec = (trigger_ns / 1_000_000_000) as i64;
         let nanosec = trigger_ns % 1_000_000_000;
@@ -325,23 +368,45 @@ impl TestEnv {
              trigger_time: {{sec: {sec}, nanosec: {nanosec}}}, \
              preroll: {preroll_ns}, postroll: {postroll_ns}}}"
         );
-        let mut cmd = self.command("ros2");
-        cmd.args([
-            "topic",
-            "pub",
-            "--once",
-            "-w",
-            "1",
-            TRIGGER_TOPIC,
-            "momentedge_msgs/msg/Trigger",
-            &yaml,
-        ]);
-        let mut proc = self.spawn(&format!("trigger-{name}"), cmd);
-        let status = proc.wait_exit(Duration::from_secs(60)).unwrap_or_else(|| {
-            proc.dump_log();
-            panic!("trigger publish {name} did not complete");
-        });
-        assert!(status.success(), "trigger publish {name} failed: {status}");
+        let waiters = if self.records_trigger_topic.load(Ordering::Relaxed) {
+            "2"
+        } else {
+            "1"
+        };
+        let extractor_log = self.log_dir().join("extractor.log");
+        let needle = format!("trigger name=\"{name}\"");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let mut cmd = self.command("ros2");
+            cmd.args([
+                "topic",
+                "pub",
+                "--once",
+                "-w",
+                waiters,
+                TRIGGER_TOPIC,
+                "momentedge_msgs/msg/Trigger",
+                &yaml,
+            ]);
+            let mut proc = self.spawn(&format!("trigger-{name}"), cmd);
+            let status = proc.wait_exit(Duration::from_secs(30)).unwrap_or_else(|| {
+                proc.dump_log();
+                panic!("trigger publish {name} did not complete");
+            });
+            assert!(status.success(), "trigger publish {name} failed: {status}");
+
+            // The publish reached the extractor iff it logs the trigger — the
+            // first thing the handler logs on receipt, so a short window settles
+            // it and keeps a rare miss's republish prompt.
+            if wait_for_file_contains(&extractor_log, &needle, Duration::from_millis(1500)) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "extractor never logged receipt of trigger {name:?}; see {}",
+                extractor_log.display(),
+            );
+        }
     }
 
     /// `out_dir/.capturing` must exist (the extractor ran) and hold nothing
