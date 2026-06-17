@@ -146,17 +146,20 @@ for a supervisor to restart.
 
 ### Configuration
 
-`clipper` takes no CLI args. It reads `clipper.toml` from
-the working directory (or the path in `$CLIPPER_CONFIG`; a missing file is
-fine), overridable per key by `CLIPPER_*` environment variables (e.g.
-`EDGESTREAM_GRACE_SECS=60`). All keys are optional:
+`clipper` is configured by CLI flags, each with a `MOMENTEDGE_*` environment
+fallback and a built-in default: a flag overrides the env var, which overrides
+the default. `clipper --help` lists them and `clipper --version` prints the
+version. All settings are optional:
 
-```toml
-record_dir = "./record-cont"   # bag directory of the continuous recording
-out_dir = "./triggered-cont"   # where clips are written
-grace_secs = 30                # wait past the window end for coverage before cutting
-extract_parallelism = 1        # concurrent clip copies (1 = one at a time, FIFO)
-```
+| Flag | Env var | Default | Meaning |
+|---|---|---|---|
+| `--record-dir` | `MOMENTEDGE_RECORD_DIR` | `./record-cont` | bag directory of the continuous recording |
+| `--out-dir` | `MOMENTEDGE_OUT_DIR` | `./triggered-cont` | where clips are written |
+| `--grace-secs` | `MOMENTEDGE_GRACE_SECS` | `30` | wait past the window end for coverage before cutting |
+| `--extract-parallelism` | `MOMENTEDGE_EXTRACT_PARALLELISM` | `1` | concurrent clip copies (1 = one at a time, FIFO) |
+
+For example, `clipper --grace-secs 60` and `MOMENTEDGE_GRACE_SECS=60 clipper`
+are equivalent.
 
 At most 16 triggers are handled concurrently — a fixed bound, not a config key.
 A trigger that arrives while all 16 handler slots are occupied is rejected: a

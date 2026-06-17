@@ -33,20 +33,21 @@
 //! orderly exit 0). Clip copies run on a fixed pool of
 //! `extract_parallelism` worker threads consuming one FIFO job channel.
 //!
-//! Configuration is layered (defaults → TOML file → environment, via
-//! config-rs); there are no CLI args. The TOML file is
-//! `clipper.toml` in the working directory, or the path in
-//! `$CLIPPER_CONFIG`; each key also reads from an
-//! `CLIPPER_<KEY>` environment variable. Keys (all optional):
-//!   record_dir   bag directory of the continuous recording (default ./record-cont)
-//!   out_dir      where clips are written                   (default ./triggered-cont)
-//!   grace_secs   how long past the window end to wait for coverage
-//!                before cutting from what is on disk (default 30; must
-//!                exceed the recorder's flush latency — for a chunked
-//!                recording roughly chunk size / aggregate data rate)
-//!   extract_parallelism  extraction worker threads (default 1: copies
-//!                queue FIFO — the bulk copy competes with the recorder's
-//!                writes for disk bandwidth; waiting is always concurrent)
+//! Configuration is parsed by clap (`Config`): each setting is a CLI flag that
+//! falls back to a `MOMENTEDGE_<KEY>` environment variable, then to a built-in
+//! default — a CLI flag wins over the env var, which wins over the default. The
+//! `MOMENTEDGE_*` env names are derived from one prefix applied to every field
+//! (`with_env_prefix`). `--help` lists the flags and `--version` prints the
+//! version. Settings (all optional):
+//!   --record-dir   bag directory of the continuous recording (default ./record-cont)
+//!   --out-dir      where clips are written                   (default ./triggered-cont)
+//!   --grace-secs   how long past the window end to wait for coverage
+//!                  before cutting from what is on disk (default 30; must
+//!                  exceed the recorder's flush latency — for a chunked
+//!                  recording roughly chunk size / aggregate data rate)
+//!   --extract-parallelism  extraction worker threads (default 1: copies
+//!                  queue FIFO — the bulk copy competes with the recorder's
+//!                  writes for disk bandwidth; waiting is always concurrent)
 //!
 //! Logging uses the `log` facade with a pretty_env_logger backend; `RUST_LOG`
 //! controls verbosity.
@@ -62,12 +63,12 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
+use clap::{CommandFactory, FromArgMatches, Parser};
 use crossbeam_channel::{Receiver, Sender, bounded, select, unbounded};
 use futures::executor::block_on;
 use futures::stream::StreamExt;
 use log::{error, info, warn};
 use r2r::{Publisher, QosProfile};
-use serde::Deserialize;
 use signal_hook::consts::{SIGINT, SIGTERM};
 use tail::{Coverage, Tailer};
 use watch::Watch;
@@ -88,16 +89,30 @@ const RECORDED_TOPIC: &str = "/events/momentedge/recorded";
 /// concurrent burst.
 const MAX_ACTIVE_TRIGGERS: usize = 16;
 
-#[derive(Debug, Deserialize)]
+/// Recorder configuration, parsed by clap from CLI flags with a `CLIPPER_*`
+/// environment-variable fallback per field (see [`load_config`]). The field doc
+/// comments are the `--help` text: the first line is the short help, the rest is
+/// shown under `--help`.
+#[derive(Debug, Parser)]
+#[command(version, about = "Triggered MCAP clip recorder")]
 struct Config {
+    /// Bag directory of the continuous recording that is tailed.
+    #[arg(long, default_value = "./record-cont")]
     record_dir: PathBuf,
+    /// Directory finished clips are written to.
+    #[arg(long, default_value = "./triggered-cont")]
     out_dir: PathBuf,
+    /// Seconds to wait past the window end for coverage before cutting.
+    ///
     /// How long past the window end to keep waiting for the recording to
     /// cover `trigger_time + postroll` before cutting the clip from what is
     /// on disk. Coverage normally lags the wall clock by the recorder's flush
     /// latency only; the timeout fires when the recorded topics go quiet, and
     /// the clip then simply ends at the last data that exists.
+    #[arg(long, default_value_t = 30)]
     grace_secs: u64,
+    /// Number of concurrent clip extractions (extraction worker-pool size).
+    ///
     /// How many clip extractions may run at once — the size of the extraction
     /// worker pool. The default of 1 serializes the bulk copies FIFO:
     /// extraction reads compete with the recorder's writes on the same disk,
@@ -105,6 +120,7 @@ struct Config {
     /// cache drops messages when it cannot drain). Waiting — postroll,
     /// coverage — is always concurrent; only the copy is queued. Raise on
     /// storage with IO headroom.
+    #[arg(long, default_value_t = 1)]
     extract_parallelism: usize,
 }
 
@@ -114,20 +130,32 @@ impl Config {
     }
 }
 
-/// Layered load: defaults, then the TOML file (`clipper.toml` in
-/// the working directory, or `$CLIPPER_CONFIG`; missing is fine), then
-/// `CLIPPER_<KEY>` environment variables.
-fn load_config() -> Result<Config, config::ConfigError> {
-    let file = std::env::var("CLIPPER_CONFIG").unwrap_or_else(|_| "clipper.toml".to_string());
-    config::Config::builder()
-        .set_default("record_dir", "./record-cont")?
-        .set_default("out_dir", "./triggered-cont")?
-        .set_default("grace_secs", 30_u64)?
-        .set_default("extract_parallelism", 1_u64)?
-        .add_source(config::File::with_name(&file).required(false))
-        .add_source(config::Environment::with_prefix("CLIPPER"))
-        .build()?
-        .try_deserialize()
+/// Prefix shared by every `MOMENTEDGE_*` environment variable. [`with_env_prefix`]
+/// applies it to all of [`Config`]'s arguments, so the env names track the field
+/// names (`grace_secs` → `MOMENTEDGE_GRACE_SECS`) with no per-field wiring.
+const ENV_PREFIX: &str = "MOMENTEDGE";
+
+/// Give every argument an environment-variable fallback named `<ENV_PREFIX>_` +
+/// the field name upper-cased (`record_dir` → `MOMENTEDGE_RECORD_DIR`). One place
+/// defines the prefix; the auto-generated `--help`/`--version` flags are left
+/// without an env binding.
+fn with_env_prefix(cmd: clap::Command) -> clap::Command {
+    cmd.mut_args(|arg| match arg.get_id().as_str() {
+        "help" | "version" => arg,
+        id => {
+            let env = format!("{ENV_PREFIX}_{}", id.to_uppercase());
+            arg.env(env)
+        }
+    })
+}
+
+/// Parse [`Config`] from the command line, each field falling back to its
+/// `CLIPPER_*` environment variable and then its default (CLI > env > default).
+/// clap prints `--help`/`--version` and any parse error, then exits the process,
+/// so this returns only a fully-populated config.
+fn load_config() -> Config {
+    let matches = with_env_prefix(Config::command()).get_matches();
+    Config::from_arg_matches(&matches).unwrap_or_else(|e| e.exit())
 }
 
 /// One supervised thread: the channel its closure's return value arrives on,
@@ -313,7 +341,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .parse_default_env()
         .init();
 
-    let cfg = Arc::new(load_config()?);
+    let cfg = Arc::new(load_config());
 
     // Start each run with a clean capturing dir: a crash mid-publish can strand
     // a stale staged file there, and clearing it at startup bounds that clutter
@@ -642,26 +670,68 @@ fn sanitize(name: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Parse a `Config` from an explicit argv through the same env-prefixed
+    /// command `load_config` builds, so the tests exercise the real wiring.
+    fn parse_from<I, T>(argv: I) -> Result<Config, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        let matches = with_env_prefix(Config::command()).try_get_matches_from(argv)?;
+        Config::from_arg_matches(&matches)
+    }
+
     #[test]
-    fn config_loads_every_key_from_toml() {
-        let cfg: Config = config::Config::builder()
-            .add_source(config::File::from_str(
-                r#"
-                record_dir = "/data/record"
-                out_dir = "/data/clips"
-                grace_secs = 7
-                extract_parallelism = 3
-                "#,
-                config::FileFormat::Toml,
-            ))
-            .build()
-            .unwrap()
-            .try_deserialize()
-            .unwrap();
+    fn config_defaults_when_no_flags_given() {
+        let cfg = parse_from(["clipper"]).unwrap();
+        assert_eq!(cfg.record_dir, PathBuf::from("./record-cont"));
+        assert_eq!(cfg.out_dir, PathBuf::from("./triggered-cont"));
+        assert_eq!(cfg.grace(), Duration::from_secs(30));
+        assert_eq!(cfg.extract_parallelism, 1);
+    }
+
+    #[test]
+    fn config_cli_flags_populate_every_field() {
+        let cfg = parse_from([
+            "clipper",
+            "--record-dir",
+            "/data/record",
+            "--out-dir",
+            "/data/clips",
+            "--grace-secs",
+            "7",
+            "--extract-parallelism",
+            "3",
+        ])
+        .unwrap();
         assert_eq!(cfg.record_dir, PathBuf::from("/data/record"));
         assert_eq!(cfg.out_dir, PathBuf::from("/data/clips"));
         assert_eq!(cfg.grace(), Duration::from_secs(7));
         assert_eq!(cfg.extract_parallelism, 3);
+    }
+
+    #[test]
+    fn env_prefix_binds_clipper_names_to_every_field() {
+        let cmd = with_env_prefix(Config::command());
+        let env_of = |id: &str| {
+            cmd.get_arguments()
+                .find(|a| a.get_id().as_str() == id)
+                .and_then(|a| a.get_env())
+                .map(|e| e.to_string_lossy().into_owned())
+        };
+        assert_eq!(
+            env_of("record_dir").as_deref(),
+            Some("MOMENTEDGE_RECORD_DIR")
+        );
+        assert_eq!(env_of("out_dir").as_deref(), Some("MOMENTEDGE_OUT_DIR"));
+        assert_eq!(
+            env_of("grace_secs").as_deref(),
+            Some("MOMENTEDGE_GRACE_SECS")
+        );
+        assert_eq!(
+            env_of("extract_parallelism").as_deref(),
+            Some("MOMENTEDGE_EXTRACT_PARALLELISM")
+        );
     }
 
     #[test]
@@ -689,20 +759,7 @@ mod tests {
 
     #[test]
     fn config_rejects_a_non_numeric_grace() {
-        let res = config::Config::builder()
-            .add_source(config::File::from_str(
-                r#"
-                record_dir = "/data/record"
-                out_dir = "/data/clips"
-                grace_secs = "soon"
-                extract_parallelism = 1
-                "#,
-                config::FileFormat::Toml,
-            ))
-            .build()
-            .unwrap()
-            .try_deserialize::<Config>();
-        assert!(res.is_err());
+        assert!(parse_from(["clipper", "--grace-secs", "soon"]).is_err());
     }
 
     // ── supervise() tests ──────────────────────────────────────────────────

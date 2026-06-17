@@ -26,11 +26,10 @@ signal-hook.workspace = true
 mcap.workspace = true
 # Error plumbing for the tail and extraction paths.
 anyhow.workspace = true
-# Layered configuration: defaults -> optional TOML file -> CLIPPER_*
-# environment variables, deserialized into `Config` (no CLI args).
-config.workspace = true
-# Derives `Deserialize` for `Config`.
-serde.workspace = true
+# CLI + env configuration: clap derives the `Config` parser. CLI flags take
+# precedence over the prefixed `CLIPPER_*` environment variables, which take
+# precedence over the per-field defaults. Provides `--help` and `--version`.
+clap.workspace = true
 # Logging via the `log` facade; pretty_env_logger is the backend (honours RUST_LOG).
 log.workspace = true
 pretty_env_logger.workspace = true

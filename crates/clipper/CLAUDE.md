@@ -369,11 +369,15 @@ trigger publisher (`trigger-pub`). `RUST_LOG=debug` raises verbosity.
 
 ## Configuration
 
-There are no CLI args. `load_config` in `main.rs` layers config-rs sources —
-defaults → optional TOML file → `CLIPPER_*` environment variables
-(later wins) — and deserializes the merged result into `Config` via serde.
-The TOML file is `clipper.toml` in the working directory unless
-`$CLIPPER_CONFIG` names another path; a missing file is fine, so
-the binary runs with no setup. The keys (`record_dir`, `out_dir`,
-`grace_secs`, `extract_parallelism`) and their defaults are listed in the
+`Config` is a clap `derive(Parser)`: every field is a CLI flag with a
+`MOMENTEDGE_*` environment fallback and a per-field default, so precedence is
+CLI flag > env var > default. `load_config` in `main.rs` parses it — clap prints
+`--help`/`--version` and any parse error and exits before it returns, so the
+binary still runs with no setup. The `MOMENTEDGE_*` env names are not wired
+per field: `with_env_prefix` walks every argument with `Command::mut_args` and
+binds `<field>` to `MOMENTEDGE_<FIELD>` (`grace_secs` → `MOMENTEDGE_GRACE_SECS`),
+leaving the auto-generated `--help`/`--version` untouched. Changing the prefix is
+the one `ENV_PREFIX` constant. clap's `env` feature provides the per-arg env
+fallback and `string` lets the runtime-built env names be set on the args. The
+flags, env vars, and defaults are tabulated in the
 [README](../../README.md#configuration).

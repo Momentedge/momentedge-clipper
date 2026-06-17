@@ -307,13 +307,13 @@ impl TestEnv {
         self.spawn("source", cmd)
     }
 
-    /// The binary under test, configured purely via `CLIPPER_*` env onto
+    /// The binary under test, configured purely via `MOMENTEDGE_*` env onto
     /// this test's temp tree. Blocks until its "up" line is logged.
     pub fn start_extractor(&self, grace_secs: u64) -> Proc {
         let mut cmd = self.command(env!("CARGO_BIN_EXE_clipper"));
-        cmd.env("CLIPPER_RECORD_DIR", self.record_dir())
-            .env("CLIPPER_OUT_DIR", self.out_dir())
-            .env("CLIPPER_GRACE_SECS", grace_secs.to_string());
+        cmd.env("MOMENTEDGE_RECORD_DIR", self.record_dir())
+            .env("MOMENTEDGE_OUT_DIR", self.out_dir())
+            .env("MOMENTEDGE_GRACE_SECS", grace_secs.to_string());
         let proc = self.spawn("extractor", cmd);
         proc.expect_log("clipper up", Duration::from_secs(30));
         proc

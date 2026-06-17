@@ -28,8 +28,10 @@ crossbeam-channel = "0.5"
 signal-hook = "0.3"
 mcap = "0.24"
 anyhow = "1"
-config = { version = "0.15", default-features = false, features = ["toml"] }
-serde = { version = "1", features = ["derive"] }
+# CLI + env parsing: `derive` for the `Config` parser, `env` so each arg falls
+# back to a `MOMENTEDGE_*` environment variable, `string` so the runtime-built
+# env names (one prefix applied to every arg) can be set on the args.
+clap = { version = "4", features = ["derive", "env", "string"] }
 log = "0.4"
 pretty_env_logger = "0.5"
 fastrand = "2"
