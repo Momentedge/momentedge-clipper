@@ -2,7 +2,7 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>momentedge_msgs</name>
-  <version>0.0.1</version>
+  <version>0.0.3</version>
   <description>
     Event interfaces for the clipper triggered recorder: a Trigger that
     requests a clip around a timestamp, and a Recorded notification emitted once

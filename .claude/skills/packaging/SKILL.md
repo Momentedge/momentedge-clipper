@@ -62,6 +62,18 @@ distro (humble/jazzy) on native arm64 runners, then a smoke-test that installs b
 and runs `clipper`. `cargo install cargo-deb --locked` and `python3-bloom fakeroot
 debhelper dpkg-dev` are the build prerequisites beyond `setup-ros` + `libclang`.
 
+**One naming convention, one version.** Both scripts emit
+`<pkg>_<VERSION>_ubuntu<YY.MM>-<distro>_<arch>.deb` (e.g.
+`ros-humble-momentedge-msgs_0.0.3_ubuntu22.04-humble_arm64.deb` and
+`momentedge-clipper_0.0.3_ubuntu22.04-humble_arm64.deb`). `VERSION` is one value for
+both: the release tag (`release.yml` sets it from `v*`), or the workspace
+`Cargo.toml` version for a dev build. cargo-deb takes `VERSION` via `--deb-version`;
+the msgs script overrides `momentedge_msgs/package.xml`'s `<version>` with it for the
+bloom build (bloom versions the deb straight from package.xml, so without the override
+the msgs deb tracks package.xml while clipper tracks the tag) and renames bloom's
+native `…_<ver>-0<codename>_<arch>.deb` to the shared shape. The `<version>` literal in
+package.xml is just the in-source default, kept in step with the workspace version.
+
 ## Verify under act (amd64 pipeline shape)
 
 ```bash
