@@ -184,7 +184,29 @@ jobs:
       # alone. atticd skips paths already in its upstream (cache.nixos.org), so
       # only the ROS2 and project-specific paths are actually stored. The attic
       # client and its login come from the setup step above; runs on failure too.
+      #
+      # The cache fronts atticd with a Cloudflare tunnel whose origin timeout is
+      # ~100 s. A large ROS2 debug NAR can take longer than that for the small
+      # cache host to receive, compress, and write to R2, which surfaces as an
+      # HTTP 524/502; the attic client does not retry 5xx and aborts the whole
+      # push on the first one. --jobs 1 serialises uploads so each large path
+      # gets the host's full resources and finishes within the timeout, and the
+      # retry loop resumes after a transient 5xx — atticd chunk-deduplicates
+      # already-stored data, so each attempt uploads less and converges.
       - name: Push entire store to attic
         if: ${{ !cancelled() }}
         continue-on-error: true
-        run: nix path-info --all | grep -vE '\.(drv|drv\.chroot|check|lock)$' | attic push --stdin momentedge
+        run: |
+          paths=$(nix path-info --all | grep -vE '\.(drv|drv\.chroot|check|lock)$')
+          for attempt in 1 2 3 4 5; do
+            echo "::group::attic push attempt $attempt"
+            if printf '%s\n' "$paths" | attic push --jobs 1 --stdin momentedge; then
+              echo "::endgroup::"
+              echo "push complete on attempt $attempt"
+              exit 0
+            fi
+            echo "::endgroup::"
+            echo "attempt $attempt hit a transient error; retrying in 15 s (atticd dedups already-stored paths)"
+            sleep 15
+          done
+          echo "push did not fully complete after 5 attempts; momentedge is partially populated"
