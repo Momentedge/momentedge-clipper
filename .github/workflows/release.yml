@@ -1,18 +1,26 @@
-# Builds the per-distro Debian packages for the clipper recorder and, on a
-# version tag, attaches them to the GitHub release.
+# Builds the per-distro Debian packages for the clipper recorder and, on a version
+# tag, attaches them to the GitHub release. Two packages per distro, each built the
+# way the ROS2 ecosystem builds its kind:
 #
-# Native aarch64 build, matching the deployment targets: each matrix leg runs on
-# a GitHub-hosted arm64 runner (ubuntu-22.04-arm / ubuntu-24.04-arm), installs
-# the matching ROS2 distro from apt (scripts/ci-install-ros.sh), builds the two
-# binaries + the momentedge_msgs overlay natively against it, and assembles a
-# .deb (scripts/package-deb.sh). The binaries link the host's own rcl/rmw, so
-# they are ABI-compatible with the target's ROS graph — the same reason the
-# deployment build is native rather than nix or cross.
+#   ros-<distro>-momentedge-msgs   the ament_cmake interface package, built with
+#                                  bloom (the official ROS deb generator) into
+#                                  /opt/ros/<distro> — a first-class ROS package.
+#   momentedge-clipper             the Rust/r2r recorder, built with cargo-deb
+#                                  (bloom has no cargo build type); Depends on the
+#                                  msgs package above, so the message typesupport
+#                                  resolves through the standard distro setup.bash.
+#
+# Native aarch64 build, matching the deployment targets: each matrix leg runs on a
+# GitHub-hosted arm64 runner (ubuntu-22.04-arm / ubuntu-24.04-arm), installs the
+# matching ROS2 distro from apt (ros-tooling/setup-ros), and builds both packages
+# natively against it. The binary links the host's own rcl/rmw, so it is
+# ABI-compatible with the target's ROS graph — the same reason deployment is native
+# rather than nix or cross.
 #
 # A version tag (v*) publishes: the .deb files are attached to the GitHub release
-# for that tag. workflow_dispatch only builds and uploads artifacts (publish is
-# off by default), so the packaging can be exercised — and run locally under
-# `act` — without creating a release. See .claude/skills/ci/SKILL.md for the act recipe.
+# for that tag. workflow_dispatch only builds and uploads artifacts (publish is off
+# by default), so the packaging can be exercised — and run locally under `act` —
+# without creating a release. See .claude/skills/ci/SKILL.md for the act recipe.
 
 name: release
 
@@ -34,8 +42,8 @@ jobs:
   deb:
     name: ${{ matrix.distro }} (ubuntu ${{ matrix.ubuntu }})
     runs-on: ${{ matrix.runner }}
-    # Native arm64 compile of the two crates against an apt ROS2; generous so a
-    # cold apt + cargo build finishes without tripping the limit.
+    # Native arm64 compile of the crate against an apt ROS2; generous so a cold apt
+    # + cargo build finishes without tripping the limit.
     timeout-minutes: 45
     strategy:
       fail-fast: false
@@ -47,89 +55,113 @@ jobs:
           - distro: jazzy
             ubuntu: '24.04'
             runner: ubuntu-24.04-arm
-    # Shared across the build and unit-test steps so their RUSTFLAGS match and
-    # cargo reuses the compiled artifacts. The rpath dirs are the package's
-    # install prefix (must match PREFIX in scripts/package-deb.sh).
     env:
       ROS_DISTRO: ${{ matrix.distro }}
-      MOMENTEDGE_RPATH: /opt/ros/${{ matrix.distro }}/lib:/opt/momentedge-clipper/lib
     steps:
       - uses: actions/checkout@v6
 
-      # ros-tooling/setup-ros registers the packages.ros.org apt repository (its
-      # repo line carries no hardcoded arch, so apt resolves arm64 on these
-      # runners), installs the ROS dev tools (colcon, build-essential, cmake,
-      # git), and installs the matrix distro's desktop variant via
-      # required-ros-distributions — which carries the whole ROS stack this build
-      # and the package's runtime use: ros-base, rosbag2 + the MCAP storage
-      # plugin, ros2bag, rmw_fastrtps_cpp, and the ament_cmake / rosidl
-      # generators that build momentedge_msgs.
+      # ros-tooling/setup-ros registers the packages.ros.org apt repository, installs
+      # the ROS dev tools (colcon, build-essential, cmake, git) and rosdep, and
+      # installs the matrix distro's desktop variant — ros-base, rosbag2 + the MCAP
+      # storage plugin, rmw_fastrtps_cpp, and the ament_cmake / rosidl generators
+      # that bloom builds momentedge_msgs against.
       - name: Set up ROS2
         uses: ros-tooling/setup-ros@v0.7
         with:
           required-ros-distributions: ${{ matrix.distro }}
 
-      # The one build dependency the desktop variant lacks: libclang, for r2r's
-      # bindgen codegen. Everything else the build and the .deb need comes from
-      # setup-ros above or is declared as the package's Depends.
-      - name: Install libclang (r2r bindgen)
+      # bloom + debhelper build the msgs .deb; libclang is r2r's bindgen codegen dep
+      # for the clipper build. Everything else comes from setup-ros above or is
+      # declared as the packages' Depends.
+      - name: Install packaging tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends clang libclang-dev
+          sudo apt-get install -y --no-install-recommends \
+            clang libclang-dev python3-bloom fakeroot debhelper dpkg-dev
 
-      # System Rust toolchain on stable, exactly as the dev shell / native build
-      # uses (the crates carry no feature gates).
+      # System Rust toolchain on stable, exactly as the dev shell / native build uses
+      # (the crates carry no feature gates).
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
       # Cache the cargo registry + this distro's target/. The r2r build links the
-      # distro's rcl/rmw, so the key is per distro. A distinct `release-` prefix
-      # keeps it separate from the CI workflow's cache: that build runs in the nix
-      # dev shell against the nix ROS closure, this one against the host's apt
-      # ROS2, so their target/ artifacts are not interchangeable.
+      # distro's rcl/rmw, so the key is per distro.
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: release-${{ matrix.distro }}
 
-      # On a tag, version the package from the tag (v0.0.1 -> 0.0.1); otherwise
-      # package-deb.sh falls back to the workspace version in Cargo.toml.
+      # cargo-deb assembles the clipper .deb from [package.metadata.deb].
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --locked
+
+      # bloom resolves the momentedge_msgs package.xml depend keys through rosdep;
+      # refresh the cache (setup-ros initialises it).
+      - name: Update rosdep
+        run: rosdep update
+
+      # On a tag, version the clipper package from the tag (v0.0.1 -> 0.0.1);
+      # otherwise the package scripts fall back to the workspace version. The msgs
+      # package versions independently from its package.xml.
       - name: Resolve version from tag
         if: ${{ github.ref_type == 'tag' }}
         run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
 
-      # Build: the momentedge_msgs colcon overlay + the clipper binary, RUNPATHs
-      # baked for the installed layout (ROS_DISTRO + MOMENTEDGE_RPATH come from the
-      # job env, so this matches the unit-test step's RUSTFLAGS).
-      - name: Build
+      # 1. The ROS2 package: bloom-build momentedge_msgs into ros-<distro>-momentedge-msgs.
+      - name: Package momentedge_msgs (bloom)
+        run: ./scripts/package-msgs-deb.sh
+
+      # 2. Build the clipper binary natively against the host ROS2 (colcon overlay for
+      #    r2r codegen + cargo). No MOMENTEDGE_RPATH: the deployed binary resolves its
+      #    libraries through the sourced /opt/ros/<distro>/setup.bash, the standard ROS
+      #    way, rather than baked rpaths.
+      - name: Build clipper
         run: ./scripts/build-on-target.sh
         env:
           BUILD_PACKAGES: clipper
 
-      # Unit tests: clipper's inline suite only — `--bins` excludes the live-ROS
-      # e2e integration tests (tests/e2e.rs). `--release` reuses the build step's
-      # artifacts via the shared RUSTFLAGS.
+      # clipper's inline unit suite — `--bins` excludes the live-ROS e2e tests
+      # (tests/e2e.rs). `--release` reuses the build step's artifacts.
       - name: Unit tests
         run: ./scripts/ros-cargo.sh test --release -p clipper --bins
 
-      # Package: assemble the .deb from the build outputs (it does not build).
-      - name: Package the .deb
-        run: ./scripts/package-deb.sh
+      # 3. The Debian package: cargo-deb wraps the binary, Depends on the msgs deb.
+      - name: Package clipper (cargo-deb)
+        run: ./scripts/package-clipper-deb.sh
 
-      # Skipped under act (its artifact backend is absent): the act run's
-      # verification is the successful build plus package-deb.sh's
-      # `dpkg-deb --info`/`--contents` output in the log.
-      - name: Upload build artifact
+      # Validate the packages install and the dependency chain resolves: apt pulls
+      # the msgs deb as a dependency of the clipper deb (installed first so it is
+      # available locally), then clipper starts against the apt-installed typesupport,
+      # sourcing only the distro setup — no build overlay. A missing/unresolved
+      # typesupport would crash it immediately instead of idling to the SIGINT.
+      - name: Smoke-test the installed packages
+        run: |
+          sudo apt-get install -y ./dist/ros-${{ matrix.distro }}-momentedge-msgs_*.deb
+          sudo apt-get install -y ./dist/momentedge-clipper_*.deb
+          source /opt/ros/${{ matrix.distro }}/setup.bash
+          /opt/momentedge-clipper/bin/clipper --help
+          rec="$(mktemp -d)"
+          # `|| code=$?` so timeout's exit (124 when it fires the SIGINT after the
+          # full window — the healthy case) doesn't fail the step.
+          code=0
+          RUST_LOG=info MOMENTEDGE_RECORD_DIR="$rec" timeout -s INT 6 \
+            /opt/momentedge-clipper/bin/clipper || code=$?
+          echo "clipper live-run exit code: $code (124 = ran the full window, then SIGINT)"
+
+      # Skipped under act (its artifact backend is absent): the act run's verification
+      # is the successful build plus the smoke-test and the package scripts' dpkg-deb
+      # output in the log.
+      - name: Upload build artifacts
         if: ${{ !env.ACT }}
         uses: actions/upload-artifact@v4
         with:
-          name: momentedge-clipper-${{ matrix.distro }}-${{ matrix.ubuntu }}
+          name: momentedge-debs-${{ matrix.distro }}-${{ matrix.ubuntu }}
           path: dist/*.deb
           if-no-files-found: error
 
       # Publish only for a real tag push, or a dispatch that opted in. Never under
-      # act, so local runs never touch releases.
-      - name: Attach .deb to the GitHub release
+      # act, so local runs never touch releases. The glob attaches both .deb files.
+      - name: Attach .deb files to the GitHub release
         if: ${{ (github.ref_type == 'tag' || inputs.publish) && !env.ACT }}
         uses: softprops/action-gh-release@v2
         with:

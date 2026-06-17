@@ -151,55 +151,23 @@ that shapes it:
 
 ### Debian packaging and CI release
 
-`scripts/package-deb.sh` assembles a `momentedge-clipper` `.deb` from an existing
-build: `build-on-target.sh` produces the `clipper` binary and the `momentedge_msgs`
-overlay, then `package-deb.sh` stages and builds the `.deb` (it does not build the
-binary itself — the release pipeline runs build, unit-test, and package as
-separate steps). The build splits across three small scripts:
-`scripts/ros-setup.sh` is sourced to put the ROS distro and the momentedge_msgs
-overlay on the environment (the one place that sourcing lives, honouring
-`ROS_SETUP` / `ROS_DISTRO`); `scripts/ros-build-messages.sh` builds the
-momentedge_msgs colcon overlay; and `scripts/ros-cargo.sh` sources the env and
-adds the r2r-codegen environment — `IDL_PACKAGE_FILTER` and the
-`MOMENTEDGE_RPATH` RUNPATHs — before exec-ing cargo. `build-on-target.sh` runs
-the latter two in order; the CI unit-test step calls `ros-cargo.sh` directly. The baked RUNPATHs let the
-`clipper` binary resolve `rcl`/`rmw` and the directly-linked `momentedge_msgs`
-typesupport without a sourced environment. The package tree is rooted at `/opt/momentedge-clipper`
-(`bin/clipper`, `lib/`, `share/`, `setup.bash`). Following ROS convention it ships
-no launcher wrapper: to run the recorder, source `/opt/ros/<distro>/setup.bash`
-then `/opt/momentedge-clipper/setup.bash` (which extends `AMENT_PREFIX_PATH` and
-`LD_LIBRARY_PATH` with the bundled overlay and puts `clipper` on `PATH`), then run
-`clipper` — or have a systemd unit source the same two files in its `ExecStart`.
-The overlay's `LD_LIBRARY_PATH` is what the dlopen'd rmw-specific typesupport
-needs; the RUNPATHs cover only the directly-linked libraries. `clipper` is the
-only binary packaged: `trigger-pub` is a dev stand-in and the recording is
-produced by the host's own `ros2 bag record`, so neither ships in the `.deb`.
+clipper ships as **two Debian packages**, each built the way its kind is built:
+`ros-<distro>-momentedge-msgs` (the `ament_cmake` interface package) with **bloom**
+into `/opt/ros/<distro>`, and `momentedge-clipper` (the Rust/r2r binary) with
+**cargo-deb**, declaring `Depends:` on the msgs package. bloom has no cargo build
+type, so the two tools are not interchangeable; and because the msgs package is a
+first-class ROS deb, the clipper binary ships **no bundled overlay and no baked
+rpath** — it resolves its typesupport through the standard
+`/opt/ros/<distro>/setup.bash`, like every ROS executable. `clipper` is the only
+binary packaged (`trigger-pub` is a dev stand-in; the recording is the host's own
+`ros2 bag record`).
 
-`momentedge_msgs` is not in apt, so the package bundles the compiled typesupport
-(`lib/`, `share/`) from the colcon overlay produced by `build-on-target.sh`.
-Everything else `clipper` needs at runtime is declared as Debian `Depends` —
-`ros-<distro>-ros-base` and `ros-<distro>-rmw-fastrtps-cpp` — so `apt install
-./momentedge-clipper_*.deb` pulls the host ROS2 stack automatically on a fresh
-machine. The distro name is embedded in the filename
-(`ubuntu<ver>-<distro>_arm64.deb`), so the Humble and Jazzy packages can attach
-to the same release without colliding.
-
-The build environment comes almost entirely from `ros-tooling/setup-ros` with
-`required-ros-distributions: <distro>`: its desktop variant carries `ros-base`,
-`rmw_fastrtps_cpp`, and the `ament_cmake`/`rosidl` generators that build
-`momentedge_msgs`. The one build dependency it omits is `libclang` (for r2r's
-bindgen codegen), which `release.yml` adds in a one-line `apt install` step.
-
-`.github/workflows/release.yml` builds one `.deb` per distro on native arm64
-GitHub-hosted runners (`ubuntu-22.04-arm` / `ubuntu-24.04-arm`) that match the
-deployment targets, producing binaries that are ABI-compatible with those hosts
-by construction. A version tag (`v*`) publishes: the job attaches the `.deb`
-files to the GitHub release for that tag. `workflow_dispatch` builds and uploads
-artifacts but does not publish by default (`publish` input, default `false`),
-so the packaging pipeline can be exercised — including locally under `act` —
-without touching any release. Workflow mechanics — the separate build,
-unit-test, and package steps, the `setup-ros` + `libclang` install split, and
-the `act` recipe — live in the `/ci` repo skill.
+`.github/workflows/release.yml` builds both packages per distro on native arm64
+runners (ABI-compatible with the targets); a `v*` tag publishes, `workflow_dispatch`
+builds without publishing. The packaging scripts, the run model, the build and
+on-target/`act` verification recipes, and the gotchas live in the **`packaging`
+skill** (`.claude/skills/packaging/SKILL.md`); the workflow/CI mechanics and the
+`act` recipe live in the **`/ci` skill**.
 
 ## Workspace layout
 

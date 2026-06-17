@@ -2,6 +2,8 @@
 name = "clipper"
 version.workspace = true
 edition.workspace = true
+license = "MIT"
+description = "Triggered MCAP clip recorder for ROS2"
 
 [[bin]]
 name = "clipper"
@@ -45,3 +47,42 @@ libc = "0.2"
 # Test structuring: expands the storage-profile matrix into per-case tests
 # that nextest runs as isolated processes.
 rstest = "0.26"
+
+# Debian packaging via cargo-deb: `cargo deb -p clipper --no-build --variant <distro>`
+# (scripts/package-clipper-deb.sh). bloom has no cargo build type, so cargo-deb is
+# the idiomatic deb tool for this r2r node — it reads these keys, takes the binary
+# build-on-target.sh already produced, and emits a standard .deb. The binary links
+# rcl/rmw and the momentedge_msgs typesupport; all three are pulled from apt by the
+# Depends below — ros-<distro>-momentedge-msgs is the bloom-built interface package
+# (scripts/package-msgs-deb.sh), installed to /opt/ros/<distro>. So clipper carries
+# no bundled overlay: source /opt/ros/<distro>/setup.bash, then run the binary.
+[package.metadata.deb]
+name = "momentedge-clipper"
+maintainer = "Stefan Lendl <s@stfl.dev>"
+copyright = "2026 Stefan Lendl <s@stfl.dev>"
+section = "utils"
+priority = "optional"
+# Vendor-namespaced under /opt rather than /usr/bin (the `clipper` binary name is
+# taken by an unrelated Debian package); the deb name and prefix match.
+assets = [["target/release/clipper", "opt/momentedge-clipper/bin/", "755"]]
+# Per-distro Depends live in the variants below; this base default targets humble.
+depends = "ros-humble-ros-base, ros-humble-rmw-fastrtps-cpp, ros-humble-momentedge-msgs"
+extended-description = """\
+Triggered MCAP clip recorder for ROS2. clipper tails one continuous ros2 bag MCAP \
+recording and cuts clips around momentedge_msgs/Trigger events, announcing each via \
+momentedge_msgs/Recorded. Built natively against the host ROS2 distro for ABI \
+compatibility; the momentedge_msgs interface package, ros-base, and rmw_fastrtps_cpp \
+are pulled from apt. Run by sourcing /opt/ros/<distro>/setup.bash, then \
+/opt/momentedge-clipper/bin/clipper."""
+
+# `--variant <distro>` selects the matching dependency set; `name` is repeated so the
+# package stays `momentedge-clipper` (cargo-deb would otherwise append the variant).
+# The distro is carried in the .deb filename instead, so the humble and jazzy packages
+# attach to one release without colliding.
+[package.metadata.deb.variants.humble]
+name = "momentedge-clipper"
+depends = "ros-humble-ros-base, ros-humble-rmw-fastrtps-cpp, ros-humble-momentedge-msgs"
+
+[package.metadata.deb.variants.jazzy]
+name = "momentedge-clipper"
+depends = "ros-jazzy-ros-base, ros-jazzy-rmw-fastrtps-cpp, ros-jazzy-momentedge-msgs"

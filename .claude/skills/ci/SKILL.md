@@ -54,10 +54,15 @@ Result: humble/jazzy run 13/14, lyrical 12/14.
 binaries ABI-compatible with the deployment targets by construction — same
 rationale as `build-on-target.sh`.
 
-**`setup-ros` (desktop) + one `apt install clang libclang-dev` step.**
-`ros-tooling/setup-ros@v0.7` covers `ros-base`, `rmw_fastrtps_cpp`, and the
-`ament_cmake`/`rosidl` generators. It omits `libclang`; the inline apt step
-fills the gap.
+**Two packages, two tools.** The `deb` job builds `ros-<distro>-momentedge-msgs`
+with bloom and `momentedge-clipper` with cargo-deb (bloom has no cargo build
+type). `ros-tooling/setup-ros@v0.7` (desktop) covers `ros-base`,
+`rmw_fastrtps_cpp`, rosdep, and the `ament_cmake`/`rosidl` generators; the inline
+`apt install` adds `clang libclang-dev` (r2r bindgen) plus `python3-bloom fakeroot
+debhelper dpkg-dev` (bloom + the msgs deb), and `cargo install cargo-deb` follows.
+The job ends with a smoke-test that installs both `.deb` files and runs `clipper`,
+confirming the `Depends` chain resolves. The packaging steps themselves live in the
+`packaging` skill (`.claude/skills/packaging/SKILL.md`).
 
 **Tag-gated publish.** A `v*` tag publishes; `workflow_dispatch` has a `publish`
 boolean (default `false`) so packaging can be exercised without touching a
@@ -74,7 +79,8 @@ act -l
 act push -j recorder --matrix distro:jazzy \
   --container-options "--shm-size=2g"
 
-# Exercise the release packaging pipeline on amd64 (arm64 logic, amd64 binary)
+# Exercise the release packaging pipeline on amd64 (arm64 logic, amd64 binary):
+# builds both .debs (bloom msgs + cargo-deb clipper) and smoke-tests the install.
 act workflow_dispatch -j deb --matrix distro:humble \
   -P ubuntu-22.04-arm=catthehacker/ubuntu:act-22.04 \
   -P ubuntu-24.04-arm=catthehacker/ubuntu:act-24.04

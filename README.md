@@ -320,41 +320,46 @@ Humble nodes is direct.
 
 ### Install from a Debian package
 
-Each [GitHub release](../../releases) attaches two `.deb` files — one per
-target — built by CI on native arm64 runners:
+Each [GitHub release](../../releases) attaches the packages CI builds on native
+arm64 runners — per distro, two packages, each built the way ROS2 builds its kind:
 
-| Target | File |
-|---|---|
-| Ubuntu 22.04 / ROS2 Humble | `momentedge-clipper_<ver>_ubuntu22.04-humble_arm64.deb` |
-| Ubuntu 24.04 / ROS2 Jazzy  | `momentedge-clipper_<ver>_ubuntu24.04-jazzy_arm64.deb`  |
+| Package | Built with | Installs to |
+|---|---|---|
+| `ros-<distro>-momentedge-msgs` | bloom | `/opt/ros/<distro>` |
+| `momentedge-clipper`           | cargo-deb | `/opt/momentedge-clipper` |
 
-Install on the target (the matching target only — Humble package on a Humble
-host, Jazzy on a Jazzy host):
+`momentedge_msgs` is the ament interface package, packaged as a first-class ROS
+deb with bloom; `clipper` is the Rust recorder, packaged with cargo-deb (bloom has
+no cargo build type) declaring `Depends: ros-<distro>-momentedge-msgs,
+ros-<distro>-rmw-fastrtps-cpp, ros-<distro>-ros-base`.
 
-```bash
-sudo apt install ./momentedge-clipper_<ver>_ubuntu22.04-humble_arm64.deb
-```
-
-`apt` resolves the declared runtime dependencies (`ros-<distro>-ros-base`,
-`ros-<distro>-rmw-fastrtps-cpp`) automatically.
-
-The package installs the recorder under `/opt/momentedge-clipper`. Following ROS
-convention it ships no launcher wrapper — source the matching ROS distro and the
-bundled overlay, then run `clipper`:
+Install on the matching target (Humble packages on a Humble host, Jazzy on a Jazzy
+host). Pass both files so `apt` installs the msgs package and pulls the rest of the
+ROS runtime as dependencies:
 
 ```bash
-source /opt/ros/humble/setup.bash            # the matching distro
-source /opt/momentedge-clipper/setup.bash    # bundled momentedge_msgs; puts clipper on PATH
-clipper --help
+# from the directory holding the two downloaded .deb files for your distro
+sudo apt install ./ros-humble-momentedge-msgs_*.deb ./momentedge-clipper_*.deb
 ```
 
-(A systemd unit deploys it the same way: source those two files in `ExecStart`.)
+The clipper binary carries no bundled overlay and no baked rpaths: its message
+typesupport is the `ros-<distro>-momentedge-msgs` package under `/opt/ros/<distro>`,
+resolved — like every ROS executable — through the distro's own `setup.bash`. So
+running it is the standard ROS source-then-run:
 
-The package ships only the `clipper` recorder (plus its bundled `momentedge_msgs`
-typesupport under `/opt/momentedge-clipper`); the continuous recording it tails
+```bash
+source /opt/ros/humble/setup.bash            # the matching distro + the msgs package
+/opt/momentedge-clipper/bin/clipper --help
+```
+
+(A systemd unit deploys it the same way: source `/opt/ros/<distro>/setup.bash` in
+`ExecStart`, or set the equivalent `Environment=` / `LD_LIBRARY_PATH`.)
+
+The clipper package ships only the recorder binary; the `momentedge_msgs`
+typesupport comes from its own package, and the continuous recording clipper tails
 comes from the host's own `ros2 bag record` (see "Triggered recording" above).
-It is built natively against the matching apt ROS2 for ABI compatibility; see
-"Build on the target" above for the rationale.
+Both packages are built natively against the matching apt ROS2 for ABI
+compatibility; see "Build on the target" above for the rationale.
 
 ### Retention
 
