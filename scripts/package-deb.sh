@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Assemble a Debian package for the clipper recorder from a native build against
-# the host's apt ROS2. Not a cross-build and not nix: run it on (or in a
-# container matching) the deployment target — Ubuntu 22.04/Humble or 24.04/Jazzy
-# — with that distro's ROS2 installed. It builds the clipper binary and the
-# momentedge_msgs typesupport overlay (scripts/build-on-target.sh), lays them out
-# under /opt/momentedge-clipper with a thin /usr/bin/momentedge-clipper wrapper,
-# and writes a DEBIAN/control that declares clipper's ROS2 runtime packages as
-# Depends so apt pulls them on install.
+# Assemble a Debian package for the clipper recorder from an existing native
+# build. Build first with scripts/build-on-target.sh (against the host's apt ROS2
+# — on, or in a container matching, the deployment target: Ubuntu 22.04/Humble or
+# 24.04/Jazzy). This script then lays the built clipper binary and the
+# momentedge_msgs typesupport overlay out under /opt/momentedge-clipper with a
+# thin /usr/bin/momentedge-clipper wrapper, and writes a DEBIAN/control that
+# declares clipper's ROS2 runtime packages as Depends so apt pulls them on
+# install.
 #
 # clipper is the only binary packaged: trigger-pub is a dev stand-in and the
 # record scripts run from the host's ROS2, so neither ships here. The binary
@@ -18,8 +18,8 @@
 #   ROS_DISTRO   humble | jazzy            (default: derived from the sourced ROS)
 #   VERSION      package version           (default: workspace version, Cargo.toml)
 #   OUT_DIR      where the .deb is written (default: ./dist)
-#   BUILD        1 builds first, 0 packages a pre-built tree   (default: 1)
-# Tools required on PATH: dpkg-deb, colcon, cargo, a C/Rust toolchain.
+# Tools required on PATH: dpkg-deb (the build, scripts/build-on-target.sh, needs
+# colcon, cargo, and the C/Rust toolchain).
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -44,22 +44,12 @@ UBUNTU_VERSION="$(. /etc/os-release && echo "$VERSION_ID")"
 
 echo "packaging momentedge-clipper $VERSION for $ROS_DISTRO (ubuntu $UBUNTU_VERSION, $ARCH)"
 
-# 1. Build the clipper binary + momentedge_msgs overlay, unless BUILD=0 — the
-#    release pipeline builds and unit-tests in earlier steps, then packages with
-#    BUILD=0. The RUNPATHs point at the installed locations so the binary resolves
-#    rcl/rmw and the directly-linked momentedge_msgs typesupport even without a
-#    sourced environment; the wrapper adds AMENT_PREFIX_PATH and LD_LIBRARY_PATH on
-#    top for the dlopen'd rmw-specific typesupport. BUILD_PACKAGES=clipper builds
-#    only what is packaged.
-if [[ "${BUILD:-1}" != "0" ]]; then
-  MOMENTEDGE_RPATH="/opt/ros/${ROS_DISTRO}/lib:${PREFIX}/lib" \
-  ROS_SETUP="$ROS_SETUP" \
-  BUILD_PACKAGES="clipper" \
-    "$REPO_ROOT/scripts/build-on-target.sh"
-fi
-
-# The package is assembled from these build outputs; fail clearly if a BUILD=0 run
-# was pointed at a tree that was never built.
+# 1. Require the build outputs this package is assembled from (produced by
+#    scripts/build-on-target.sh). The RUNPATHs the binary carries point at the
+#    installed locations, so it resolves rcl/rmw and the directly-linked
+#    momentedge_msgs typesupport even without a sourced environment; the wrapper
+#    adds AMENT_PREFIX_PATH and LD_LIBRARY_PATH on top for the dlopen'd
+#    rmw-specific typesupport.
 [[ -x target/release/clipper ]] || { echo "missing target/release/clipper — run scripts/build-on-target.sh first" >&2; exit 1; }
 [[ -d install/momentedge_msgs/lib ]] || { echo "missing install/momentedge_msgs overlay — run scripts/build-on-target.sh first" >&2; exit 1; }
 

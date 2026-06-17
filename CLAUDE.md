@@ -154,12 +154,12 @@ that shapes it:
 
 ### Debian packaging and CI release
 
-`scripts/package-deb.sh` assembles a `momentedge-clipper` `.deb`. By default it
-first builds via `build-on-target.sh` (`BUILD_PACKAGES=clipper`,
-`MOMENTEDGE_RPATH=/opt/ros/<distro>/lib:/opt/momentedge-clipper/lib`); `BUILD=0`
-packages an already-built tree instead, which the release pipeline uses after its
-separate build and unit-test steps. The build runs through `scripts/ros-cargo.sh`,
-which sets up the ROS + r2r-codegen environment — the colcon overlay, `libclang`,
+`scripts/package-deb.sh` assembles a `momentedge-clipper` `.deb` from an existing
+build: `build-on-target.sh` produces the `clipper` binary and the `momentedge_msgs`
+overlay, then `package-deb.sh` stages and builds the `.deb` (it does not build the
+binary itself — the release pipeline runs build, unit-test, and package as
+separate steps). The build runs through `scripts/ros-cargo.sh`, which sets up the
+ROS + r2r-codegen environment — the colcon overlay, `libclang`,
 `IDL_PACKAGE_FILTER`, and the `MOMENTEDGE_RPATH` RUNPATHs — in one place shared by
 `build-on-target.sh` and the CI unit-test step. The baked RUNPATHs let the
 `clipper` binary resolve `rcl`/`rmw` and the directly-linked `momentedge_msgs`

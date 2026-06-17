@@ -112,9 +112,9 @@ jobs:
       - name: Unit tests
         run: ./scripts/ros-cargo.sh test --release -p clipper --bins
 
-      # Package: assemble the .deb from the build outputs without rebuilding.
+      # Package: assemble the .deb from the build outputs (it does not build).
       - name: Package the .deb
-        run: BUILD=0 ./scripts/package-deb.sh
+        run: ./scripts/package-deb.sh
 
       # Skipped under act (its artifact backend is absent): the act run's
       # verification is the successful build plus package-deb.sh's

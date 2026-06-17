@@ -101,8 +101,8 @@ GitHub release.
   `scripts/build-on-target.sh` (the `momentedge_msgs` colcon overlay + the
   `clipper` binary); `Unit tests` runs `scripts/ros-cargo.sh test --release -p
   clipper --bins` — clipper's inline suite only, `--bins` excluding the live-ROS
-  e2e integration tests; `Package` runs `BUILD=0 scripts/package-deb.sh`, which
-  assembles the `.deb` from those outputs without rebuilding. The ROS +
+  e2e integration tests; `Package` runs `scripts/package-deb.sh`, which assembles
+  the `.deb` from those build outputs (it does not build). The ROS +
   r2r-codegen environment lives once in `scripts/ros-cargo.sh`, and `ROS_DISTRO` +
   `MOMENTEDGE_RPATH` are job-level env so build and test share `RUSTFLAGS` and
   cargo reuses the compiled artifacts — cached per distro by `Swatinem/rust-cache`
