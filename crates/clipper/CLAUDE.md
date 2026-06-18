@@ -93,20 +93,26 @@ process exits non-zero for a supervisor to restart. Limping on would degrade eve
 grace-timeout cut with no other signal, which is exactly what the fail-fast
 budget exists to prevent.
 
-**Recorder restarts:** the recording is discovered as the newest `*.mcap`
-under `record_dir`; when that path stops resolving to the tailed inode (the
-record script wipes the bag dir on restart), the index resets and the new file
-is tailed from scratch. This is the one path that re-attaches and resets
-everything — distinct from a scan fault, which keeps the index. Clips are cut
-from the most recent recording only; a previous file's data is never recovered
-into a clip, even when that file still exists on disk. Recovery across a
-recording replacement is an explicit non-feature, tracked as out of scope in
-beads `clipper-gl2`. A `NotFound` when opening the discovered path is
-the same race resolved the same way: the file vanished between discovery and
-open, so it is treated as a replacement and re-discovery loops. A magic
-mismatch stays fatal — an append-only file whose first eight bytes are wrong
-can never become a valid MCAP. In-flight extractions hold their own `Arc<File>`
-and finish safely against the deleted inode.
+**Recorder restarts and bag splits:** the recording is discovered as the newest
+`*.mcap` under `record_dir` by ctime, and re-discovered whenever that newest
+file is no longer the one being tailed — the record script wiped the bag dir on
+a restart, or rosbag2 split the bag (`--max-bag-size`/`--max-bag-duration`) and
+rolled over to `<bag>_<n+1>.mcap` beside it. In either case the index resets and
+the new file is tailed from scratch. This is the one path that re-attaches and
+resets everything — distinct from a scan fault, which keeps the index. ctime,
+not mtime, is the ordering key: at a split the freshly opened file always has a
+later ctime than the just-closed one, and ctime cannot be set into the past by a
+timestamp-preserving copy. Clips are cut from the recording currently tailed
+only; a previous file's data is never recovered into a clip, even when that file
+still exists on disk — a split clipper has already advanced past, or a rotated
+file left behind. Recovery across a recording change, restart or split alike, is
+an explicit non-feature, tracked as out of scope in beads `clipper-gl2`. A
+`NotFound` when opening the discovered path is the same race resolved the same
+way: the file vanished between discovery and open, so it is treated as a
+replacement and re-discovery loops. A magic mismatch stays fatal — an
+append-only file whose first eight bytes are wrong can never become a valid
+MCAP. In-flight extractions hold their own `Arc<File>` and finish safely against
+the deleted inode.
 
 ## Per-trigger flow (`handle_trigger`)
 

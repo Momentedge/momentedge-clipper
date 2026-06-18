@@ -8,7 +8,8 @@ is the minimal continuous setup; these expand on it.
   clipper (the pairing clipper is built for). Covers the `--max-cache-size` and
   `--storage-preset-profile` latency/size trade-offs.
 - [`split-bags/`](split-bags/README.md) — `--max-bag-size` / `--max-bag-duration`
-  split recording with pruning for retention. Notes the rosbag2
-  message-loss-at-split caveat and why clipper does not follow splits.
+  split recording with pruning for retention. clipper follows the rollovers;
+  notes the rosbag2 message-loss-at-split caveat and the split-boundary clip
+  trade-off.
 - [`launch/`](launch/README.md) — the recorder and clipper brought up together
   with `ros2 launch` (the ROS-native orchestration), via a launch file.

@@ -102,5 +102,6 @@ clipper --record-dir ./record --grace-secs 2
 A continuous recording is one file that grows until you stop it; there is no
 built-in retention (in-place hole-punching is the planned follow-up, beads
 `clipper-wkg`). When unbounded growth is a problem, see
-[`../split-bags`](../split-bags/README.md) for split recording with pruning —
-at the cost of clipper's split limitation documented there.
+[`../split-bags`](../split-bags/README.md) for split recording with pruning;
+clipper follows the rollovers, at the cost of the split-boundary clip trade-off
+documented there.

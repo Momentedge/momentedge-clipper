@@ -29,11 +29,13 @@
 //! touched by the extraction. The same "decode only the timestamp" discipline
 //! as the rest of the workspace, applied to file tailing.
 //!
-//! The recording is discovered as the newest `*.mcap` under the record dir and
-//! re-discovered when the path stops pointing at the tailed inode (the record
-//! script wipes and recreates the bag directory on restart). Re-discovery
-//! resets the whole index — the old file's data is gone. Extractions already
-//! holding the old file handle finish safely against the deleted inode.
+//! The recording is discovered as the newest `*.mcap` under the record dir (by
+//! ctime) and re-discovered whenever that newest file is no longer the one
+//! being tailed: the record script wiped and recreated the bag directory on a
+//! restart, or rosbag2 split the bag and rolled over to a fresh
+//! `<bag>_<n+1>.mcap` beside it. Re-discovery resets the whole index — the old
+//! file's data is gone, never recovered into a later clip (beads clipper-gl2).
+//! Extractions already holding the old file handle finish safely against it.
 //!
 //! Damage in the recording is tolerated the way [`crate::clip`] tolerates it
 //! at extraction: a damaged chunk, an unparseable schema/channel, or a runt
@@ -344,16 +346,18 @@ impl Tailer {
     }
 
     /// Tail forever: discover the newest `*.mcap` under `record_dir`, scan it
-    /// until it is replaced, start over. Blocking — run on its own thread.
+    /// until it is superseded by a newer one, start over. Blocking — run on its
+    /// own thread.
     ///
     /// Returns only when [`Self::tail_file`] fails: a scan fault it could not
     /// retry past, a recording that is not an MCAP, or an IO error around the
     /// tailed file. The error names the file, and the supervisor exits the
     /// process for a restart — limping on would degrade every clip to a
     /// grace-timeout cut silently. A missing or empty record directory is not a fault: discovery
-    /// idles until the continuous recording creates the bag dir, the
-    /// documented startup state. `tail_file` returning `Ok` (a recorder
-    /// restart) just loops back to re-discover the new file.
+    /// idles until the recording creates the bag dir, the
+    /// documented startup state. `tail_file` returning `Ok` (a recorder restart
+    /// or a rosbag2 split rolling over to a new file) just loops back to
+    /// re-discover the newest recording.
     pub fn run(&self, record_dir: &Path) -> Result<()> {
         loop {
             let path = loop {
@@ -363,7 +367,7 @@ impl Tailer {
                 std::thread::sleep(DISCOVER_POLL);
             };
             info!("tailing {}", path.display());
-            self.tail_file(&path)
+            self.tail_file(record_dir, &path)
                 .with_context(|| format!("tailing {}", path.display()))?;
             info!("recording {} replaced; re-discovering", path.display());
         }
@@ -381,8 +385,9 @@ impl Tailer {
         self.coverage.send_replace(Coverage::default());
     }
 
-    /// Scan one recording until the path stops referring to it (recorder
-    /// restart → `Ok`), alternating incremental passes with short sleeps.
+    /// Scan one recording until it is superseded by the newest `*.mcap` in
+    /// `record_dir` (a recorder restart or a rosbag2 split → `Ok`), alternating
+    /// incremental passes with short sleeps.
     ///
     /// The index is attached once here and never wiped while this recording is
     /// tailed: a scan fault does not re-attach or rescan from scratch. A fault
@@ -391,7 +396,7 @@ impl Tailer {
     /// faults are bounded by [`MAX_SCAN_FAULTS`] with backoff growing from
     /// [`DISCOVER_POLL`] to [`SCAN_BACKOFF_CAP`]; a fault-free pass resets the
     /// count. The backoff is slept in `DISCOVER_POLL` increments while polling
-    /// [`replaced`], so a recorder restart during backoff is recovery (`Ok`),
+    /// [`superseded`], so a restart or split during backoff is recovery (`Ok`),
     /// not a continued fault. Exhausting the retries returns the last fault,
     /// named with the path, offset, and attempt count: the same byte faulted
     /// every retry, so the file is genuinely stuck and the process exits for a
@@ -401,7 +406,7 @@ impl Tailer {
     /// (the record script wiping the bag dir) — treated as a replacement, not
     /// an error. A magic mismatch stays fatal: an append-only file whose first
     /// eight bytes are wrong can never become a valid MCAP.
-    fn tail_file(&self, path: &Path) -> Result<()> {
+    fn tail_file(&self, record_dir: &Path, path: &Path) -> Result<()> {
         let file = match File::open(path) {
             Ok(f) => Arc::new(f),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -411,7 +416,7 @@ impl Tailer {
 
         // The writer may not have put the 8 magic bytes on disk yet.
         while file_len(&file)? < MAGIC.len() as u64 {
-            if replaced(path, &file)? {
+            if superseded(record_dir, &file)? {
                 return Ok(());
             }
             std::thread::sleep(TAIL_POLL);
@@ -441,15 +446,16 @@ impl Tailer {
                     });
                 }
                 // Back off (doubling from DISCOVER_POLL, capped) before
-                // retrying at the same offset, but watch for a replacement
-                // throughout: a restart mid-backoff is recovery, not a fault.
+                // retrying at the same offset, but watch for supersession
+                // throughout: a restart or split mid-backoff is recovery, not a
+                // fault.
                 let backoff = backoff_for(consecutive_faults);
                 warn!(
                     "scan of {} faulted at offset {offset} ({fault:#}); \
                      retry {consecutive_faults}/{MAX_SCAN_FAULTS} after {backoff:?}",
                     path.display()
                 );
-                if self.replaced_during(path, &file, backoff)? {
+                if self.superseded_during(record_dir, &file, backoff)? {
                     return Ok(());
                 }
                 continue;
@@ -458,16 +464,18 @@ impl Tailer {
             consecutive_faults = 0;
 
             if progress.ended {
-                // DataEnd/Footer scanned: the recording is complete. Nothing
-                // more will appear; wait for the next recording to replace it.
+                // DataEnd/Footer scanned: this recording is complete (the
+                // recorder stopped, or rosbag2 closed this split before rolling
+                // over). Nothing more will appear here; wait for a newer
+                // recording to supersede it.
                 info!("recording {} ended (footer on disk)", path.display());
-                while !replaced(path, &file)? {
+                while !superseded(record_dir, &file)? {
                     std::thread::sleep(DISCOVER_POLL);
                 }
                 return Ok(());
             }
             if !made_progress {
-                if replaced(path, &file)? {
+                if superseded(record_dir, &file)? {
                     return Ok(());
                 }
                 std::thread::sleep(TAIL_POLL);
@@ -476,19 +484,20 @@ impl Tailer {
     }
 
     /// Sleep up to `total`, in [`DISCOVER_POLL`] increments, returning early
-    /// `true` as soon as `path` no longer refers to `file` (recorder restart).
-    /// Lets a fault backoff treat a replacement during the wait as recovery.
-    fn replaced_during(&self, path: &Path, file: &File, total: Duration) -> Result<bool> {
+    /// `true` as soon as `file` is [`superseded`] by the newest recording in
+    /// `dir` (a recorder restart or a split). Lets a fault backoff treat a
+    /// supersession during the wait as recovery.
+    fn superseded_during(&self, dir: &Path, file: &File, total: Duration) -> Result<bool> {
         let mut waited = Duration::ZERO;
         while waited < total {
-            if replaced(path, file)? {
+            if superseded(dir, file)? {
                 return Ok(true);
             }
             let step = DISCOVER_POLL.min(total - waited);
             std::thread::sleep(step);
             waited += step;
         }
-        replaced(path, file)
+        superseded(dir, file)
     }
 
     /// One incremental pass: consume every record completely on disk in
@@ -687,26 +696,52 @@ fn backoff_for(n: u32) -> Duration {
         .min(SCAN_BACKOFF_CAP)
 }
 
-/// The newest `*.mcap` directly under `dir` by modification time — the file
-/// rosbag2 is writing. `None` while the directory or file does not exist yet.
+/// The newest `*.mcap` directly under `dir` by status-change time (ctime) — the
+/// file rosbag2 most recently created or wrote to. ctime, not mtime, because it
+/// tracks the filesystem's own creation/append order and cannot be set into the
+/// past by a tool that preserves timestamps: at a rosbag2 split the freshly
+/// opened `<bag>_<n+1>.mcap` always carries a later ctime than the just-closed
+/// `<bag>_<n>.mcap`, so this resolves to the split the recorder rolled over to.
+/// `None` while the directory or file does not exist yet.
 fn newest_mcap(dir: &Path) -> Option<PathBuf> {
     std::fs::read_dir(dir)
         .ok()?
         .filter_map(|e| Some(e.ok()?.path()))
         .filter(|p| p.extension().is_some_and(|e| e == "mcap"))
-        .max_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
+        .max_by_key(|p| {
+            std::fs::metadata(p)
+                .map(|m| (m.ctime(), m.ctime_nsec()))
+                .unwrap_or((i64::MIN, i64::MIN))
+        })
 }
 
-/// Whether `path` no longer refers to the open `file` (deleted or recreated —
-/// the recorder was restarted into a fresh bag directory).
-fn replaced(path: &Path, file: &File) -> Result<bool> {
-    let by_path = match std::fs::metadata(path) {
+/// Whether the tail should stop following `file` and re-discover, because the
+/// newest `*.mcap` in `dir` is no longer `file`. Two situations resolve the
+/// same way:
+///
+/// * `file`'s inode vanished — the record script wiped the bag dir and the
+///   recorder restarted into a fresh file (`newest_mcap` returns another file
+///   or `None`).
+/// * a newer recording appeared beside `file` — rosbag2 split and rolled over
+///   to `<bag>_<n+1>.mcap`, which now carries the later ctime.
+///
+/// In both, the newest file is the one to tail and the file left behind is
+/// treated as lost: its data is never recovered into a later clip (the
+/// cross-file non-recovery rule, beads clipper-gl2). An empty or vanished
+/// directory also returns `true`, sending [`Tailer::run`] back to its discovery
+/// idle until a recording reappears.
+fn superseded(dir: &Path, file: &File) -> Result<bool> {
+    let newest = match newest_mcap(dir) {
+        Some(p) => p,
+        None => return Ok(true),
+    };
+    let by_newest = match std::fs::metadata(&newest) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
-        Err(e) => return Err(e).with_context(|| format!("stat {}", path.display())),
+        Err(e) => return Err(e).with_context(|| format!("stat {}", newest.display())),
     };
     let by_fd = file.metadata().context("stat of tailed file")?;
-    Ok((by_path.dev(), by_path.ino()) != (by_fd.dev(), by_fd.ino()))
+    Ok((by_newest.dev(), by_newest.ino()) != (by_fd.dev(), by_fd.ino()))
 }
 
 fn file_len(file: &File) -> Result<u64> {
@@ -1050,7 +1085,7 @@ pub(crate) mod tests {
         std::fs::write(&path, b"definitely not an mcap file")?;
 
         let (tailer, _coverage) = Tailer::new();
-        let err = tailer.tail_file(&path).unwrap_err();
+        let err = tailer.tail_file(&root, &path).unwrap_err();
         assert!(
             err.to_string().contains("not an MCAP file"),
             "unexpected error: {err:#}"
@@ -1069,7 +1104,7 @@ pub(crate) mod tests {
         // dir: the file vanishes between discovery and open. A NotFound on
         // open is the same as a replacement — Ok(()), re-discover — not a fault.
         let (tailer, _coverage) = Tailer::new();
-        tailer.tail_file(&path)?;
+        tailer.tail_file(&root, &path)?;
 
         std::fs::remove_dir_all(root)?;
         Ok(())
@@ -1473,18 +1508,43 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn replaced_detects_deletion_and_recreation() -> Result<()> {
-        let root = test_dir("replaced")?;
-        let path = root.join("rec.mcap");
-        std::fs::write(&path, b"x")?;
-        let file = File::open(&path)?;
+    fn superseded_detects_a_newer_split_deletion_and_recreation() -> Result<()> {
+        let root = test_dir("superseded")?;
+        let split0 = root.join("rec_0.mcap");
+        std::fs::write(&split0, b"x")?;
+        let file = File::open(&split0)?;
 
-        assert!(!replaced(&path, &file)?);
-        std::fs::remove_file(&path)?;
-        assert!(replaced(&path, &file)?, "deleted path means replaced");
-        std::fs::write(&path, b"y")?;
         assert!(
-            replaced(&path, &file)?,
+            !superseded(&root, &file)?,
+            "the only mcap is the one being tailed"
+        );
+
+        // rosbag2 rolled over: a newer split appears beside the tailed file. It
+        // is now the newest, so the tail is superseded and must advance to it.
+        std::thread::sleep(Duration::from_millis(10));
+        let split1 = root.join("rec_1.mcap");
+        std::fs::write(&split1, b"y")?;
+        assert!(
+            superseded(&root, &file)?,
+            "a newer split beside the tailed file supersedes it"
+        );
+        std::fs::remove_file(&split1)?;
+        assert!(
+            !superseded(&root, &file)?,
+            "with the newer split gone the tailed file is newest again"
+        );
+
+        // A recorder restart wiping the dir: the tailed inode vanishes.
+        std::fs::remove_file(&split0)?;
+        assert!(
+            superseded(&root, &file)?,
+            "a deleted recording is superseded"
+        );
+
+        // Recreated at the same path is a different inode — still superseded.
+        std::fs::write(&split0, b"z")?;
+        assert!(
+            superseded(&root, &file)?,
             "a recreated file is a different inode"
         );
 
@@ -1493,20 +1553,27 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn newest_mcap_picks_the_latest_and_ignores_non_mcap() -> Result<()> {
+    fn newest_mcap_picks_the_latest_by_ctime_and_ignores_non_mcap() -> Result<()> {
         let root = test_dir("discover")?;
         assert_eq!(newest_mcap(&root.join("missing")), None);
         assert_eq!(newest_mcap(&root), None, "no mcap yet");
 
         let old = root.join("old.mcap");
         std::fs::write(&old, b"")?;
-        File::options()
-            .write(true)
-            .open(&old)?
-            .set_modified(SystemTime::now() - Duration::from_secs(60))?;
+        std::thread::sleep(Duration::from_millis(10));
         let newer = root.join("new.mcap");
         std::fs::write(&newer, b"")?;
-        std::fs::write(root.join("note.txt"), b"")?; // newest mtime, wrong extension
+        std::fs::write(root.join("note.txt"), b"")?; // wrong extension, ignored
+
+        // Discovery is by ctime (the filesystem's creation/append order), not
+        // mtime: backdating new.mcap's mtime below old.mcap does not change that
+        // it was created last (and the backdating itself bumps its ctime), so it
+        // stays the newest. This is what lets the tail follow a split whose
+        // files a timestamp-preserving copy might otherwise reorder by mtime.
+        File::options()
+            .write(true)
+            .open(&newer)?
+            .set_modified(SystemTime::now() - Duration::from_secs(60))?;
 
         assert_eq!(newest_mcap(&root), Some(newer));
 
@@ -1652,6 +1719,69 @@ pub(crate) mod tests {
 
         // The thread is detached: it loops forever against the good recording
         // and dies with the test process. Do not join it.
+        drop(handle);
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn run_follows_a_new_split_file() -> Result<()> {
+        // rosbag2 `--max-bag-duration`/`--max-bag-size` keeps every finished
+        // split on disk and rolls over to `<bag>_<n+1>.mcap`. The tail must
+        // leave the file it opened and follow the newest split, treating the
+        // older one as lost (the cross-file non-recovery rule, clipper-gl2).
+        let root = test_dir("run-split")?;
+
+        // Split 0: a finished recording — rosbag2 closes each split (footer).
+        let split0 = root.join("rec_0.mcap");
+        write_recording(&split0, false, &[("/t", 1_000)])?;
+
+        let (tailer, coverage) = Tailer::new();
+        let runner = tailer.clone();
+        let dir = root.clone();
+        let handle = std::thread::spawn(move || runner.run(&dir));
+
+        // The tail discovers and indexes split 0.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while coverage.get().high_water_ns != 1_000 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "split 0 must be discovered and indexed"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+
+        // The recorder rolls over: split 1 appears beside split 0 with a later
+        // ctime and later message times. The tail must advance to it.
+        let split1 = root.join("rec_1.mcap");
+        write_recording(&split1, false, &[("/t", 5_000)])?;
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let cov = coverage.get();
+            if cov.high_water_ns == 5_000 && cov.ended {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the tail must follow the new split file (high_water stuck at {})",
+                cov.high_water_ns
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+
+        // Split 1's window is plannable; split 0's index was dropped on the
+        // switch (attach reset everything), so its window covers nothing.
+        assert!(
+            !tailer.plan_window(4_000, 6_000).extents.is_empty(),
+            "split 1 is indexed after the tail follows the rollover"
+        );
+        assert!(
+            tailer.plan_window(500, 1_500).extents.is_empty(),
+            "split 0's data is gone — the old split is not recovered"
+        );
+
+        // Detached: it loops forever against split 1 and dies with the process.
         drop(handle);
         std::fs::remove_dir_all(root)?;
         Ok(())
