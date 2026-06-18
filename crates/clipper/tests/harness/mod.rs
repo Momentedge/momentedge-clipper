@@ -20,6 +20,7 @@
 //! carries the shared identity instead.
 
 use std::fs::File;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -276,8 +277,9 @@ impl TestEnv {
         (recorder2, restart_ns)
     }
 
-    /// Newest `*.mcap` under `record/` by mtime — the same discovery rule the
-    /// extractor's tail uses.
+    /// Newest `*.mcap` under `record/` by ctime — the same discovery rule the
+    /// extractor's tail uses to follow the newest file across recorder restarts
+    /// and rosbag2 splits alike.
     pub fn newest_recording(&self) -> Option<PathBuf> {
         let entries = std::fs::read_dir(self.record_dir()).ok()?;
         entries
@@ -286,8 +288,8 @@ impl TestEnv {
             .filter(|p| p.extension().is_some_and(|x| x == "mcap"))
             .max_by_key(|p| {
                 p.metadata()
-                    .and_then(|m| m.modified())
-                    .unwrap_or(UNIX_EPOCH)
+                    .map(|m| (m.ctime(), m.ctime_nsec()))
+                    .unwrap_or((i64::MIN, i64::MIN))
             })
     }
 

@@ -2,8 +2,9 @@
 
 Splitting caps each bag file at a size or a duration; rosbag2 rolls over to a
 fresh `<bag>_<n>.mcap` when a cap is hit, so old files can be pruned to bound
-disk use. This is the recording shape for plain capture with retention — **not**
-for clipper (see the limitation below).
+disk use. clipper follows the rollovers (see below), so this pairs with live
+clipping as well as plain capture-and-retain — within the split-boundary
+trade-offs the two caveats below describe.
 
 ```bash
 ros2 bag record --all \
@@ -39,19 +40,24 @@ tune away:
 A larger `--max-cache-size` (and a non-blocking storage profile) reduces but
 does not eliminate the loss.
 
-## Caveat: clipper does not follow splits
+## clipper follows the newest split
 
-clipper tails **one** MCAP file. It discovers the newest `*.mcap` once and
-follows that file until its path is deleted or recreated (a recorder restart
-wiping the directory). A split keeps every file in place and adds a new
-`_<n+1>.mcap` alongside, so clipper stays pinned to the file it opened and never
-advances to later splits. Point clipper at a splitting recorder and it cuts
-clips only from the split it started on.
+clipper tails the newest `*.mcap` under its record directory, chosen by ctime,
+and keeps re-checking as it tails. When rosbag2 rolls over to `<bag>_<n+1>.mcap`,
+clipper finishes the file it is on, then advances to the new split and tails it
+from the start. No `WriteSplitEvent` subscription is involved — discovery is by
+ctime, the same mechanism that follows a recorder restart, so a split is just
+another way the newest file changes.
 
-So split recording is for capture-and-retain workflows where clips are not cut
-live. For clipper, use [`../continuous`](../continuous/README.md) (one growing
-file) instead. Teaching the tail to follow splits is tracked in beads
-(`clipper-wjm`).
+**A clip is cut only from the split clipper is currently on.** Advancing to a
+new split resets clipper's in-memory index, so data in a split clipper has
+already moved past is not pulled into a later clip — the same cross-file
+non-recovery rule it applies across a recorder restart. A trigger whose pre-roll
+reaches back across a split boundary therefore captures only the portion in the
+current split. Where a window must never straddle a boundary, set the split
+duration/size well above the pre + post-roll, or use
+[`../continuous`](../continuous/README.md) (one growing file), which has no
+boundaries at all.
 
 ## Retention: prune old splits
 
