@@ -63,5 +63,4 @@ disk bounded:
 find ./record -mindepth 1 -type f -mmin +1440 -delete
 ```
 
-See [`../systemd`](../systemd/README.md) for this as a timer unit beside the
-recorder and clipper.
+Run it from cron (or any scheduler) beside the recorder and clipper.

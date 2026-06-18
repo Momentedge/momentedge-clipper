@@ -110,7 +110,7 @@ Setup is in the README; the parts that matter when changing the build:
 - `ros2bag` + `rosbag2-transport` + `rosbag2-storage-mcap` provide the standalone
   `ros2 bag record`. `scripts/record.sh` runs it as the one growing MCAP file
   `clipper` tails (started with `scripts/run.sh`); the [`example/`](example/)
-  guides cover the continuous, split-bag, and systemd setups. rosbag2 publishes
+  guides cover the continuous, split-bag, and `ros2 launch` setups. rosbag2 publishes
   `WriteSplitEvent` on `/events/write_split` when a bag splits, but the recorder
   tails a continuous file and consumes no split events.
 
