@@ -9,15 +9,15 @@ over plain OS threads — there is no async runtime.
 ## The pipeline it sits in
 
 ```
-ros2 bag record (scripts/record-continuous.sh) ──▶ ./record-cont/<bag>_0.mcap   (one growing file)
+ros2 bag record (scripts/record.sh) ──▶ ./record/<bag>_0.mcap   (one growing file)
         ▲ kept open + tailed (incremental scan, persistent offsets)
 clipper ◀── /events/momentedge/trigger ── trigger-pub (or any publisher)
         │ cuts [trigger_time-preroll, trigger_time+postroll]
-        ├──▶ ./triggered-cont/<trigger_ns>_<name>.mcap
+        ├──▶ ./clipped/<trigger_ns>_<name>.mcap
         └──▶ /events/momentedge/recorded
 ```
 
-`record-continuous.sh` is a standalone `ros2 bag record` — this binary never
+`record.sh` is a standalone `ros2 bag record` — this binary never
 spawns it. The two communicate only through the file: there is no split event
 (rosbag2 publishes none for an unsplit bag) and none is needed.
 
@@ -308,8 +308,9 @@ complete clips. There is no explicit runtime teardown step.
 
 The inline `#[cfg(test)]` suites cover the tail/clip/supervise logic against
 synthetic MCAP files; `tests/e2e.rs` covers the contract against the real
-stack — a live `ros2 bag record` started through the production
-`scripts/record-continuous.sh`, triggers published with the ros2 CLI, and
+stack — a live `ros2 bag record` matching the production `scripts/record.sh`
+invocation (the harness builds the command directly), triggers published with
+the ros2 CLI, and
 `Recorded` asserted via `ros2 topic echo`. How to run it (gating, the
 cargo-nextest prerequisite, the exact command) is in the
 [README](../../README.md#integration-tests-live-ros2-e2e); this section is the
@@ -364,7 +365,7 @@ losing access, st_size growth, punch/extraction coordination).
 nix develop --command cargo run -p clipper
 ```
 
-Needs `scripts/record-continuous.sh` running (for `./record-cont`) and a
+Needs `scripts/record.sh` running (for `./record`) and a
 trigger publisher (`trigger-pub`). `RUST_LOG=debug` raises verbosity.
 
 ## Configuration

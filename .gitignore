@@ -4,11 +4,8 @@
 # cargo-llvm-cov output (README "Tests and coverage")
 /lcov.info
 
-# Local rosbag2 recordings (5 s splits and one growing continuous file) and
-# the clips the recorder cuts out of them — runtime data, not source.
-/record/
-/record-cont/
-/triggered-cont/
+record/
+clipped/
 
 # Python launch-file bytecode (sim/launch)
 __pycache__/

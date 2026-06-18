@@ -154,9 +154,10 @@ refuses an existing bag dir) and `./record` is gitignored. Mind the size: the
 raw `rgb8` stream alone is ~190 MB/s at 1080p30.
 
 To record the same topics **out of process** instead — e.g. as the continuous
-recording the triggered-recording workflow cuts clips from — use the repo's
-standalone recorder from the root: `./scripts/record.sh config/cam_sim.yaml`
-(that is the root `config/`, not this directory's). See the root
+recording the triggered-recording workflow cuts clips from — run `ros2 bag
+record --topics /camera/image_raw /camera/camera_info
+/camera/image_raw/compressed /camera/image_raw/ffmpeg` from the root, or
+`./scripts/record.sh` to capture every live topic. See the root
 [README](../README.md#triggered-recording).
 
 ## Environment

@@ -1,10 +1,10 @@
 //! Shared harness for the live ROS2 end-to-end suite (`tests/e2e.rs`).
 //!
-//! The test process spawns everything as child processes — the continuous
-//! recorder (`scripts/record-continuous.sh`), a `ros2 topic pub` message
-//! source, the extractor binary under test, and a `ros2 topic echo` listener
-//! for `Recorded` announcements — and creates no ROS node of its own, keeping
-//! the test free of process-global DDS state.
+//! The test process spawns everything as child processes — a continuous
+//! `ros2 bag record` (the production recording the extractor tails), a `ros2
+//! topic pub` message source, the extractor binary under test, and a `ros2
+//! topic echo` listener for `Recorded` announcements — and creates no ROS node
+//! of its own, keeping the test free of process-global DDS state.
 //!
 //! Isolation: every test gets its own `ROS_DOMAIN_ID` (band 80–101, clear of
 //! the host's domain 0) and its own temp tree (`record/`, `triggered/`,
@@ -112,7 +112,7 @@ pub struct TestEnv {
     /// Whether the running recorder subscribes to the trigger topic (it does
     /// when recording `--all`), so [`Self::fire_trigger`] knows whether to wait
     /// for one matched subscriber (the extractor) or two (the extractor and the
-    /// recorder). Set by [`Self::start_recorder_with_config`].
+    /// recorder). Set by [`Self::start_recorder`] / [`Self::start_recorder_topics`].
     records_trigger_topic: AtomicBool,
 }
 
@@ -184,50 +184,51 @@ impl TestEnv {
         }
     }
 
-    /// The production recorder invocation: `scripts/record-continuous.sh`
-    /// recording all topics into this test's `record/`.
+    /// The production recording the extractor tails: a continuous `ros2 bag
+    /// record --all` writing one growing MCAP file into this test's `record/`.
     pub fn start_recorder(&self, preset: &str, cache: u64) -> Proc {
-        self.start_recorder_with_config(None, preset, cache)
+        // `--all` records every live topic, so the recorder also subscribes to
+        // the trigger topic; `fire_trigger` then waits for two matched
+        // subscribers (the extractor and the recorder).
+        self.spawn_recorder(&["--all"], preset, cache, true)
     }
 
-    /// [`Self::start_recorder`] with an optional rosbag2 recorder-parameters
-    /// YAML for topic selection (the same file `record-continuous.sh` accepts
-    /// in production).
-    pub fn start_recorder_with_config(
+    /// [`Self::start_recorder`] restricted to exactly `topics` (via
+    /// `--topics`), for tests that must keep ambient topics (`/rosout`, the
+    /// trigger) out of the recording.
+    pub fn start_recorder_topics(&self, topics: &[&str], preset: &str, cache: u64) -> Proc {
+        let mut selection = vec!["--topics"];
+        selection.extend_from_slice(topics);
+        // A topic-restricted recorder does not subscribe to the trigger topic,
+        // so the extractor is the sole trigger subscriber (`fire_trigger` -w 1).
+        self.spawn_recorder(&selection, preset, cache, false)
+    }
+
+    /// Spawn `ros2 bag record <selection> --storage mcap
+    /// --storage-preset-profile <preset> --max-cache-size <cache> --output
+    /// record/` — the same invocation the examples document. `record/` is wiped
+    /// first: rosbag2 refuses to record into an existing bag directory, and a
+    /// recorder restart relies on the wipe so the extractor's tail sees a fresh
+    /// inode (its replacement signal).
+    fn spawn_recorder(
         &self,
-        config: Option<&Path>,
+        selection: &[&str],
         preset: &str,
         cache: u64,
+        records_trigger: bool,
     ) -> Proc {
-        let script =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/record-continuous.sh");
-        let script = script
-            .canonicalize()
-            .expect("locating record-continuous.sh");
-        let mut cmd = self.command(script);
-        cmd.arg(config.map(Path::as_os_str).unwrap_or_default())
-            .arg(self.record_dir())
-            .env("STORAGE_PRESET", preset)
-            .env("MAX_CACHE_SIZE", cache.to_string());
-        // A configless recorder records `--all` and so subscribes to the
-        // trigger topic; the configs the suite passes select only the source
-        // topic, so they do not. `fire_trigger` waits for the matching count.
+        let _ = std::fs::remove_dir_all(self.record_dir());
+        let cache = cache.to_string();
+        let mut cmd = self.command("ros2");
+        cmd.args(["bag", "record"])
+            .args(selection)
+            .args(["--storage", "mcap", "--storage-preset-profile", preset])
+            .args(["--max-cache-size", &cache])
+            .arg("--output")
+            .arg(self.record_dir());
         self.records_trigger_topic
-            .store(config.is_none(), Ordering::Relaxed);
+            .store(records_trigger, Ordering::Relaxed);
         self.spawn("recorder", cmd)
-    }
-
-    /// A recorder-parameters YAML selecting exactly `topics`, for tests that
-    /// must keep ambient topics (`/rosout`, the trigger) out of the recording.
-    pub fn write_recorder_topics_config(&self, topics: &[&str]) -> PathBuf {
-        let path = self.root.path().join("recorder-topics.yaml");
-        let list = topics.join(", ");
-        std::fs::write(
-            &path,
-            format!("e2e_recorder:\n  ros__parameters:\n    record:\n      topics: [{list}]\n"),
-        )
-        .expect("writing the recorder topic config");
-        path
     }
 
     /// Block until the recorder has created its MCAP file; returns its path.
@@ -255,7 +256,7 @@ impl TestEnv {
     }
 
     /// The production recorder-restart protocol: stop the recorder cleanly,
-    /// relaunch it (the record script wipes the bag dir), and gate on the
+    /// relaunch it ([`Self::start_recorder`] wipes the bag dir), and gate on the
     /// extractor noticing the replacement and the new recording existing on
     /// disk. Returns the new recorder and the instant between the two
     /// recorders' lifetimes — every message in the new recording is stamped

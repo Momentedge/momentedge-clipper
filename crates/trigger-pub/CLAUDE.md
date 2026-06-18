@@ -40,6 +40,6 @@ Needs the flake's `LIBCLANG_PATH`; does not need `ROS_DISTRO`.
 nix develop --command cargo run -p trigger-pub -- --period 5 --preroll 2000000000 --postroll 2000000000
 ```
 
-Pair with a running `clipper` and `scripts/record-continuous.sh`.
+Pair with a running `clipper` and `scripts/record.sh`.
 Logging uses the `log` facade with a `pretty_env_logger` backend; `RUST_LOG`
 controls verbosity.

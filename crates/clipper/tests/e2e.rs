@@ -1,6 +1,6 @@
 //! Live ROS2 end-to-end tests for the continuous extractor: a real
-//! `ros2 bag record` (the production `scripts/record-continuous.sh`
-//! invocation), real CLI-published triggers, and real `Recorded`
+//! `ros2 bag record` (the production recording invocation, driven directly
+//! by the harness), real CLI-published triggers, and real `Recorded`
 //! announcements, against the deployed storage profiles.
 //!
 //! Gated on `EDGESTREAM_E2E` (see [`harness::require_e2e`]); cargo-nextest is
@@ -511,8 +511,7 @@ fn quiet_topics_grace_timeout_cut() {
         return;
     }
     let env = TestEnv::new();
-    let config = env.write_recorder_topics_config(&[SRC_TOPIC]);
-    let _recorder = env.start_recorder_with_config(Some(&config), "fastwrite", 0);
+    let _recorder = env.start_recorder_topics(&[SRC_TOPIC], "fastwrite", 0);
     let mut source = env.start_source(SRC_TOPIC, SRC_RATE);
     env.wait_for_recording(Duration::from_secs(60));
     let mut extractor = env.start_extractor(5);
