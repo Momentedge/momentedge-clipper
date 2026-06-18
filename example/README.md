@@ -10,6 +10,5 @@ is the minimal continuous setup; these expand on it.
 - [`split-bags/`](split-bags/README.md) — `--max-bag-size` / `--max-bag-duration`
   split recording with pruning for retention. Notes the rosbag2
   message-loss-at-split caveat and why clipper does not follow splits.
-- [`systemd/`](systemd/README.md) — the recorder, clipper, and a prune timer as
-  systemd units, with the ROS env and `MOMENTEDGE_*` configuration in
-  `Environment=`.
+- [`launch/`](launch/README.md) — the recorder and clipper brought up together
+  with `ros2 launch` (the ROS-native orchestration), via a launch file.

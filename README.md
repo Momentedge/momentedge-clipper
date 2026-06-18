@@ -319,8 +319,9 @@ It builds `momentedge_msgs` into a colcon overlay (`./install`) and compiles
 ### Run
 
 The recorder is `scripts/record.sh` (continuous `ros2 bag record`) plus
-`clipper` via `scripts/run.sh`; [`example/systemd`](example/systemd/README.md)
-wires them as services. The trigger publisher has a demo launcher too:
+`clipper` via `scripts/run.sh`; [`example/launch`](example/launch/README.md)
+brings both up together with `ros2 launch`. The trigger publisher has a demo
+launcher too:
 
 ```bash
 ./scripts/start_demo_trigger_pub.sh   # demo trigger source (foreground)
@@ -376,11 +377,11 @@ compatibility; see "Build on the target" above for the rationale.
 ### Retention
 
 The continuous recording is one growing file with no built-in retention; the
-clips clipper writes accumulate too. [`example/systemd`](example/systemd/README.md)
-includes a prune timer that deletes clips older than 24 h, and
-[`example/split-bags`](example/split-bags/README.md) covers bounding the
-recording itself with split bags. In-place hole-punch retention for the
-continuous file is tracked in beads (`clipper-wkg`).
+clips clipper writes accumulate too. Prune old clips on a schedule (e.g. a cron
+running `find ./clipped -mindepth 1 -type f -mmin +1440 -delete`), and see
+[`example/split-bags`](example/split-bags/README.md) for bounding the recording
+itself with split bags. In-place hole-punch retention for the continuous file is
+tracked in beads (`clipper-wkg`).
 
 ## Layout
 
@@ -390,7 +391,7 @@ crates/trigger-pub/     # r2r periodic trigger publisher
 momentedge_msgs/        # local ROS2 interface package (Trigger, Recorded)
 sim/                    # synthetic gscam camera, raw + H.265 (sim/cam_sim.sh) — see sim/README.md
 nix/                    # flake package defs: momentedge-msgs, ros-env, binaries
-example/                # setup guides: continuous, split-bags, systemd
+example/                # setup guides: continuous, split-bags, launch
 scripts/record.sh       # continuous `ros2 bag record` → ./record (clipper's source)
 scripts/run.sh          # run clipper against ./record (matching options)
 scripts/build-on-target.sh  # native target build (momentedge_msgs overlay + binaries)
@@ -402,7 +403,7 @@ flake.nix               # per-distro ROS2 dev shells (humble/jazzy/lyrical/rolli
 live topic into one growing MCAP file under `./record`, with storage defaults
 suited to tailing. `scripts/run.sh` starts `clipper` against the same directory.
 The [`example/`](example/) guides cover the continuous (clipper) setup, split
-bags with pruning, and a systemd service stack:
+bags with pruning, and bringing both up with `ros2 launch`:
 
 ```bash
 ./scripts/record.sh   # continuous --all → ./record
