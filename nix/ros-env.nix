@@ -37,8 +37,8 @@ let
     rosbag2-transport
     rosbag2-storage-mcap
     # rosbag2 publishes WriteSplitEvent on /events/write_split at each split
-    # boundary of scripts/record.sh's split recording; this package carries
-    # that type. Part of the rosbag2 stack.
+    # boundary of split-bag recording (see example/split-bags); this package
+    # carries that type. Part of the rosbag2 stack.
     rosbag2-interfaces
     # message packages carried by the UGV bag (see ../ros2_sources/REPLAY.md)
     builtin-interfaces
@@ -74,7 +74,7 @@ let
     # The H.265 leg: ffmpeg_image_transport publishes FFMPEGPacket and does the
     # libav (libx265 / hevc_nvenc) encode. *-msgs is the wire type — it also
     # gives `ros2 bag record` the type support to capture the topic
-    # (config/cam_sim.yaml). Env-only: not in IDL_PACKAGE_FILTER, no Rust
+    # (sim/config/recorder_params.yaml). Env-only: not in IDL_PACKAGE_FILTER, no Rust
     # crate decodes it.
     ffmpeg-image-transport
     ffmpeg-image-transport-msgs

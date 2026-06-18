@@ -18,8 +18,8 @@
 //! * **Schema/channel registry** — every `Schema`/`Channel` record seen, keyed
 //!   by the file's channel ID (unique within one continuous file). Chunked
 //!   recordings carry these *inside* chunks, so chunks are decompressed during
-//!   the tail; the default `record-continuous.sh` profile (fastwrite) is
-//!   unchunked and pays no such cost.
+//!   the tail; an unchunked recording (the fastwrite storage profile) pays no
+//!   such cost.
 //! * **Coverage watch** — the highest `log_time` seen plus an "ended" flag
 //!   ([`Coverage`]); a trigger handler waits on it until the recording provably
 //!   covers its window end.

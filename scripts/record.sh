@@ -1,81 +1,48 @@
 #!/usr/bin/env bash
-# Standalone ros2 bag record writing 5-second MCAP splits under ./record. Each
-# split boundary makes rosbag2 publish a rosbag2_interfaces/WriteSplitEvent on
-# /events/write_split. General-purpose recorder — used for the sim camera
-# (config/cam_sim.yaml) and any other recording that benefits from fixed-size
-# splits.
+# Example continuous `ros2 bag record` for clipper to tail.
 #
-# Topic selection comes from an optional rosbag2 recorder-parameters YAML — the
-# rosbag2_transport Recorder node schema, the same file a composable Recorder
-# node accepts (see config/cam_sim.yaml). Only the record.* topic-selection keys
-# are read: topics, all/all_topics, regex, exclude_regex, exclude_topics.
-# Without a config, every live topic is recorded.
+# Records every live topic (`--all`) into one growing MCAP file under ./record
+# — the single file clipper keeps open and tails (scripts/run.sh runs clipper
+# against the same directory). There are no bag splits: clipper follows one file,
+# so a continuous recording is what pairs with it.
 #
-# rosbag2 refuses to record into an existing bag directory, so OUT_DIR is wiped
-# on start. ./record is gitignored. There is no automatic retention — the splits
-# accumulate until you stop recording or clear the directory yourself.
+# This is a minimal example invocation, not a deployment entry point. The full
+# setups — low-latency tuning, split bags with retention, and a systemd unit
+# layout — live under example/:
+#   example/continuous/   --max-cache-size / --storage-preset-profile trade-offs
+#   example/split-bags/   --max-bag-size / --max-bag-duration (and clipper's limits)
+#   example/systemd/      rosbag + clipper + pruning as services
 #
-# Run inside the dev shell (provides ros2bag + the mcap storage plugin):
-#   nix develop --command ./scripts/record.sh                       # all topics
-#   nix develop --command ./scripts/record.sh config/cam_sim.yaml   # cam_sim topics
+# rosbag2 refuses to record into an existing bag directory, so ./record is
+# wiped on start. ./record is gitignored.
+#
+# Run inside a sourced ROS2 environment (e.g. . /opt/ros/<distro>/setup.bash):
+#   ./scripts/record.sh
 set -euo pipefail
 
-CONFIG="${1:-}"
-OUT_DIR="${2:-./record}"
-
-# `--all` (not `--all-topics`) records every live topic on every supported
-# distro: Humble names this flag `-a`/`--all` and has no `--all-topics`, while
-# Jazzy and newer keep `--all` as a superset (topics + service-event topics, no
-# service events in this bench). The config-path flags below (`--topics`,
-# `--exclude-regex`, …) are Jazzy+ syntax used only by the Jazzy-only sim config.
-SELECT_ARGS=(--all)
-if [[ -n "$CONFIG" ]]; then
-  [[ -f "$CONFIG" ]] || { echo "config not found: $CONFIG" >&2; exit 1; }
-  selection="$(python3 - "$CONFIG" <<'EOF'
-import sys
-import yaml
-
-with open(sys.argv[1]) as f:
-    doc = yaml.safe_load(f) or {}
-# Top-level key is the (arbitrary) recorder node name.
-params = next(iter(doc.values()), {}).get("ros__parameters", {})
-rec = params.get("record", {})
-
-args = []
-selected = False
-if rec.get("all") or rec.get("all_topics"):
-    args.append("--all")
-    selected = True
-if rec.get("topics"):
-    # An explicit topic list goes through --regex (anchored alternation), the
-    # only selection form ros2 bag record accepts on every supported distro:
-    # Humble has no --topics (positional only), Lyrical has no positional topics
-    # (--topics only), and --regex works on all of them.
-    import re
-    alt = "|".join(re.escape(t) for t in rec["topics"])
-    args += ["--regex", "^(" + alt + ")$"]
-    selected = True
-if rec.get("regex"):
-    args += ["--regex", rec["regex"]]
-    selected = True
-if rec.get("exclude_regex"):
-    args += ["--exclude-regex", rec["exclude_regex"]]
-if rec.get("exclude_topics"):
-    args += ["--exclude-topics", *rec["exclude_topics"]]
-
-if not selected:
-    sys.exit("config selects no topics: set record.topics, record.regex "
-             "or record.all_topics")
-print("\n".join(args))
-EOF
-)"
-  mapfile -t SELECT_ARGS <<< "$selection"
-  echo "topic selection from $CONFIG: ${SELECT_ARGS[*]}"
+# rosbag2 needs a sourced ROS2 environment. setup.bash exports ROS_DISTRO, so
+# its absence means nothing is sourced yet — fail fast rather than emit an
+# opaque "ros2: command not found".
+if [[ -z "${ROS_DISTRO:-}" ]]; then
+  echo "ROS_DISTRO is unset — source a ROS2 environment first:" >&2
+  echo "  . /opt/ros/<distro>/setup.bash" >&2
+  exit 1
 fi
 
+OUT_DIR="${OUT_DIR:-./record}"
+
+# Storage defaults: regular caching and the stock chunked+compressed profile.
+# These are the rosbag2 defaults — a clip's data becomes visible to the tail
+# only once a chunk fills and the cache drains, so clipper's --grace-secs must
+# exceed that flush latency (see example/continuous for the fastwrite profile,
+# which writes every message straight through for minimal tail latency).
+MAX_CACHE_SIZE="${MAX_CACHE_SIZE:-104857600}"     # 100 MiB, rosbag2 default
+STORAGE_PRESET="${STORAGE_PRESET:-zstd_fast}"      # none | fastwrite | zstd_fast | zstd_small
+
 rm -rf "$OUT_DIR"
-echo "recording into $OUT_DIR (5 s mcap splits) — Ctrl-C to stop"
-exec ros2 bag record "${SELECT_ARGS[@]}" \
+echo "recording all topics into $OUT_DIR (one continuous mcap, preset=$STORAGE_PRESET cache=$MAX_CACHE_SIZE) — Ctrl-C to stop"
+exec ros2 bag record --all \
   --storage mcap \
-  --max-bag-duration 5 \
+  --storage-preset-profile "$STORAGE_PRESET" \
+  --max-cache-size "$MAX_CACHE_SIZE" \
   --output "$OUT_DIR"

@@ -1,7 +1,7 @@
 //! Triggered clip recorder reading ONE continuous MCAP file.
 //!
 //! A continuous `ros2 bag record` (started separately — see the README and
-//! `scripts/record-continuous.sh`) writes a single growing MCAP file. This
+//! `scripts/record.sh`) writes a single growing MCAP file. This
 //! binary keeps that file open and tails it ([`tail`]): an incremental scan
 //! over the record framing that maintains a byte-extent index, a
 //! schema/channel registry, and a coverage watch (the highest `log_time` on
@@ -12,7 +12,7 @@
 //! wall clock passes the window end, wait until the tail's coverage reaches it
 //! (the recording provably holds the window), then bulk-copy the in-window
 //! messages out of the planned extents into a clip published at
-//! `./triggered-cont/<trigger_ns>_<name>.mcap` (see [`clip`] — a raw-bytes
+//! `./clipped/<trigger_ns>_<name>.mcap` (see [`clip`] — a raw-bytes
 //! copy, no CDR decode, finished with a proper summary + footer, assembled in
 //! a capturing dir and moved atomically into place so observers never see a
 //! footer-less file), and finally publish `/events/momentedge/recorded`
@@ -39,8 +39,8 @@
 //! `MOMENTEDGE_*` env names are derived from one prefix applied to every field
 //! (`with_env_prefix`). `--help` lists the flags and `--version` prints the
 //! version. Settings (all optional):
-//!   --record-dir   bag directory of the continuous recording (default ./record-cont)
-//!   --out-dir      where clips are written                   (default ./triggered-cont)
+//!   --record-dir   bag directory of the continuous recording (default ./record)
+//!   --out-dir      where clips are written                   (default ./clipped)
 //!   --grace-secs   how long past the window end to wait for coverage
 //!                  before cutting from what is on disk (default 30; must
 //!                  exceed the recorder's flush latency — for a chunked
@@ -97,10 +97,10 @@ const MAX_ACTIVE_TRIGGERS: usize = 16;
 #[command(version, about = "Triggered MCAP clip recorder")]
 struct Config {
     /// Bag directory of the continuous recording that is tailed.
-    #[arg(long, default_value = "./record-cont")]
+    #[arg(long, default_value = "./record")]
     record_dir: PathBuf,
     /// Directory finished clips are written to.
-    #[arg(long, default_value = "./triggered-cont")]
+    #[arg(long, default_value = "./clipped")]
     out_dir: PathBuf,
     /// Seconds to wait past the window end for coverage before cutting.
     ///
@@ -430,7 +430,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !cfg.record_dir.is_dir() {
         warn!(
             "record dir {} does not exist; the tail idles until the continuous \
-             recording (scripts/record-continuous.sh) creates it",
+             recording (scripts/record.sh) creates it",
             cfg.record_dir.display()
         );
     }
@@ -684,8 +684,8 @@ mod tests {
     #[test]
     fn config_defaults_when_no_flags_given() {
         let cfg = parse_from(["clipper"]).unwrap();
-        assert_eq!(cfg.record_dir, PathBuf::from("./record-cont"));
-        assert_eq!(cfg.out_dir, PathBuf::from("./triggered-cont"));
+        assert_eq!(cfg.record_dir, PathBuf::from("./record"));
+        assert_eq!(cfg.out_dir, PathBuf::from("./clipped"));
         assert_eq!(cfg.grace(), Duration::from_secs(30));
         assert_eq!(cfg.extract_parallelism, 1);
     }

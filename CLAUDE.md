@@ -97,7 +97,7 @@ Setup is in the README; the parts that matter when changing the build:
   but the Rust build. The sim camera's stack (`ros-core`, `gscam`, the
   image_transport plugins, `rclcpp-components`) serves only `sim/`, with
   `ffmpeg-image-transport-msgs` doubling as the type support `ros2 bag record`
-  needs to capture the H.265 topic (`config/cam_sim.yaml`). Env-only packages
+  needs to capture the H.265 topic (`sim/config/recorder_params.yaml`). Env-only packages
   like these stay out of `IDL_PACKAGE_FILTER` — no Rust crate decodes them. Each
   crate's CLAUDE.md has the details.
 - `momentedge_msgs/` is a **local ament_cmake interface package** built by the
@@ -108,9 +108,9 @@ Setup is in the README; the parts that matter when changing the build:
   be `git add`ed before `nix develop`/`cargo build`, or the eval fails with "Path
   … is not tracked by Git".
 - `ros2bag` + `rosbag2-transport` + `rosbag2-storage-mcap` provide the standalone
-  `ros2 bag record`. `scripts/record-continuous.sh` runs it as the one growing
-  MCAP file `clipper` tails; `scripts/record.sh` is the general
-  standalone recorder (also used for the sim camera). rosbag2 publishes
+  `ros2 bag record`. `scripts/record.sh` runs it as the one growing MCAP file
+  `clipper` tails (started with `scripts/run.sh`); the [`example/`](example/)
+  guides cover the continuous, split-bag, and systemd setups. rosbag2 publishes
   `WriteSplitEvent` on `/events/write_split` when a bag splits, but the recorder
   tails a continuous file and consumes no split events.
 
