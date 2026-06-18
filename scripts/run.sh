@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Example clipper invocation matching scripts/record.sh.
 #
-# clipper tails the one growing MCAP file scripts/record.sh writes (./record)
-# and cuts a clip per trigger into ./clipped. The --record-dir here must
-# match record.sh's output directory, and --grace-secs must exceed the recorder's
-# flush latency: with record.sh's stock chunked+compressed profile a clip's data
-# is visible to the tail only once a chunk fills, so the default 30 s grace leaves
-# headroom (drop it toward 0 only with the fastwrite profile — see
-# example/continuous).
+# clipper tails the split recording scripts/record.sh writes under ./record,
+# following each rollover to the newest `<bag>_<n>.mcap`, and cuts a clip per
+# trigger into ./clipped. The --record-dir here must match record.sh's output
+# directory, and --grace-secs must exceed the recorder's flush latency: with
+# record.sh's stock chunked+compressed profile a clip's data is visible to the
+# tail only once a chunk fills, so the default 30 s grace leaves headroom (drop
+# it toward 0 only with the fastwrite profile — see example/continuous).
 #
 # This is a minimal example invocation. example/systemd shows the same as a
 # long-running service.
