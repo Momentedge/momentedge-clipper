@@ -7,9 +7,9 @@
 # directory, and --grace-secs must exceed the recorder's flush latency: with
 # record.sh's stock chunked+compressed profile a clip's data is visible to the
 # tail only once a chunk fills, so the default 30 s grace leaves headroom (drop
-# it toward 0 only with the fastwrite profile — see example/continuous).
+# it toward 0 only with the fastwrite profile — see examples/continuous).
 #
-# This is a minimal example invocation. example/systemd shows the same as a
+# This is a minimal example invocation. examples/systemd shows the same as a
 # long-running service.
 #
 # Run inside a sourced ROS2 environment (e.g. . /opt/ros/<distro>/setup.bash):

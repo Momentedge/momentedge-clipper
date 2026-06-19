@@ -37,7 +37,7 @@ let
     rosbag2-transport
     rosbag2-storage-mcap
     # rosbag2 publishes WriteSplitEvent on /events/write_split at each split
-    # boundary of split-bag recording (see example/split-bags); this package
+    # boundary of split-bag recording (see examples/split-bags); this package
     # carries that type. Part of the rosbag2 stack.
     rosbag2-interfaces
     # message packages carried by the UGV bag (see ../ros2_sources/REPLAY.md)

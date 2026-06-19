@@ -6,7 +6,7 @@
 # is the retention half — `find -mmin` deletes any split last modified more than
 # MAX_AGE_MIN minutes ago. The split rosbag2 is actively writing keeps a fresh
 # mtime, so it is never matched as long as MAX_AGE_MIN stays well above
-# record.sh's --max-bag-duration (default 300 s). See example/split-bags.
+# record.sh's --max-bag-duration (default 300 s). See examples/split-bags.
 #
 # Two modes, by PRUNE_INTERVAL:
 #   PRUNE_INTERVAL=0  (default)  one sweep, then exit — for cron / a systemd timer
