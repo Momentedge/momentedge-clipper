@@ -1,4 +1,4 @@
-# Momentedge-clipper
+# Momentedge Clipper
 
 Event-triggered clips from a continuous ROS 2 recording 
 The data worth keeping is sparse, but you can't know an event mattered until after it's started — and a useful clip needs the lead-up, not just the aftermath. That preroll only exists if the data was already on disk when the event fired. 
