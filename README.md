@@ -1,4 +1,5 @@
-Momentedge-clipper
+# Momentedge-clipper
+
 Event-triggered clips from a continuous ROS 2 recording 
 The data worth keeping is sparse, but you can't know an event mattered until after it's started — and a useful clip needs the lead-up, not just the aftermath. That preroll only exists if the data was already on disk when the event fired. 
 momentedge-clipper turns an ordinary ros2 bag record into an on-demand event recorder. It runs alongside the recorder, tails the growing MCAP file, and on each trigger cuts a standalone clip covering the window around the event — the seconds before it is included, not just after. Recording stays rosbag2's job; clipping is ours. The two never talk except through the file. If the strategy, example code is offered to handle recorded buffer size and rewrite disk to prevent disk fill up (a pseudo circular buffer set up). 
@@ -9,9 +10,6 @@ Recording and deciding-what-matters are different jobs with different change rat
 - MCAP in, MCAP out. Clips are standard, complete MCAP files — readable by Foxglove, the mcap CLI, and rosbag2 replay. No vendor format on either side.
 - The clipper is small on purpose. Decode-free byte copying, sequential IO, plain OS threads, no async runtime, a fail-fast supervisor. It's built to be pinned at a version and frozen on a robot without frequent updates.
 - Triggers are just a topic. Anything that can publish momentedge_msgs/Trigger — a fault detector, a watchdog, an operator button, your own perception stack — can drive it. The clipper has no opinion about when to capture; it only answers "give me the window around time T."
-
-
-# ros2_subscribe
 
 A **triggered clip recorder** for ROS2, written in Rust. It keeps a continuous
 on-disk `ros2 bag record` running and, on each trigger event, cuts a short clip
