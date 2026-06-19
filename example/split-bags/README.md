@@ -69,4 +69,10 @@ disk bounded:
 find ./record -mindepth 1 -type f -mmin +1440 -delete
 ```
 
-Run it from cron (or any scheduler) beside the recorder and clipper.
+Run it from cron (or any scheduler) beside the recorder and clipper, or as a
+standalone loop with no scheduler:
+
+```bash
+# same sweep every 30s, printing each file it removes
+while true; do find ./record -mindepth 1 -type f -mmin +1440 -print -delete; sleep 30; done
+```
