@@ -8,16 +8,16 @@
 # live from the current split.
 #
 # Splitting bounds each file; disk is bounded only once old splits are pruned,
-# which is a separate job — this script only records. See example/split-bags
-# for a delete-by-age timer and example/systemd for the recorder + clipper +
+# which is a separate job — this script only records. See examples/split-bags
+# for a delete-by-age timer and examples/systemd for the recorder + clipper +
 # pruner as services.
 #
 # This is a minimal example invocation, not a deployment entry point. The full
 # setups — low-latency tuning, split bags with retention, and a systemd unit
-# layout — live under example/:
-#   example/continuous/   one growing file (no splits) + latency trade-offs
-#   example/split-bags/   --max-bag-size / --max-bag-duration + pruning
-#   example/systemd/      rosbag + clipper + pruning as services
+# layout — live under examples/:
+#   examples/continuous/   one growing file (no splits) + latency trade-offs
+#   examples/split-bags/   --max-bag-size / --max-bag-duration + pruning
+#   examples/systemd/      rosbag + clipper + pruning as services
 #
 # rosbag2 refuses to record into an existing bag directory, so ./record is
 # wiped on start. ./record is gitignored.
@@ -40,7 +40,7 @@ OUT_DIR="${OUT_DIR:-./record}"
 # Storage defaults: regular caching and the stock chunked+compressed profile.
 # These are the rosbag2 defaults — a clip's data becomes visible to the tail
 # only once a chunk fills and the cache drains, so clipper's --grace-secs must
-# exceed that flush latency (see example/continuous for the fastwrite profile,
+# exceed that flush latency (see examples/continuous for the fastwrite profile,
 # which writes every message straight through for minimal tail latency).
 MAX_CACHE_SIZE="${MAX_CACHE_SIZE:-104857600}"     # 100 MiB, rosbag2 default
 STORAGE_PRESET="${STORAGE_PRESET:-zstd_fast}"      # none | fastwrite | zstd_fast | zstd_small

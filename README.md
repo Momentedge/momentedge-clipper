@@ -136,7 +136,7 @@ clipper ◀── /events/momentedge/trigger ── trigger-pub
 
   The script's storage defaults (`--storage-preset-profile zstd_fast
   --max-cache-size` 100 MiB) trade tail latency for size; the
-  [`example/continuous`](example/continuous/README.md) setup explains the two
+  [`examples/continuous`](examples/continuous/README.md) setup explains the two
   knobs and the low-latency `fastwrite --max-cache-size 0` alternative.
 - **`clipper`** listens on `/events/momentedge/trigger`
   (`momentedge_msgs/Trigger`: `name`, `description`, `trigger_time`, and the
@@ -180,7 +180,7 @@ logged error is emitted and the trigger produces no clip and no
 clipper also reads chunked recordings (record.sh's default `zstd_fast` profile,
 or any `STORAGE_PRESET` / `MAX_CACHE_SIZE` override), but `grace_secs` must then
 be sized to the resulting flush latency (roughly chunk size / aggregate data
-rate); see [`example/continuous`](example/continuous/README.md). Every
+rate); see [`examples/continuous`](examples/continuous/README.md). Every
 file visible in `out_dir` is a complete, crash-durable clip; the
 `/events/momentedge/recorded` announce always names an already-written file. The
 single recording file has no retention — it grows until you stop recording.
@@ -319,7 +319,7 @@ It builds `momentedge_msgs` into a colcon overlay (`./install`) and compiles
 ### Run
 
 The recorder is `scripts/record.sh` (continuous `ros2 bag record`) plus
-`clipper` via `scripts/run.sh`; [`example/launch`](example/launch/README.md)
+`clipper` via `scripts/run.sh`; [`examples/launch`](examples/launch/README.md)
 brings both up together with `ros2 launch`. The trigger publisher has a demo
 launcher too:
 
@@ -379,7 +379,7 @@ compatibility; see "Build on the target" above for the rationale.
 The continuous recording is one growing file with no built-in retention; the
 clips clipper writes accumulate too. Prune old clips on a schedule (e.g. a cron
 running `find ./clipped -mindepth 1 -type f -mmin +1440 -delete`), and see
-[`example/split-bags`](example/split-bags/README.md) for bounding the recording
+[`examples/split-bags`](examples/split-bags/README.md) for bounding the recording
 itself with split bags. In-place hole-punch retention for the continuous file is
 tracked in beads (`clipper-wkg`).
 
@@ -391,7 +391,7 @@ crates/trigger-pub/     # r2r periodic trigger publisher
 momentedge_msgs/        # local ROS2 interface package (Trigger, Recorded)
 sim/                    # synthetic gscam camera, raw + H.265 (sim/cam_sim.sh) — see sim/README.md
 nix/                    # flake package defs: momentedge-msgs, ros-env, binaries
-example/                # setup guides: continuous, split-bags, launch
+examples/                # setup guides: continuous, split-bags, launch
 scripts/record.sh       # continuous `ros2 bag record` → ./record (clipper's source)
 scripts/run.sh          # run clipper against ./record (matching options)
 scripts/build-on-target.sh  # native target build (momentedge_msgs overlay + binaries)
@@ -402,7 +402,7 @@ flake.nix               # per-distro ROS2 dev shells (humble/jazzy/lyrical/rolli
 `scripts/record.sh` is the continuous `ros2 bag record` clipper tails: every
 live topic into one growing MCAP file under `./record`, with storage defaults
 suited to tailing. `scripts/run.sh` starts `clipper` against the same directory.
-The [`example/`](example/) guides cover the continuous (clipper) setup, split
+The [`examples/`](examples/) guides cover the continuous (clipper) setup, split
 bags with pruning, and bringing both up with `ros2 launch`:
 
 ```bash

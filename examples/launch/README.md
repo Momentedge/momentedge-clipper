@@ -19,17 +19,17 @@ Each in its own shell, both with a sourced ROS 2 environment (the dev shell, or
 
 ```bash
 # shell 1 — recorder
-ros2 launch example/launch/record.launch.py
+ros2 launch examples/launch/record.launch.py
 
 # shell 2 — clipper
-ros2 launch example/launch/clipper.launch.py
+ros2 launch examples/launch/clipper.launch.py
 ```
 
 Override any default with `name:=value`, e.g. a low-latency recording:
 
 ```bash
-ros2 launch example/launch/record.launch.py  storage_preset:=fastwrite max_cache_size:=0
-ros2 launch example/launch/clipper.launch.py grace_secs:=2
+ros2 launch examples/launch/record.launch.py  storage_preset:=fastwrite max_cache_size:=0
+ros2 launch examples/launch/clipper.launch.py grace_secs:=2
 ```
 
 To bring both up from one terminal, include them from a parent launch file:
@@ -40,7 +40,7 @@ from launch.actions import IncludeLaunchDescription
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 
 def generate_launch_description():
-    here = "example/launch"
+    here = "examples/launch"
     return LaunchDescription([
         IncludeLaunchDescription(PythonLaunchDescriptionSource(f"{here}/record.launch.py")),
         IncludeLaunchDescription(PythonLaunchDescriptionSource(f"{here}/clipper.launch.py")),

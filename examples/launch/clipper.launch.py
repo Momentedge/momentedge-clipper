@@ -9,9 +9,9 @@ ament executable, so it is an ExecuteProcess rather than a launch_ros Node.
 
 Run with a sourced ROS 2 environment:
 
-    ros2 launch example/launch/clipper.launch.py
-    ros2 launch example/launch/clipper.launch.py record_dir:=/data/record clipped_dir:=/data/clipped grace_secs:=2
-    ros2 launch example/launch/clipper.launch.py clipper_bin:=./target/release/clipper   # dev build
+    ros2 launch examples/launch/clipper.launch.py
+    ros2 launch examples/launch/clipper.launch.py record_dir:=/data/record clipped_dir:=/data/clipped grace_secs:=2
+    ros2 launch examples/launch/clipper.launch.py clipper_bin:=./target/release/clipper   # dev build
 
 clipper is launched with respawn=True so it restarts on exit (it re-discovers
 the recording).

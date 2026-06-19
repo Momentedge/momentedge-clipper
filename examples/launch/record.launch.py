@@ -6,8 +6,8 @@ you already sourced to call it, so there is no per-process sourcing.
 
 Run with a sourced ROS 2 environment:
 
-    ros2 launch example/launch/record.launch.py
-    ros2 launch example/launch/record.launch.py record_dir:=/data/record storage_preset:=fastwrite max_cache_size:=0
+    ros2 launch examples/launch/record.launch.py
+    ros2 launch examples/launch/record.launch.py record_dir:=/data/record storage_preset:=fastwrite max_cache_size:=0
 
 The recorder is not respawned: rosbag2 refuses to reuse the bag directory this
 launch wipes once at startup.
