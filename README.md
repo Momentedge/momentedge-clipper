@@ -16,15 +16,16 @@ Recording and deciding-what-matters are different jobs with different change rat
 A **triggered clip recorder** for ROS2, written in Rust. It keeps a continuous
 on-disk `ros2 bag record` running and, on each trigger event, cuts a short clip
 out of it — copying MCAP messages straight through without decoding their
-bodies. Two crates make up the pad:
+bodies. The recorder is one crate, with an example trigger source alongside it:
 
 - **`clipper`** — the recorder. It tails one growing MCAP file and,
   for each trigger, bulk-copies the messages in the trigger's pre/post window
   into a standalone clip, then announces the result. See
   [Triggered recording](#triggered-recording).
-- **`trigger-pub`** — a development stand-in for a real trigger source. It
-  periodically publishes `momentedge_msgs/Trigger` so you can exercise the
-  recorder end to end.
+- **`trigger-pub`** — an example trigger source
+  ([`examples/trigger-pub`](examples/trigger-pub/README.md)), standing in for a
+  real one. It periodically publishes `momentedge_msgs/Trigger` so you can
+  exercise the recorder end to end.
 
 It is a testing pad, not a finished tool.
 
@@ -324,7 +325,7 @@ brings both up together with `ros2 launch`. The trigger publisher has a demo
 launcher too:
 
 ```bash
-./scripts/start_demo_trigger_pub.sh   # demo trigger source (foreground)
+./examples/trigger-pub/start_demo_trigger_pub.sh   # demo trigger source (foreground)
 ```
 
 Running natively, every ROS2 process shares the host `/dev/shm`, so FastDDS
@@ -386,16 +387,15 @@ tracked in beads (`clipper-wkg`).
 ## Layout
 
 ```
-crates/clipper/  # triggered clip recorder tailing one continuous mcap
-crates/trigger-pub/     # r2r periodic trigger publisher
+crates/clipper/         # triggered clip recorder tailing one continuous mcap
 momentedge_msgs/        # local ROS2 interface package (Trigger, Recorded)
 sim/                    # synthetic gscam camera, raw + H.265 (sim/cam_sim.sh) — see sim/README.md
 nix/                    # flake package defs: momentedge-msgs, ros-env, binaries
-examples/                # setup guides: continuous, split-bags, launch
+examples/               # setup guides (continuous, split-bags, launch) + the trigger-pub example
+examples/trigger-pub/   # r2r periodic trigger publisher (example) + start_demo_trigger_pub.sh
 scripts/record.sh       # continuous `ros2 bag record` → ./record (clipper's source)
 scripts/run.sh          # run clipper against ./record (matching options)
 scripts/build-on-target.sh  # native target build (momentedge_msgs overlay + binaries)
-scripts/start_demo_trigger_pub.sh  # run the deployed trigger publisher natively
 flake.nix               # per-distro ROS2 dev shells (humble/jazzy/lyrical/rolling) + nix-built binaries
 ```
 
@@ -437,6 +437,5 @@ and `git push`. The `bd` workflow and conventions are in
 
 Implementation rationale, concurrency design, and build mechanics live in the
 `CLAUDE.md` files: [`CLAUDE.md`](CLAUDE.md) for the shared model and workspace,
-and one per crate
-([`clipper`](crates/clipper/CLAUDE.md),
-[`trigger-pub`](crates/trigger-pub/CLAUDE.md)).
+the recorder crate ([`clipper`](crates/clipper/CLAUDE.md)), and the example
+trigger source ([`trigger-pub`](examples/trigger-pub/CLAUDE.md)).

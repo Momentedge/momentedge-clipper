@@ -16,8 +16,8 @@
 # Produces, under the repo root:
 #   install/                  colcon overlay carrying momentedge_msgs typesupport
 #   target/release/clipper, target/release/trigger-pub
-# trigger-pub is run by start_demo_trigger_pub.sh; clipper is run
-# with scripts/record.sh per deployment.
+# trigger-pub is run by examples/trigger-pub/start_demo_trigger_pub.sh; clipper
+# is run with scripts/record.sh per deployment.
 #
 # Override the ROS install with ROS_SETUP=/opt/ros/<distro>/setup.bash.
 set -euo pipefail
@@ -45,4 +45,4 @@ echo
 echo "built:"
 for _p in "${_build_pkgs[@]}"; do echo "  $REPO_ROOT/target/release/$_p"; done
 echo "run the recorder: scripts/record.sh + target/release/clipper"
-echo "run the demo trigger: scripts/start_demo_trigger_pub.sh (needs trigger-pub built)"
+echo "run the demo trigger: examples/trigger-pub/start_demo_trigger_pub.sh (needs trigger-pub built)"

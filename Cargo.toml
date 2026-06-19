@@ -5,7 +5,9 @@
 resolver = "3"
 members = [
     "crates/clipper",
-    "crates/trigger-pub",
+    # Example trigger source — a workspace member so it inherits the shared
+    # package metadata and dependency versions below, not a deployable crate.
+    "examples/trigger-pub",
 ]
 
 # Shared package metadata; members inherit with `version.workspace = true` etc.

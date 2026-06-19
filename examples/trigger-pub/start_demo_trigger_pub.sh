@@ -6,7 +6,7 @@
 #
 # Runs in the foreground (Ctrl-C to stop). Extra args are forwarded; the
 # preroll/postroll windows are in nanoseconds, e.g. a 2 s / 3 s window:
-#   ./scripts/start_demo_trigger_pub.sh --preroll 2000000000 --postroll 3000000000
+#   ./examples/trigger-pub/start_demo_trigger_pub.sh --preroll 2000000000 --postroll 3000000000
 # With no flags each trigger draws a random 1–10 s window.
 #
 # Build the binary first with scripts/build-on-target.sh, and run inside a
@@ -22,7 +22,7 @@ if [[ -z "${ROS_DISTRO:-}" ]]; then
   exit 1
 fi
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BIN_DIR="${BIN_DIR:-$REPO_ROOT/target/release}"
 
 # momentedge_msgs typesupport comes from the local build overlay (not apt); the

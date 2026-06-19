@@ -3,21 +3,22 @@
 [README.md](README.md) is the canonical overview: what this testing pad is, the
 triggered-recording workflow, prerequisites, and the build/run/replay quickstart.
 Start there. This file covers what a contributor or agent needs *beyond* the
-README — build mechanics and conventions — without repeating it. Each crate has
-its own CLAUDE.md:
-[`clipper`](crates/clipper/CLAUDE.md),
-[`trigger-pub`](crates/trigger-pub/CLAUDE.md); the sim camera (`sim/`) has
+README — build mechanics and conventions — without repeating it. The recorder
+crate [`clipper`](crates/clipper/CLAUDE.md) and the example trigger source
+[`trigger-pub`](examples/trigger-pub/CLAUDE.md) each carry their own CLAUDE.md;
+the sim camera (`sim/`) has
 [`sim/CLAUDE.md`](sim/CLAUDE.md), and CI mechanics live in the `/ci` repo skill (`.claude/skills/ci/SKILL.md`). The nested files load on demand when
 you work in their directory, keeping their detail out of context otherwise.
 
-## The recorders
+## The recorder
 
-`clipper` is a triggered clip recorder, and `trigger-pub` is the
-periodic `Trigger` publisher that drives it. The recorder owns no sensor
-subscriptions and no message index; it cuts clips out of a continuous on-disk
-`ros2 bag record` on ROS2 trigger events, copying MCAP messages straight through.
-It tails one growing MCAP file, decoding nothing but each message's MCAP log
-time. Internals live in
+`clipper` is a triggered clip recorder; the example
+[`trigger-pub`](examples/trigger-pub/CLAUDE.md) is a periodic `Trigger` publisher
+that drives it during development, standing in for a real trigger source. The
+recorder owns no sensor subscriptions and no message index; it cuts clips out of
+a continuous on-disk `ros2 bag record` on ROS2 trigger events, copying MCAP
+messages straight through. It tails one growing MCAP file, decoding nothing but
+each message's MCAP log time. Internals live in
 [`clipper`](crates/clipper/CLAUDE.md).
 
 ## The sim camera (`sim/`)
@@ -159,8 +160,8 @@ type, so the two tools are not interchangeable; and because the msgs package is 
 first-class ROS deb, the clipper binary ships **no bundled overlay and no baked
 rpath** — it resolves its typesupport through the standard
 `/opt/ros/<distro>/setup.bash`, like every ROS executable. `clipper` is the only
-binary packaged (`trigger-pub` is a dev stand-in; the recording is the host's own
-`ros2 bag record`).
+binary packaged (`trigger-pub` is the example trigger source under
+`examples/trigger-pub`; the recording is the host's own `ros2 bag record`).
 
 `.github/workflows/release.yml` builds both packages per distro on native arm64
 runners (ABI-compatible with the targets); a `v*` tag publishes, `workflow_dispatch`
@@ -174,9 +175,11 @@ skill** (`.claude/skills/packaging/SKILL.md`); the workflow/CI mechanics and the
 A virtual workspace (no root package), so `resolver = "3"` (the edition-2024
 resolver) is set explicitly — a virtual workspace does not infer the resolver
 from member editions and otherwise falls back to `"1"` with a warning. Members
-are the two crates (`clipper`, `trigger-pub`); shared metadata is in
-`[workspace.package]`. `momentedge_msgs/` (ROS2 interface package) and `sim/`
-(the sim camera's launch/config tree) are not Cargo members.
+are the recorder crate (`crates/clipper`) and the example trigger source
+(`examples/trigger-pub`) — the example stays a member so it inherits
+`[workspace.package]` and the shared `[workspace.dependencies]` versions, rather
+than for shipping. `momentedge_msgs/` (ROS2 interface package) and `sim/` (the
+sim camera's launch/config tree) are not Cargo members.
 
 ## Sibling repositories
 

@@ -1,5 +1,11 @@
 [package]
 name = "trigger-pub"
+# An example trigger source, not a published crate.
+publish = false
+# A workspace member (see the root Cargo.toml), so it inherits the shared
+# version/edition and the `[workspace.dependencies]` versions via `.workspace =
+# true` — exactly as the clipper crate does. Living under examples/ rather than
+# crates/ changes nothing here; membership is what enables the inheritance.
 version.workspace = true
 edition.workspace = true
 
