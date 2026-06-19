@@ -175,11 +175,15 @@ skill** (`.claude/skills/packaging/SKILL.md`); the workflow/CI mechanics and the
 A virtual workspace (no root package), so `resolver = "3"` (the edition-2024
 resolver) is set explicitly — a virtual workspace does not infer the resolver
 from member editions and otherwise falls back to `"1"` with a warning. Members
-are the recorder crate (`crates/clipper`) and the example trigger source
-(`examples/trigger-pub`) — the example stays a member so it inherits
+are the recorder crate (`crates/clipper`) and two examples under `examples/` —
+the trigger source (`trigger-pub`) and a minimal MCAP writer
+(`custom-mcap-writer`). The examples stay members so they inherit
 `[workspace.package]` and the shared `[workspace.dependencies]` versions, rather
-than for shipping. `momentedge_msgs/` (ROS2 interface package) and `sim/` (the
-sim camera's launch/config tree) are not Cargo members.
+than for shipping; `custom-mcap-writer` is a single-file binary that writes JSON
+channels straight to one MCAP file with the `mcap` crate and depends on no r2r,
+so it builds and tests off the dev shell on every distro. `momentedge_msgs/`
+(ROS2 interface package) and `sim/` (the sim camera's launch/config tree) are not
+Cargo members.
 
 ## Sibling repositories
 

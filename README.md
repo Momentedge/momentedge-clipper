@@ -26,6 +26,10 @@ bodies. The recorder is one crate, with an example trigger source alongside it:
   ([`examples/trigger-pub`](examples/trigger-pub/README.md)), standing in for a
   real one. It periodically publishes `momentedge_msgs/Trigger` so you can
   exercise the recorder end to end.
+- **`custom-mcap-writer`** — a minimal example
+  ([`examples/custom-mcap-writer`](examples/custom-mcap-writer/README.md)) that
+  writes an MCAP file directly with the `mcap` crate (no ROS): two JSON channels,
+  a typed struct and a raw JSON string.
 
 It is a testing pad, not a finished tool.
 
@@ -391,8 +395,9 @@ crates/clipper/         # triggered clip recorder tailing one continuous mcap
 momentedge_msgs/        # local ROS2 interface package (Trigger, Recorded)
 sim/                    # synthetic gscam camera, raw + H.265 (sim/cam_sim.sh) — see sim/README.md
 nix/                    # flake package defs: momentedge-msgs, ros-env, binaries
-examples/               # setup guides (continuous, split-bags, launch) + the trigger-pub example
+examples/               # setup guides (continuous, split-bags, launch) + the example crates
 examples/trigger-pub/   # r2r periodic trigger publisher (example) + start_demo_trigger_pub.sh
+examples/custom-mcap-writer/  # minimal mcap-crate writer: two JSON channels (no ROS)
 scripts/record.sh       # continuous `ros2 bag record` → ./record (clipper's source)
 scripts/run.sh          # run clipper against ./record (matching options)
 scripts/build-on-target.sh  # native target build (momentedge_msgs overlay + binaries)

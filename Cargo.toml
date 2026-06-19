@@ -8,6 +8,9 @@ members = [
     # Example trigger source — a workspace member so it inherits the shared
     # package metadata and dependency versions below, not a deployable crate.
     "examples/trigger-pub",
+    # Minimal MCAP writer example — writes one MCAP file directly with the
+    # `mcap` crate (no ROS/r2r): two JSON channels, a typed struct and a raw string.
+    "examples/custom-mcap-writer",
 ]
 
 # Shared package metadata; members inherit with `version.workspace = true` etc.
@@ -37,3 +40,6 @@ clap = { version = "4", features = ["derive", "env", "string"] }
 log = "0.4"
 pretty_env_logger = "0.5"
 fastrand = "2"
+# JSON payloads for the custom-mcap-writer example.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

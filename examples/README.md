@@ -16,3 +16,7 @@ root is the minimal continuous setup; the guides expand on it.
 - [`trigger-pub/`](trigger-pub/README.md) — an example trigger source: a small
   r2r node that publishes `momentedge_msgs/Trigger` periodically, so you can
   exercise the recorder without a real trigger publisher.
+- [`custom-mcap-writer/`](custom-mcap-writer/README.md) — a minimal standalone
+  program that writes an MCAP file directly with the `mcap` crate (no ROS): two
+  JSON channels (a typed struct and a raw JSON string), pulled from per-channel
+  iterators every 20 ms. A from-scratch how-to for writing MCAP.
