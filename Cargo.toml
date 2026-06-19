@@ -10,7 +10,7 @@ members = [
 
 # Shared package metadata; members inherit with `version.workspace = true` etc.
 [workspace.package]
-version = "0.0.3"
+version = "0.0.4"
 edition = "2024"
 
 # Shared dependency versions; members inherit with `<crate>.workspace = true` and
