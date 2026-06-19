@@ -3,7 +3,7 @@
 //! by the harness), real CLI-published triggers, and real `Recorded`
 //! announcements, against the deployed storage profiles.
 //!
-//! Gated on `EDGESTREAM_E2E` (see [`harness::require_e2e`]); cargo-nextest is
+//! Gated on `MOMENTEDGE_E2E` (see [`harness::require_e2e`]); cargo-nextest is
 //! the required runner. Inside the dev shell:
 //!
 //! ```text
