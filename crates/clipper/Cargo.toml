@@ -2,7 +2,7 @@
 name = "clipper"
 version.workspace = true
 edition.workspace = true
-license = "MIT"
+license.workspace = true
 description = "Triggered MCAP clip recorder for ROS2"
 
 [[bin]]

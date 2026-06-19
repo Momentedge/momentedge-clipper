@@ -10,10 +10,10 @@ members = [
     "examples/trigger-pub",
 ]
 
-# Shared package metadata; members inherit with `version.workspace = true` etc.
 [workspace.package]
 version = "0.0.4"
 edition = "2024"
+license = "Apache-2.0"
 
 # Shared dependency versions; members inherit with `<crate>.workspace = true` and
 # keep their own role comment (and any crate-specific features) at the use site.
