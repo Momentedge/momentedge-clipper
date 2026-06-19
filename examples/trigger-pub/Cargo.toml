@@ -8,6 +8,7 @@ publish = false
 # crates/ changes nothing here; membership is what enables the inheritance.
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 # r2r: ROS2 client bindings. Used here for a typed publisher of
