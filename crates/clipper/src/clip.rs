@@ -106,6 +106,23 @@ pub struct StagedClip {
     staged: bool,
 }
 
+impl StagedClip {
+    /// Override the filename this clip will be published under. Used to assign a
+    /// `_NN` segment suffix once a window's segment count is known: a window that
+    /// stayed in one file keeps its bare desired name, a window that straddled a
+    /// rollover gets one numbered segment per source file.
+    pub fn set_final_name(&mut self, name: std::ffi::OsString) {
+        self.desired_name = name;
+    }
+
+    /// Whether this staged segment copied no in-window messages — a rollover
+    /// whose new file held nothing inside the window stages such an empty
+    /// trailing segment, which the caller drops when other segments carry data.
+    pub fn is_empty(&self) -> bool {
+        self.stats.messages_copied == 0
+    }
+}
+
 impl Drop for StagedClip {
     fn drop(&mut self) {
         // Only the unpublished staged file is ours to remove; once it is linked
@@ -135,6 +152,11 @@ impl Drop for StagedClip {
 /// `compression` is the codec the clip's `mcap::Writer` is built with (`None`
 /// for uncompressed); it is set explicitly rather than inherited from the mcap
 /// crate default.
+///
+/// The recorder stages and publishes in two explicit steps (so a window
+/// straddling a rollover can publish all its segments together once their count
+/// is known); this one-call composition serves the clip-assembly tests.
+#[cfg(test)]
 pub fn extract_clip(
     plan: &WindowPlan,
     out_path: &Path,
@@ -520,7 +542,18 @@ pub(crate) mod tests {
         channel_body, message_body, raw_record, scan_to_end, test_dir, write_raw, write_recording,
         write_recording_opts,
     };
-    use crate::tail::{Extent, Tailer, op};
+    use crate::tail::{Extent, Tailer, WindowPlan, op};
+
+    /// Plan the single source recording a clip test cuts from. These tests each
+    /// index one recording, so [`Tailer::plan_window`]'s `Vec` holds at most one
+    /// plan; an empty `Vec` (no recording yet) becomes an empty plan.
+    fn plan_one(tailer: &Tailer, start_ns: u64, end_ns: u64) -> WindowPlan {
+        tailer
+            .plan_window(start_ns, end_ns)
+            .into_iter()
+            .next()
+            .unwrap_or_else(WindowPlan::empty)
+    }
 
     /// The clip compression the recorder's default (zstd) maps to; most tests
     /// cut clips through the same codec the recorder uses by default.
@@ -554,7 +587,7 @@ pub(crate) mod tests {
         let tailer = tail_whole(&rec)?;
 
         let out = root.join("clip.mcap");
-        let plan = tailer.plan_window(0, 100);
+        let plan = plan_one(&tailer, 0, 100);
         let stats = extract_clip(&plan, &out, 0, 100, TEST_COMPRESSION)?;
 
         // The final path is the published location, holding a complete clip.
@@ -589,7 +622,7 @@ pub(crate) mod tests {
         let tailer = tail_whole(&rec)?;
 
         let out = root.join("clip.mcap");
-        let plan = tailer.plan_window(0, 100);
+        let plan = plan_one(&tailer, 0, 100);
 
         // After stage 1 only: the final dir holds no clip, but the staged file
         // in the capturing dir is already complete and read_clip-valid.
@@ -624,7 +657,7 @@ pub(crate) mod tests {
         let tailer = tail_whole(&rec)?;
 
         let out = root.join("clip.mcap");
-        let plan = tailer.plan_window(0, 100);
+        let plan = plan_one(&tailer, 0, 100);
 
         // A staged clip abandoned without publishing — an early return or a
         // panic between the stages — must not strand the file in the capturing
@@ -697,7 +730,7 @@ pub(crate) mod tests {
         reset_capturing_dir(&out_dir)?;
 
         let out = out_dir.join("clip.mcap");
-        let plan = tailer.plan_window(0, 100);
+        let plan = plan_one(&tailer, 0, 100);
         let stats = extract_clip(&plan, &out, 0, 100, TEST_COMPRESSION)?;
 
         assert_eq!(stats.out_path, out);
@@ -733,7 +766,7 @@ pub(crate) mod tests {
         let tailer = tail_whole(&rec)?;
 
         let out = root.join("clip.mcap");
-        let plan = tailer.plan_window(100, 200);
+        let plan = plan_one(&tailer, 100, 200);
         let stats = extract_clip(&plan, &out, 100, 200, TEST_COMPRESSION)?;
 
         assert_eq!(stats.messages_copied, 3);
@@ -762,7 +795,7 @@ pub(crate) mod tests {
         let tailer = tail_whole(&rec)?;
 
         let out = root.join("clip.mcap");
-        let plan = tailer.plan_window(20, 40);
+        let plan = plan_one(&tailer, 20, 40);
         let stats = extract_clip(&plan, &out, 20, 40, TEST_COMPRESSION)?;
 
         assert_eq!(stats.messages_copied, 3);
@@ -785,7 +818,7 @@ pub(crate) mod tests {
         let (tailer, _coverage) = Tailer::new();
 
         let out = root.join("clip.mcap");
-        let plan = tailer.plan_window(0, 100);
+        let plan = plan_one(&tailer, 0, 100);
         let stats = extract_clip(&plan, &out, 0, 100, TEST_COMPRESSION)?;
 
         assert_eq!(stats.messages_copied, 0);
@@ -801,7 +834,7 @@ pub(crate) mod tests {
         let rec = root.join("rec.mcap");
         write_recording(&rec, false, &[("/t", 10), ("/t", 20)])?;
         let tailer = tail_whole(&rec)?;
-        let plan = tailer.plan_window(0, 100);
+        let plan = plan_one(&tailer, 0, 100);
 
         // Two publications of the same desired name: the collision is resolved
         // at the publish stage against the final dir, so the second lands as a
@@ -831,7 +864,7 @@ pub(crate) mod tests {
         let tailer = tail_whole(&rec)?;
 
         let out = root.join("clip.mcap");
-        let plan = tailer.plan_window(0, 100);
+        let plan = plan_one(&tailer, 0, 100);
         extract_clip(&plan, &out, 0, 100, TEST_COMPRESSION)?;
 
         let buf = std::fs::read(&out)?;
@@ -848,7 +881,7 @@ pub(crate) mod tests {
         let rec = root.join("rec.mcap");
         write_recording(&rec, false, &[("/t", 10), ("/t", 20)])?;
         let tailer = tail_whole(&rec)?;
-        let plan = tailer.plan_window(0, 100);
+        let plan = plan_one(&tailer, 0, 100);
 
         // The recorder-restart scenario: the bag directory is wiped while a
         // window is still being cut. The plan's `Arc<File>` keeps the inode
@@ -873,7 +906,7 @@ pub(crate) mod tests {
         let rec = root.join("rec.mcap");
         write_recording(&rec, false, &[("/t", 10), ("/t", 20), ("/t", 30)])?;
         let tailer = tail_whole(&rec)?;
-        let plan = tailer.plan_window(0, 100);
+        let plan = plan_one(&tailer, 0, 100);
 
         // Shrink the recording under the plan (append-only violated — e.g. a
         // damaged filesystem). The extent read must fail, and the failure must
@@ -907,7 +940,7 @@ pub(crate) mod tests {
         let rec = root.join("rec.mcap");
         write_recording(&rec, false, &[("/t", 10)])?;
         let tailer = tail_whole(&rec)?;
-        let mut plan = tailer.plan_window(0, 100);
+        let mut plan = plan_one(&tailer, 0, 100);
         // No Channel record for the message's ID: nothing to emit a
         // Schema/Channel from, so the message is skipped — the clip stays
         // valid rather than failing.
@@ -970,7 +1003,7 @@ pub(crate) mod tests {
         // The extent (time bounds 100..200) overlaps the window, so it is
         // planned and read — but no individual message falls inside it.
         let out = root.join("clip.mcap");
-        let plan = tailer.plan_window(120, 180);
+        let plan = plan_one(&tailer, 120, 180);
         let stats = extract_clip(&plan, &out, 120, 180, TEST_COMPRESSION)?;
 
         assert!(stats.extents_read > 0, "the covering extent is read");
@@ -1000,7 +1033,7 @@ pub(crate) mod tests {
         let tailer = tail_whole(&rec)?;
 
         let out = root.join("clip.mcap");
-        let plan = tailer.plan_window(20, 40);
+        let plan = plan_one(&tailer, 20, 40);
         let stats = extract_clip(&plan, &out, 20, 40, TEST_COMPRESSION)?;
 
         assert_eq!(stats.messages_copied, 3);
@@ -1040,7 +1073,7 @@ pub(crate) mod tests {
         writer.finish()?;
 
         let tailer = tail_whole(&rec)?;
-        let plan = tailer.plan_window(0, 100);
+        let plan = plan_one(&tailer, 0, 100);
         assert!(
             plan.channels.values().all(|c| c.schema.is_none()),
             "schema_id 0 must resolve to no schema"
@@ -1065,7 +1098,7 @@ pub(crate) mod tests {
         }
 
         let (tailer, _coverage) = Tailer::new();
-        let plan = tailer.plan_window(0, 100);
+        let plan = plan_one(&tailer, 0, 100);
         // Staging succeeds — the capturing dir is empty, so the clip assembles
         // there — and the collision only surfaces at publish, where 1000
         // suffixes against the pre-filled final dir are exhausted.
@@ -1105,12 +1138,12 @@ pub(crate) mod tests {
         )?;
         let tailer = tail_whole(&rec)?;
         assert!(
-            tailer.plan_window(0, u64::MAX).extents.len() >= 2,
+            plan_one(&tailer, 0, u64::MAX).extents.len() >= 2,
             "precondition: the recording spans several extents"
         );
 
         let out = root.join("clip.mcap");
-        let plan = tailer.plan_window(30, 70);
+        let plan = plan_one(&tailer, 30, 70);
         let stats = extract_clip(&plan, &out, 30, 70, TEST_COMPRESSION)?;
 
         assert!(
@@ -1148,14 +1181,14 @@ pub(crate) mod tests {
         )?;
         let tailer = tail_whole(&rec)?;
 
-        let all = tailer.plan_window(0, u64::MAX);
+        let all = plan_one(&tailer, 0, u64::MAX);
         assert_eq!(all.extents.len(), 3, "one oversized extent per message");
         for pair in all.extents.windows(2) {
             assert_eq!(pair[1].offset, pair[0].offset + pair[0].len);
         }
 
         let out = root.join("clip.mcap");
-        let plan = tailer.plan_window(15, 25);
+        let plan = plan_one(&tailer, 15, 25);
         let stats = extract_clip(&plan, &out, 15, 25, TEST_COMPRESSION)?;
 
         assert_eq!(stats.extents_read, 1);
@@ -1193,7 +1226,7 @@ pub(crate) mod tests {
                 &stamps,
             )?;
             let tailer = tail_whole(&rec)?;
-            let plan = tailer.plan_window(20, 30);
+            let plan = plan_one(&tailer, 20, 30);
             assert_eq!(plan.channels.len(), 2, "{name}: registry from chunks");
 
             let out = root.join(format!("clip-{name}.mcap"));
@@ -1217,7 +1250,7 @@ pub(crate) mod tests {
         let rec = root.join("rec.mcap");
         write_recording(&rec, false, &[("/t", 10), ("/t", 20), ("/t", 30)])?;
         let tailer = tail_whole(&rec)?;
-        let plan = tailer.plan_window(0, 100);
+        let plan = plan_one(&tailer, 0, 100);
         let expected = vec![
             ("/t".to_string(), 10),
             ("/t".to_string(), 20),
@@ -1274,7 +1307,7 @@ pub(crate) mod tests {
             &[("/big", 10)],
         )?;
         let tailer = tail_whole(&rec)?;
-        let plan = tailer.plan_window(0, 100);
+        let plan = plan_one(&tailer, 0, 100);
         assert!(
             plan.extents.iter().map(|e| e.len).sum::<u64>() < (1 << 20),
             "precondition: the chunk compressed far below the payload size"
@@ -1308,7 +1341,7 @@ pub(crate) mod tests {
             &[("/t", 10), ("/t", 20), ("/t", 30), ("/t", 40)],
         )?;
         let tailer = tail_whole(&rec)?;
-        let plan = tailer.plan_window(0, 100);
+        let plan = plan_one(&tailer, 0, 100);
 
         // Corrupt a payload byte *after* the tail scanned (and CRC-checked)
         // the chunk: post-scan disk damage. Payload bytes exist only inside
@@ -1369,7 +1402,7 @@ pub(crate) mod tests {
         );
 
         let out = root.join("clip.mcap");
-        let plan = tailer.plan_window(0, 100);
+        let plan = plan_one(&tailer, 0, 100);
         let stats = extract_clip(&plan, &out, 0, 100, TEST_COMPRESSION)?;
         assert_eq!(stats.records_skipped, 1);
         assert_eq!(stats.messages_copied, 2);

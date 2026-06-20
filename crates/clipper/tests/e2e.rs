@@ -28,6 +28,18 @@ const SRC_TOPIC: &str = "/e2e/chatter";
 const SRC_RATE: u32 = 20;
 const SEC: u64 = 1_000_000_000;
 
+/// Read every announced segment and concatenate their `(topic, log_time)` pairs
+/// in announcement order — the window's full content across a multi-file cut. A
+/// window straddling a rollover is published as one segment per source file, so
+/// the recovered window is the union of the segments.
+fn read_all(recorded: &Recorded) -> Vec<(String, u64)> {
+    recorded
+        .filenames
+        .iter()
+        .flat_map(|f| read_clip(Path::new(f)))
+        .collect()
+}
+
 /// The full happy path per storage profile: real append/flush, trigger
 /// publication, `Recorded` semantics, and final-path visibility.
 ///
@@ -77,7 +89,7 @@ fn trigger_produces_clip_and_announcement(
     assert_eq!(recorded.name, "e2e-clip");
     let expected = env.out_dir().join(format!("{trigger_ns}_e2e-clip.mcap"));
     assert_eq!(
-        Path::new(&recorded.filename),
+        Path::new(recorded.only()),
         expected,
         "announced filename must be <out_dir>/<trigger_ns>_<name>.mcap"
     );
@@ -85,7 +97,7 @@ fn trigger_produces_clip_and_announcement(
     // Final-path visibility: the announced file already exists, is a
     // complete MCAP (read_clip parses through the footer), holds only
     // in-window messages, and includes the source topic.
-    let msgs = read_clip(Path::new(&recorded.filename));
+    let msgs = read_clip(Path::new(recorded.only()));
     assert!(!msgs.is_empty(), "the clip must hold the recorded window");
     assert_clip_within_window(&msgs, trigger_ns - preroll, trigger_ns + postroll);
     assert!(
@@ -119,7 +131,7 @@ fn recorder_restart_recovers_and_keeps_extracting() {
     let t1 = now_ns();
     env.fire_trigger("restart-1", t1, 2 * SEC, 2 * SEC);
     let r1 = wait_for_recorded(&mut listener1, Duration::from_secs(60));
-    assert!(!read_clip(Path::new(&r1.filename)).is_empty());
+    assert!(!read_clip(Path::new(r1.only())).is_empty());
 
     // Restart: clean stop, relaunch; the script wipes record/ and starts a
     // fresh bag, which the tail must notice as a replacement.
@@ -136,7 +148,7 @@ fn recorder_restart_recovers_and_keeps_extracting() {
     env.fire_trigger("restart-2", t2, 2 * SEC, 2 * SEC);
     let r2 = wait_for_recorded(&mut listener2, Duration::from_secs(60));
     assert_eq!(r2.name, "restart-2");
-    let msgs = read_clip(Path::new(&r2.filename));
+    let msgs = read_clip(Path::new(r2.only()));
     assert!(!msgs.is_empty(), "the post-restart clip must hold data");
     assert_clip_within_window(&msgs, t2 - 2 * SEC, t2 + 2 * SEC);
     assert!(msgs.iter().any(|(topic, _)| topic == SRC_TOPIC));
@@ -144,24 +156,21 @@ fn recorder_restart_recovers_and_keeps_extracting() {
     assert!(extractor.is_running());
 }
 
-/// The recorder is restarted inside an open trigger window: the tail attaches
-/// the replacement recording and the index resets, so the clip is cut from
-/// the most recent recording only — the pre-restart data is accepted as lost
-/// (recovering it from a still-readable old file is explicitly out of scope:
-/// beads clipper-gl2). The announcement must still go out and every
-/// message in the clip must postdate the restart.
+/// The recorder is restarted inside an open trigger window: the tail keeps the
+/// closing recording in its collection (its data was indexed live, the open
+/// file handle keeps it readable) and indexes the replacement, so the clip
+/// recovers data from **both** sides of the boundary — one segment per source
+/// file (beads clipper-gl2). The announcement still goes out and the recovered
+/// window spans the restart.
 ///
 /// The cases vary when the recording file is deleted relative to the trigger
 /// and the relaunch (the record script's wipe deletes it at relaunch anyway):
 /// a clean stop+start inside the window; an explicit deletion inside the
 /// window before the restart; a deletion before the trigger even fires, with
 /// the restart landing inside the window (the tail is idle re-discovering
-/// when the trigger arrives).
-/// When the recording file is deleted, relative to the trigger and the
-/// restart, in [`recorder_restart_inside_the_window_cuts_only_the_new_recording`].
-/// One axis with three points rather than two booleans: deleting both before
-/// the trigger and again mid-window is no fourth case — the file is already
-/// gone.
+/// when the trigger arrives). One axis with three points rather than two
+/// booleans: deleting both before the trigger and again mid-window is no fourth
+/// case — the file is already gone.
 #[derive(Clone, Copy, PartialEq)]
 enum Deletion {
     /// No explicit deletion — the relaunch's bag-dir wipe is the only one.
@@ -176,7 +185,7 @@ enum Deletion {
 #[case::clean_restart(Deletion::Never)]
 #[case::deleted_then_restarted(Deletion::MidWindow)]
 #[case::deleted_before_the_trigger(Deletion::BeforeTrigger)]
-fn recorder_restart_inside_the_window_cuts_only_the_new_recording(#[case] deletion: Deletion) {
+fn recorder_restart_inside_the_window_recovers_across_the_boundary(#[case] deletion: Deletion) {
     if !require_e2e() {
         return;
     }
@@ -187,9 +196,10 @@ fn recorder_restart_inside_the_window_cuts_only_the_new_recording(#[case] deleti
     let mut extractor = env.start_extractor(30);
     std::thread::sleep(Duration::from_secs(3));
 
-    // Deleted before the trigger: the recorder keeps appending to the
-    // unlinked inode, the tail notices the replacement and idles
-    // re-discovering, and the coverage high-water freezes.
+    // Deleted before the trigger: the recorder keeps appending to the unlinked
+    // inode, but the tail notices its file's inode vanish, ends the recording
+    // into the collection (the open handle keeps it readable), and idles with no
+    // current; the coverage high-water freezes until the relaunch.
     if deletion == Deletion::BeforeTrigger {
         env.delete_recording();
         std::thread::sleep(Duration::from_secs(1));
@@ -197,13 +207,17 @@ fn recorder_restart_inside_the_window_cuts_only_the_new_recording(#[case] deleti
 
     let mut listener = env.start_recorded_listener("restart-inside");
     let trigger_ns = now_ns();
-    // The postroll must outlast the restart sequence with data time to
-    // spare; the precondition after the relaunch checks that it did.
-    let (preroll, postroll) = (2 * SEC, 15 * SEC);
+    // The preroll reaches back into the closing recording's data — far enough to
+    // clear the `BeforeTrigger` case's delete→trigger gap (the deletion, a 1 s
+    // settle, and the listener's 2 s head start), so the retained closing
+    // recording always holds in-window data. The postroll outlasts the restart
+    // sequence with data time to spare; the precondition after the relaunch
+    // checks that it did.
+    let (preroll, postroll) = (8 * SEC, 15 * SEC);
     env.fire_trigger("restart-inside", trigger_ns, preroll, postroll);
 
-    // Two seconds of the window lie down before the restart; that data is
-    // the part the cut must not contain afterwards.
+    // Two seconds of the window lie down before the restart; that data is the
+    // closing recording's part the cut recovers across the boundary.
     std::thread::sleep(Duration::from_secs(2));
     if deletion == Deletion::MidWindow {
         env.delete_recording();
@@ -219,17 +233,24 @@ fn recorder_restart_inside_the_window_cuts_only_the_new_recording(#[case] deleti
 
     let recorded = wait_for_recorded(&mut listener, Duration::from_secs(60));
     assert_eq!(recorded.name, "restart-inside");
-    let msgs = read_clip(Path::new(&recorded.filename));
+    // The window straddles the restart, so it is recovered across the boundary:
+    // the closing recording's pre-restart data and the replacement's post-restart
+    // data both land in the clip — read every announced segment.
+    let msgs = read_all(&recorded);
     assert!(
         !msgs.is_empty(),
-        "the window tail past the restart must be in the clip"
+        "the recovered window must hold data from both sides of the restart"
     );
     assert_clip_within_window(&msgs, trigger_ns - preroll, trigger_ns + postroll);
     assert!(
-        msgs.iter().all(|(_, log_time)| *log_time >= restart_ns),
-        "the clip must hold only the new recording's data: a message predates \
-         the restart at {restart_ns}, oldest stamp {:?}",
-        msgs.iter().map(|(_, t)| t).min(),
+        msgs.iter().any(|(_, log_time)| *log_time < restart_ns),
+        "the closing recording's pre-restart data must be recovered: no stamp \
+         before the restart at {restart_ns}, stamps {:?}",
+        msgs.iter().map(|(_, t)| t).collect::<Vec<_>>(),
+    );
+    assert!(
+        msgs.iter().any(|(_, log_time)| *log_time >= restart_ns),
+        "the replacement recording's post-restart data must be in the clip"
     );
     env.assert_capturing_drained();
     assert!(
@@ -270,7 +291,7 @@ fn recorder_killed_mid_trigger_still_announces_via_grace_cut() {
         extractor.log_text().contains("still uncovered after"),
         "the cut must have come from the grace timeout"
     );
-    let msgs = read_clip(Path::new(&r.filename));
+    let msgs = read_clip(Path::new(r.only()));
     assert!(
         !msgs.is_empty(),
         "data recorded before the kill lies in the window"
@@ -336,8 +357,15 @@ fn recording_deleted_without_restart_grace_cuts_the_old_data(
         extractor.log_text().contains("still uncovered after"),
         "the frozen coverage must have forced a grace-timeout cut"
     );
-    extractor.expect_log("replaced; re-discovering", Duration::from_secs(60));
-    let msgs = read_clip(Path::new(&r.filename));
+    // The tail notices its own file's inode vanish and ends the recording,
+    // keeping it in the collection so the grace cut still reads the data it
+    // scanned before the deletion (through the open handle).
+    extractor.expect_log("inode vanished", Duration::from_secs(60));
+    // rosbag2 rolls over into fresh split files after its active recording is
+    // deleted; the tail indexes each and the grace cut recovers every segment
+    // overlapping the window, so the clip may come back as several files. The
+    // data scanned before the deletion is among them.
+    let msgs = read_all(&r);
     assert!(
         !msgs.is_empty(),
         "the data scanned before the deletion lies in the window"
@@ -350,15 +378,15 @@ fn recording_deleted_without_restart_grace_cuts_the_old_data(
     );
 }
 
-/// The recording is deleted inside the window and the recorder only comes
-/// back after the window has ended: the handler is still in its grace wait
-/// when the replacement attaches and wipes the index, and the new
-/// recording's first messages — stamped past the window end — release the
-/// coverage wait. The plan then holds no extent overlapping the window, so
-/// the cut is a complete, valid, empty clip, announced all the same: the
-/// window's data is accepted as lost with the file it lived in.
+/// The recording is deleted inside the window and the recorder only comes back
+/// after the window has ended: the handler is still in its grace wait when the
+/// replacement's first messages — stamped past the window end — release the
+/// coverage wait. The closing recording stays in the collection (its data was
+/// indexed live, the open handle keeps the unlinked inode readable), so the cut
+/// recovers the window's data from it even though the file is gone from disk and
+/// the replacement holds nothing inside the window.
 #[rstest]
-fn restart_after_the_window_ended_announces_an_empty_clip() {
+fn restart_after_the_window_ended_recovers_the_closing_recording() {
     if !require_e2e() {
         return;
     }
@@ -399,106 +427,94 @@ fn restart_after_the_window_ended_announces_an_empty_clip() {
     let (_recorder2, _) = env.restart_recorder(&mut recorder, &extractor, "fastwrite", 0);
 
     let r = wait_for_recorded(&mut listener, Duration::from_secs(60));
-    let msgs = read_clip(Path::new(&r.filename));
+    let msgs = read_all(&r);
     assert!(
-        msgs.is_empty(),
-        "the new recording holds nothing inside the window, so the clip must \
-         be empty — the old file's data is lost with it, got {} messages",
-        msgs.len()
+        !msgs.is_empty(),
+        "the closing recording's window data must be recovered from the \
+         retained index, even though the replacement holds nothing in-window"
     );
+    assert_clip_within_window(&msgs, t - preroll, t + postroll);
     env.assert_capturing_drained();
     assert!(
         extractor.is_running(),
-        "an empty cut is a valid outcome, not a failure"
+        "the extractor must survive a restart after the window ended"
     );
 }
 
-/// A finished recording left on disk next to the live one is never read
-/// again: the tail follows the newest file only, and a window lying entirely
-/// inside the old file's data cuts an empty clip even though that data is
-/// still on disk and readable. Recovering a previous recording's data is an
-/// explicit non-feature (beads clipper-gl2): a rotation means the old
-/// file's data is gone as far as clips are concerned — later windows over
-/// the live recording keep working.
+/// The headline cross-file recovery: a rosbag2 bag split rolls the recording
+/// over into numbered files while clipper runs, and a trigger whose window
+/// straddles a split boundary recovers data from both sides — one announced
+/// segment per source file, together tiling the window (beads clipper-gl2).
 #[rstest]
-fn old_recording_on_disk_is_not_recovered_after_restart() {
+fn window_straddling_an_in_run_split_recovers_both_sides() {
     if !require_e2e() {
         return;
     }
     let env = TestEnv::new();
-    let mut recorder = env.start_recorder("fastwrite", 0);
+    // Roll the bag over every 3 s, keeping each finished split on disk, so a
+    // window a few seconds wide straddles at least one split boundary.
+    let _recorder = env.start_recorder_split("fastwrite", 0, 3);
     let _source = env.start_source(SRC_TOPIC, SRC_RATE);
-    let bag = env.wait_for_recording(Duration::from_secs(60));
-    let mut extractor = env.start_extractor(30);
-    std::thread::sleep(Duration::from_secs(3));
-
-    // Stop cleanly: a finished recording whose data runs up to t_old, moved
-    // outside record/ before the relaunch wipes the bag dir.
-    let t_old = now_ns();
-    recorder.stop(libc::SIGINT, Duration::from_secs(30));
-    let saved = env.root().join("previous.saved");
-    std::fs::rename(&bag, &saved).expect("saving the finished recording");
-
-    let _recorder2 = env.start_recorder("fastwrite", 0);
     env.wait_for_recording(Duration::from_secs(60));
-    // The new recording must be attached before the old file reappears in
-    // record/ — a fresh-mtime mcap there could otherwise win the discovery.
-    // The needle carries the bag path (identical across the restart): the
-    // second "tailing <bag>" line is the re-attach. A path-free needle would
-    // already be satisfied by the startup banner, which names the record dir
-    // in the same words.
-    extractor.expect_log_count(
-        &format!("tailing {}", bag.display()),
-        2,
-        Duration::from_secs(60),
-    );
+    let mut extractor = env.start_extractor(30);
+    // Let at least one rollover happen so the tail has indexed two recordings.
+    std::thread::sleep(Duration::from_secs(7));
 
-    // Put the finished old recording back next to the live one. Staged
-    // outside the *.mcap glob and renamed in, with its mtime predated first,
-    // so newest-by-mtime discovery keeps following the live file from the
-    // moment the old one becomes discoverable at all.
-    let staged = env.record_dir().join("previous.staged");
-    std::fs::rename(&saved, &staged).expect("restoring the old recording");
-    std::fs::File::options()
-        .write(true)
-        .open(&staged)
-        .and_then(|f| f.set_modified(std::time::SystemTime::now() - Duration::from_secs(60)))
-        .expect("predating the old recording's mtime");
-    let restored = env.record_dir().join("previous_0.mcap");
-    std::fs::rename(&staged, &restored).expect("renaming the old recording into place");
+    let mut listener = env.start_recorded_listener("straddle");
+    let trigger_ns = now_ns();
+    // ±4 s spans at least one 3 s split boundary on each side of the stamp.
+    let (preroll, postroll) = (4 * SEC, 4 * SEC);
+    env.fire_trigger("straddle", trigger_ns, preroll, postroll);
 
-    // The window lies entirely inside the old recording's data — and that
-    // data demonstrably sits on disk, readable, in record/.
-    let (start, end) = (t_old - 2 * SEC, t_old);
-    let old_msgs = read_clip(&restored);
+    let recorded = wait_for_recorded(&mut listener, Duration::from_secs(60));
+    assert_eq!(recorded.name, "straddle");
     assert!(
-        old_msgs
-            .iter()
-            .any(|(_, log_time)| (start..=end).contains(log_time)),
-        "precondition: the restored old recording holds the window's data"
+        recorded.filenames.len() >= 2,
+        "a window straddling a split must recover one segment per source file, \
+         got {:?}",
+        recorded.filenames,
     );
-
-    let mut listener = env.start_recorded_listener("old-window");
-    env.fire_trigger("old-window", t_old, 2 * SEC, 0);
-    let r = wait_for_recorded(&mut listener, Duration::from_secs(60));
-    let msgs = read_clip(Path::new(&r.filename));
+    // Every segment is published under the `<base>_NN.mcap` naming and is a
+    // complete, in-window MCAP.
+    for f in &recorded.filenames {
+        let name = Path::new(f)
+            .file_name()
+            .expect("segment has a file name")
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            name.starts_with(&format!("{trigger_ns}_straddle_")),
+            "segment {name} must carry the {{trigger_ns}}_{{name}}_NN suffix"
+        );
+    }
+    let msgs = read_all(&recorded);
+    assert!(!msgs.is_empty(), "the recovered window must hold data");
+    assert_clip_within_window(&msgs, trigger_ns - preroll, trigger_ns + postroll);
     assert!(
-        msgs.is_empty(),
-        "the old file's data must not be recovered into the clip, got {} messages",
-        msgs.len()
+        msgs.iter().any(|(topic, _)| topic == SRC_TOPIC),
+        "the source topic must be in the recovered window"
     );
-
-    // Health proof: a window over the live recording still cuts real data.
-    std::thread::sleep(Duration::from_secs(2));
-    let mut listener2 = env.start_recorded_listener("fresh");
-    let t2 = now_ns();
-    env.fire_trigger("fresh", t2, SEC, 2 * SEC);
-    let r2 = wait_for_recorded(&mut listener2, Duration::from_secs(60));
-    let msgs2 = read_clip(Path::new(&r2.filename));
-    assert!(!msgs2.is_empty(), "the live recording must still cut clips");
-    assert_clip_within_window(&msgs2, t2 - SEC, t2 + 2 * SEC);
+    // The segments must tile the window, not overlap: each source recording is
+    // indexed exactly once, so no source message appears in two segments. A
+    // duplicated `(topic, log_time)` would mean the tail re-indexed a recording
+    // (the phantom-duplicate failure the identity-based discovery prevents). The
+    // 20 Hz source guarantees distinct stamps, so any repeat is a regression.
+    let mut src_stamps: Vec<u64> = msgs
+        .iter()
+        .filter(|(topic, _)| topic == SRC_TOPIC)
+        .map(|(_, t)| *t)
+        .collect();
+    let total = src_stamps.len();
+    src_stamps.sort_unstable();
+    src_stamps.dedup();
+    assert_eq!(
+        src_stamps.len(),
+        total,
+        "recovered segments must not overlap — a duplicated source stamp means \
+         a recording was indexed more than once"
+    );
     env.assert_capturing_drained();
-    assert!(extractor.is_running());
+    assert!(extractor.is_running(), "the extractor must outlive the cut");
 }
 
 /// Quiet topics: the recording's topics go silent, so coverage never reaches
@@ -529,7 +545,7 @@ fn quiet_topics_grace_timeout_cut() {
         extractor.log_text().contains("still uncovered after"),
         "the cut must have come from the grace timeout"
     );
-    let msgs = read_clip(Path::new(&r.filename));
+    let msgs = read_clip(Path::new(r.only()));
     assert!(
         !msgs.is_empty(),
         "the preroll data recorded before the quiet period lies in the window"
@@ -628,7 +644,7 @@ fn corrupt_tail_health_live() {
     env.fire_trigger("over-damage", ta, 60 * SEC, SEC);
     if let Some(a) = try_wait_for_recorded(&mut listener_a, Duration::from_secs(30)) {
         // Whatever the damage did, an announced file is a complete MCAP.
-        let msgs = read_clip(Path::new(&a.filename));
+        let msgs = read_clip(Path::new(a.only()));
         assert_clip_within_window(&msgs, ta - 60 * SEC, ta + SEC);
     }
     if !extractor.is_running() {
@@ -642,7 +658,7 @@ fn corrupt_tail_health_live() {
     let tb = now_ns();
     env.fire_trigger("post-damage", tb, SEC, SEC);
     let b = wait_for_recorded(&mut listener_b, Duration::from_secs(60));
-    let msgs = read_clip(Path::new(&b.filename));
+    let msgs = read_clip(Path::new(b.only()));
     assert!(
         !msgs.is_empty(),
         "a window over undamaged data must still produce a full clip"

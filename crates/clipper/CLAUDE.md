@@ -1,25 +1,22 @@
 # clipper
 
-A *triggered* clip recorder over **one continuous MCAP file**. It keeps the
-single growing recording open and **tails it**, so a clip can be cut as soon as
-the data is physically on disk: clip latency is bounded by the recorder's
-write-through latency. Built on [r2r](https://github.com/sequenceplanner/r2r)
-over plain OS threads — there is no async runtime.
+A *triggered* clip recorder over a **continuous `ros2 bag record`** output. It keeps the growing recording(s) open and **tails them**, so a clip can be cut as soon as the data is physically on disk: clip latency is bounded by the recorder's write-through latency. Built on [r2r](https://github.com/sequenceplanner/r2r) over plain OS threads — there is no async runtime.
 
 ## The pipeline it sits in
 
 ```
 ros2 bag record (scripts/record.sh) ──▶ ./record/<bag>_0.mcap   (one growing file)
-        ▲ kept open + tailed (incremental scan, persistent offsets)
+                                    ──▶ ./record/<bag>_1.mcap   (next split, on rollover)
+        ▲ each file discovered, kept open, and tailed (incremental scan)
 clipper ◀── /events/momentedge/trigger ── trigger-pub (or any publisher)
         │ cuts [trigger_time-preroll, trigger_time+postroll]
-        ├──▶ ./clipped/<trigger_ns>_<name>.mcap
-        └──▶ /events/momentedge/recorded
+        │   one recording  → ./clipped/<trigger_ns>_<name>.mcap
+        │   rollover split → ./clipped/<trigger_ns>_<name>_00.mcap + _01.mcap …
+        └──▶ /events/momentedge/recorded  (filenames[] lists every segment)
 ```
 
 `record.sh` is a standalone `ros2 bag record` — this binary never
-spawns it. The two communicate only through the file: there is no split event
-(rosbag2 publishes none for an unsplit bag) and none is needed.
+spawns it. The two communicate only through the files.
 
 ## Why tailing a live MCAP is sound (`tail.rs`)
 
@@ -50,10 +47,11 @@ yields three artefacts, shared with the per-trigger handlers:
   (zstd, lz4 and uncompressed chunks all work — mcap's default features);
   the default fastwrite profile is unchunked and skips that cost entirely.
 - **Coverage watch** — a `Watch<Coverage>` (`Mutex` + `Condvar`, `src/watch.rs`)
-  holding the highest `log_time` on disk plus an `ended` flag
-  (DataEnd/Footer scanned). Sound because messages land in the file in
-  (approximately) non-decreasing `log_time` order — rosbag2's single writer
-  stamps `log_time` at receive.
+  holding the collection-wide highest `log_time` (`high_water_ns`). Sound
+  because messages land in the file in (approximately) non-decreasing `log_time`
+  order — rosbag2's single writer stamps `log_time` at receive — and because the
+  tail scans recordings strictly oldest-first, one at a time, so a later
+  recording's coverage cannot advance before an earlier one is complete.
 
 Per top-level `Message` record only the 14-byte prefix is read (channel id,
 sequence, `log_time`); bodies are first touched at extraction. The same
@@ -93,56 +91,79 @@ process exits non-zero for a supervisor to restart. Limping on would degrade eve
 grace-timeout cut with no other signal, which is exactly what the fail-fast
 budget exists to prevent.
 
-**Recorder restarts and bag splits:** the recording is discovered as the newest
-`*.mcap` under `record_dir` by ctime, and re-discovered whenever that newest
-file is no longer the one being tailed — the record script wiped the bag dir on
-a restart, or rosbag2 split the bag (`--max-bag-size`/`--max-bag-duration`) and
-rolled over to `<bag>_<n+1>.mcap` beside it. In either case the index resets and
-the new file is tailed from scratch. This is the one path that re-attaches and
-resets everything — distinct from a scan fault, which keeps the index. ctime,
-not mtime, is the ordering key: at a split the freshly opened file always has a
-later ctime than the just-closed one, and ctime cannot be set into the past by a
-timestamp-preserving copy. Clips are cut from the recording currently tailed
-only; a previous file's data is never recovered into a clip, even when that file
-still exists on disk — a split clipper has already advanced past, or a rotated
-file left behind. Recovery across a recording change, restart or split alike, is
-an explicit non-feature, tracked as out of scope in beads `clipper-gl2`. A
-`NotFound` when opening the discovered path is the same race resolved the same
-way: the file vanished between discovery and open, so it is treated as a
-replacement and re-discovery loops. A magic mismatch stays fatal — an
-append-only file whose first eight bytes are wrong can never become a valid
-MCAP. In-flight extractions hold their own `Arc<File>` and finish safely against
-the deleted inode.
+**Recorder restarts and bag splits:** recordings are discovered by
+`discover::NewFileWatchIterator`, a lazy iterator that yields new `*.mcap` files
+one per `next()`. Each poll drains it; each yielded path is opened and inserted
+as a `New` recording into the collection (`TailState`). Files are tracked by
+`(dev, ino)` **identity**, not a timestamp cursor: a file under tail grows and
+its mtime (and ctime) advances, so a cursor would re-yield it every poll and
+index the same recording as a phantom duplicate. The iterator records the inode
+of every file it yields and never yields it again, forgetting inodes no longer on
+disk (so the set stays bounded and a reused inode yields its new file). mtime
+orders the unseen files oldest-first, so several appearing between polls drain in
+creation order. No file observed during a run is skipped.
 
-## Per-trigger flow (`handle_trigger`)
+At startup the newest existing file (by mtime) is adopted directly and the
+iterator seeded past every file present then. Pre-existing bags older than that
+newest file are not indexed: clipper recovers only rollovers it observes during
+its own run, never reconstructing offsets or footers it did not scan
+incrementally. A trigger fired shortly after startup whose preroll reaches into a
+prior split that existed before launch gets no segment from that file.
+
+A bag split (rosbag2 `--max-bag-size`/`--max-bag-duration`) is detected when a
+footer appears on disk, when a successor is yielded by the iterator while
+`current` is length-stable, or when the tailed inode vanishes or is replaced. In
+each case the recording transitions to `Ended` and the tail advances to the next
+indexed recording — no index reset, no data lost from recordings already in the
+collection. A recorder restart (record script wipes the bag directory) is detected
+via `inode_changed`: the tailed path no longer resolves to the open fd's inode.
+The `Arc<File>` keeps the old inode readable, so the final scan drains every
+complete record before the recording is retired, and in-flight extractions finish
+safely against the deleted inode. A magic mismatch stays fatal — an append-only
+file whose first eight bytes are wrong can never become a valid MCAP. A `NotFound`
+when opening a discovered path (the file vanished between discovery and open) is
+silently skipped; the iterator has already advanced past it.
+
+## Per-trigger flow (`handle_trigger` / `record_clip`)
 
 Each admitted `momentedge_msgs/Trigger` is handled on its own thread, so
-overlapping windows are cut concurrently against the one shared tail. Admission
+overlapping windows are cut concurrently against the shared tail. Admission
 is bounded: at most `MAX_ACTIVE_TRIGGERS` (16) handlers may be active at once,
 and a trigger that arrives while all of them are is rejected — logged with
 `error!` and otherwise ignored: no handler runs, no clip is extracted, and no
 `momentedge_msgs/Recorded` is published.
 
 1. **Wait out the postroll.** Sleep until the system clock passes
-   `trigger_time + postroll`.
-2. **Wait for coverage.** Block on the coverage watch until the recording
-   covers the window end — a message with `log_time` at/after the window end is
-   on disk (or the recording ended). A grace timeout
-   (`grace_secs`, default 30 s) bounds the wait; on timeout the clip is cut
-   from what exists, with a warning. The grace must exceed the recorder's
-   flush latency: near zero for the fastwrite profile, roughly one chunk fill
+   `trigger_time + postroll`. `checked_sub` reads the clock once per
+   iteration, so a clock that crosses `end_ns` between the check and the sleep
+   cannot underflow.
+2. **Wait for coverage.** Block on the collection-wide coverage watch until
+   `high_water_ns >= end_ns`. A grace timeout (`grace_secs`, default 30 s)
+   bounds the wait; on timeout the clip is cut from what exists, with a
+   warning. A window whose end falls inside an already-scanned recording is
+   satisfied as soon as the scan reaches `end_ns` (or at the footer), so
+   only a window whose end is past the last recorded message with no successor
+   waits out the full grace. The grace must exceed the recorder's flush
+   latency: near zero for the fastwrite profile, roughly one chunk fill
    (chunk size / aggregate data rate) for chunked profiles.
-3. **Extract** via the extraction worker pool (`extract_parallelism` threads,
-   default 1): the handler queues an `ExtractJob` (window bounds, output path,
-   bounded reply channel) on the shared FIFO channel and blocks on the reply.
-   A worker dequeues the job, snapshots `plan_window` at copy start (so a job
-   that waited in the queue still cuts from the freshest index), runs
-   `clip::extract_clip`, and sends the result back. With the default single
-   worker the bulk copies serialize FIFO; the waits in steps 1–2 are always
-   concurrent.
-4. **Announce** by publishing `momentedge_msgs/Recorded` — only after the
-   extraction has moved the clip into `out_dir` and fsynced that directory, so
-   the announce names an already-moved, crash-durable file.
+3. **Multi-file snapshot.** Call `tailer.plan_window(start_ns, end_ns)` once,
+   producing a `Vec<WindowPlan>` — one plan per recording whose extents overlap
+   the window, oldest first. Each plan carries its own `Arc<File>` clone, so a
+   retention prune or rollover after this snapshot cannot pull the bytes out.
+4. **Stage** via the staging worker pool (`extract_parallelism` `stage-N`
+   threads, default 1): one `StageJob` per plan is enqueued on the shared FIFO
+   channel and the handler blocks on each reply. A worker runs
+   `clip::stage_clip` into `.capturing/` and replies a `StagedClip`. When no
+   recording covers the window, one empty plan is staged so every trigger
+   produces a valid (possibly empty) clip.
+5. **Publish.** Empty segments are dropped when the window produced real data
+   elsewhere (one is kept if all are empty). The count determines naming: a
+   single segment keeps the bare `<trigger_ns>_<name>.mcap`; multiple segments
+   get `<base>_00.mcap`, `<base>_01.mcap`, … Each is atomically published into
+   `out_dir` via `hard_link` + unlink.
+6. **Announce** by publishing one `momentedge_msgs/Recorded` with all segment
+   paths in `filenames[]` — only after every segment is in `out_dir` and
+   fsynced, so every announced path is already crash-durable.
 
 ## The copy is direct (`clip.rs`)
 
@@ -242,12 +263,13 @@ No `rosbag2_interfaces` subscription — coverage comes from the file itself.
 
 ## Concurrency
 
-**Thread inventory.** Four singleton threads and the extraction worker pool
+**Thread inventory.** Four singleton threads and the staging worker pool
 run for the process's lifetime, plus one short-lived thread per admitted
 trigger:
 
-- **`tail`** — runs `Tailer::run`; performs all blocking file IO for the
-  incremental scan.
+- **`tail`** — runs `Tailer::run`; discovers recordings via
+  `NewFileWatchIterator`, performs all blocking file IO for the incremental
+  scan, and prunes the collection every poll.
 - **`node-spin`** — the node's single owner; loops `node.spin_once(10 ms)` to
   pump the DDS executor and feed the typed streams. Because the node is owned
   here, no other thread touches it.
@@ -255,12 +277,15 @@ trigger:
   `futures::executor::block_on` on the stream, so the stream is consumed on
   this thread without an async runtime. For each admitted trigger it spawns a
   named `trigger-<ns>` handler thread.
-- **`extract-N`** (N = 0 .. `extract_parallelism − 1`) — the extraction worker
-  pool; each worker loops on the shared FIFO job channel.
+- **`stage-N`** (N = 0 .. `extract_parallelism − 1`) — the staging worker
+  pool; each worker loops on the shared FIFO `StageJob` channel, runs
+  `clip::stage_clip`, and replies a `StagedClip`. The handler publishes the
+  staged segments itself once the window's segment count is known.
 - **`signals`** — blocks on signal-hook's iterator and forwards the first
   SIGINT or SIGTERM into a channel for `supervise`.
-- **`trigger-<ns>`** (one per admitted trigger) — runs the wait/extract/announce
-  flow for one trigger; exits when the clip is published or an error is logged.
+- **`trigger-<ns>`** (one per admitted trigger) — runs the
+  wait/snapshot/stage/publish/announce flow for one trigger; exits when the
+  clip is published or an error is logged.
 
 The `Recorded` publisher is `Clone` and is shared into each handler thread.
 
@@ -273,20 +298,22 @@ holds an `Arc<Admission>` and decrements the counter on `Drop`, so a panicking
 handler returns its slot through unwinding. The cap is a flood-sanity bound
 rather than a resource necessity: an active handler is a parked thread sleeping
 through its postroll and waiting on the coverage watch — the heavy copy stage
-is already serialized by the extraction worker pool. 16 comfortably exceeds
+is already serialized by the staging worker pool. 16 comfortably exceeds
 any legitimate concurrent trigger burst. Per-trigger failures stay isolated
 inside each handler thread — logged and counted, never propagated to the
 consumer.
 
-**Extraction worker pool.** `spawn_extract_workers` starts `extract_parallelism`
+**Staging worker pool.** `spawn_stage_workers` starts `extract_parallelism`
 threads (at least one) sharing one unbounded FIFO channel. A handler enqueues
-an `ExtractJob` (window bounds, output path, bounded(1) reply channel) and
-blocks on the reply. The worker dequeues FIFO, snapshots `plan_window` at copy
-start (after dequeue, so a queued job still cuts from the freshest index), runs
-`clip::extract_clip`, and replies. `std::panic::catch_unwind` isolates a
-panicking extraction per job; the pool thread survives and continues processing.
-With the default `extract_parallelism = 1` bulk copies serialize in submission
-order; postroll and coverage waiting are always concurrent.
+one `StageJob` per `WindowPlan` (the plan snapshot, window bounds, base output
+path, bounded(1) reply channel) and blocks on each reply. The worker dequeues
+FIFO, runs `clip::stage_clip` into `.capturing/`, and replies a `StagedClip`.
+The handler — not the worker — publishes the staged segments once the window's
+segment count is known, so naming (`_00`/`_01`) and atomic publication happen
+together. `std::panic::catch_unwind` isolates a panicking stage per job; the
+pool thread survives and continues processing. With the default
+`extract_parallelism = 1` bulk copies serialize in submission order; postroll
+and coverage waiting are always concurrent.
 
 **`supervise()`.** Each long-lived companion thread is started with
 `spawn_supervised`: the closure sends its return value over a `bounded(1)`
@@ -366,11 +393,31 @@ rationale.
 
 ## Retention
 
-None. The single file grows until the recording stops. Punching holes below a
-retention horizon with `fallocate(FALLOC_FL_PUNCH_HOLE)` — keeping offsets
-stable under the live writer — is the designed follow-up, tracked in beads as
-`clipper-wkg` (constraints: schema/channel custody, standard readers
-losing access, st_size growth, punch/extraction coordination).
+The tail prunes `Ended` recordings every poll (not only at rollover). A
+recording is pruned when its `max_log_time` is older than
+`now - watch_old_files_duration` (default 600 s, env
+`MOMENTEDGE_WATCH_OLD_FILES_DURATION`). Pruning is file-granular — never the
+`current` recording, never mid-file. Dropping a `RecordingIndex` releases its
+`Arc<File>`, closing the descriptor once no in-flight plan still holds a clone.
+Running the prune every poll (rather than only at rollover) is what bounds open
+fds and index memory when the recorder stops splitting or goes idle.
+
+`high_water_ns` is monotonic across prunes: a pruned file is below the watch
+floor and never held the collection maximum, so dropping it never lowers the
+high-water. Handlers never see coverage regress.
+
+By default pruning forgets a recording in-memory only; the `.mcap` file remains
+on disk for `ros2 bag record` and other consumers. When `--delete-old-files` is
+set (env `MOMENTEDGE_DELETE_OLD_FILES`, default false), a prune also unlinks the
+expired file from disk. An in-flight extraction's own `Arc<File>` clone keeps
+the unlinked inode readable to completion (POSIX unlink-while-open), so deletion
+never breaks a clip already in progress.
+
+**Prune vs in-flight trigger:** `watch_old_files_duration` must be set
+comfortably above the largest preroll any trigger will request. A trigger whose
+preroll reaches past the retention floor may lose its oldest segment — that
+recording was intentionally forgotten. See the [README](../../README.md#configuration)
+for the flag reference.
 
 ## Run
 

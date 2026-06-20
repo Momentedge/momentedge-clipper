@@ -29,13 +29,14 @@
 //! touched by the extraction. The same "decode only the timestamp" discipline
 //! as the rest of the workspace, applied to file tailing.
 //!
-//! The recording is discovered as the newest `*.mcap` under the record dir (by
-//! ctime) and re-discovered whenever that newest file is no longer the one
-//! being tailed: the record script wiped and recreated the bag directory on a
-//! restart, or rosbag2 split the bag and rolled over to a fresh
-//! `<bag>_<n+1>.mcap` beside it. Re-discovery resets the whole index — the old
-//! file's data is gone, never recovered into a later clip (beads clipper-gl2).
-//! Extractions already holding the old file handle finish safely against it.
+//! The tail owns a time-ordered collection of recordings. New `*.mcap` files
+//! under the record dir — a rosbag2 split rolling over to `<bag>_<n+1>.mcap`, or
+//! a restart recreating the bag directory — are discovered (a recorder running
+//! its files appear in mtime order, [`crate::discover`]) and indexed alongside
+//! the ones already known. Each is scanned in turn; a finished recording is
+//! retained for a watch window so a clip straddling a rollover recovers across
+//! it (beads clipper-gl2), then pruned. Extractions hold their own file handle,
+//! so a recording pruned or deleted while a clip reads it stays readable.
 //!
 //! Damage in the recording is tolerated the way [`crate::clip`] tolerates it
 //! at extraction: a damaged chunk, an unparseable schema/channel, or a runt
@@ -149,20 +150,24 @@ impl Extent {
     }
 }
 
-/// How far the recording provably reaches: the highest message `log_time` the
-/// tail has seen on disk, and whether the recording has ended (DataEnd/Footer
-/// scanned — nothing more will ever appear).
+/// How far the recordings provably reach: the highest message `log_time` the
+/// tail has seen on disk, across the whole collection of indexed recordings.
 ///
-/// "Provably" rests on an ordering assumption: messages land in the file in
-/// (approximately) non-decreasing `log_time` order. rosbag2 has that shape —
-/// one writer, `log_time` stamped at receive — up to millisecond-scale
-/// interleaving between concurrent subscription callbacks, which the flush
-/// and extraction latency in front of every cut dwarfs. A high-water mark at
-/// or past a window end therefore implies the window's messages are on disk.
+/// "Provably" rests on two properties. First an ordering assumption: messages
+/// land in a file in (approximately) non-decreasing `log_time` order. rosbag2
+/// has that shape — one writer, `log_time` stamped at receive — up to
+/// millisecond-scale interleaving between concurrent subscription callbacks,
+/// which the flush and extraction latency in front of every cut dwarfs. Second,
+/// the tail scans strictly in order, one `current` recording at a time, oldest
+/// first, finishing each before the next: a later file's coverage can never
+/// advance before an earlier file is complete. So a collection-wide high-water
+/// at or past a window end implies the window's messages are on disk in
+/// whichever recording holds them — no per-file coverage is needed. The mark is
+/// monotonic across retention prunes: a pruned file is below the watch floor and
+/// never held the maximum, so dropping it never lowers the high-water.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Coverage {
     pub high_water_ns: u64,
-    pub ended: bool,
 }
 
 /// A snapshot for one clip: the open recording, the extents overlapping the
@@ -174,21 +179,265 @@ pub struct WindowPlan {
     pub channels: HashMap<u16, ChannelDef>,
 }
 
-#[derive(Default)]
-struct IndexState {
-    file: Option<Arc<File>>,
+impl WindowPlan {
+    /// A plan with no source file — stages a channelless empty clip (magic +
+    /// summary + footer) for a window no recording covers. The empty path needs
+    /// no `Arc<File>`, so it serves the "no recording exists yet" case too.
+    pub fn empty() -> Self {
+        WindowPlan {
+            file: None,
+            extents: Vec::new(),
+            channels: HashMap::new(),
+        }
+    }
+}
+
+/// A monotonic recording sequence number, assigned at insertion. Insertion
+/// order is mtime order is time order (rosbag2 opens each split/restart file
+/// after closing the previous one), so a larger id is always a later recording.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, PartialOrd, Ord)]
+struct RecordingId(u64);
+
+/// Where a recording is in its lifecycle. Exactly one recording is `Tailing` at
+/// a time (the `current` one); successors wait as `New` until it finishes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecordingState {
+    /// Indexed (fd open) but not yet scanned: its 8 magic bytes may not be on
+    /// disk yet, and it waits behind the `current` recording.
+    New,
+    /// The single recording being incrementally scanned (`current`).
+    Tailing,
+    /// Fully scanned to EOF (footer, inode vanished, or superseded by a
+    /// length-stable successor). Nothing more will ever appear; eligible for
+    /// retention pruning once its data ages past the watch floor.
+    Ended,
+}
+
+/// The `log_time` span of the messages indexed in one recording. `has_messages`
+/// is false until the first timed record lands, distinguishing "no data" from
+/// "data at time 0". Drives both window overlap and retention (`max_log_time`
+/// against the watch floor). `log_time` only — `publish_time` is deferred
+/// (beads clipper-75k).
+#[derive(Clone, Copy, Debug, Default)]
+struct TimeBounds {
+    min_log_time: u64,
+    max_log_time: u64,
+    has_messages: bool,
+}
+
+impl TimeBounds {
+    fn absorb(&mut self, min: u64, max: u64) {
+        if self.has_messages {
+            self.min_log_time = self.min_log_time.min(min);
+            self.max_log_time = self.max_log_time.max(max);
+        } else {
+            *self = TimeBounds {
+                min_log_time: min,
+                max_log_time: max,
+                has_messages: true,
+            };
+        }
+    }
+}
+
+/// One indexed recording: its open file handle, scan progress, extent index,
+/// schema/channel registry, and time bounds. The tail owns a time-ordered
+/// collection of these (see [`TailState`]); trigger handlers read them through
+/// [`Tailer::plan_window`].
+struct RecordingIndex {
+    id: RecordingId,
+    path: PathBuf,
+    file: Arc<File>,
+    state: RecordingState,
+    /// The scan resume point: bytes below it are consumed, the next pass starts
+    /// here. Begins at 0 (magic unverified); set past the magic once verified.
+    offset: u64,
+    /// Whether the 8 magic bytes have been verified — gates the `New → Tailing`
+    /// transition, since a freshly created file may not hold them yet.
+    magic_ok: bool,
     extents: Vec<Extent>,
     /// The extent still accumulating records at the end of the scanned region.
     /// Included in window plans — a window may end inside it.
     open: Option<Extent>,
     schemas: HashMap<u16, SchemaDef>,
     channels: HashMap<u16, ChannelDef>,
+    bounds: TimeBounds,
+}
+
+impl RecordingIndex {
+    /// Fold one scan pass's delta into this recording's registry, extents, and
+    /// time bounds. Mirrors the single-index `apply`: schemas first (so a
+    /// channel resolves its schema against the registry as this pass updates
+    /// it), then channels, then extents, then bounds.
+    fn apply_delta(&mut self, delta: ScanDelta) {
+        for (id, schema) in delta.schemas {
+            self.schemas.insert(id, schema);
+        }
+        for raw in delta.channels {
+            let schema = (raw.schema_id != 0)
+                .then(|| self.schemas.get(&raw.schema_id).cloned())
+                .flatten();
+            self.channels.insert(
+                raw.id,
+                ChannelDef {
+                    topic: raw.topic,
+                    message_encoding: raw.message_encoding,
+                    metadata: raw.metadata,
+                    schema,
+                },
+            );
+        }
+        self.extents.extend(delta.closed);
+        self.open = delta.open;
+        for extent in self.extents.iter().chain(self.open.iter()) {
+            if let Some((min, max)) = extent.time {
+                self.bounds.absorb(min, max);
+            }
+        }
+    }
+
+    /// A single-file [`WindowPlan`] over this recording's extents overlapping
+    /// `[start_ns, end_ns]`, or `None` if none do.
+    fn plan(&self, start_ns: u64, end_ns: u64) -> Option<WindowPlan> {
+        let extents: Vec<Extent> = self
+            .extents
+            .iter()
+            .chain(self.open.iter())
+            .filter(|e| e.overlaps(start_ns, end_ns))
+            .copied()
+            .collect();
+        (!extents.is_empty()).then(|| WindowPlan {
+            file: Some(self.file.clone()),
+            extents,
+            channels: self.channels.clone(),
+        })
+    }
+}
+
+/// The tail-owned collection of recording indexes, in time order
+/// (oldest .. newest), plus which one is being incrementally scanned. The tail
+/// thread is the sole writer; trigger handlers only read it (under the mutex)
+/// via [`Tailer::plan_window`].
+#[derive(Default)]
+struct TailState {
+    recordings: std::collections::VecDeque<RecordingIndex>,
+    /// The recording being incrementally tailed (`Tailing`). `None` before the
+    /// first file is discovered or after the last one ends with no successor.
+    current: Option<RecordingId>,
+    /// Source of the next [`RecordingId`]; only ever increases.
+    next_id: u64,
+}
+
+impl TailState {
+    fn recording(&self, id: RecordingId) -> Option<&RecordingIndex> {
+        self.recordings.iter().find(|r| r.id == id)
+    }
+
+    fn recording_mut(&mut self, id: RecordingId) -> Option<&mut RecordingIndex> {
+        self.recordings.iter_mut().find(|r| r.id == id)
+    }
+
+    /// Index a freshly discovered recording at the back of the collection (it is
+    /// the newest). Adopts it as `current` when there is none (startup, or after
+    /// the last recording ended) so the first file is always tailed; otherwise
+    /// it waits as a `New` successor behind the recording in flight.
+    fn insert_new_recording(&mut self, path: PathBuf, file: Arc<File>) -> RecordingId {
+        let id = RecordingId(self.next_id);
+        self.next_id += 1;
+        self.recordings.push_back(RecordingIndex {
+            id,
+            path,
+            file,
+            state: RecordingState::New,
+            offset: 0,
+            magic_ok: false,
+            extents: Vec::new(),
+            open: None,
+            schemas: HashMap::new(),
+            channels: HashMap::new(),
+            bounds: TimeBounds::default(),
+        });
+        if self.current.is_none() {
+            self.current = Some(id);
+        }
+        id
+    }
+
+    /// Mark a recording as the one being scanned.
+    fn mark_tailing(&mut self, id: RecordingId) {
+        if let Some(r) = self.recording_mut(id) {
+            r.state = RecordingState::Tailing;
+        }
+    }
+
+    /// Retire the finished `current` recording and advance to the oldest
+    /// remaining non-`Ended` one (the next split/restart), or to no current at
+    /// all when none remain.
+    fn mark_ended_and_advance(&mut self, id: RecordingId) {
+        if let Some(r) = self.recording_mut(id) {
+            r.state = RecordingState::Ended;
+        }
+        self.current = self
+            .recordings
+            .iter()
+            .find(|r| r.state != RecordingState::Ended)
+            .map(|r| r.id);
+    }
+
+    /// Whether a recording newer than `id` has been indexed — a successor is
+    /// present, so rosbag2 has already closed `id`'s file.
+    fn has_successor(&self, id: RecordingId) -> bool {
+        self.recordings.iter().any(|r| r.id > id)
+    }
+
+    /// One single-file [`WindowPlan`] per recording overlapping
+    /// `[start_ns, end_ns]`, oldest first. Empty when no recording covers the
+    /// window (a rollover gap, all relevant files pruned, or nothing indexed
+    /// yet) — the caller then stages one empty clip.
+    fn plan_window(&self, start_ns: u64, end_ns: u64) -> Vec<WindowPlan> {
+        self.recordings
+            .iter()
+            .filter_map(|r| r.plan(start_ns, end_ns))
+            .collect()
+    }
+
+    /// Drop every `Ended` recording whose newest data is older than
+    /// `floor_ns` — never the `current` file, never a `New` or `Tailing` one,
+    /// never mid-file. Returns the dropped recordings' paths (for optional
+    /// on-disk deletion). Dropping a [`RecordingIndex`] releases its
+    /// `Arc<File>`, closing the descriptor once no in-flight plan still holds a
+    /// clone, so the prune bounds both memory and open fds.
+    fn prune(&mut self, floor_ns: u64) -> Vec<PathBuf> {
+        let mut pruned = Vec::new();
+        self.recordings.retain(|r| {
+            let expired = r.state == RecordingState::Ended
+                && Some(r.id) != self.current
+                && r.bounds.has_messages
+                && r.bounds.max_log_time < floor_ns;
+            if expired {
+                pruned.push(r.path.clone());
+            }
+            !expired
+        });
+        pruned
+    }
+
+    /// The collection-wide high-water `log_time` — the maximum over all indexed
+    /// recordings.
+    fn high_water_ns(&self) -> u64 {
+        self.recordings
+            .iter()
+            .filter(|r| r.bounds.has_messages)
+            .map(|r| r.bounds.max_log_time)
+            .max()
+            .unwrap_or(0)
+    }
 }
 
 /// Shared tail state: the scanning thread feeds it, trigger handlers snapshot
 /// it via [`Tailer::plan_window`] and wait on the coverage watch.
 pub struct Tailer {
-    state: Mutex<IndexState>,
+    state: Mutex<TailState>,
     coverage: Arc<Watch<Coverage>>,
 }
 
@@ -321,183 +570,260 @@ impl Tailer {
         let coverage = Arc::new(Watch::new(Coverage::default()));
         (
             Arc::new(Tailer {
-                state: Mutex::new(IndexState::default()),
+                state: Mutex::new(TailState::default()),
                 coverage: coverage.clone(),
             }),
             coverage,
         )
     }
 
-    /// Snapshot everything one clip needs for `[start_ns, end_ns]`.
-    pub fn plan_window(&self, start_ns: u64, end_ns: u64) -> WindowPlan {
-        let st = self.state.lock().unwrap();
-        let extents = st
-            .extents
-            .iter()
-            .chain(st.open.iter())
-            .filter(|e| e.overlaps(start_ns, end_ns))
-            .copied()
-            .collect();
-        WindowPlan {
-            file: st.file.clone(),
-            extents,
-            channels: st.channels.clone(),
-        }
+    /// Snapshot one single-file plan per recording overlapping
+    /// `[start_ns, end_ns]`, oldest first. A window inside one recording yields
+    /// one plan; one straddling a rollover yields one per source file. Empty
+    /// when no indexed recording covers the window.
+    pub fn plan_window(&self, start_ns: u64, end_ns: u64) -> Vec<WindowPlan> {
+        self.state.lock().unwrap().plan_window(start_ns, end_ns)
     }
 
-    /// Tail forever: discover the newest `*.mcap` under `record_dir`, scan it
-    /// until it is superseded by a newer one, start over. Blocking — run on its
-    /// own thread.
+    /// Tail forever: follow the directory's recordings as a time-ordered
+    /// collection, scanning each in turn and recovering across rollovers.
+    /// Blocking — run on its own thread.
     ///
-    /// Returns only when [`Self::tail_file`] fails: a scan fault it could not
-    /// retry past, a recording that is not an MCAP, or an IO error around the
-    /// tailed file. The error names the file, and the supervisor exits the
-    /// process for a restart — limping on would degrade every clip to a
-    /// grace-timeout cut silently. A missing or empty record directory is not a fault: discovery
-    /// idles until the recording creates the bag dir, the
-    /// documented startup state. `tail_file` returning `Ok` (a recorder restart
-    /// or a rosbag2 split rolling over to a new file) just loops back to
-    /// re-discover the newest recording.
-    pub fn run(&self, record_dir: &Path) -> Result<()> {
+    /// Discovery is a [`crate::discover::NewFileWatchIterator`]: each poll drains
+    /// the `*.mcap` files that appeared since the last and indexes each as a
+    /// `New` recording. At startup the newest existing file is adopted directly
+    /// and the iterator seeded past every file present then, so a pre-existing
+    /// backlog is **not** re-indexed — clipper recovers only rollovers it observes
+    /// during its own run, never reconstructing offsets or footers it did not scan
+    /// incrementally.
+    ///
+    /// The `current` recording is scanned incrementally until it finishes — a
+    /// footer/DataEnd on disk, its own inode vanishing or being replaced (a
+    /// record-script dir wipe + restart), or a length-stable successor appearing
+    /// (an abrupt split whose footer never flushed) — the last scan to EOF
+    /// having already drained every complete trailing record. Then `current`
+    /// advances to the next recording. Every poll prunes `Ended` recordings
+    /// whose newest data has aged past the watch floor (`watch`), releasing
+    /// their fds and — when `delete_old_files` is set — unlinking them from disk.
+    ///
+    /// Returns only on an unrecoverable scan fault (the same byte faulting
+    /// through the whole [`MAX_SCAN_FAULTS`] budget) or a magic mismatch; the
+    /// supervisor then exits the process for a restart, since limping on would
+    /// degrade every clip to a grace-timeout cut silently. A missing or empty
+    /// record directory is not a fault — discovery idles until the recorder
+    /// creates the bag dir, the documented startup state.
+    pub fn run(&self, record_dir: &Path, watch: Duration, delete_old_files: bool) -> Result<()> {
+        let watch_ns = watch.as_nanos().min(u64::MAX as u128) as u64;
+
+        // Startup seed: adopt the newest existing recording directly, and seed
+        // the iterator past every file present now so the backlog behind it is
+        // not indexed — discovery yields only recordings that appear later.
+        let mut discover = match newest_mcap(record_dir) {
+            Some(newest) => {
+                self.index_recording(&newest);
+                crate::discover::NewFileWatchIterator::seeded(record_dir)
+            }
+            None => crate::discover::NewFileWatchIterator::new(record_dir),
+        };
+
+        let mut faults = 0u32;
         loop {
-            let path = loop {
-                if let Some(p) = newest_mcap(record_dir) {
-                    break p;
+            // 1. Discover: index every file that appeared since the last poll.
+            //    `by_ref` so the iterator (and its seen-inode set) survives the
+            //    poll — it is drained again next iteration as files appear.
+            for path in discover.by_ref() {
+                self.index_recording(&path);
+            }
+
+            // 2. Prune aged-out recordings (every poll, not only at rollover) —
+            //    bounds open fds and index memory even when the recorder idles.
+            let floor = now_ns().saturating_sub(watch_ns);
+            for path in self.state.lock().unwrap().prune(floor) {
+                info!("retention: forgetting {}", path.display());
+                if delete_old_files {
+                    match std::fs::remove_file(&path) {
+                        Ok(()) => info!("retention: deleted {}", path.display()),
+                        Err(e) => warn!("retention: deleting {}: {e}", path.display()),
+                    }
                 }
+            }
+
+            // 3. Scan the current recording, if one is in flight.
+            let Some(id) = self.current_id() else {
                 std::thread::sleep(DISCOVER_POLL);
+                continue;
             };
-            info!("tailing {}", path.display());
-            self.tail_file(record_dir, &path)
-                .with_context(|| format!("tailing {}", path.display()))?;
-            info!("recording {} replaced; re-discovering", path.display());
+            match self.poll_current(id)? {
+                PollOutcome::Progressed | PollOutcome::Ended => faults = 0,
+                PollOutcome::Idle => {
+                    faults = 0;
+                    std::thread::sleep(TAIL_POLL);
+                }
+                PollOutcome::NotReady => std::thread::sleep(TAIL_POLL),
+                PollOutcome::Faulted(fault) => {
+                    faults += 1;
+                    if faults >= MAX_SCAN_FAULTS {
+                        return Err(fault).with_context(|| {
+                            format!("scan faulted on {faults} consecutive passes; giving up")
+                        });
+                    }
+                    let backoff = backoff_for(faults);
+                    warn!(
+                        "scan faulted ({fault:#}); retry {faults}/{MAX_SCAN_FAULTS} after {backoff:?}"
+                    );
+                    std::thread::sleep(backoff);
+                }
+            }
         }
     }
 
-    /// Point the shared state at a new recording, dropping everything known
-    /// about a previous one.
+    /// The id of the recording currently being tailed, if any.
+    fn current_id(&self) -> Option<RecordingId> {
+        self.state.lock().unwrap().current
+    }
+
+    /// Open a freshly discovered recording and index it at the back of the
+    /// collection (adopted as `current` when there is none). A file that
+    /// vanished between discovery and open (a dir wipe) is skipped; the iterator
+    /// has already advanced past it.
+    pub(crate) fn index_recording(&self, path: &Path) {
+        match File::open(path) {
+            Ok(f) => {
+                let id = self
+                    .state
+                    .lock()
+                    .unwrap()
+                    .insert_new_recording(path.to_path_buf(), Arc::new(f));
+                info!("indexing recording {} as {id:?}", path.display());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => warn!("opening discovered {}: {e}", path.display()),
+        }
+    }
+
+    /// Retire the finished `current` recording and advance to the next.
+    fn end_current(&self, id: RecordingId) {
+        self.state.lock().unwrap().mark_ended_and_advance(id);
+    }
+
+    /// One scan poll of the `current` recording: verify its magic on first
+    /// contact, scan the bytes added since the last pass (applying them to its
+    /// index and refreshing coverage), then decide whether it has finished.
+    fn poll_current(&self, id: RecordingId) -> Result<PollOutcome> {
+        let (path, file, mut offset, magic_ok) = {
+            let st = self.state.lock().unwrap();
+            let r = st.recording(id).expect("current id is in the collection");
+            (r.path.clone(), r.file.clone(), r.offset, r.magic_ok)
+        };
+
+        // First contact: the writer may not have flushed the 8 magic bytes yet.
+        if !magic_ok {
+            if file_len(&file)? < MAGIC.len() as u64 {
+                // Too short to validate. If it vanished before it ever became a
+                // valid MCAP, retire it; otherwise wait for the magic.
+                if inode_changed(&path, &file)? {
+                    self.end_current(id);
+                    return Ok(PollOutcome::Ended);
+                }
+                return Ok(PollOutcome::NotReady);
+            }
+            let mut magic = [0u8; 8];
+            file.read_exact_at(&mut magic, 0)?;
+            if magic != MAGIC {
+                bail!("{} is not an MCAP file", path.display());
+            }
+            offset = MAGIC.len() as u64;
+            let mut st = self.state.lock().unwrap();
+            if let Some(r) = st.recording_mut(id) {
+                r.offset = offset;
+                r.magic_ok = true;
+            }
+            st.mark_tailing(id);
+            info!("tailing {}", path.display());
+        }
+
+        // Incremental scan to the current EOF; applies the delta to `current`
+        // (== id) and refreshes the coverage high-water.
+        let progress = self.scan_available(&file, offset, file_len(&file)?);
+        let made_progress = progress.offset != offset;
+
+        if let Some(fault) = progress.fault {
+            // A restart/replacement during the fault is recovery, not a
+            // continued fault: the file we were stuck on is gone.
+            if inode_changed(&path, &file)? {
+                self.end_current(id);
+                return Ok(PollOutcome::Ended);
+            }
+            let fault = fault.context(format!(
+                "scan of {} faulted at offset {}",
+                path.display(),
+                progress.offset
+            ));
+            return Ok(PollOutcome::Faulted(fault));
+        }
+
+        // Finished on any of three signals; the scan above already drained every
+        // complete record to EOF, so nothing trailing is lost.
+        let inode_dead = inode_changed(&path, &file)?;
+        let has_successor = self.state.lock().unwrap().has_successor(id);
+        if progress.ended || inode_dead || (has_successor && !made_progress) {
+            let why = if progress.ended {
+                "footer on disk"
+            } else if inode_dead {
+                "inode vanished/replaced"
+            } else {
+                "successor present, length stable"
+            };
+            info!("recording {} ended ({why})", path.display());
+            self.end_current(id);
+            return Ok(PollOutcome::Ended);
+        }
+
+        Ok(if made_progress {
+            PollOutcome::Progressed
+        } else {
+            PollOutcome::Idle
+        })
+    }
+
+    /// Test/setup helper: index `file` as the sole recording and mark it the
+    /// `current` one, ready to scan from past the magic. Production discovery
+    /// runs through [`Self::run`]'s iterator instead of this.
+    #[cfg(test)]
     pub(crate) fn attach(&self, file: Arc<File>) {
         let mut st = self.state.lock().unwrap();
-        *st = IndexState {
-            file: Some(file),
-            ..IndexState::default()
-        };
-        drop(st);
-        self.coverage.send_replace(Coverage::default());
+        let id = st.insert_new_recording(PathBuf::new(), file);
+        if let Some(r) = st.recording_mut(id) {
+            r.magic_ok = true;
+            r.offset = MAGIC.len() as u64;
+        }
+        st.mark_tailing(id);
     }
 
-    /// Scan one recording until it is superseded by the newest `*.mcap` in
-    /// `record_dir` (a recorder restart or a rosbag2 split → `Ok`), alternating
-    /// incremental passes with short sleeps.
-    ///
-    /// The index is attached once here and never wiped while this recording is
-    /// tailed: a scan fault does not re-attach or rescan from scratch. A fault
-    /// leaves the partial delta applied and reports the faulted offset, so a
-    /// retry resumes exactly there (see [`Self::scan_available`]). Consecutive
-    /// faults are bounded by [`MAX_SCAN_FAULTS`] with backoff growing from
-    /// [`DISCOVER_POLL`] to [`SCAN_BACKOFF_CAP`]; a fault-free pass resets the
-    /// count. The backoff is slept in `DISCOVER_POLL` increments while polling
-    /// [`superseded`], so a restart or split during backoff is recovery (`Ok`),
-    /// not a continued fault. Exhausting the retries returns the last fault,
-    /// named with the path, offset, and attempt count: the same byte faulted
-    /// every retry, so the file is genuinely stuck and the process exits for a
-    /// supervisor to restart rather than degrading every clip silently.
-    ///
-    /// A `NotFound` on open means the file vanished between discovery and open
-    /// (the record script wiping the bag dir) — treated as a replacement, not
-    /// an error. A magic mismatch stays fatal: an append-only file whose first
-    /// eight bytes are wrong can never become a valid MCAP.
-    fn tail_file(&self, record_dir: &Path, path: &Path) -> Result<()> {
-        let file = match File::open(path) {
-            Ok(f) => Arc::new(f),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(e).with_context(|| format!("opening {}", path.display())),
+    /// Publish one scan pass's delta to the `current` recording — its registry,
+    /// extents, and time bounds — record its new scan offset, and refresh the
+    /// collection-wide coverage high-water (monotonic; never lowered). The brief
+    /// state lock is the only one a handler's `plan_window` can contend on; the
+    /// file IO above ran with no lock held.
+    fn apply_to_current(&self, delta: ScanDelta, offset: u64) {
+        let hw = {
+            let mut st = self.state.lock().unwrap();
+            if let Some(id) = st.current
+                && let Some(r) = st.recording_mut(id)
+            {
+                r.apply_delta(delta);
+                r.offset = offset;
+            }
+            st.high_water_ns()
         };
-        self.attach(file.clone());
-
-        // The writer may not have put the 8 magic bytes on disk yet.
-        while file_len(&file)? < MAGIC.len() as u64 {
-            if superseded(record_dir, &file)? {
-                return Ok(());
+        self.coverage.send_if_modified(|c| {
+            if hw > c.high_water_ns {
+                c.high_water_ns = hw;
+                true
+            } else {
+                false
             }
-            std::thread::sleep(TAIL_POLL);
-        }
-        let mut magic = [0u8; 8];
-        file.read_exact_at(&mut magic, 0)?;
-        if magic != MAGIC {
-            bail!("{} is not an MCAP file", path.display());
-        }
-
-        let mut offset = MAGIC.len() as u64;
-        let mut consecutive_faults = 0u32;
-        loop {
-            let progress = self.scan_available(&file, offset, file_len(&file)?);
-            let made_progress = progress.offset != offset;
-            offset = progress.offset;
-
-            if let Some(fault) = progress.fault {
-                consecutive_faults += 1;
-                if consecutive_faults >= MAX_SCAN_FAULTS {
-                    return Err(fault).with_context(|| {
-                        format!(
-                            "scan of {} faulted at offset {offset} on {consecutive_faults} \
-                             consecutive passes; giving up",
-                            path.display()
-                        )
-                    });
-                }
-                // Back off (doubling from DISCOVER_POLL, capped) before
-                // retrying at the same offset, but watch for supersession
-                // throughout: a restart or split mid-backoff is recovery, not a
-                // fault.
-                let backoff = backoff_for(consecutive_faults);
-                warn!(
-                    "scan of {} faulted at offset {offset} ({fault:#}); \
-                     retry {consecutive_faults}/{MAX_SCAN_FAULTS} after {backoff:?}",
-                    path.display()
-                );
-                if self.superseded_during(record_dir, &file, backoff)? {
-                    return Ok(());
-                }
-                continue;
-            }
-
-            consecutive_faults = 0;
-
-            if progress.ended {
-                // DataEnd/Footer scanned: this recording is complete (the
-                // recorder stopped, or rosbag2 closed this split before rolling
-                // over). Nothing more will appear here; wait for a newer
-                // recording to supersede it.
-                info!("recording {} ended (footer on disk)", path.display());
-                while !superseded(record_dir, &file)? {
-                    std::thread::sleep(DISCOVER_POLL);
-                }
-                return Ok(());
-            }
-            if !made_progress {
-                if superseded(record_dir, &file)? {
-                    return Ok(());
-                }
-                std::thread::sleep(TAIL_POLL);
-            }
-        }
-    }
-
-    /// Sleep up to `total`, in [`DISCOVER_POLL`] increments, returning early
-    /// `true` as soon as `file` is [`superseded`] by the newest recording in
-    /// `dir` (a recorder restart or a split). Lets a fault backoff treat a
-    /// supersession during the wait as recovery.
-    fn superseded_during(&self, dir: &Path, file: &File, total: Duration) -> Result<bool> {
-        let mut waited = Duration::ZERO;
-        while waited < total {
-            if superseded(dir, file)? {
-                return Ok(true);
-            }
-            let step = DISCOVER_POLL.min(total - waited);
-            std::thread::sleep(step);
-            waited += step;
-        }
-        superseded(dir, file)
+        });
     }
 
     /// One incremental pass: consume every record completely on disk in
@@ -524,7 +850,12 @@ impl Tailer {
         file_len: u64,
     ) -> ScanProgress {
         let mut delta = ScanDelta {
-            open: self.state.lock().unwrap().open,
+            open: {
+                let st = self.state.lock().unwrap();
+                st.current
+                    .and_then(|id| st.recording(id))
+                    .and_then(|r| r.open)
+            },
             ..ScanDelta::default()
         };
         let mut ended = false;
@@ -629,61 +960,29 @@ impl Tailer {
             offset = end;
         }
 
-        self.apply(delta, ended);
+        self.apply_to_current(delta, offset);
         ScanProgress {
             offset,
             ended,
             fault,
         }
     }
+}
 
-    /// Publish one pass's delta: registry inserts (channels resolve their
-    /// schema against the registry as updated by this pass), extent appends,
-    /// then the coverage watch.
-    ///
-    /// The MCAP spec requires a Schema record to appear before any Channel
-    /// referencing it, so a channel's schema is always complete on disk — and
-    /// thus in the registry — by the pass that consumes the channel record.
-    /// A file violating that order still resolves when both records land in
-    /// one pass (schemas apply first); otherwise the channel degrades to
-    /// schemaless instead of failing, where the reference reader hard-errors
-    /// (`McapError::UnknownSchema`).
-    fn apply(&self, delta: ScanDelta, ended: bool) {
-        let mut st = self.state.lock().unwrap();
-        for (id, schema) in delta.schemas {
-            st.schemas.insert(id, schema);
-        }
-        for raw in delta.channels {
-            let schema = (raw.schema_id != 0)
-                .then(|| st.schemas.get(&raw.schema_id).cloned())
-                .flatten();
-            st.channels.insert(
-                raw.id,
-                ChannelDef {
-                    topic: raw.topic,
-                    message_encoding: raw.message_encoding,
-                    metadata: raw.metadata,
-                    schema,
-                },
-            );
-        }
-        st.extents.extend(delta.closed);
-        st.open = delta.open;
-        drop(st);
-
-        self.coverage.send_if_modified(|c| {
-            let mut changed = false;
-            if delta.high_water_ns > c.high_water_ns {
-                c.high_water_ns = delta.high_water_ns;
-                changed = true;
-            }
-            if ended && !c.ended {
-                c.ended = true;
-                changed = true;
-            }
-            changed
-        });
-    }
+/// The outcome of one [`Tailer::poll_current`] scan pass, telling [`Tailer::run`]
+/// how to pace the next iteration and how to count faults.
+#[derive(Debug)]
+enum PollOutcome {
+    /// New bytes were consumed; loop again immediately.
+    Progressed,
+    /// Caught up to EOF with the recording still live; sleep [`TAIL_POLL`].
+    Idle,
+    /// `current` is `New` and its 8 magic bytes are not on disk yet.
+    NotReady,
+    /// The recording finished; `current` has advanced.
+    Ended,
+    /// A framing fault with no resync point; back off and retry the same byte.
+    Faulted(anyhow::Error),
 }
 
 /// The scan-fault backoff for the `n`th consecutive fault (1-based): doubling
@@ -696,13 +995,12 @@ fn backoff_for(n: u32) -> Duration {
         .min(SCAN_BACKOFF_CAP)
 }
 
-/// The newest `*.mcap` directly under `dir` by status-change time (ctime) — the
-/// file rosbag2 most recently created or wrote to. ctime, not mtime, because it
-/// tracks the filesystem's own creation/append order and cannot be set into the
-/// past by a tool that preserves timestamps: at a rosbag2 split the freshly
-/// opened `<bag>_<n+1>.mcap` always carries a later ctime than the just-closed
-/// `<bag>_<n>.mcap`, so this resolves to the split the recorder rolled over to.
-/// `None` while the directory or file does not exist yet.
+/// The newest `*.mcap` directly under `dir` by modification time (mtime) — the
+/// file most recently written to. At a rosbag2 split the just-closed
+/// `<bag>_<n>.mcap` stops being written while `<bag>_<n+1>.mcap` keeps growing,
+/// so the live recording carries the latest mtime; this resolves to it. Used
+/// only to pick the recording adopted at startup. `None` while the directory or
+/// file does not exist yet.
 fn newest_mcap(dir: &Path) -> Option<PathBuf> {
     std::fs::read_dir(dir)
         .ok()?
@@ -710,38 +1008,35 @@ fn newest_mcap(dir: &Path) -> Option<PathBuf> {
         .filter(|p| p.extension().is_some_and(|e| e == "mcap"))
         .max_by_key(|p| {
             std::fs::metadata(p)
-                .map(|m| (m.ctime(), m.ctime_nsec()))
+                .map(|m| (m.mtime(), m.mtime_nsec()))
                 .unwrap_or((i64::MIN, i64::MIN))
         })
 }
 
-/// Whether the tail should stop following `file` and re-discover, because the
-/// newest `*.mcap` in `dir` is no longer `file`. Two situations resolve the
-/// same way:
-///
-/// * `file`'s inode vanished — the record script wiped the bag dir and the
-///   recorder restarted into a fresh file (`newest_mcap` returns another file
-///   or `None`).
-/// * a newer recording appeared beside `file` — rosbag2 split and rolled over
-///   to `<bag>_<n+1>.mcap`, which now carries the later ctime.
-///
-/// In both, the newest file is the one to tail and the file left behind is
-/// treated as lost: its data is never recovered into a later clip (the
-/// cross-file non-recovery rule, beads clipper-gl2). An empty or vanished
-/// directory also returns `true`, sending [`Tailer::run`] back to its discovery
-/// idle until a recording reappears.
-fn superseded(dir: &Path, file: &File) -> Result<bool> {
-    let newest = match newest_mcap(dir) {
-        Some(p) => p,
-        None => return Ok(true),
-    };
-    let by_newest = match std::fs::metadata(&newest) {
-        Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
-        Err(e) => return Err(e).with_context(|| format!("stat {}", newest.display())),
-    };
+/// Whether `path` no longer resolves to `file`'s open inode — the file vanished
+/// (the record script wiped the bag dir) or was replaced by a restart's fresh
+/// inode. This is the narrowed survivor of the old whole-directory `superseded`
+/// check: *"is **my** file still live"*, not *"is there a newer file"* — the
+/// [`crate::discover::NewFileWatchIterator`] owns the latter. The open
+/// `Arc<File>` keeps the old inode readable regardless, so the final scan still
+/// drains every complete record before the recording is retired. A `NotFound` on
+/// `path` means the file is gone; any other stat error propagates.
+fn inode_changed(path: &Path, file: &File) -> Result<bool> {
     let by_fd = file.metadata().context("stat of tailed file")?;
-    Ok((by_newest.dev(), by_newest.ino()) != (by_fd.dev(), by_fd.ino()))
+    match std::fs::metadata(path) {
+        Ok(m) => Ok((m.dev(), m.ino()) != (by_fd.dev(), by_fd.ino())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(e) => Err(e).with_context(|| format!("stat {}", path.display())),
+    }
+}
+
+/// Nanoseconds since the Unix epoch on the system clock — the same base as
+/// message `log_time`, for computing the retention watch floor.
+fn now_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos().min(u64::MAX as u128) as u64)
+        .unwrap_or(0)
 }
 
 fn file_len(file: &File) -> Result<u64> {
@@ -845,6 +1140,40 @@ pub(crate) mod tests {
         }
     }
 
+    /// Open `path` and attach it as the sole `current` recording, returning the
+    /// handle — the setup the single-recording scan tests share. A scan applies
+    /// to the `current` recording, so a standalone scan needs one indexed first.
+    pub(crate) fn attached(tailer: &Tailer, path: &Path) -> Result<Arc<File>> {
+        let file = Arc::new(File::open(path)?);
+        tailer.attach(file.clone());
+        Ok(file)
+    }
+
+    /// The single plan a one-recording test cuts from: [`Tailer::plan_window`]
+    /// returns one plan per overlapping recording, and these tests index one, so
+    /// its `Vec` holds at most one; no overlap becomes an empty plan.
+    pub(crate) fn plan_one(tailer: &Tailer, start_ns: u64, end_ns: u64) -> WindowPlan {
+        tailer
+            .plan_window(start_ns, end_ns)
+            .into_iter()
+            .next()
+            .unwrap_or_else(WindowPlan::empty)
+    }
+
+    /// Drive scan polls until every indexed recording has been scanned to
+    /// `Ended` (no `current` remains) — the synchronous equivalent of the run
+    /// loop for a fixed set of already-finished recordings. Used by the
+    /// collection tests, which index several recordings up front and then drain.
+    pub(crate) fn drain(tailer: &Tailer) -> Result<()> {
+        let mut guard = 0;
+        while let Some(id) = tailer.current_id() {
+            tailer.poll_current(id)?;
+            guard += 1;
+            assert!(guard < 1000, "drain did not converge");
+        }
+        Ok(())
+    }
+
     #[test]
     fn scan_consumes_only_complete_records_and_resumes() -> Result<()> {
         let root = test_dir("grow")?;
@@ -882,9 +1211,8 @@ pub(crate) mod tests {
 
         let cov = coverage.get();
         assert_eq!(cov.high_water_ns, 400);
-        assert!(cov.ended);
 
-        let plan = tailer.plan_window(150, 350);
+        let plan = plan_one(&tailer, 150, 350);
         assert!(!plan.extents.is_empty());
         let topics: Vec<_> = plan.channels.values().map(|c| c.topic.clone()).collect();
         assert!(topics.contains(&"/a".to_string()) && topics.contains(&"/b".to_string()));
@@ -906,7 +1234,7 @@ pub(crate) mod tests {
 
         assert!(progress.ended);
         assert_eq!(coverage.get().high_water_ns, 30);
-        let plan = tailer.plan_window(0, 100);
+        let plan = plan_one(&tailer, 0, 100);
         assert_eq!(plan.channels.len(), 2, "channels live inside the chunks");
         assert!(
             plan.channels.values().all(|c| c.schema.is_some()),
@@ -929,15 +1257,15 @@ pub(crate) mod tests {
         tailer.attach(file.clone());
         scan_to_end(&tailer, &file, MAGIC.len() as u64)?;
 
-        assert!(tailer.plan_window(300, 500).extents.is_empty());
-        assert!(!tailer.plan_window(150, 500).extents.is_empty());
+        assert!(plan_one(&tailer, 300, 500).extents.is_empty());
+        assert!(!plan_one(&tailer, 150, 500).extents.is_empty());
 
         // Inclusive boundaries, exactly at the extent's min/max (100, 200):
         // a window touching a bound by one nanosecond still plans the extent.
-        assert!(!tailer.plan_window(200, 500).extents.is_empty());
-        assert!(tailer.plan_window(201, 500).extents.is_empty());
-        assert!(!tailer.plan_window(0, 100).extents.is_empty());
-        assert!(tailer.plan_window(0, 99).extents.is_empty());
+        assert!(!plan_one(&tailer, 200, 500).extents.is_empty());
+        assert!(plan_one(&tailer, 201, 500).extents.is_empty());
+        assert!(!plan_one(&tailer, 0, 100).extents.is_empty());
+        assert!(plan_one(&tailer, 0, 99).extents.is_empty());
 
         std::fs::remove_dir_all(root)?;
         Ok(())
@@ -1062,14 +1390,17 @@ pub(crate) mod tests {
                     op::SCHEMA,
                     &schema_body(5, "std_msgs/msg/String", "ros2msg", b"string data"),
                 ),
+                // A message so the channel's extent carries a time and is
+                // plannable; the registry resolution is what this test checks.
+                raw_record(op::MESSAGE, &message_body(1, 0, 10, b"x")),
             ],
         )?;
 
         let (tailer, _coverage) = Tailer::new();
-        let file = File::open(&path)?;
+        let file = attached(&tailer, &path)?;
         scan_to_end(&tailer, &file, MAGIC.len() as u64)?;
 
-        let plan = tailer.plan_window(0, u64::MAX);
+        let plan = plan_one(&tailer, 0, u64::MAX);
         let ch = plan.channels.get(&1).expect("channel registered");
         let schema = ch.schema.as_ref().expect("same-pass schema resolves");
         assert_eq!(schema.name, "std_msgs/msg/String");
@@ -1084,8 +1415,13 @@ pub(crate) mod tests {
         let path = root.join("rec.mcap");
         std::fs::write(&path, b"definitely not an mcap file")?;
 
+        // Indexed as the current recording, the first scan poll verifies the
+        // magic and rejects it: an append-only file whose first eight bytes are
+        // wrong can never become a valid MCAP.
         let (tailer, _coverage) = Tailer::new();
-        let err = tailer.tail_file(&root, &path).unwrap_err();
+        tailer.index_recording(&path);
+        let id = tailer.current_id().expect("the file is indexed as current");
+        let err = tailer.poll_current(id).unwrap_err();
         assert!(
             err.to_string().contains("not an MCAP file"),
             "unexpected error: {err:#}"
@@ -1096,15 +1432,19 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn tail_file_on_a_missing_path_is_not_an_error() -> Result<()> {
+    fn a_vanished_discovered_file_indexes_nothing() -> Result<()> {
         let root = test_dir("missing")?;
         let path = root.join("gone.mcap");
 
-        // The newest-mcap discovery can race the record script wiping the bag
-        // dir: the file vanishes between discovery and open. A NotFound on
-        // open is the same as a replacement — Ok(()), re-discover — not a fault.
+        // Discovery can race the record script wiping the bag dir: the file
+        // vanishes between the iterator yielding it and the open. A NotFound on
+        // open is skipped — no recording indexed, no current, no fault.
         let (tailer, _coverage) = Tailer::new();
-        tailer.tail_file(&root, &path)?;
+        tailer.index_recording(&path);
+        assert!(
+            tailer.current_id().is_none(),
+            "a vanished file leaves nothing indexed"
+        );
 
         std::fs::remove_dir_all(root)?;
         Ok(())
@@ -1134,7 +1474,7 @@ pub(crate) mod tests {
         std::fs::write(&path, bytes)?;
 
         let (tailer, coverage) = Tailer::new();
-        let file = File::open(&path)?;
+        let file = attached(&tailer, &path)?;
         let progress = scan_to_end(&tailer, &file, MAGIC.len() as u64)?;
 
         let fault = progress.fault.expect("the oversized record must fault");
@@ -1151,7 +1491,7 @@ pub(crate) mod tests {
         // The good prefix was applied before the fault.
         assert_eq!(coverage.get().high_water_ns, 200);
         assert!(
-            !tailer.plan_window(50, 250).extents.is_empty(),
+            !plan_one(&tailer, 50, 250).extents.is_empty(),
             "the prefix's extent stays plannable across the fault"
         );
 
@@ -1177,7 +1517,7 @@ pub(crate) mod tests {
         )?;
 
         let (tailer, coverage) = Tailer::new();
-        let file = File::open(&path)?;
+        let file = attached(&tailer, &path)?;
         let progress = scan_to_end(&tailer, &file, MAGIC.len() as u64)?;
         assert_eq!(
             progress.offset,
@@ -1186,7 +1526,7 @@ pub(crate) mod tests {
         );
         assert_eq!(coverage.get().high_water_ns, 42);
 
-        let plan = tailer.plan_window(0, 100);
+        let plan = plan_one(&tailer, 0, 100);
         assert!(!plan.extents.is_empty(), "the good message is indexed");
         let ch = plan
             .channels
@@ -1227,7 +1567,7 @@ pub(crate) mod tests {
         )?;
 
         let (tailer, coverage) = Tailer::new();
-        let file = File::open(&path)?;
+        let file = attached(&tailer, &path)?;
         let progress = scan_to_end(&tailer, &file, MAGIC.len() as u64)?;
         assert_eq!(
             progress.offset,
@@ -1240,7 +1580,7 @@ pub(crate) mod tests {
             "the dropped chunk's message (500) never reaches coverage"
         );
 
-        let plan = tailer.plan_window(0, u64::MAX);
+        let plan = plan_one(&tailer, 0, u64::MAX);
         assert!(
             plan.channels.contains_key(&2),
             "the post-chunk channel registers"
@@ -1286,7 +1626,7 @@ pub(crate) mod tests {
         )?;
 
         let (tailer, coverage) = Tailer::new();
-        let file = File::open(&path)?;
+        let file = attached(&tailer, &path)?;
         let progress = scan_to_end(&tailer, &file, MAGIC.len() as u64)?;
         assert_eq!(
             progress.offset,
@@ -1295,7 +1635,7 @@ pub(crate) mod tests {
         );
         assert_eq!(coverage.get().high_water_ns, 300);
         assert!(
-            tailer.plan_window(0, u64::MAX).channels.contains_key(&9),
+            plan_one(&tailer, 0, u64::MAX).channels.contains_key(&9),
             "data after the unsupported chunk still indexes"
         );
 
@@ -1330,7 +1670,7 @@ pub(crate) mod tests {
         )?;
 
         let (tailer, coverage) = Tailer::new();
-        let file = File::open(&path)?;
+        let file = attached(&tailer, &path)?;
         let progress = scan_to_end(&tailer, &file, MAGIC.len() as u64)?;
         assert_eq!(
             progress.offset,
@@ -1339,7 +1679,7 @@ pub(crate) mod tests {
         );
         assert_eq!(coverage.get().high_water_ns, 55);
 
-        let plan = tailer.plan_window(0, 100);
+        let plan = plan_one(&tailer, 0, 100);
         assert!(
             !plan.channels.contains_key(&1),
             "the unparseable channel must not register"
@@ -1367,7 +1707,7 @@ pub(crate) mod tests {
         )?;
 
         let (tailer, coverage) = Tailer::new();
-        let file = File::open(&path)?;
+        let file = attached(&tailer, &path)?;
         let progress = scan_to_end(&tailer, &file, MAGIC.len() as u64)?;
         assert_eq!(
             progress.offset,
@@ -1376,7 +1716,7 @@ pub(crate) mod tests {
         );
         assert_eq!(coverage.get().high_water_ns, 42);
 
-        let plan = tailer.plan_window(0, 100);
+        let plan = plan_one(&tailer, 0, 100);
         assert_eq!(plan.extents.len(), 1);
         assert_eq!(
             plan.extents[0].time,
@@ -1397,7 +1737,7 @@ pub(crate) mod tests {
         std::fs::write(&path, bytes)?;
 
         let (tailer, coverage) = Tailer::new();
-        let file = File::open(&path)?;
+        let file = attached(&tailer, &path)?;
         let start = MAGIC.len() as u64;
 
         // Only the magic on disk: nothing to scan, nothing to fault on.
@@ -1431,7 +1771,7 @@ pub(crate) mod tests {
             100,
             "high water never moves backwards"
         );
-        let plan = tailer.plan_window(40, 60);
+        let plan = plan_one(&tailer, 40, 60);
         assert_eq!(plan.extents.len(), 1, "the late stamp widens the bounds");
         assert_eq!(plan.extents[0].time, Some((50, 100)));
 
@@ -1459,7 +1799,7 @@ pub(crate) mod tests {
         tailer.attach(file.clone());
         scan_to_end(&tailer, &file, MAGIC.len() as u64)?;
 
-        let plan = tailer.plan_window(0, u64::MAX);
+        let plan = plan_one(&tailer, 0, u64::MAX);
         assert!(plan.extents.len() >= 2, "the cap must have closed extents");
         assert_eq!(plan.extents[0].offset, MAGIC.len() as u64);
         for pair in plan.extents.windows(2) {
@@ -1478,73 +1818,136 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn attach_resets_index_registry_and_coverage() -> Result<()> {
-        let root = test_dir("reattach")?;
-        let path = root.join("rec.mcap");
-        write_recording(&path, false, &[("/a", 400)])?;
+    fn a_window_straddling_a_rollover_plans_both_files() -> Result<()> {
+        // The previous-file preroll case: a recorder split (or restart) clipper
+        // indexed while running leaves two finished recordings on disk. A window
+        // whose preroll reaches into the earlier file and whose postroll lands in
+        // the later one plans BOTH — one single-file plan per source, oldest
+        // first — recovering across the boundary (beads clipper-gl2).
+        let root = test_dir("straddle")?;
+        let split0 = root.join("rec_0.mcap");
+        let split1 = root.join("rec_1.mcap");
+        write_recording(&split0, false, &[("/t", 1_000), ("/t", 2_000)])?;
+        write_recording(&split1, false, &[("/t", 5_000), ("/t", 6_000)])?;
 
         let (tailer, coverage) = Tailer::new();
-        let file = Arc::new(File::open(&path)?);
-        tailer.attach(file.clone());
-        scan_to_end(&tailer, &file, MAGIC.len() as u64)?;
-        assert_eq!(coverage.get().high_water_ns, 400);
-        assert!(!tailer.plan_window(0, u64::MAX).extents.is_empty());
+        // Index both up front (split0 the older), then scan them to completion in
+        // order through the production poll loop.
+        tailer.index_recording(&split0);
+        tailer.index_recording(&split1);
+        drain(&tailer)?;
 
-        // The recorder restarted into a fresh file: everything known about
-        // the old one is gone, including its coverage.
-        let empty = root.join("empty.mcap");
-        std::fs::write(&empty, b"")?;
-        tailer.attach(Arc::new(File::open(&empty)?));
+        // Coverage is collection-wide: the high-water is the newest file's max.
+        assert_eq!(coverage.get().high_water_ns, 6_000);
 
-        let cov = coverage.get();
-        assert_eq!(cov.high_water_ns, 0);
-        assert!(!cov.ended);
-        let plan = tailer.plan_window(0, u64::MAX);
-        assert!(plan.extents.is_empty());
-        assert!(plan.channels.is_empty());
+        // A window inside one file plans exactly one source.
+        assert_eq!(tailer.plan_window(900, 2_100).len(), 1);
+        assert_eq!(tailer.plan_window(4_900, 6_100).len(), 1);
+
+        // A window straddling the rollover plans both, oldest first.
+        let plans = tailer.plan_window(1_500, 5_500);
+        assert_eq!(plans.len(), 2, "the straddling window plans both files");
+        assert!(plans.iter().all(|p| !p.extents.is_empty()));
 
         std::fs::remove_dir_all(root)?;
         Ok(())
     }
 
     #[test]
-    fn superseded_detects_a_newer_split_deletion_and_recreation() -> Result<()> {
-        let root = test_dir("superseded")?;
+    fn retention_prunes_aged_ended_files_but_keeps_current_and_in_flight() -> Result<()> {
+        let root = test_dir("retention")?;
         let split0 = root.join("rec_0.mcap");
-        std::fs::write(&split0, b"x")?;
-        let file = File::open(&split0)?;
-
-        assert!(
-            !superseded(&root, &file)?,
-            "the only mcap is the one being tailed"
-        );
-
-        // rosbag2 rolled over: a newer split appears beside the tailed file. It
-        // is now the newest, so the tail is superseded and must advance to it.
-        std::thread::sleep(Duration::from_millis(10));
         let split1 = root.join("rec_1.mcap");
-        std::fs::write(&split1, b"y")?;
+        // split0's data is "old" (low log_time), split1's is "current".
+        write_recording(&split0, false, &[("/t", 1_000)])?;
+        write_recording(&split1, false, &[("/t", 9_000)])?;
+
+        let (tailer, _coverage) = Tailer::new();
+        tailer.index_recording(&split0);
+        tailer.index_recording(&split1);
+        drain(&tailer)?;
+
+        // An in-flight extraction holds its own clone of split0's file handle:
+        // pruning the index entry must not pull the bytes out from under it.
+        let in_flight = tailer.plan_window(900, 1_100);
+        assert_eq!(in_flight.len(), 1, "split0 is plannable before the prune");
+
+        // Prune with a floor above split0's data (1_000) but below split1's
+        // (9_000): split0 is dropped, split1 retained. (Both are Ended here;
+        // the floor, not the state, decides — `current` is None after draining.)
+        let dropped = tailer.state.lock().unwrap().prune(5_000);
+        assert_eq!(dropped, vec![split0.clone()], "the aged file is pruned");
+
         assert!(
-            superseded(&root, &file)?,
-            "a newer split beside the tailed file supersedes it"
+            tailer.plan_window(900, 1_100).is_empty(),
+            "split0's index is gone after the prune"
         );
-        std::fs::remove_file(&split1)?;
         assert!(
-            !superseded(&root, &file)?,
-            "with the newer split gone the tailed file is newest again"
+            !tailer.plan_window(8_900, 9_100).is_empty(),
+            "split1 is retained"
+        );
+
+        // The pre-prune plan still reads through its own Arc<File> (POSIX
+        // unlink-while-open semantics); the index drop did not invalidate it.
+        let file = in_flight[0].file.clone().expect("plan pins the file");
+        assert!(
+            file.metadata().is_ok(),
+            "the in-flight handle stays readable"
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn the_current_file_is_never_pruned() -> Result<()> {
+        let root = test_dir("prune-current")?;
+        let path = root.join("rec_0.mcap");
+        write_unfinished_recording(&path, "/t", &[1_000])?;
+
+        let (tailer, _coverage) = Tailer::new();
+        tailer.index_recording(&path);
+        let id = tailer.current_id().expect("indexed as current");
+        // One poll indexes the data but, with no footer and no successor, leaves
+        // the file `current` (still being tailed).
+        tailer.poll_current(id)?;
+        assert_eq!(tailer.current_id(), Some(id), "still the current file");
+
+        // Even a floor far above its data does not drop the file being recorded.
+        let dropped = tailer.state.lock().unwrap().prune(u64::MAX);
+        assert!(dropped.is_empty(), "the current file is never pruned");
+        assert!(!tailer.plan_window(900, 1_100).is_empty());
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn inode_changed_detects_a_vanished_or_replaced_file() -> Result<()> {
+        // The narrowed "is *my* file still live" check: whether the tailed path
+        // still resolves to the open fd's inode. "Is there a newer file" is the
+        // discovery iterator's job, not this one (see the `discover` tests).
+        let root = test_dir("inode")?;
+        let path = root.join("rec_0.mcap");
+        std::fs::write(&path, b"x")?;
+        let file = File::open(&path)?;
+
+        assert!(
+            !inode_changed(&path, &file)?,
+            "the path still resolves to the tailed inode"
         );
 
         // A recorder restart wiping the dir: the tailed inode vanishes.
-        std::fs::remove_file(&split0)?;
+        std::fs::remove_file(&path)?;
         assert!(
-            superseded(&root, &file)?,
-            "a deleted recording is superseded"
+            inode_changed(&path, &file)?,
+            "a deleted recording's path no longer resolves to the fd"
         );
 
-        // Recreated at the same path is a different inode — still superseded.
-        std::fs::write(&split0, b"z")?;
+        // Recreated at the same path is a different inode — still changed.
+        std::fs::write(&path, b"z")?;
         assert!(
-            superseded(&root, &file)?,
+            inode_changed(&path, &file)?,
             "a recreated file is a different inode"
         );
 
@@ -1553,7 +1956,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn newest_mcap_picks_the_latest_by_ctime_and_ignores_non_mcap() -> Result<()> {
+    fn newest_mcap_picks_the_latest_by_mtime_and_ignores_non_mcap() -> Result<()> {
         let root = test_dir("discover")?;
         assert_eq!(newest_mcap(&root.join("missing")), None);
         assert_eq!(newest_mcap(&root), None, "no mcap yet");
@@ -1565,17 +1968,18 @@ pub(crate) mod tests {
         std::fs::write(&newer, b"")?;
         std::fs::write(root.join("note.txt"), b"")?; // wrong extension, ignored
 
-        // Discovery is by ctime (the filesystem's creation/append order), not
-        // mtime: backdating new.mcap's mtime below old.mcap does not change that
-        // it was created last (and the backdating itself bumps its ctime), so it
-        // stays the newest. This is what lets the tail follow a split whose
-        // files a timestamp-preserving copy might otherwise reorder by mtime.
+        // Discovery is by mtime: the most recently written `*.mcap` wins. The
+        // `.txt` is ignored regardless of its time.
+        assert_eq!(newest_mcap(&root), Some(newer.clone()));
+
+        // Bumping old.mcap's mtime to the latest makes it the newest — mtime,
+        // not creation order, decides.
+        std::thread::sleep(Duration::from_millis(10));
         File::options()
             .write(true)
-            .open(&newer)?
-            .set_modified(SystemTime::now() - Duration::from_secs(60))?;
-
-        assert_eq!(newest_mcap(&root), Some(newer));
+            .open(&old)?
+            .set_modified(SystemTime::now())?;
+        assert_eq!(newest_mcap(&root), Some(old));
 
         std::fs::remove_dir_all(root)?;
         Ok(())
@@ -1597,10 +2001,10 @@ pub(crate) mod tests {
         )?;
 
         let (tailer, _coverage) = Tailer::new();
-        let file = File::open(&path)?;
+        let file = attached(&tailer, &path)?;
         scan_to_end(&tailer, &file, MAGIC.len() as u64)?;
 
-        let plan = tailer.plan_window(0, 100);
+        let plan = plan_one(&tailer, 0, 100);
         let ch = plan.channels.get(&1).expect("channel registered");
         assert_eq!(ch.topic, "/raw");
         assert!(ch.schema.is_none());
@@ -1637,7 +2041,7 @@ pub(crate) mod tests {
         let runner = tailer.clone();
         let dir = root.clone();
         let started = std::time::Instant::now();
-        let handle = std::thread::spawn(move || runner.run(&dir));
+        let handle = std::thread::spawn(move || runner.run(&dir, Duration::from_secs(600), false));
 
         // The same byte faults on every pass, so run() must exhaust the retry
         // budget and return Err well within the deadline.
@@ -1660,15 +2064,17 @@ pub(crate) mod tests {
         );
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("framing desynchronised") && msg.contains("faulted at offset"),
-            "the error chain must name the desync and offset: {msg}"
+            msg.contains("framing desynchronised")
+                && msg.contains("offset")
+                && msg.contains("consecutive passes"),
+            "the error chain must name the desync, offset, and give-up: {msg}"
         );
 
         // The good prefix survived every retry — the index was never wiped.
         let cov = coverage.get();
         assert_eq!(cov.high_water_ns, 200, "the prefix's coverage survived");
         assert!(
-            !tailer.plan_window(50, 250).extents.is_empty(),
+            !plan_one(&tailer, 50, 250).extents.is_empty(),
             "the prefix's extent stayed plannable through the retries"
         );
 
@@ -1685,7 +2091,7 @@ pub(crate) mod tests {
         let (tailer, coverage) = Tailer::new();
         let runner = tailer.clone();
         let dir = root.clone();
-        let handle = std::thread::spawn(move || runner.run(&dir));
+        let handle = std::thread::spawn(move || runner.run(&dir, Duration::from_secs(600), false));
 
         // While run() is backing off over the poisoned file, replace it with a
         // finished good recording: the restart mid-backoff is recovery, and the
@@ -1700,7 +2106,7 @@ pub(crate) mod tests {
         loop {
             {
                 let cov = coverage.get();
-                if cov.high_water_ns == 1_000 && cov.ended {
+                if cov.high_water_ns == 1_000 {
                     break;
                 }
             }
@@ -1725,11 +2131,12 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn run_follows_a_new_split_file() -> Result<()> {
+    fn run_follows_a_new_split_and_retains_the_previous_one() -> Result<()> {
         // rosbag2 `--max-bag-duration`/`--max-bag-size` keeps every finished
-        // split on disk and rolls over to `<bag>_<n+1>.mcap`. The tail must
-        // leave the file it opened and follow the newest split, treating the
-        // older one as lost (the cross-file non-recovery rule, clipper-gl2).
+        // split on disk and rolls over to `<bag>_<n+1>.mcap`. The tail advances
+        // to the new split AND retains the previous one in its collection (within
+        // the watch window), so a window straddling the boundary recovers both
+        // (beads clipper-gl2). A long watch duration keeps the older split.
         let root = test_dir("run-split")?;
 
         // Split 0: a finished recording — rosbag2 closes each split (footer).
@@ -1739,7 +2146,11 @@ pub(crate) mod tests {
         let (tailer, coverage) = Tailer::new();
         let runner = tailer.clone();
         let dir = root.clone();
-        let handle = std::thread::spawn(move || runner.run(&dir));
+        // A watch larger than the wall clock pins the floor at 0, so the test's
+        // synthetic (epoch-relative tiny) log_times never age out — this test
+        // checks cross-file retention, not the pruning horizon.
+        let handle =
+            std::thread::spawn(move || runner.run(&dir, Duration::from_secs(u64::MAX), false));
 
         // The tail discovers and indexes split 0.
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -1752,33 +2163,35 @@ pub(crate) mod tests {
         }
 
         // The recorder rolls over: split 1 appears beside split 0 with a later
-        // ctime and later message times. The tail must advance to it.
+        // mtime and later message times. The tail must advance to it.
         let split1 = root.join("rec_1.mcap");
         write_recording(&split1, false, &[("/t", 5_000)])?;
 
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            let cov = coverage.get();
-            if cov.high_water_ns == 5_000 && cov.ended {
-                break;
-            }
+        while coverage.get().high_water_ns != 5_000 {
             assert!(
                 std::time::Instant::now() < deadline,
                 "the tail must follow the new split file (high_water stuck at {})",
-                cov.high_water_ns
+                coverage.get().high_water_ns
             );
             std::thread::sleep(Duration::from_millis(25));
         }
 
-        // Split 1's window is plannable; split 0's index was dropped on the
-        // switch (attach reset everything), so its window covers nothing.
+        // BOTH splits are plannable: split 1 (current) and split 0 (retained in
+        // the collection) — the cross-file recovery the redesign provides.
         assert!(
-            !tailer.plan_window(4_000, 6_000).extents.is_empty(),
+            !plan_one(&tailer, 4_000, 6_000).extents.is_empty(),
             "split 1 is indexed after the tail follows the rollover"
         );
         assert!(
-            tailer.plan_window(500, 1_500).extents.is_empty(),
-            "split 0's data is gone — the old split is not recovered"
+            !plan_one(&tailer, 500, 1_500).extents.is_empty(),
+            "split 0 is retained for cross-file recovery, not dropped"
+        );
+        // A window straddling the boundary plans both source files.
+        assert_eq!(
+            tailer.plan_window(900, 5_100).len(),
+            2,
+            "a straddling window recovers both splits"
         );
 
         // Detached: it loops forever against split 1 and dies with the process.

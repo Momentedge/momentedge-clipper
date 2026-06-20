@@ -33,7 +33,9 @@ impl<T: Clone> Watch<T> {
         self.value.lock().unwrap().clone()
     }
 
-    /// Replace the value and wake every waiter.
+    /// Replace the value and wake every waiter. Coverage updates go through
+    /// [`Self::send_if_modified`]; this unconditional setter serves the tests.
+    #[cfg(test)]
     pub fn send_replace(&self, value: T) {
         *self.value.lock().unwrap() = value;
         self.changed.notify_all();

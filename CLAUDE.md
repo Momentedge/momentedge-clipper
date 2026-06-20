@@ -17,8 +17,17 @@ you work in their directory, keeping their detail out of context otherwise.
 that drives it during development, standing in for a real trigger source. The
 recorder owns no sensor subscriptions and no message index; it cuts clips out of
 a continuous on-disk `ros2 bag record` on ROS2 trigger events, copying MCAP
-messages straight through. It tails one growing MCAP file, decoding nothing but
-each message's MCAP log time. Internals live in
+messages straight through. It tails a **collection** of recording indexes — the
+current growing file plus any finished recordings (splits or restarts) it
+indexed while running — decoding nothing but each message's MCAP log time.
+
+A trigger window that falls inside one recording produces a single clip
+(`<trigger_ns>_<name>.mcap`); one that straddles a rollover produces one segment
+per source file (`<base>_00.mcap`, `_01.mcap`, …), tiled in time order. The
+`momentedge_msgs/Recorded` message carries every segment in its `string[]
+filenames` field. Recovery is only for rollovers clipper indexed live — a
+recording already on disk before clipper started contributes nothing to a trigger
+fired after startup (no startup back-indexing). Internals live in
 [`clipper`](crates/clipper/CLAUDE.md).
 
 ## The sim camera (`sim/`)
@@ -91,9 +100,9 @@ Setup is in the README; the parts that matter when changing the build:
   crates build on `humble`, `jazzy`, and `lyrical` — but not `rolling`, which
   r2r `0.9.6` still references the variant for (beads `clipper-2xb`); the
   pin returns to crates.io once `0.9.6` ships there (beads `clipper-4rw`).
-  So the live e2e suite passes fully on `humble` and `jazzy`, and 12/14 on
-  `lyrical` (two recorder-restart tests trip over lyrical's timestamped rosbag2
-  bag filenames — a harness assumption, not a recorder bug, beads
+  So the live e2e suite runs on `humble`, `jazzy`, and `lyrical` — the recovery
+  tests discover recordings by mtime and assert on path-free log needles, so
+  lyrical's timestamped rosbag2 bag filenames do not break them (beads
   `clipper-7ys`); `rolling` still gets a working ROS2 shell for everything
   but the Rust build. The sim camera's stack (`ros-core`, `gscam`, the
   image_transport plugins, `rclcpp-components`) serves only `sim/`, with
@@ -109,11 +118,12 @@ Setup is in the README; the parts that matter when changing the build:
   be `git add`ed before `nix develop`/`cargo build`, or the eval fails with "Path
   … is not tracked by Git".
 - `ros2bag` + `rosbag2-transport` + `rosbag2-storage-mcap` provide the standalone
-  `ros2 bag record`. `scripts/record.sh` runs it as the one growing MCAP file
+  `ros2 bag record`. `scripts/record.sh` runs it as the growing MCAP recording
   `clipper` tails (started with `scripts/run.sh`); the [`examples/`](examples/)
   guides cover the continuous, split-bag, and `ros2 launch` setups. rosbag2 publishes
-  `WriteSplitEvent` on `/events/write_split` when a bag splits, but the recorder
-  tails a continuous file and consumes no split events.
+  `WriteSplitEvent` on `/events/write_split` when a bag splits, but clipper
+  discovers splits by watching the recording directory for new `*.mcap` files and
+  consumes no split events.
 
 ## Continuous integration
 

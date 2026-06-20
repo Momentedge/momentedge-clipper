@@ -41,12 +41,11 @@ a timing-sensitive corruption race that reliably fails under CI-grade scheduling
 The skip lives in the test next to the reason; a local run (env unset) still
 exercises it.
 
-Lyrical additionally skips `old_recording_on_disk_is_not_recovered_after_restart`
-via a nextest filterset (`not test(...)`), not an env gate — its timestamped
-rosbag2 filenames break a harness assumption (beads `clipper-7ys`), so it's a
-distro incompatibility, not flakiness.
+Every distro runs the full e2e binary: the recovery suite discovers recordings
+by mtime and asserts on path-free log needles, so lyrical's timestamped rosbag2
+filenames do not break it (beads `clipper-7ys`).
 
-Result: humble/jazzy run 13/14, lyrical 12/14.
+Result: every distro runs the whole binary minus the one flaky-skipped test.
 
 ## release.yml — key decisions
 

@@ -77,22 +77,20 @@ jobs:
         include:
           # Per-distro e2e selection (nextest filterset). corrupt_tail_health_live
           # — the live-corruption race the project flags as its one inherently
-          # flaky case (README "Integration tests") — is skipped on every leg, but
-          # not here: the E2E step sets CLIPPER_E2E_SKIP_FLAKY=1, which its
-          # in-test skip_flaky() gate reads to skip-and-pass. Its mandatory 60 s
-          # post-damage announcement misses under CI-grade timing, and nextest's
-          # default fail-fast then masks the rest of the suite (beads
-          # clipper-3q8). Lyrical additionally drops
-          # old_recording_on_disk_is_not_recovered_after_restart — a distro
-          # incompatibility (its timestamped rosbag2 filenames break the test's
-          # harness assumption, beads clipper-7ys), not CI flakiness — via
-          # the filterset, so only lyrical carries one.
+          # flaky case (README "Integration tests") — is skipped on every leg: the
+          # E2E step sets CLIPPER_E2E_SKIP_FLAKY=1, which its in-test skip_flaky()
+          # gate reads to skip-and-pass. Its mandatory 60 s post-damage
+          # announcement misses under CI-grade timing, and nextest's default
+          # fail-fast then masks the rest of the suite (beads clipper-3q8). The
+          # recovery suite discovers recordings by ctime and asserts on path-free
+          # log needles, so lyrical's timestamped rosbag2 filenames no longer
+          # break it (beads clipper-7ys); every distro runs the full binary.
           - distro: humble
             e2e_filter: binary(e2e)
           - distro: jazzy
             e2e_filter: binary(e2e)
           - distro: lyrical
-            e2e_filter: binary(e2e) and not test(old_recording_on_disk_is_not_recovered_after_restart)
+            e2e_filter: binary(e2e)
     steps:
       - uses: actions/checkout@v6
 
