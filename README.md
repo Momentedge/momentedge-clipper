@@ -167,6 +167,7 @@ version. All settings are optional:
 | `--out-dir` | `MOMENTEDGE_OUT_DIR` | `./clipped` | where clips are written |
 | `--grace-secs` | `MOMENTEDGE_GRACE_SECS` | `30` | wait past the window end for coverage before cutting |
 | `--extract-parallelism` | `MOMENTEDGE_EXTRACT_PARALLELISM` | `1` | concurrent clip copies (1 = one at a time, FIFO) |
+| `--clip-compression` | `MOMENTEDGE_CLIP_COMPRESSION` | `zstd` | codec for written clips: `none`, `lz4`, or `zstd` (zstd = smallest, lz4 = faster, none = no recompression) |
 
 For example, `clipper --grace-secs 60` and `MOMENTEDGE_GRACE_SECS=60 clipper`
 are equivalent.

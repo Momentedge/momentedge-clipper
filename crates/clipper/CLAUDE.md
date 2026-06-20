@@ -165,7 +165,14 @@ length, failing any conformant chunk whose contents out-compress it. Messages wh
 `log_time` falls in the inclusive window are written through with their **raw
 serialized bytes** (`write_to_known_channel`); CDR bodies are never decoded.
 
-Output channels are registered from the registry per source channel ID and
+The clip writer is built from explicit `mcap::WriteOptions` with `.compression(..)`
+set — the codec is a deliberate choice (`--clip-compression`, default zstd; see
+the [README](../../README.md#configuration)), not inherited from the mcap crate
+default, so a future default change cannot silently alter clip output. `copy_window`
+takes the codec as `Option<mcap::Compression>` (`None` = uncompressed), threaded
+down from `Config` through `extract_clip`/`stage_clip`; chunk size and chunking
+stay at the `WriteOptions` default. Output channels are registered from the
+registry per source channel ID and
 cached; `mcap::Writer` deduplicates schemas/channels by content. The clip ends
 with `Writer::finish()`, which writes the summary section, footer and closing
 magic — every clip is a complete, standalone MCAP file
