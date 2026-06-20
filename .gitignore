@@ -31,3 +31,4 @@ __pycache__/
 
 # Debian packages assembled by scripts/package-deb.sh
 /dist/
+/.claude/settings.local.json
