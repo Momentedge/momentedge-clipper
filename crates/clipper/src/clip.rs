@@ -131,13 +131,18 @@ impl Drop for StagedClip {
 /// directory before this returns, so a caller may announce it as on disk; on
 /// error nothing partial reaches the final directory — cleanup is confined to
 /// the capturing directory.
+///
+/// `compression` is the codec the clip's `mcap::Writer` is built with (`None`
+/// for uncompressed); it is set explicitly rather than inherited from the mcap
+/// crate default.
 pub fn extract_clip(
     plan: &WindowPlan,
     out_path: &Path,
     start_ns: u64,
     end_ns: u64,
+    compression: Option<mcap::Compression>,
 ) -> Result<ClipStats> {
-    let staged = stage_clip(plan, out_path, start_ns, end_ns)?;
+    let staged = stage_clip(plan, out_path, start_ns, end_ns, compression)?;
     publish_clip(staged)
 }
 
@@ -153,6 +158,7 @@ pub fn stage_clip(
     out_path: &Path,
     start_ns: u64,
     end_ns: u64,
+    compression: Option<mcap::Compression>,
 ) -> Result<StagedClip> {
     let out_dir = out_path
         .parent()
@@ -167,7 +173,7 @@ pub fn stage_clip(
         .with_context(|| format!("creating capturing dir {}", capturing.display()))?;
 
     let (file, staged_path) = create_new_file(&capturing.join(&desired_name))?;
-    let stats = copy_window(plan, file, start_ns, end_ns).inspect_err(|_| {
+    let stats = copy_window(plan, file, start_ns, end_ns, compression).inspect_err(|_| {
         // A failed copy must not leave a half-written, footer-less file even in
         // the capturing dir; the error itself is what the caller reports. No
         // `StagedClip` is constructed on this path, so its `Drop` cannot do it.
@@ -227,9 +233,23 @@ pub fn publish_clip(mut staged: StagedClip) -> Result<ClipStats> {
 /// Assemble the clip into the freshly created `out_file`: register window
 /// channels from the registry on first use, stream the planned extents,
 /// finish and fsync the file. The caller removes the staged file if this fails.
-fn copy_window(plan: &WindowPlan, out_file: File, start_ns: u64, end_ns: u64) -> Result<ClipStats> {
+///
+/// The writer is built from explicit [`mcap::WriteOptions`] with `compression`
+/// set (`None` = uncompressed), so the codec is a deliberate choice rather than
+/// the mcap crate default. Chunk size and chunking stay at the `WriteOptions`
+/// default.
+fn copy_window(
+    plan: &WindowPlan,
+    out_file: File,
+    start_ns: u64,
+    end_ns: u64,
+    compression: Option<mcap::Compression>,
+) -> Result<ClipStats> {
     let mut clip = ClipWriter {
-        writer: mcap::Writer::new(BufWriter::new(out_file)).context("opening mcap writer")?,
+        writer: mcap::WriteOptions::new()
+            .compression(compression)
+            .create(BufWriter::new(out_file))
+            .context("opening mcap writer")?,
         channels: &plan.channels,
         out_ids: HashMap::new(),
         start_ns,
@@ -502,6 +522,10 @@ pub(crate) mod tests {
     };
     use crate::tail::{Extent, Tailer, op};
 
+    /// The clip compression the recorder's default (zstd) maps to; most tests
+    /// cut clips through the same codec the recorder uses by default.
+    const TEST_COMPRESSION: Option<mcap::Compression> = Some(mcap::Compression::Zstd);
+
     /// Read a finished clip back; `MessageStream` insists on a complete
     /// summary/footer/magic, so this doubles as a validity check.
     pub(crate) fn read_clip(path: &Path) -> Result<Vec<(String, u64)>> {
@@ -531,7 +555,7 @@ pub(crate) mod tests {
 
         let out = root.join("clip.mcap");
         let plan = tailer.plan_window(0, 100);
-        let stats = extract_clip(&plan, &out, 0, 100)?;
+        let stats = extract_clip(&plan, &out, 0, 100, TEST_COMPRESSION)?;
 
         // The final path is the published location, holding a complete clip.
         assert_eq!(stats.out_path, out);
@@ -569,7 +593,7 @@ pub(crate) mod tests {
 
         // After stage 1 only: the final dir holds no clip, but the staged file
         // in the capturing dir is already complete and read_clip-valid.
-        let staged = stage_clip(&plan, &out, 0, 100)?;
+        let staged = stage_clip(&plan, &out, 0, 100, TEST_COMPRESSION)?;
         assert!(
             !out.exists(),
             "the clip is invisible in the final dir before publication"
@@ -605,7 +629,7 @@ pub(crate) mod tests {
         // A staged clip abandoned without publishing — an early return or a
         // panic between the stages — must not strand the file in the capturing
         // dir; its `Drop` removes it, and nothing ever reaches the final dir.
-        let staged = stage_clip(&plan, &out, 0, 100)?;
+        let staged = stage_clip(&plan, &out, 0, 100, TEST_COMPRESSION)?;
         assert!(staged.staged_path.exists(), "the staged file exists");
         drop(staged);
 
@@ -674,7 +698,7 @@ pub(crate) mod tests {
 
         let out = out_dir.join("clip.mcap");
         let plan = tailer.plan_window(0, 100);
-        let stats = extract_clip(&plan, &out, 0, 100)?;
+        let stats = extract_clip(&plan, &out, 0, 100, TEST_COMPRESSION)?;
 
         assert_eq!(stats.out_path, out);
         assert_eq!(
@@ -710,7 +734,7 @@ pub(crate) mod tests {
 
         let out = root.join("clip.mcap");
         let plan = tailer.plan_window(100, 200);
-        let stats = extract_clip(&plan, &out, 100, 200)?;
+        let stats = extract_clip(&plan, &out, 100, 200, TEST_COMPRESSION)?;
 
         assert_eq!(stats.messages_copied, 3);
         assert_eq!(
@@ -739,7 +763,7 @@ pub(crate) mod tests {
 
         let out = root.join("clip.mcap");
         let plan = tailer.plan_window(20, 40);
-        let stats = extract_clip(&plan, &out, 20, 40)?;
+        let stats = extract_clip(&plan, &out, 20, 40, TEST_COMPRESSION)?;
 
         assert_eq!(stats.messages_copied, 3);
         assert_eq!(
@@ -762,7 +786,7 @@ pub(crate) mod tests {
 
         let out = root.join("clip.mcap");
         let plan = tailer.plan_window(0, 100);
-        let stats = extract_clip(&plan, &out, 0, 100)?;
+        let stats = extract_clip(&plan, &out, 0, 100, TEST_COMPRESSION)?;
 
         assert_eq!(stats.messages_copied, 0);
         assert!(read_clip(&out)?.is_empty());
@@ -783,8 +807,8 @@ pub(crate) mod tests {
         // at the publish stage against the final dir, so the second lands as a
         // `_1` sibling and both clips are complete.
         let out = root.join("clip.mcap");
-        let first = extract_clip(&plan, &out, 0, 100)?;
-        let second = extract_clip(&plan, &out, 0, 100)?;
+        let first = extract_clip(&plan, &out, 0, 100, TEST_COMPRESSION)?;
+        let second = extract_clip(&plan, &out, 0, 100, TEST_COMPRESSION)?;
 
         assert_eq!(first.out_path, out);
         assert_eq!(second.out_path, root.join("clip_1.mcap"));
@@ -808,7 +832,7 @@ pub(crate) mod tests {
 
         let out = root.join("clip.mcap");
         let plan = tailer.plan_window(0, 100);
-        extract_clip(&plan, &out, 0, 100)?;
+        extract_clip(&plan, &out, 0, 100, TEST_COMPRESSION)?;
 
         let buf = std::fs::read(&out)?;
         let summary = mcap::Summary::read(&buf)?.expect("clip has a summary");
@@ -831,7 +855,7 @@ pub(crate) mod tests {
         // alive, so the extraction must succeed against the deleted path.
         std::fs::remove_file(&rec)?;
         let out = root.join("clip.mcap");
-        let stats = extract_clip(&plan, &out, 0, 100)?;
+        let stats = extract_clip(&plan, &out, 0, 100, TEST_COMPRESSION)?;
 
         assert_eq!(stats.messages_copied, 2);
         assert_eq!(
@@ -861,7 +885,7 @@ pub(crate) mod tests {
             .set_len(last.offset + last.len / 2)?;
 
         let out = root.join("clip.mcap");
-        let err = extract_clip(&plan, &out, 0, 100).unwrap_err();
+        let err = extract_clip(&plan, &out, 0, 100, TEST_COMPRESSION).unwrap_err();
         assert!(
             format!("{err:#}").contains("reading extent"),
             "unexpected error: {err:#}"
@@ -890,7 +914,7 @@ pub(crate) mod tests {
         plan.channels.clear();
 
         let out = root.join("clip.mcap");
-        let stats = extract_clip(&plan, &out, 0, 100)?;
+        let stats = extract_clip(&plan, &out, 0, 100, TEST_COMPRESSION)?;
         assert_eq!(stats.messages_copied, 0);
         assert_eq!(stats.records_skipped, 1);
         assert!(read_clip(&out)?.is_empty(), "a valid, empty clip");
@@ -920,7 +944,7 @@ pub(crate) mod tests {
         };
 
         let out = root.join("clip.mcap");
-        let err = extract_clip(&plan, &out, 0, u64::MAX).unwrap_err();
+        let err = extract_clip(&plan, &out, 0, u64::MAX, TEST_COMPRESSION).unwrap_err();
         assert!(
             format!("{err:#}").contains("framing inconsistent"),
             "unexpected error: {err:#}"
@@ -947,7 +971,7 @@ pub(crate) mod tests {
         // planned and read — but no individual message falls inside it.
         let out = root.join("clip.mcap");
         let plan = tailer.plan_window(120, 180);
-        let stats = extract_clip(&plan, &out, 120, 180)?;
+        let stats = extract_clip(&plan, &out, 120, 180, TEST_COMPRESSION)?;
 
         assert!(stats.extents_read > 0, "the covering extent is read");
         assert_eq!(stats.messages_copied, 0);
@@ -977,7 +1001,7 @@ pub(crate) mod tests {
 
         let out = root.join("clip.mcap");
         let plan = tailer.plan_window(20, 40);
-        let stats = extract_clip(&plan, &out, 20, 40)?;
+        let stats = extract_clip(&plan, &out, 20, 40, TEST_COMPRESSION)?;
 
         assert_eq!(stats.messages_copied, 3);
         assert_eq!(
@@ -1023,7 +1047,7 @@ pub(crate) mod tests {
         );
 
         let out = root.join("clip.mcap");
-        let stats = extract_clip(&plan, &out, 0, 100)?;
+        let stats = extract_clip(&plan, &out, 0, 100, TEST_COMPRESSION)?;
         assert_eq!(stats.messages_copied, 1);
         assert_eq!(read_clip(&out)?, vec![("/raw".to_string(), 10)]);
 
@@ -1045,7 +1069,7 @@ pub(crate) mod tests {
         // Staging succeeds — the capturing dir is empty, so the clip assembles
         // there — and the collision only surfaces at publish, where 1000
         // suffixes against the pre-filled final dir are exhausted.
-        let err = extract_clip(&plan, &out, 0, 100).unwrap_err();
+        let err = extract_clip(&plan, &out, 0, 100, TEST_COMPRESSION).unwrap_err();
         assert!(
             format!("{err:#}").contains("publishing"),
             "unexpected error: {err:#}"
@@ -1087,7 +1111,7 @@ pub(crate) mod tests {
 
         let out = root.join("clip.mcap");
         let plan = tailer.plan_window(30, 70);
-        let stats = extract_clip(&plan, &out, 30, 70)?;
+        let stats = extract_clip(&plan, &out, 30, 70, TEST_COMPRESSION)?;
 
         assert!(
             stats.extents_read >= 2,
@@ -1132,7 +1156,7 @@ pub(crate) mod tests {
 
         let out = root.join("clip.mcap");
         let plan = tailer.plan_window(15, 25);
-        let stats = extract_clip(&plan, &out, 15, 25)?;
+        let stats = extract_clip(&plan, &out, 15, 25, TEST_COMPRESSION)?;
 
         assert_eq!(stats.extents_read, 1);
         assert_eq!(stats.messages_copied, 1);
@@ -1173,9 +1197,57 @@ pub(crate) mod tests {
             assert_eq!(plan.channels.len(), 2, "{name}: registry from chunks");
 
             let out = root.join(format!("clip-{name}.mcap"));
-            let stats = extract_clip(&plan, &out, 20, 30)?;
+            let stats = extract_clip(&plan, &out, 20, 30, TEST_COMPRESSION)?;
             assert_eq!(stats.messages_copied, 2, "{name}");
             assert_eq!(read_clip(&out)?, expected, "{name}");
+        }
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// The configurable *output* codec reaches the clip writer: each setting
+    /// produces a valid clip that reads back identically, and the clip's chunk
+    /// records carry the matching compression string — so the codec is genuinely
+    /// applied, not silently ignored or left at the mcap crate default. The
+    /// acceptance test for beads clipper-hcd.
+    #[test]
+    fn output_compression_setting_is_applied_to_the_clip() -> Result<()> {
+        let root = test_dir("clip-outcomp")?;
+        let rec = root.join("rec.mcap");
+        write_recording(&rec, false, &[("/t", 10), ("/t", 20), ("/t", 30)])?;
+        let tailer = tail_whole(&rec)?;
+        let plan = tailer.plan_window(0, 100);
+        let expected = vec![
+            ("/t".to_string(), 10),
+            ("/t".to_string(), 20),
+            ("/t".to_string(), 30),
+        ];
+
+        // mcap's default WriteOptions chunks, so each clip holds at least one
+        // Chunk record whose `compression` names the codec ("" = uncompressed).
+        for (compression, want) in [
+            (None, ""),
+            (Some(mcap::Compression::Zstd), "zstd"),
+            (Some(mcap::Compression::Lz4), "lz4"),
+        ] {
+            let out = root.join(format!("clip-{want}.mcap"));
+            let stats = extract_clip(&plan, &out, 0, 100, compression)?;
+            assert_eq!(stats.messages_copied, 3, "{want}: every message copied");
+            assert_eq!(read_clip(&out)?, expected, "{want}: clip reads back intact");
+
+            let buf = std::fs::read(&out)?;
+            let codecs: Vec<String> = mcap::read::LinearReader::new(&buf)?
+                .filter_map(|rec| match rec {
+                    Ok(Record::Chunk { header, .. }) => Some(header.compression),
+                    _ => None,
+                })
+                .collect();
+            assert!(!codecs.is_empty(), "{want}: the clip is chunked");
+            assert!(
+                codecs.iter().all(|c| c == want),
+                "{want}: chunks must use the set codec, got {codecs:?}"
+            );
         }
 
         std::fs::remove_dir_all(root)?;
@@ -1209,7 +1281,7 @@ pub(crate) mod tests {
         );
 
         let out = root.join("clip.mcap");
-        let stats = extract_clip(&plan, &out, 0, 100)?;
+        let stats = extract_clip(&plan, &out, 0, 100, TEST_COMPRESSION)?;
         assert_eq!(stats.messages_copied, 1);
         assert_eq!(stats.bytes_copied, 8 << 20);
         assert_eq!(read_clip(&out)?, vec![("/big".to_string(), 10)]);
@@ -1253,7 +1325,7 @@ pub(crate) mod tests {
         std::fs::write(&rec, &bytes)?;
 
         let out = root.join("clip.mcap");
-        let stats = extract_clip(&plan, &out, 0, 100)?;
+        let stats = extract_clip(&plan, &out, 0, 100, TEST_COMPRESSION)?;
         assert_eq!(stats.chunks_dropped, 1);
         assert_eq!(stats.messages_copied, 3);
         assert_eq!(
@@ -1298,7 +1370,7 @@ pub(crate) mod tests {
 
         let out = root.join("clip.mcap");
         let plan = tailer.plan_window(0, 100);
-        let stats = extract_clip(&plan, &out, 0, 100)?;
+        let stats = extract_clip(&plan, &out, 0, 100, TEST_COMPRESSION)?;
         assert_eq!(stats.records_skipped, 1);
         assert_eq!(stats.messages_copied, 2);
         assert_eq!(

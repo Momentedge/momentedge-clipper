@@ -48,6 +48,9 @@
 //!   --extract-parallelism  extraction worker threads (default 1: copies
 //!                  queue FIFO — the bulk copy competes with the recorder's
 //!                  writes for disk bandwidth; waiting is always concurrent)
+//!   --clip-compression  codec for written clips: none, lz4, or zstd
+//!                  (default zstd) — the choice is explicit, not inherited
+//!                  from the mcap crate default
 //!
 //! Logging uses the `log` facade with a pretty_env_logger backend; `RUST_LOG`
 //! controls verbosity.
@@ -63,7 +66,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
-use clap::{CommandFactory, FromArgMatches, Parser};
+use clap::{CommandFactory, FromArgMatches, Parser, ValueEnum};
 use crossbeam_channel::{Receiver, Sender, bounded, select, unbounded};
 use futures::executor::block_on;
 use futures::stream::StreamExt;
@@ -88,6 +91,40 @@ const RECORDED_TOPIC: &str = "/events/momentedge/recorded";
 /// growth, not a resource budget; 16 comfortably exceeds any legitimate
 /// concurrent burst.
 const MAX_ACTIVE_TRIGGERS: usize = 16;
+
+/// Compression codec for written clips, the clap surface of the otherwise
+/// implicit `mcap::WriteOptions` compression. [`to_mcap`](ClipCompression::to_mcap)
+/// maps it to the `Option<mcap::Compression>` the clip writer takes: `None` →
+/// uncompressed, `Zstd`/`Lz4` → the matching codec.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ClipCompression {
+    None,
+    Zstd,
+    Lz4,
+}
+
+impl ClipCompression {
+    /// The `mcap::WriteOptions::compression` argument this codec selects.
+    fn to_mcap(self) -> Option<mcap::Compression> {
+        match self {
+            ClipCompression::None => None,
+            ClipCompression::Zstd => Some(mcap::Compression::Zstd),
+            ClipCompression::Lz4 => Some(mcap::Compression::Lz4),
+        }
+    }
+}
+
+impl std::fmt::Display for ClipCompression {
+    /// Render as the clap value name (`none`/`zstd`/`lz4`) so the `--help`
+    /// default rendered by `default_value_t` and the accepted flag values share
+    /// one source — the `ValueEnum` possible-value names.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.to_possible_value()
+            .expect("no ClipCompression variant is skipped")
+            .get_name()
+            .fmt(f)
+    }
+}
 
 /// Recorder configuration, parsed by clap from CLI flags with a `CLIPPER_*`
 /// environment-variable fallback per field (see [`load_config`]). The field doc
@@ -122,6 +159,15 @@ struct Config {
     /// storage with IO headroom.
     #[arg(long, default_value_t = 1)]
     extract_parallelism: usize,
+    /// Compression codec for written clips (none, lz4, zstd).
+    ///
+    /// `zstd` (the default) writes the smallest clips; `lz4` trades size for
+    /// lower CPU; `none` skips recompression entirely. The codec is set
+    /// explicitly on the clip writer rather than inherited from the mcap crate
+    /// default. Only the codec is configurable here — chunk size and chunking
+    /// stay at the mcap default.
+    #[arg(long, value_enum, default_value_t = ClipCompression::Zstd)]
+    clip_compression: ClipCompression,
 }
 
 impl Config {
@@ -295,7 +341,11 @@ struct ExtractJob {
 /// taken at copy start, so a job that waited in the queue still cuts from the
 /// freshest index. A panicking extraction is caught and replied as an error —
 /// per-job isolation, the pool outlives it.
-fn spawn_extract_workers(parallelism: usize, tailer: Arc<Tailer>) -> Sender<ExtractJob> {
+fn spawn_extract_workers(
+    parallelism: usize,
+    tailer: Arc<Tailer>,
+    compression: Option<mcap::Compression>,
+) -> Sender<ExtractJob> {
     let (tx, rx) = unbounded::<ExtractJob>();
     for i in 0..parallelism.max(1) {
         let rx = rx.clone();
@@ -306,7 +356,13 @@ fn spawn_extract_workers(parallelism: usize, tailer: Arc<Tailer>) -> Sender<Extr
                 for job in rx.iter() {
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         let plan = tailer.plan_window(job.start_ns, job.end_ns);
-                        clip::extract_clip(&plan, &job.out_path, job.start_ns, job.end_ns)
+                        clip::extract_clip(
+                            &plan,
+                            &job.out_path,
+                            job.start_ns,
+                            job.end_ns,
+                            compression,
+                        )
                     }))
                     .unwrap_or_else(|payload| {
                         Err(anyhow::anyhow!(
@@ -373,7 +429,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // One worker per allowed concurrent clip copy; see Config::extract_parallelism.
-    let extract_tx = spawn_extract_workers(cfg.extract_parallelism, tailer);
+    // The clip compression codec is process-global, captured in the workers.
+    let extract_tx = spawn_extract_workers(
+        cfg.extract_parallelism,
+        tailer,
+        cfg.clip_compression.to_mcap(),
+    );
 
     // Admission gate for trigger handlers; see [`Admission`].
     let admission = Admission::new(MAX_ACTIVE_TRIGGERS);
@@ -670,6 +731,11 @@ fn sanitize(name: &str) -> String {
 mod tests {
     use super::*;
 
+    /// The clip compression the recorder's default (zstd) maps to; the unit
+    /// tests drive the extraction worker pool through the same codec the
+    /// recorder uses by default.
+    const TEST_COMPRESSION: Option<mcap::Compression> = Some(mcap::Compression::Zstd);
+
     /// Parse a `Config` from an explicit argv through the same env-prefixed
     /// command `load_config` builds, so the tests exercise the real wiring.
     fn parse_from<I, T>(argv: I) -> Result<Config, clap::Error>
@@ -688,6 +754,7 @@ mod tests {
         assert_eq!(cfg.out_dir, PathBuf::from("./clipped"));
         assert_eq!(cfg.grace(), Duration::from_secs(30));
         assert_eq!(cfg.extract_parallelism, 1);
+        assert_eq!(cfg.clip_compression, ClipCompression::Zstd);
     }
 
     #[test]
@@ -702,12 +769,15 @@ mod tests {
             "7",
             "--extract-parallelism",
             "3",
+            "--clip-compression",
+            "lz4",
         ])
         .unwrap();
         assert_eq!(cfg.record_dir, PathBuf::from("/data/record"));
         assert_eq!(cfg.out_dir, PathBuf::from("/data/clips"));
         assert_eq!(cfg.grace(), Duration::from_secs(7));
         assert_eq!(cfg.extract_parallelism, 3);
+        assert_eq!(cfg.clip_compression, ClipCompression::Lz4);
     }
 
     #[test]
@@ -731,6 +801,10 @@ mod tests {
         assert_eq!(
             env_of("extract_parallelism").as_deref(),
             Some("MOMENTEDGE_EXTRACT_PARALLELISM")
+        );
+        assert_eq!(
+            env_of("clip_compression").as_deref(),
+            Some("MOMENTEDGE_CLIP_COMPRESSION")
         );
     }
 
@@ -905,7 +979,7 @@ mod tests {
     fn record_clip_grace_timeout_cuts_what_is_on_disk() -> anyhow::Result<()> {
         let root = test_dir("grace")?;
         let (tailer, coverage) = Tailer::new();
-        let extract_tx = spawn_extract_workers(1, tailer);
+        let extract_tx = spawn_extract_workers(1, tailer, TEST_COMPRESSION);
 
         // The window end is far in the past on the wall clock (no postroll
         // sleep), but coverage never reaches it — no recording was ever
@@ -945,7 +1019,7 @@ mod tests {
             scan_to_end(&scanner, &file, 8).unwrap();
         });
 
-        let extract_tx = spawn_extract_workers(1, tailer);
+        let extract_tx = spawn_extract_workers(1, tailer, TEST_COMPRESSION);
         let stats = record_clip(
             100,
             1_000,
@@ -979,7 +1053,7 @@ mod tests {
         tailer.attach(file.clone());
         scan_to_end(&tailer, &file, 8)?;
 
-        let extract_tx = spawn_extract_workers(1, tailer);
+        let extract_tx = spawn_extract_workers(1, tailer, TEST_COMPRESSION);
         let end_ns = now + 150_000_000; // 150 ms past the trigger stamp
         let started = std::time::Instant::now();
         let stats = record_clip(
@@ -1015,7 +1089,7 @@ mod tests {
         tailer.attach(file.clone());
         scan_to_end(&tailer, &file, 8)?;
 
-        let extract_tx = spawn_extract_workers(1, tailer);
+        let extract_tx = spawn_extract_workers(1, tailer, TEST_COMPRESSION);
         let started = std::time::Instant::now();
         let stats = record_clip(
             50,
@@ -1055,7 +1129,7 @@ mod tests {
             assert_eq!(cov.high_water_ns, 1_000);
         }
 
-        let extract_tx = spawn_extract_workers(1, tailer);
+        let extract_tx = spawn_extract_workers(1, tailer, TEST_COMPRESSION);
         let started = std::time::Instant::now();
         let stats = record_clip(
             0,
@@ -1094,7 +1168,7 @@ mod tests {
         // Two overlapping windows racing for the same out path and a single
         // extraction worker: the copies serialize FIFO, the second writer
         // lands on a `_1` sibling, and both clips come out complete.
-        let extract_tx = spawn_extract_workers(1, tailer);
+        let extract_tx = spawn_extract_workers(1, tailer, TEST_COMPRESSION);
         let out = root.join("clip.mcap");
         let cut = |start_ns: u64, end_ns: u64| {
             let coverage = coverage.clone();
@@ -1159,7 +1233,7 @@ mod tests {
         tailer.attach(file.clone());
         scan_to_end(&tailer, &file, 8)?;
 
-        let extract_tx = spawn_extract_workers(1, tailer);
+        let extract_tx = spawn_extract_workers(1, tailer, TEST_COMPRESSION);
         let out = root.join("clip.mcap");
         let (reply_a, recv_a) = bounded(1);
         let (reply_b, recv_b) = bounded(1);
