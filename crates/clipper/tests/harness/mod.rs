@@ -137,12 +137,6 @@ impl TestEnv {
         env
     }
 
-    /// The test's temp root — a scratch home for files that must survive a
-    /// recorder relaunch (the record script wipes `record/` on start).
-    pub fn root(&self) -> &Path {
-        self.root.path()
-    }
-
     pub fn record_dir(&self) -> PathBuf {
         self.root.path().join("record")
     }
@@ -191,7 +185,7 @@ impl TestEnv {
         // `--all` records every live topic, so the recorder also subscribes to
         // the trigger topic; `fire_trigger` then waits for two matched
         // subscribers (the extractor and the recorder).
-        self.spawn_recorder(&["--all"], preset, cache, true)
+        self.spawn_recorder(&["--all"], preset, cache, true, 0)
     }
 
     /// [`Self::start_recorder`] restricted to exactly `topics` (via
@@ -202,7 +196,20 @@ impl TestEnv {
         selection.extend_from_slice(topics);
         // A topic-restricted recorder does not subscribe to the trigger topic,
         // so the extractor is the sole trigger subscriber (`fire_trigger` -w 1).
-        self.spawn_recorder(&selection, preset, cache, false)
+        self.spawn_recorder(&selection, preset, cache, false, 0)
+    }
+
+    /// [`Self::start_recorder`] that rolls the bag over every
+    /// `max_bag_duration_secs` (`--max-bag-duration`), keeping every split on
+    /// disk — the rosbag2 split recording a clip window can straddle, which the
+    /// collection tailer recovers across.
+    pub fn start_recorder_split(
+        &self,
+        preset: &str,
+        cache: u64,
+        max_bag_duration_secs: u64,
+    ) -> Proc {
+        self.spawn_recorder(&["--all"], preset, cache, true, max_bag_duration_secs)
     }
 
     /// Spawn `ros2 bag record <selection> --storage mcap
@@ -210,23 +217,30 @@ impl TestEnv {
     /// record/` — the same invocation the examples document. `record/` is wiped
     /// first: rosbag2 refuses to record into an existing bag directory, and a
     /// recorder restart relies on the wipe so the extractor's tail sees a fresh
-    /// inode (its replacement signal).
+    /// inode (its replacement signal). `split_secs > 0` adds `--max-bag-duration`
+    /// so the bag rolls over into numbered splits.
     fn spawn_recorder(
         &self,
         selection: &[&str],
         preset: &str,
         cache: u64,
         records_trigger: bool,
+        split_secs: u64,
     ) -> Proc {
         let _ = std::fs::remove_dir_all(self.record_dir());
         let cache = cache.to_string();
+        let split = split_secs.to_string();
         let mut cmd = self.command("ros2");
         cmd.args(["bag", "record"])
             .args(selection)
             .args(["--storage", "mcap", "--storage-preset-profile", preset])
-            .args(["--max-cache-size", &cache])
-            .arg("--output")
-            .arg(self.record_dir());
+            .args(["--max-cache-size", &cache]);
+        // 0 means no duration split (rosbag2's own default), so only pass the
+        // flag when a test asks the bag to roll over.
+        if split_secs > 0 {
+            cmd.args(["--max-bag-duration", &split]);
+        }
+        cmd.arg("--output").arg(self.record_dir());
         self.records_trigger_topic
             .store(records_trigger, Ordering::Relaxed);
         self.spawn("recorder", cmd)
@@ -272,14 +286,17 @@ impl TestEnv {
         recorder.stop(libc::SIGINT, Duration::from_secs(30));
         let restart_ns = now_ns();
         let recorder2 = self.start_recorder(preset, cache);
-        extractor.expect_log("replaced; re-discovering", Duration::from_secs(60));
+        // The tail indexes the replacement recording: the startup recording is
+        // the first "indexing recording" line, the restart's fresh inode the
+        // second (the bag dir is wiped and recreated with the same name, so the
+        // path repeats — the second occurrence is the signal).
+        extractor.expect_log_count("indexing recording", 2, Duration::from_secs(60));
         self.wait_for_recording(Duration::from_secs(60));
         (recorder2, restart_ns)
     }
 
-    /// Newest `*.mcap` under `record/` by ctime — the same discovery rule the
-    /// extractor's tail uses to follow the newest file across recorder restarts
-    /// and rosbag2 splits alike.
+    /// Newest `*.mcap` under `record/` by mtime — the same startup-adoption rule
+    /// the extractor's tail uses to pick the live recording.
     pub fn newest_recording(&self) -> Option<PathBuf> {
         let entries = std::fs::read_dir(self.record_dir()).ok()?;
         entries
@@ -288,7 +305,7 @@ impl TestEnv {
             .filter(|p| p.extension().is_some_and(|x| x == "mcap"))
             .max_by_key(|p| {
                 p.metadata()
-                    .map(|m| (m.ctime(), m.ctime_nsec()))
+                    .map(|m| (m.mtime(), m.mtime_nsec()))
                     .unwrap_or((i64::MIN, i64::MIN))
             })
     }
@@ -551,15 +568,33 @@ impl Drop for Proc {
     }
 }
 
-/// The fields of one `Recorded` announcement the suite asserts on.
+/// The fields of one `Recorded` announcement the suite asserts on. `filenames`
+/// lists every segment the window produced — one for a window that stayed in a
+/// single recording, several when it straddled a rollover.
 #[derive(Debug)]
 pub struct Recorded {
     pub name: String,
-    pub filename: String,
+    pub filenames: Vec<String>,
 }
 
-/// Parse `ros2 topic echo` YAML output: top-level scalars sit at column 0,
-/// so the nested `trigger_time` fields can never shadow them.
+impl Recorded {
+    /// The sole clip path, for the common case of a window that stayed in one
+    /// recording. Panics if the window produced several segments.
+    pub fn only(&self) -> &str {
+        assert_eq!(
+            self.filenames.len(),
+            1,
+            "expected a single clip segment, got {:?}",
+            self.filenames
+        );
+        &self.filenames[0]
+    }
+}
+
+/// Parse `ros2 topic echo` YAML output: top-level scalars sit at column 0, so
+/// the nested `trigger_time` fields can never shadow them. `filenames` is a
+/// `string[]`, printed either inline empty (`filenames: []`) or as a block of
+/// `- <path>` items following the key.
 fn parse_recorded(yaml: &str) -> Option<Recorded> {
     fn unquote(v: &str) -> String {
         let v = v.trim();
@@ -570,17 +605,44 @@ fn parse_recorded(yaml: &str) -> Option<Recorded> {
             .to_string()
     }
     let mut name = None;
-    let mut filename = None;
-    for line in yaml.lines() {
+    let mut filenames: Option<Vec<String>> = None;
+    let mut lines = yaml.lines().peekable();
+    while let Some(line) = lines.next() {
         if let Some(v) = line.strip_prefix("name: ") {
             name = Some(unquote(v));
-        } else if let Some(v) = line.strip_prefix("filename: ") {
-            filename = Some(unquote(v));
+        } else if let Some(rest) = line.strip_prefix("filenames:") {
+            let rest = rest.trim();
+            let mut files = Vec::new();
+            if rest.is_empty() {
+                // Block style: subsequent `- <path>` items until the next key.
+                while let Some(peek) = lines.peek() {
+                    match peek.trim_start().strip_prefix("- ") {
+                        Some(item) => {
+                            files.push(unquote(item));
+                            lines.next();
+                        }
+                        None => break,
+                    }
+                }
+            } else if rest != "[]" {
+                // Inline flow style: `filenames: [a, b]`.
+                for item in rest
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .split(',')
+                {
+                    let item = item.trim();
+                    if !item.is_empty() {
+                        files.push(unquote(item));
+                    }
+                }
+            }
+            filenames = Some(files);
         }
     }
     Some(Recorded {
         name: name?,
-        filename: filename?,
+        filenames: filenames?,
     })
 }
 

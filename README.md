@@ -16,9 +16,10 @@ on-disk `ros2 bag record` running and, on each trigger event, cuts a short clip
 out of it — copying MCAP messages straight through without decoding their
 bodies. The recorder is one crate, with an example trigger source alongside it:
 
-- **`clipper`** — the recorder. It tails one growing MCAP file and,
+- **`clipper`** — the recorder. It tails a collection of MCAP recordings and,
   for each trigger, bulk-copies the messages in the trigger's pre/post window
-  into a standalone clip, then announces the result. See
+  into a standalone clip (or one segment per source file when the window spans
+  a rollover), then announces the result. See
   [Triggered recording](#triggered-recording).
 - **`trigger-pub`** — an example trigger source
   ([`examples/trigger-pub`](examples/trigger-pub/README.md)), standing in for a
@@ -35,11 +36,11 @@ It is a testing pad, not a finished tool.
   shell, selected at the command line — `nix develop` is Jazzy (the default);
   `nix develop .#humble`, `.#lyrical`, and `.#rolling` select the others. The
   `nix develop` and `cargo` commands below take a `.#<distro>` selector to pick
-  one. The recorder builds and the e2e suite pass fully on **humble** and
-  **jazzy**; **lyrical** builds and passes 12/14 (two recorder-restart tests
-  trip lyrical's timestamped rosbag2 filenames — a harness assumption, beads
-  `clipper-7ys`); **rolling** gets a working ROS2 shell but cannot build
-  the Rust crates (an `r2r` limitation — see "Integration tests" below).
+  one. The recorder builds and the e2e suite run on **humble**, **jazzy**, and
+  **lyrical** — the recovery tests discover recordings by mtime and assert on
+  path-free log needles, so lyrical's timestamped rosbag2 filenames do not break
+  them (beads `clipper-7ys`); **rolling** gets a working ROS2 shell but cannot
+  build the Rust crates (an `r2r` limitation — see "Integration tests" below).
 - **System Rust** (`cargo`/`rustc` on your `PATH`). The flake intentionally does
   not provide a Rust toolchain.
 - **A data source** — the in-repo synthetic camera ([`sim/`](sim/README.md)),
@@ -108,23 +109,28 @@ The data source, the recording, and the recorder must share the same middleware
 and domain (`RMW_IMPLEMENTATION=rmw_fastrtps_cpp`, `ROS_DOMAIN_ID=0`); each
 repo's dev shell sets these for you.
 
-A healthy run drops a clip into `./clipped` for each trigger
-(`<trigger_ns>_<name>.mcap`) and publishes an `momentedge_msgs/Recorded`
-announcement on `/events/momentedge/recorded` naming the file just written.
-Inspect a clip with `ros2 bag info clipped/<file>.mcap`.
+A healthy run drops one or more clips into `./clipped` for each trigger and
+publishes a `momentedge_msgs/Recorded` announcement on
+`/events/momentedge/recorded` naming every file written. A window inside one
+recording produces `<trigger_ns>_<name>.mcap`; one spanning a rollover produces
+`<trigger_ns>_<name>_00.mcap`, `_01.mcap`, etc. Inspect a clip with
+`ros2 bag info clipped/<file>.mcap`.
 
 ## Triggered recording
 
 The recorder keeps a continuous on-disk recording open and extracts short clips
-from it on demand, tailing **one growing MCAP file** — no split boundaries and
-no per-split events. Clip latency is bounded by the recorder's write-through
-latency rather than any split duration.
+from it on demand, tailing a **collection of MCAP recordings** — the current
+growing file plus any finished recordings (splits or restarts) it has indexed
+while running. Clip latency is bounded by the recorder's write-through latency
+rather than any split duration.
 
 ```
-ros2 bag record ──one growing mcap──▶ ./record/<bag>_0.mcap
-       ▲ kept open + tailed
+ros2 bag record ──growing mcap──▶ ./record/<bag>_0.mcap
+       ▲ kept open + tailed     ▶ ./record/<bag>_1.mcap  (split, if any)
 clipper ◀── /events/momentedge/trigger ── trigger-pub
-       ├──▶ ./clipped/<trigger_ns>_<name>.mcap
+       ├──▶ ./clipped/<trigger_ns>_<name>.mcap          (window in one recording)
+       ├──▶ ./clipped/<trigger_ns>_<name>_00.mcap  ─┐  (window spanning a rollover)
+       ├──▶ ./clipped/<trigger_ns>_<name>_01.mcap  ─┘
        └──▶ /events/momentedge/recorded
 ```
 
@@ -140,12 +146,21 @@ clipper ◀── /events/momentedge/trigger ── trigger-pub
 - **`clipper`** listens on `/events/momentedge/trigger`
   (`momentedge_msgs/Trigger`: `name`, `description`, `trigger_time`, and the
   `preroll`/`postroll` windows in nanoseconds). For each trigger it waits until
-  the recording covers the window `[trigger_time - preroll, trigger_time +
-  postroll]` (or the grace timeout elapses), then bulk-copies every message in
-  that window into `./clipped/<trigger_ns>_<name>.mcap` and publishes
+  the recording collection covers the window `[trigger_time - preroll,
+  trigger_time + postroll]` (or the grace timeout elapses), then bulk-copies
+  every message in that window into one or more clips and publishes
   `momentedge_msgs/Recorded` on `/events/momentedge/recorded`. The copy re-emits
   raw MCAP message bytes — channels and schemas are carried over, message bodies
   are never decoded.
+
+  **Clip naming.** A window that falls inside a single recording produces one
+  file: `./clipped/<trigger_ns>_<name>.mcap`. A window that straddles a rollover
+  (a rosbag2 bag split or a recorder restart that clipper indexed while running)
+  produces one segment per source file: `<trigger_ns>_<name>_00.mcap`,
+  `_01.mcap`, and so on, tiling the window in time order. The
+  `momentedge_msgs/Recorded` message carries every segment path in its
+  `string[] filenames` field. Every file named in `filenames` is already on disk
+  and crash-durable before the announcement is published.
 - **`trigger-pub`** publishes a trigger every 1 s (configurable), stamping
   `trigger_time` with the current time — a development stand-in for a real
   trigger source. With no `--preroll`/`--postroll` flags it draws each side a
@@ -168,6 +183,8 @@ version. All settings are optional:
 | `--grace-secs` | `MOMENTEDGE_GRACE_SECS` | `30` | wait past the window end for coverage before cutting |
 | `--extract-parallelism` | `MOMENTEDGE_EXTRACT_PARALLELISM` | `1` | concurrent clip copies (1 = one at a time, FIFO) |
 | `--clip-compression` | `MOMENTEDGE_CLIP_COMPRESSION` | `zstd` | codec for written clips: `none`, `lz4`, or `zstd` (zstd = smallest, lz4 = faster, none = no recompression) |
+| `--watch-old-files-duration` | `MOMENTEDGE_WATCH_OLD_FILES_DURATION` | `600` | seconds to keep a finished (split/restart) recording indexed and its file descriptor open so a trigger's preroll can still reach into it; set this comfortably above the largest preroll any trigger will request |
+| `--delete-old-files` | `MOMENTEDGE_DELETE_OLD_FILES` | `false` | when set, a prune also unlinks the expired `.mcap` from disk (off by default — clipper does not own the recordings; `ros2 bag record` does) |
 
 For example, `clipper --grace-secs 60` and `MOMENTEDGE_GRACE_SECS=60 clipper`
 are equivalent.
@@ -218,13 +235,19 @@ no tests, so the suite is `clipper`'s.
 `crates/clipper/tests/e2e.rs` drives the real stack end to end: a
 real `ros2 bag record` (matching the production `scripts/record.sh` invocation),
 CLI-published triggers, and a `ros2 topic echo` listener for the
-`Recorded` announcements. The matrix covers the fastwrite and zstd_fast
-storage profiles; recorder restarts both between and inside an open trigger
-window; deletion of the recording with and without a subsequent restart;
-grace-timeout degraded paths; offline/live corruption of the recording; and
-the most-recent-file-only semantics — when a recording is replaced, data from
-the previous file is never recovered into a clip, even if that file still
-exists on disk.
+`Recorded` announcements. The matrix covers:
+
+- The fastwrite and zstd_fast storage profiles (happy path per profile).
+- Recorder restarts between triggers and inside an open trigger window (clean
+  restart, deletion-then-restart, deletion before the trigger), each recovered
+  across the boundary as one segment per source file.
+- Deletion of the recording without a restart (mid-window and pre-trigger): the
+  grace cut recovers the data scanned before the deletion.
+- A restart after the window closes: the closing recording, kept in the
+  collection, is recovered even though its file is gone from disk.
+- A window straddling an in-run rosbag2 split, recovered as one segment per
+  source file (the headline cross-file recovery; preroll reaches the prior file).
+- Grace-timeout degraded paths and offline/live recording corruption.
 
 The suite is gated on `CLIPPER_E2E`: unset (plain `cargo test`,
 `cargo llvm-cov`) every e2e test prints a skip notice and passes, so the
@@ -260,17 +283,15 @@ for d in humble jazzy lyrical; do
 done
 ```
 
-The suite passes 14/14 on **humble** and **jazzy**. **Lyrical** builds (the
-workspace pins [`r2r`](https://github.com/sequenceplanner/r2r) to its `0.9.6` git
-tag, which supports lyrical) and passes 12/14: two recorder-restart tests
-(`old_recording_on_disk_is_not_recovered_after_restart` and
-`corrupt_tail_health_live`) fail because lyrical's rosbag2 names bag files with a
-timestamp, breaking the test harness's stable-filename re-attach check — the
-recorder itself is unaffected (beads `clipper-7ys`). **Rolling** selects
-and builds its ROS2 closure (`nix develop .#rolling` works) but cannot build the
-Rust crates: even r2r `0.9.6` references the `RMW_QOS_POLICY_LIVELINESS_MANUAL_BY_NODE`
-rmw enum variant that the current rolling has dropped (beads `clipper-2xb`).
-The r2r pin returns to a crates.io release once `0.9.6` is published there (beads
+The suite runs on **humble**, **jazzy**, and **lyrical** (the workspace pins
+[`r2r`](https://github.com/sequenceplanner/r2r) to its `0.9.6` git tag, which
+supports lyrical). The recovery tests discover recordings by mtime and assert on
+path-free log needles, so lyrical's timestamped rosbag2 bag filenames do not
+break them (beads `clipper-7ys`). **Rolling** selects and builds its ROS2 closure
+(`nix develop .#rolling` works) but cannot build the Rust crates: even r2r
+`0.9.6` references the `RMW_QOS_POLICY_LIVELINESS_MANUAL_BY_NODE` rmw enum
+variant that the current rolling has dropped (beads `clipper-2xb`). The r2r pin
+returns to a crates.io release once `0.9.6` is published there (beads
 `clipper-4rw`).
 
 CI runs this suite — build, unit tests, and the gated e2e — on every push across
@@ -376,12 +397,25 @@ compatibility; see "Build on the target" above for the rationale.
 
 ### Retention
 
-The continuous recording is one growing file with no built-in retention; the
-clips clipper writes accumulate too. Prune old clips on a schedule (e.g. a cron
-running `find ./clipped -mindepth 1 -type f -mmin +1440 -delete`), and see
-[`examples/split-bags`](examples/split-bags/README.md) for bounding the recording
-itself with split bags. In-place hole-punch retention for the continuous file is
-tracked in beads (`clipper-wkg`).
+**Recording index retention.** clipper keeps finished recordings (splits or
+restarts it indexed while running) in memory with their file descriptors open
+for `--watch-old-files-duration` seconds (default 600 s = 10 min) so a
+trigger's preroll can reach into them. The tail prunes expired recordings every
+poll — whole files only, never the one currently being recorded. The prune
+releases the file descriptor and frees the index memory; by default it leaves
+the `.mcap` on disk for `ros2 bag record` or other consumers. Set
+`--delete-old-files` to have clipper also unlink expired recordings from disk,
+turning the watch duration into a real disk-cleanup horizon for the recording
+directory. Set `--watch-old-files-duration` comfortably above the largest
+preroll any trigger will request: a preroll that reaches past the watch floor
+may lose its oldest segment.
+
+**Clip retention.** The clips clipper writes accumulate in `./clipped`. Prune
+old clips on a schedule (e.g. a cron running
+`find ./clipped -mindepth 1 -type f -mmin +1440 -delete`), and see
+[`examples/split-bags`](examples/split-bags/README.md) for bounding the
+recording itself with split bags. In-place hole-punch retention for the
+continuous file is tracked in beads (`clipper-wkg`).
 
 ## Layout
 
