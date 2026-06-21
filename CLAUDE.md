@@ -16,10 +16,18 @@ you work in their directory, keeping their detail out of context otherwise.
 [`trigger-pub`](examples/trigger-pub/CLAUDE.md) is a periodic `Trigger` publisher
 that drives it during development, standing in for a real trigger source. The
 recorder owns no sensor subscriptions and no message index; it cuts clips out of
-a continuous on-disk `ros2 bag record` on ROS2 trigger events, copying MCAP
-messages straight through. It tails a **collection** of recording indexes — the
-current growing file plus any finished recordings (splits or restarts) it
-indexed while running — decoding nothing but each message's MCAP log time.
+a continuous on-disk `ros2 bag record` on trigger events, copying MCAP messages
+straight through. It tails a **collection** of recording indexes — the current
+growing file plus any finished recordings (splits or restarts) it indexed while
+running — decoding nothing but each message's MCAP log time.
+
+`--interface {ros|mcap}` selects how a trigger reaches it and how completion is
+signalled — one mutually-exclusive interface per run. `ros` (the default,
+deployed path) subscribes to the ROS2 trigger topic and publishes
+`momentedge_msgs/Recorded`. `mcap` reads the trigger straight out of the tailed
+recording itself, decoding each by the MCAP channel's `message_encoding`, and
+runs ROS-free at runtime — the clip's move into `out_dir` is the only completion
+signal. Internals live in [`clipper`](crates/clipper/CLAUDE.md).
 
 A trigger window that falls inside one recording produces a single clip
 (`<trigger_ns>_<name>.mcap`); one that straddles a rollover produces one segment

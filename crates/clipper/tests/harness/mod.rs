@@ -339,6 +339,21 @@ impl TestEnv {
         proc
     }
 
+    /// The binary under test on the MCAP interface: it reads triggers out of the
+    /// tailed recording (decoding each by its `message_encoding`) and runs
+    /// ROS-free — no trigger subscription, no `Recorded` publish. Same temp-tree
+    /// wiring as [`Self::start_extractor`], plus `MOMENTEDGE_INTERFACE=mcap`.
+    pub fn start_extractor_mcap(&self, grace_secs: u64) -> Proc {
+        let mut cmd = self.command(env!("CARGO_BIN_EXE_clipper"));
+        cmd.env("MOMENTEDGE_RECORD_DIR", self.record_dir())
+            .env("MOMENTEDGE_OUT_DIR", self.out_dir())
+            .env("MOMENTEDGE_GRACE_SECS", grace_secs.to_string())
+            .env("MOMENTEDGE_INTERFACE", "mcap");
+        let proc = self.spawn("extractor", cmd);
+        proc.expect_log("clipper up", Duration::from_secs(30));
+        proc
+    }
+
     /// A `ros2 topic echo --once` capturing the next `Recorded` announcement
     /// into its log. Started (and given a discovery head start) BEFORE the
     /// trigger fires, so the announcement publisher is already matched by the
@@ -447,6 +462,71 @@ impl TestEnv {
             leftover.is_empty(),
             ".capturing must hold no finished clip, found: {leftover:?}"
         );
+    }
+
+    /// Publish one `Trigger` so it lands in the recording, for the MCAP
+    /// interface to read back out. clipper on `--interface mcap` does NOT
+    /// subscribe to the trigger topic, so the only subscriber to wait for is the
+    /// `--all` recorder (`-w 1`); the publish lands in the bag and clipper reads
+    /// it off the file. Publishes exactly once — a republish would write a second
+    /// trigger record into the bag and cut a duplicate clip — then confirms
+    /// clipper logged receipt after decoding it out of the MCAP.
+    pub fn fire_trigger_into_bag(
+        &self,
+        name: &str,
+        trigger_ns: u64,
+        preroll_ns: u64,
+        postroll_ns: u64,
+    ) {
+        let sec = (trigger_ns / 1_000_000_000) as i64;
+        let nanosec = trigger_ns % 1_000_000_000;
+        let yaml = format!(
+            "{{name: {name}, description: e2e, \
+             trigger_time: {{sec: {sec}, nanosec: {nanosec}}}, \
+             preroll: {preroll_ns}, postroll: {postroll_ns}}}"
+        );
+        let mut cmd = self.command("ros2");
+        cmd.args([
+            "topic",
+            "pub",
+            "--once",
+            "-w",
+            "1",
+            TRIGGER_TOPIC,
+            "momentedge_msgs/msg/Trigger",
+            &yaml,
+        ]);
+        let mut proc = self.spawn(&format!("trigger-{name}"), cmd);
+        let status = proc.wait_exit(Duration::from_secs(30)).unwrap_or_else(|| {
+            proc.dump_log();
+            panic!("trigger publish {name} did not complete");
+        });
+        assert!(status.success(), "trigger publish {name} failed: {status}");
+
+        // clipper logs `trigger name="<name>"` the moment it decodes the trigger
+        // out of the tailed MCAP — the receipt confirmation for the mcap path.
+        let extractor_log = self.log_dir().join("extractor.log");
+        let needle = format!("trigger name=\"{name}\"");
+        assert!(
+            wait_for_file_contains(&extractor_log, &needle, Duration::from_secs(30)),
+            "clipper never logged receipt of the in-bag trigger {name:?}; see {}",
+            extractor_log.display(),
+        );
+    }
+
+    /// Poll `out_dir` for the clip a cut produces, returning its path once it
+    /// appears. The MCAP interface publishes no `Recorded`, so the finished
+    /// clip's atomic appearance in `out_dir` is the only completion signal.
+    pub fn wait_for_clip(&self, file_name: &str, timeout: Duration) -> PathBuf {
+        let path = self.out_dir().join(file_name);
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if path.is_file() {
+                return path;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!("clip {} never appeared in out_dir", path.display());
     }
 }
 

@@ -169,6 +169,29 @@ clipper ◀── /events/momentedge/trigger ── trigger-pub
 Ctrl-C stops the recorder cleanly (exit zero); any internal fault exits non-zero
 for a supervisor to restart.
 
+### The two interfaces
+
+How a trigger reaches `clipper` and how it signals a finished clip are one
+choice — the **interface**, set by `--interface {ros|mcap}` (default `ros`). The
+two are mutually exclusive; `clipper` runs exactly one per launch.
+
+- **`ros`** (the default) is the topic-driven path above: it subscribes to
+  `/events/momentedge/trigger` and publishes `momentedge_msgs/Recorded` on
+  `/events/momentedge/recorded` for each clip. This is the deployed path.
+- **`mcap`** reads triggers straight out of the recording `clipper` already
+  tails — run `ros2 bag record --all` so the continuous recording captures the
+  trigger topic, and `clipper` lifts each trigger back out of it, decoding it by
+  the MCAP channel's `message_encoding` (`cdr` or `json`). It runs
+  ROS-free: no node, subscription, or publisher. It announces nothing on any
+  topic — a finished clip is signalled by the file appearing in `--out-dir`, so
+  watch that directory or the log lines for completion.
+
+Both cut identical clips; only the trigger and completion edges differ. The
+window is still anchored on each trigger's `trigger_time`. For the interface
+seam's design — the neutral trigger/completion contract, the decoder dispatch,
+and the ROS-free MCAP path — see
+[`crates/clipper/CLAUDE.md`](crates/clipper/CLAUDE.md).
+
 ### Configuration
 
 `clipper` is configured by CLI flags, each with a `MOMENTEDGE_*` environment
@@ -180,6 +203,7 @@ version. All settings are optional:
 |---|---|---|---|
 | `--record-dir` | `MOMENTEDGE_RECORD_DIR` | `./record` | bag directory of the continuous recording |
 | `--out-dir` | `MOMENTEDGE_OUT_DIR` | `./clipped` | where clips are written |
+| `--interface` | `MOMENTEDGE_INTERFACE` | `ros` | where triggers come from and completions go: `ros` (subscribe to the trigger topic, publish `Recorded`) or `mcap` (read triggers out of the tailed recording, ROS-free, signal completion by the clip's move into `out-dir`) — see [The two interfaces](#the-two-interfaces) |
 | `--grace-secs` | `MOMENTEDGE_GRACE_SECS` | `30` | wait past the window end for coverage before cutting |
 | `--extract-parallelism` | `MOMENTEDGE_EXTRACT_PARALLELISM` | `1` | concurrent clip copies (1 = one at a time, FIFO) |
 | `--clip-compression` | `MOMENTEDGE_CLIP_COMPRESSION` | `zstd` | codec for written clips: `none`, `lz4`, or `zstd` (zstd = smallest, lz4 = faster, none = no recompression) |

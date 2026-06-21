@@ -27,7 +27,12 @@
 //! Only the 14-byte prefix of each top-level `Message` record is read during
 //! the tail (channel id, sequence, `log_time`); message bodies are first
 //! touched by the extraction. The same "decode only the timestamp" discipline
-//! as the rest of the workspace, applied to file tailing.
+//! as the rest of the workspace, applied to file tailing. The one exception is
+//! an opt-in trigger tap ([`Tailer::with_trigger_tap`], wired only by the MCAP
+//! interface): when set, the scan also lifts the full body of messages on the
+//! trigger topic out as [`TriggerRecord`]s for the interface to decode by
+//! `message_encoding`. With the tap unset — the default — no message body is
+//! read during the scan at all.
 //!
 //! The tail owns a time-ordered collection of recordings. New `*.mcap` files
 //! under the record dir — a rosbag2 split rolling over to `<bag>_<n+1>.mcap`, or
@@ -59,9 +64,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use crossbeam_channel::Sender;
 use log::{info, warn};
 use mcap::records::Record;
 
+use crate::trigger::TriggerRecord;
 use crate::watch::Watch;
 
 /// The 8 magic bytes opening (and, after `finish`, closing) every MCAP file.
@@ -261,6 +268,11 @@ struct RecordingIndex {
     open: Option<Extent>,
     schemas: HashMap<u16, SchemaDef>,
     channels: HashMap<u16, ChannelDef>,
+    /// Channels on the trigger topic (`id -> message_encoding`), the subset of
+    /// `channels` the MCAP-interface tap watches. Empty unless the tail was built
+    /// with a trigger tap (`Tailer::with_trigger_tap`); seeds each scan pass so a
+    /// trigger message references its channel defined in an earlier pass.
+    trigger_channels: HashMap<u16, String>,
     bounds: TimeBounds,
 }
 
@@ -286,6 +298,9 @@ impl RecordingIndex {
                     schema,
                 },
             );
+        }
+        for (id, encoding) in delta.trigger_channels {
+            self.trigger_channels.insert(id, encoding);
         }
         self.extents.extend(delta.closed);
         self.open = delta.open;
@@ -355,6 +370,7 @@ impl TailState {
             open: None,
             schemas: HashMap::new(),
             channels: HashMap::new(),
+            trigger_channels: HashMap::new(),
             bounds: TimeBounds::default(),
         });
         if self.current.is_none() {
@@ -439,6 +455,16 @@ impl TailState {
 pub struct Tailer {
     state: Mutex<TailState>,
     coverage: Arc<Watch<Coverage>>,
+    /// The topic whose messages the scan lifts out as triggers, or `None` to
+    /// disable the tap entirely (the ROS interface, which reads triggers from a
+    /// live subscription instead). When `None`, the scan is byte-for-byte the
+    /// timestamp-only tail; no message body is ever read during the scan.
+    trigger_topic: Option<String>,
+    /// Where lifted [`TriggerRecord`]s go (the MCAP interface drains the far
+    /// end). `Some` exactly when `trigger_topic` is. Best-effort: a full or
+    /// closed tap never stalls the scan. Cloned into each scan's [`ScanDelta`],
+    /// which sends triggers straight down it the moment it lifts them.
+    trigger_tx: Option<Sender<TriggerRecord>>,
 }
 
 /// Where one scan pass stopped, whether the recording ended, and whether a
@@ -453,6 +479,26 @@ pub(crate) struct ScanProgress {
     pub(crate) fault: Option<anyhow::Error>,
 }
 
+/// Where a [`ScanDelta`] routes a trigger it lifts. A trigger emits only once it
+/// is durable: a top-level record the moment its framing is read, a
+/// chunk-interior record only after the chunk's CRC verifies. So the top-level
+/// delta carries the live tap and sends straight down it, while a chunk sub-delta
+/// stages until [`ScanDelta::absorb_chunk`] re-emits each through the parent.
+#[derive(Default)]
+enum TriggerSink {
+    /// The live tap the MCAP interface drains — the top-level scan delta. A
+    /// lifted trigger sends now.
+    Live(Sender<TriggerRecord>),
+    /// A chunk sub-delta's staging buffer: triggers wait here until the chunk
+    /// iterates cleanly, then `absorb_chunk` re-emits them through the parent's
+    /// `Live` sink. A damaged chunk is discarded whole, so its staged triggers
+    /// never emit.
+    Staged(Vec<TriggerRecord>),
+    /// The tap is disabled (no `--interface mcap`): no trigger is ever lifted.
+    #[default]
+    Off,
+}
+
 /// Registry and extent updates of one scan pass, collected without the state
 /// lock (the pass does file IO) and applied under one short lock at the end.
 #[derive(Default)]
@@ -464,6 +510,17 @@ struct ScanDelta {
     schemas: Vec<(u16, SchemaDef)>,
     channels: Vec<RawChannel>,
     high_water_ns: u64,
+    /// The trigger topic to lift, seeded from the tailer. `None` disables the
+    /// tap, so the fields below stay empty/idle and the scan never reads a body.
+    trigger_topic: Option<String>,
+    /// Channels on the trigger topic seen so far — seeded from the recording's
+    /// registry and grown as this pass parses `Channel` records — as
+    /// `id -> message_encoding`. Consulted when a message references one of them.
+    trigger_channels: HashMap<u16, String>,
+    /// Where a lifted trigger goes: the top-level delta sends it straight down the
+    /// live tap ([`TriggerSink::Live`]) the instant its framing is read; a chunk
+    /// sub-delta stages it ([`TriggerSink::Staged`]) until the chunk's CRC clears.
+    trigger_sink: TriggerSink,
 }
 
 /// A `Channel` record before its schema is resolved against the registry.
@@ -484,6 +541,45 @@ impl ScanDelta {
         });
     }
 
+    /// Lift one trigger-topic message into a [`TriggerRecord`] and emit it. The
+    /// two scan sites that find a trigger — a chunk-interior message
+    /// ([`Self::absorb_parsed`]) and a top-level message
+    /// ([`Tailer::scan_available`]) — funnel through here so the record is built
+    /// one way; they differ only in how each obtains `body` (a decoded chunk
+    /// `Cow` vs. a direct file read).
+    fn capture_trigger(&mut self, message_encoding: String, body: Vec<u8>, log_time: u64) {
+        self.emit_trigger(TriggerRecord {
+            message_encoding,
+            body,
+            log_time,
+        });
+    }
+
+    /// Route one lifted trigger by the delta's [`TriggerSink`]: the top-level
+    /// delta's [`TriggerSink::Live`] sends it straight down the tap now; a chunk
+    /// sub-delta's [`TriggerSink::Staged`] holds it until [`Self::absorb_chunk`]
+    /// re-emits it through the parent once the chunk's CRC verifies — a damaged
+    /// chunk emits nothing. The send is best-effort: a full or closed tap never
+    /// stalls the scan.
+    fn emit_trigger(&mut self, rec: TriggerRecord) {
+        match &mut self.trigger_sink {
+            // The live tap. `send` fails only when the receiver — the MCAP
+            // interface draining the tap — is gone, which happens only once its
+            // thread has died and `supervise` is already tearing the process
+            // down. There is nothing useful left to do with the trigger then, and
+            // the supervisor surfaces the real fault (a panicked interface
+            // thread), so the drop is deliberate, not a swallowed error.
+            TriggerSink::Live(tx) => {
+                let _ = tx.send(rec);
+            }
+            // A chunk sub-delta: hold the trigger until its chunk's CRC clears.
+            TriggerSink::Staged(staged) => staged.push(rec),
+            // Unreachable: a trigger is lifted only when `trigger_channels` is
+            // non-empty, which the disabled tap never fills.
+            TriggerSink::Off => {}
+        }
+    }
+
     /// Fold one parsed record into the delta: schema/channel definitions into
     /// the registry, message times into the pending extent bounds.
     fn absorb_parsed(&mut self, rec: Record<'_>) {
@@ -496,14 +592,32 @@ impl ScanDelta {
                     data: data.into_owned(),
                 },
             )),
-            Record::Channel(ch) => self.channels.push(RawChannel {
-                id: ch.id,
-                schema_id: ch.schema_id,
-                topic: ch.topic,
-                message_encoding: ch.message_encoding,
-                metadata: ch.metadata,
-            }),
-            Record::Message { header, .. } => self.absorb_time(header.log_time),
+            Record::Channel(ch) => {
+                // Register a trigger channel before `ch` is moved, so messages
+                // later in this pass (or in later passes, via the recording's
+                // registry) resolve their encoding.
+                if self.trigger_topic.as_deref() == Some(ch.topic.as_str()) {
+                    self.trigger_channels
+                        .insert(ch.id, ch.message_encoding.clone());
+                }
+                self.channels.push(RawChannel {
+                    id: ch.id,
+                    schema_id: ch.schema_id,
+                    topic: ch.topic,
+                    message_encoding: ch.message_encoding,
+                    metadata: ch.metadata,
+                });
+            }
+            Record::Message { header, data } => {
+                self.absorb_time(header.log_time);
+                // A message on a trigger channel is lifted whole (its body is the
+                // serialized Trigger payload); any other message contributes only
+                // its timestamp, its body untouched. Inside a chunk sub-delta this
+                // stages the trigger (TriggerSink::Staged) until the CRC clears.
+                if let Some(encoding) = self.trigger_channels.get(&header.channel_id).cloned() {
+                    self.capture_trigger(encoding, data.into_owned(), header.log_time);
+                }
+            }
             _ => {}
         }
     }
@@ -525,13 +639,33 @@ impl ScanDelta {
         let Record::Chunk { header, data } = mcap::parse_record(op::CHUNK, body)? else {
             bail!("chunk opcode did not parse as a chunk record");
         };
-        let mut sub = ScanDelta::default();
+        // Seed the sub-delta with the tap context so a Channel and a Message on
+        // the trigger topic inside this chunk (or in an earlier pass) resolve.
+        let mut sub = ScanDelta {
+            trigger_topic: self.trigger_topic.clone(),
+            trigger_channels: self.trigger_channels.clone(),
+            // Stage triggers lifted from the chunk; they emit only after the
+            // chunk iterates cleanly, so a damaged chunk lifts nothing.
+            trigger_sink: TriggerSink::Staged(Vec::new()),
+            ..ScanDelta::default()
+        };
         for rec in mcap::read::ChunkReader::new(header, &data).context("opening chunk")? {
             sub.absorb_parsed(rec.context("reading record inside chunk")?);
         }
         self.schemas.extend(sub.schemas);
         self.channels.extend(sub.channels);
         self.high_water_ns = self.high_water_ns.max(sub.high_water_ns);
+        // Trigger channels discovered in the chunk persist for later records;
+        // triggers lifted from it emit only here, after the chunk iterated
+        // cleanly. The sub-delta staged them (TriggerSink::Staged) rather than
+        // sending; re-emitting through the parent's live sink sends each now (a
+        // damaged chunk never reaches this point, so it emits nothing).
+        self.trigger_channels.extend(sub.trigger_channels);
+        if let TriggerSink::Staged(staged) = sub.trigger_sink {
+            for rec in staged {
+                self.emit_trigger(rec);
+            }
+        }
         if let Some((min, max)) = sub.pending_time {
             self.pending_time = Some(match self.pending_time {
                 Some((omin, omax)) => (omin.min(min), omax.max(max)),
@@ -565,13 +699,36 @@ impl ScanDelta {
 }
 
 impl Tailer {
-    /// A fresh tailer plus the coverage watch trigger handlers wait on.
+    /// A fresh tailer (no trigger tap) plus the coverage watch trigger handlers
+    /// wait on. The scan reads only message timestamps; triggers arrive through
+    /// the ROS interface, not the file.
     pub fn new() -> (Arc<Self>, Arc<Watch<Coverage>>) {
+        Self::build(None, None)
+    }
+
+    /// A tailer whose scan also lifts messages on `trigger_topic` out of the
+    /// recording as [`TriggerRecord`]s, sending each on `trigger_tx` — the MCAP
+    /// interface's trigger source. Only recordings indexed live emit triggers
+    /// (no startup back-indexing); a trigger already on disk before clipper
+    /// started never fires.
+    pub fn with_trigger_tap(
+        trigger_topic: impl Into<String>,
+        trigger_tx: Sender<TriggerRecord>,
+    ) -> (Arc<Self>, Arc<Watch<Coverage>>) {
+        Self::build(Some(trigger_topic.into()), Some(trigger_tx))
+    }
+
+    fn build(
+        trigger_topic: Option<String>,
+        trigger_tx: Option<Sender<TriggerRecord>>,
+    ) -> (Arc<Self>, Arc<Watch<Coverage>>) {
         let coverage = Arc::new(Watch::new(Coverage::default()));
         (
             Arc::new(Tailer {
                 state: Mutex::new(TailState::default()),
                 coverage: coverage.clone(),
+                trigger_topic,
+                trigger_tx,
             }),
             coverage,
         )
@@ -806,6 +963,12 @@ impl Tailer {
     /// state lock is the only one a handler's `plan_window` can contend on; the
     /// file IO above ran with no lock held.
     fn apply_to_current(&self, delta: ScanDelta, offset: u64) {
+        // Triggers were already sent straight down the tap as the scan lifted
+        // them ([`ScanDelta::emit_trigger`]); apply only publishes the index and
+        // advances coverage. A handler that received a trigger before this runs
+        // still cannot cut its clip until coverage reaches the window end, and
+        // coverage advances only here — so the cut never races ahead of the
+        // index it reads.
         let hw = {
             let mut st = self.state.lock().unwrap();
             if let Some(id) = st.current
@@ -849,14 +1012,25 @@ impl Tailer {
         mut offset: u64,
         file_len: u64,
     ) -> ScanProgress {
-        let mut delta = ScanDelta {
-            open: {
-                let st = self.state.lock().unwrap();
-                st.current
-                    .and_then(|id| st.recording(id))
-                    .and_then(|r| r.open)
-            },
-            ..ScanDelta::default()
+        let mut delta = {
+            let st = self.state.lock().unwrap();
+            let current = st.current.and_then(|id| st.recording(id));
+            ScanDelta {
+                open: current.and_then(|r| r.open),
+                // Seed the tap from the tailer and the current recording's known
+                // trigger channels; both stay empty/idle when the tap is disabled.
+                // The top-level delta carries the live sink, so triggers it lifts
+                // send straight down the tap as the scan finds them.
+                trigger_topic: self.trigger_topic.clone(),
+                trigger_sink: self
+                    .trigger_tx
+                    .clone()
+                    .map_or(TriggerSink::Off, TriggerSink::Live),
+                trigger_channels: current
+                    .map(|r| r.trigger_channels.clone())
+                    .unwrap_or_default(),
+                ..ScanDelta::default()
+            }
         };
         let mut ended = false;
         // The offset of the faulted record is `offset` (left unadvanced) when
@@ -905,9 +1079,10 @@ impl Tailer {
                     }
                 }
                 op::MESSAGE => {
-                    // Decode only the 14-byte prefix: channel_id u16,
-                    // sequence u32, log_time u64 (all LE). The body stays
-                    // untouched until extraction.
+                    // Decode the 14-byte prefix: channel_id u16, sequence u32,
+                    // log_time u64 (all LE). A message on a trigger channel also
+                    // has its payload (past the 22-byte fixed fields) lifted out;
+                    // every other body stays untouched until extraction.
                     if len >= 14 {
                         let mut prefix = [0u8; 14];
                         if let Err(e) = file.read_exact_at(&mut prefix, offset + 9) {
@@ -916,7 +1091,33 @@ impl Tailer {
                             )));
                             break;
                         }
-                        delta.absorb_time(u64::from_le_bytes(prefix[6..14].try_into().unwrap()));
+                        let channel_id = u16::from_le_bytes(prefix[0..2].try_into().unwrap());
+                        let log_time = u64::from_le_bytes(prefix[6..14].try_into().unwrap());
+                        delta.absorb_time(log_time);
+
+                        if let Some(encoding) = delta.trigger_channels.get(&channel_id).cloned() {
+                            // The payload follows the 22-byte fixed fields. A
+                            // conformant Message is >= 22 B; a shorter trigger
+                            // record carries no payload to decode and is skipped
+                            // (a warning), the framing intact.
+                            if len >= 22 {
+                                let mut payload = vec![0u8; (len - 22) as usize];
+                                if let Err(e) = file.read_exact_at(&mut payload, offset + 9 + 22) {
+                                    fault = Some(anyhow::Error::new(e).context(format!(
+                                        "reading trigger payload at {offset}; framing desynchronised?"
+                                    )));
+                                    break;
+                                }
+                                // A top-level record is durable the instant its
+                                // framing is read, so capture_trigger sends it
+                                // straight down the tap (no chunk CRC to clear).
+                                delta.capture_trigger(encoding, payload, log_time);
+                            } else {
+                                warn!(
+                                    "trigger message at {offset} is only {len} B; no payload to decode"
+                                );
+                            }
+                        }
                     } else {
                         // A conformant Message body is >= 22 bytes (its fixed
                         // fields alone); below 14 not even log_time exists.
