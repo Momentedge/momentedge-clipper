@@ -248,6 +248,8 @@ dependencies = [
  "pretty_env_logger",
  "r2r",
  "rstest",
+ "serde",
+ "serde_json",
  "signal-hook",
  "tempfile",
 ]

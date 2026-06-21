@@ -7,16 +7,24 @@
 //! schema/channel registry, and a coverage watch (the highest `log_time` on
 //! disk). There are no bag splits and no `/events/write_split` dependency.
 //!
-//! On `/events/momentedge/trigger` (`momentedge_msgs/Trigger`) it cuts the
-//! window `[trigger_time - preroll, trigger_time + postroll]`: wait until the
-//! wall clock passes the window end, wait until the tail's coverage reaches it
-//! (the recording provably holds the window), then bulk-copy the in-window
-//! messages out of the planned extents into a clip published at
-//! `./clipped/<trigger_ns>_<name>.mcap` (see [`clip`] — a raw-bytes
-//! copy, no CDR decode, finished with a proper summary + footer, assembled in
-//! a capturing dir and moved atomically into place so observers never see a
-//! footer-less file), and finally publish `/events/momentedge/recorded`
-//! (`momentedge_msgs/Recorded`), which therefore always names a durable clip.
+//! A trigger requests the window `[trigger_time - preroll, trigger_time +
+//! postroll]`: the [`handler`] waits until the wall clock passes the window end,
+//! waits until the tail's coverage reaches it (the recording provably holds the
+//! window), then bulk-copies the in-window messages out of the planned extents
+//! into a clip at `./clipped/<trigger_ns>_<name>.mcap` (see [`clip`] — a
+//! raw-bytes copy, no CDR decode, finished with a proper summary + footer,
+//! assembled in a capturing dir and moved atomically into place so observers
+//! never see a footer-less file).
+//!
+//! Where triggers come from and how completion is signalled is the [`interface`],
+//! one active per run (`--interface`). The `ros` interface subscribes to
+//! `/events/momentedge/trigger` (`momentedge_msgs/Trigger`) on a ROS node and
+//! publishes `/events/momentedge/recorded` (`momentedge_msgs/Recorded`) naming
+//! every durable segment. The `mcap` interface reads triggers out of the tailed
+//! recording itself — decoding each by its MCAP `message_encoding` ([`decode`])
+//! — and runs ROS-free, the clip's atomic move into the output directory
+//! standing in for the `Recorded` publish. The handler cutting the clip is
+//! identical either way; it knows only the neutral [`trigger`] contract.
 //!
 //! Time base: MCAP `log_time`, the trigger stamp, and the wait clock are all
 //! treated as nanoseconds on the system (ROS) clock — this assumes the default
@@ -26,12 +34,12 @@
 //! logged, and ignored.
 //!
 //! Everything runs on plain OS threads — there is no async runtime. The main
-//! thread supervises ([`supervise`]) four long-lived companions over
-//! crossbeam channels: the tail thread (file scan), the node spin thread
-//! (ROS executor), the trigger consumer (drains the typed subscription with
-//! `futures::executor::block_on`), and a signal forwarder (SIGINT/SIGTERM →
-//! orderly exit 0). Clip copies run on a fixed pool of
-//! `extract_parallelism` worker threads consuming one FIFO job channel.
+//! thread supervises ([`supervise`]) two long-lived companions over crossbeam
+//! channels — the tail thread (file scan) and the interface thread (draining the
+//! active trigger source; the `ros` interface owns its node spin and
+//! subscription drain internally) — plus a signal forwarder (SIGINT/SIGTERM →
+//! orderly exit 0). Clip copies run on a fixed pool of `extract_parallelism`
+//! worker threads consuming one FIFO job channel.
 //!
 //! Configuration is parsed by clap (`Config`): each setting is a CLI flag that
 //! falls back to a `MOMENTEDGE_<KEY>` environment variable, then to a built-in
@@ -41,6 +49,10 @@
 //! version. Settings (all optional):
 //!   --record-dir   bag directory of the continuous recording (default ./record)
 //!   --out-dir      where clips are written                   (default ./clipped)
+//!   --interface    trigger source + completion sink: ros (subscribe + publish
+//!                  Recorded) or mcap (read triggers from the tailed file,
+//!                  ROS-free, the clip's move into out-dir the signal)
+//!                  (default ros)
 //!   --grace-secs   how long past the window end to wait for coverage
 //!                  before cutting from what is on disk (default 30; must
 //!                  exceed the recorder's flush latency — for a chunked
@@ -56,25 +68,28 @@
 //! controls verbosity.
 
 mod clip;
+mod decode;
 mod discover;
+mod handler;
+mod interface;
 mod tail;
+mod trigger;
 mod watch;
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::Context;
 use clap::{CommandFactory, FromArgMatches, Parser, ValueEnum};
 use crossbeam_channel::{Receiver, Sender, bounded, select, unbounded};
-use futures::executor::block_on;
-use futures::stream::StreamExt;
+use interface::{Interface, McapInterface, RosInterface};
 use log::{error, info, warn};
-use r2r::{Publisher, QosProfile};
 use signal_hook::consts::{SIGINT, SIGTERM};
-use tail::{Coverage, Tailer, WindowPlan};
+use tail::{Coverage, Tailer};
+use trigger::Trigger;
 use watch::Watch;
 
 const TRIGGER_TOPIC: &str = "/events/momentedge/trigger";
@@ -127,6 +142,31 @@ impl std::fmt::Display for ClipCompression {
     }
 }
 
+/// Where clipper takes triggers from and where it announces completions — one
+/// interface to the outside world, chosen by `--interface`. The two are mutually
+/// exclusive; clipper drives exactly one per run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum InterfaceKind {
+    /// Subscribe to the trigger topic on a ROS node and publish `Recorded` on
+    /// completion. The default — the deployed, ROS-native path.
+    Ros,
+    /// Read triggers out of the tailed MCAP (decoding each by its
+    /// `message_encoding`) and signal completion by the clip's move into
+    /// `out_dir`. Runs ROS-free: no node, executor, subscription, or publish.
+    Mcap,
+}
+
+impl std::fmt::Display for InterfaceKind {
+    /// Render as the clap value name (`ros`/`mcap`) so the `--help` default and
+    /// the accepted flag values share the `ValueEnum` possible-value names.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.to_possible_value()
+            .expect("no InterfaceKind variant is skipped")
+            .get_name()
+            .fmt(f)
+    }
+}
+
 /// Recorder configuration, parsed by clap from CLI flags with a `CLIPPER_*`
 /// environment-variable fallback per field (see [`load_config`]). The field doc
 /// comments are the `--help` text: the first line is the short help, the rest is
@@ -169,6 +209,16 @@ struct Config {
     /// stay at the mcap default.
     #[arg(long, value_enum, default_value_t = ClipCompression::Zstd)]
     clip_compression: ClipCompression,
+
+    /// Where triggers come from and completions go: `ros` or `mcap`.
+    ///
+    /// `ros` (the default) subscribes to the trigger topic on a ROS node and
+    /// publishes `Recorded` on completion. `mcap` reads triggers out of the
+    /// tailed recording (decoding each by its `message_encoding`) and signals
+    /// completion by moving the clip into `out_dir` — it runs ROS-free, with no
+    /// node, subscription, or publish. Exactly one interface is active per run.
+    #[arg(long, value_enum, default_value_t = InterfaceKind::Ros)]
+    interface: InterfaceKind,
 
     /// Seconds to keep a finished recording indexed (and its fd open) for clip
     /// preroll.
@@ -351,68 +401,6 @@ impl Drop for AdmissionPermit {
     }
 }
 
-/// One queued clip-segment staging: the window-plan snapshot the handler took
-/// for one source recording, the window bounds for the message-time filter, the
-/// base output path, and the reply channel. Queued by [`record_clip`]; dequeued
-/// FIFO by the staging workers, which run the bulk copy into the capturing dir
-/// and reply a [`clip::StagedClip`]. The handler publishes the staged segments
-/// itself, once the window's segment count is known.
-struct StageJob {
-    plan: WindowPlan,
-    start_ns: u64,
-    end_ns: u64,
-    out_path: PathBuf,
-    reply: Sender<anyhow::Result<clip::StagedClip>>,
-}
-
-/// Spawn the fixed staging worker pool: `parallelism` threads consuming one
-/// shared FIFO channel. With the default single worker the bulk copies serialize
-/// in submission order — staging reads compete with the recorder's writes for
-/// disk bandwidth (see [`Config::extract_parallelism`]).
-///
-/// Each worker runs only [`clip::stage_clip`] — the bulk copy into the capturing
-/// dir — and replies the [`clip::StagedClip`]; the handler publishes it once it
-/// knows the window's segment count. The window plan rides in the job: the
-/// handler snapshots it (one per source recording, pinning each file's
-/// `Arc<File>`), so the worker never touches the tailer. The clip compression
-/// codec is process-global, captured here. A panicking stage is caught and
-/// replied as an error — per-job isolation, the pool outlives it.
-fn spawn_stage_workers(
-    parallelism: usize,
-    compression: Option<mcap::Compression>,
-) -> Sender<StageJob> {
-    let (tx, rx) = unbounded::<StageJob>();
-    for i in 0..parallelism.max(1) {
-        let rx = rx.clone();
-        thread::Builder::new()
-            .name(format!("stage-{i}"))
-            .spawn(move || {
-                for job in rx.iter() {
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        clip::stage_clip(
-                            &job.plan,
-                            &job.out_path,
-                            job.start_ns,
-                            job.end_ns,
-                            compression,
-                        )
-                    }))
-                    .unwrap_or_else(|payload| {
-                        Err(anyhow::anyhow!(
-                            "staging panicked: {}",
-                            panic_text(payload.as_ref())
-                        ))
-                    });
-                    // A send failure means the handler is gone (its thread
-                    // died); there is no one left to care about this clip.
-                    let _ = job.reply.send(result);
-                }
-            })
-            .expect("spawning staging worker");
-    }
-    tx
-}
-
 /// Entry point and supervisor. Spawns the long-lived threads — tail, node
 /// spin, trigger consumer, the extraction worker pool, and the signal
 /// forwarder — then blocks in [`supervise`] until a shutdown signal (exit 0)
@@ -439,17 +427,110 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // cannot prepare its output directory must not start.
     clip::reset_capturing_dir(&cfg.out_dir)?;
 
-    let ctx = r2r::Context::create()?;
-    let mut node = r2r::Node::create(ctx, "clipper", "")?;
+    // One staging worker per allowed concurrent clip copy; see
+    // Config::extract_parallelism. The clip compression codec is process-global,
+    // captured in the workers.
+    let extract_tx =
+        handler::spawn_stage_workers(cfg.extract_parallelism, cfg.clip_compression.to_mcap());
 
-    let mut trigger_sub =
-        node.subscribe::<r2r::momentedge_msgs::msg::Trigger>(TRIGGER_TOPIC, QosProfile::default())?;
-    let recorded_pub = node.create_publisher::<r2r::momentedge_msgs::msg::Recorded>(
-        RECORDED_TOPIC,
-        QosProfile::default(),
-    )?;
+    // Admission gate for trigger handlers; see [`Admission`].
+    let admission = Admission::new(MAX_ACTIVE_TRIGGERS);
 
-    let (tailer, coverage) = Tailer::new();
+    if !cfg.record_dir.is_dir() {
+        warn!(
+            "record dir {} does not exist; the tail idles until the continuous \
+             recording (scripts/record.sh) creates it",
+            cfg.record_dir.display()
+        );
+    }
+
+    // Build the tailer and the selected interface together, then drive the
+    // recorder with them. Exactly one interface is active; `drive` is generic
+    // over it (static dispatch, no `Box<dyn>`). The MCAP interface drives off a
+    // decode-free trigger tap — the tail lifts trigger-topic messages out of the
+    // recording — so its arm wires the tap channel and hands the receiver to the
+    // interface; the ROS interface reads triggers from a live subscription and
+    // needs no tap, so its tailer is built without one.
+    let result = match cfg.interface {
+        InterfaceKind::Ros => {
+            let (tailer, coverage) = Tailer::new();
+            let iface = RosInterface::new(TRIGGER_TOPIC, RECORDED_TOPIC)?;
+            drive(iface, cfg, tailer, coverage, extract_tx, admission)
+        }
+        InterfaceKind::Mcap => {
+            let (tx, rx) = unbounded();
+            let (tailer, coverage) = Tailer::with_trigger_tap(TRIGGER_TOPIC, tx);
+            let iface = McapInterface::new(rx);
+            drive(iface, cfg, tailer, coverage, extract_tx, admission)
+        }
+    };
+    result.map_err(Into::into)
+}
+
+/// Wire one interface to the tail and run the recorder for the process's
+/// lifetime, then supervise. Generic over the active [`Interface`] — static
+/// dispatch, no `Box<dyn>`.
+///
+/// Spawns two long-lived companions over the supervision channels: the **tail**
+/// thread (file scan feeding coverage and the extent index) and the
+/// **interface** thread (`iface.run`, which drains its trigger source — a ROS
+/// subscription or the MCAP tap — and fires the per-trigger callback). The
+/// callback admits the trigger (a flood bound), then spawns one handler thread
+/// that cuts the clip and announces through the interface's announcer; per-trigger
+/// errors are isolated (logged, the permit returned on drop). The ROS interface
+/// owns its own node spin internally, so supervision is uniform in either mode.
+fn drive<I: Interface>(
+    iface: I,
+    cfg: Arc<Config>,
+    tailer: Arc<Tailer>,
+    coverage: Arc<Watch<Coverage>>,
+    extract_tx: Sender<handler::StageJob>,
+    admission: Arc<Admission>,
+) -> anyhow::Result<()> {
+    let iface_name = iface.name();
+    let announcer = iface.announcer();
+
+    // The callback the interface fires per decoded Trigger. `Fn` + `Send`: it is
+    // moved into the single interface thread and called from there, never shared.
+    let fire = {
+        let cfg = cfg.clone();
+        let tailer = tailer.clone();
+        let coverage = coverage.clone();
+        let extract_tx = extract_tx.clone();
+        let admission = admission.clone();
+        move |trig: Trigger| {
+            let Some(permit) = admission.clone().try_acquire() else {
+                error!(
+                    "trigger rejected: all {MAX_ACTIVE_TRIGGERS} trigger handlers are busy; \
+                     ignoring name={:?} trigger_time={}",
+                    trig.name,
+                    trig.trigger_time.ns(),
+                );
+                return;
+            };
+            let cfg = cfg.clone();
+            let tailer = tailer.clone();
+            let coverage = coverage.clone();
+            let extract_tx = extract_tx.clone();
+            let announcer = announcer.clone();
+            // Per-trigger error isolation: a failed cut is logged and counted but
+            // does not tear down the interface loop, and a panic dies with the
+            // handler's own thread (its permit returns on drop either way).
+            let spawned = thread::Builder::new()
+                .name(format!("trigger-{}", trig.trigger_time.ns()))
+                .spawn(move || {
+                    let _permit = permit;
+                    if let Err(e) =
+                        handler::handle_trigger(trig, cfg, tailer, coverage, extract_tx, announcer)
+                    {
+                        error!("trigger handling failed: {e:#}");
+                    }
+                });
+            if let Err(e) = spawned {
+                error!("spawning a trigger handler failed: {e}");
+            }
+        }
+    };
 
     // The tail thread: discovers and scans the recording for the process's
     // lifetime (blocking IO on its own thread). Supervised: with a dead tailer
@@ -465,147 +546,68 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
     };
 
-    // One staging worker per allowed concurrent clip copy; see
-    // Config::extract_parallelism. The clip compression codec is process-global,
-    // captured in the workers.
-    let extract_tx = spawn_stage_workers(cfg.extract_parallelism, cfg.clip_compression.to_mcap());
-
-    // Admission gate for trigger handlers; see [`Admission`].
-    let admission = Admission::new(MAX_ACTIVE_TRIGGERS);
-
-    // Trigger consumer: drains the typed trigger stream for the process's
-    // lifetime, spawning one handler thread per admitted trigger. A trigger
-    // arriving while all MAX_ACTIVE_TRIGGERS handlers are active is rejected
-    // with error! and ignored — no handler, no clip, no Recorded. Supervised:
-    // a dead consumer (stream closed or panic) must exit the process rather
-    // than silently stopping on triggers.
-    let consumer = {
-        let cfg = cfg.clone();
-        let coverage = coverage.clone();
-        let tailer = tailer.clone();
-        spawn_supervised("trigger-consumer", move || {
-            while let Some(trig) = block_on(trigger_sub.next()) {
-                let Some(permit) = admission.clone().try_acquire() else {
-                    error!(
-                        "trigger rejected: all {MAX_ACTIVE_TRIGGERS} trigger handlers are busy; \
-                         ignoring name={:?} trigger_time={}",
-                        trig.name,
-                        time_to_ns(&trig.trigger_time),
-                    );
-                    continue;
-                };
-                let cfg = cfg.clone();
-                let recorded_pub = recorded_pub.clone();
-                let coverage = coverage.clone();
-                let tailer = tailer.clone();
-                let extract_tx = extract_tx.clone();
-                // Per-trigger error isolation: a failed extraction is logged
-                // and counted but does not tear down the consumer loop, and a
-                // panic dies with the handler's own thread.
-                let spawned = thread::Builder::new()
-                    .name(format!("trigger-{}", time_to_ns(&trig.trigger_time)))
-                    .spawn(move || {
-                        let _permit = permit;
-                        if let Err(e) =
-                            handle_trigger(trig, cfg, recorded_pub, tailer, coverage, extract_tx)
-                        {
-                            error!("trigger handling failed: {e:#}");
-                        }
-                    });
-                if let Err(e) = spawned {
-                    error!("spawning a trigger handler failed: {e}");
-                }
-            }
-        })
-    };
-
-    info!(
-        "clipper up: triggers on {TRIGGER_TOPIC}, tailing {}, writing clips to {}",
-        cfg.record_dir.display(),
-        cfg.out_dir.display(),
-    );
-    if !cfg.record_dir.is_dir() {
-        warn!(
-            "record dir {} does not exist; the tail idles until the continuous \
-             recording (scripts/record.sh) creates it",
-            cfg.record_dir.display()
-        );
-    }
-
-    // The node's single owner: spin continuously to feed the streams.
-    // Supervised alongside the tail and consumer; any of the three exiting is
-    // an error.
-    let spin: Supervised<()> = spawn_supervised("node-spin", move || {
-        loop {
-            node.spin_once(Duration::from_millis(10));
-        }
-    });
+    // The interface thread: drains its trigger source and fires the callback for
+    // the process's lifetime. Supervised: a dead interface silently stops acting
+    // on triggers, so the process exits rather than going quiet.
+    let interface = spawn_supervised("interface", move || iface.run(fire));
 
     let signal_rx = signal_channel().context("signal handler failed to install")?;
 
-    match supervise(tail, spin, consumer, signal_rx) {
-        Ok(()) => Ok(()),
-        Err(e) => Err(e.into()),
-    }
+    info!(
+        "clipper up: {iface_name} interface, triggers on {TRIGGER_TOPIC}, \
+         tailing {}, writing clips to {}",
+        cfg.record_dir.display(),
+        cfg.out_dir.display(),
+    );
+
+    supervise(tail, interface, signal_rx)
 }
 
-/// Watch the three critical long-lived threads and the shutdown signal;
-/// return when any of them resolves.
+/// Watch the two critical long-lived threads and the shutdown signal; return
+/// when any of them resolves.
 ///
-/// Each supervised thread reports on its channel (see [`spawn_supervised`]):
-/// a received value is its verdict, a disconnect without a value is a panic,
+/// Each supervised thread reports on its channel (see [`spawn_supervised`]): a
+/// received value is its verdict, a disconnect without a value is a panic,
 /// harvested through the join handle so the payload lands in the error chain.
 ///
 /// Returns `Ok(())` when the signal channel delivers SIGINT or SIGTERM — the
-/// requested, orderly stop path; the signal is logged here and the caller
-/// exits zero. Every other arm returns `Err`: a thread exiting (clean or
-/// panic) is a fault that a supervisor must respond to by restarting the
-/// process, and the signal channel disconnecting (the forwarder thread died)
-/// must not be silent either, since it means SIGINT could never trigger a
-/// clean shutdown.
+/// requested, orderly stop path; the signal is logged here and the caller exits
+/// zero. Every other arm returns `Err`: a thread exiting (clean or panic) is a
+/// fault that a supervisor must respond to by restarting the process, and the
+/// signal channel disconnecting (the forwarder thread died) must not be silent
+/// either, since it means SIGINT could never trigger a clean shutdown.
 ///
-/// The tail thread carries a typed `anyhow::Result<()>`: its loop never
-/// returns `Ok` on its own, so a clean return is treated as an unexpected
-/// exit, while a scan fault it could not retry past surfaces as the inner
-/// `Err`, wrapped so the operator sees the scan-fault root cause and the path
-/// it named.
-///
-/// All three threads must run for the lifetime of the process: the tail
-/// thread feeds coverage and the extent index (a dead tailer silently
-/// degrades every clip to a grace-timeout cut); the spin thread pumps the ROS
-/// node (a dead spin thread silently stops delivering triggers); the trigger
-/// consumer drains the typed stream (a dead consumer silently stops acting on
-/// triggers).
+/// Both threads carry a typed `anyhow::Result<()>` and loop for the process's
+/// lifetime, so a clean `Ok(())` return is as unexpected as a fault; a fault
+/// surfaces as the inner `Err`, wrapped so the operator sees the root cause. The
+/// **tail** thread feeds coverage and the extent index (a dead tailer silently
+/// degrades every clip to a grace-timeout cut); the **interface** thread drains
+/// the trigger source and, for the ROS interface, owns the node spin (a dead
+/// interface silently stops acting on triggers).
 fn supervise(
     tail: Supervised<anyhow::Result<()>>,
-    spin: Supervised<()>,
-    consumer: Supervised<()>,
+    interface: Supervised<anyhow::Result<()>>,
     signal: Receiver<i32>,
 ) -> anyhow::Result<()> {
     let (tail_rx, tail_handle) = tail;
-    let (spin_rx, spin_handle) = spin;
-    let (consumer_rx, consumer_handle) = consumer;
+    let (interface_rx, interface_handle) = interface;
     select! {
         recv(tail_rx) -> res => match res {
             // run() loops for the process's lifetime, so a clean return is
-            // as unexpected as the other threads ending. A scan fault it
-            // could not retry past comes back as the inner Err, wrapped so
-            // the operator sees the root cause; a panic is the disconnect.
+            // as unexpected as a fault. A scan fault it could not retry past
+            // comes back as the inner Err, wrapped so the operator sees the
+            // root cause; a panic is the disconnect.
             Ok(Ok(())) => anyhow::bail!("tail thread exited unexpectedly"),
             Ok(Err(e)) => Err(e.context("tail thread failed")),
             Err(_) => Err(harvest_panic(tail_handle).context("tail thread exited unexpectedly")),
         },
-        recv(spin_rx) -> res => match res {
-            Ok(()) => anyhow::bail!("node spin thread exited unexpectedly"),
-            Err(_) => {
-                Err(harvest_panic(spin_handle).context("node spin thread exited unexpectedly"))
-            }
-        },
-        recv(consumer_rx) -> res => match res {
-            Ok(()) => anyhow::bail!("trigger consumer exited unexpectedly"),
-            Err(_) => {
-                Err(harvest_panic(consumer_handle).context("trigger consumer exited unexpectedly"))
-            }
+        recv(interface_rx) -> res => match res {
+            // The interface drains its trigger source for the process's
+            // lifetime; a clean return or a fault both mean it stopped.
+            Ok(Ok(())) => anyhow::bail!("interface thread exited unexpectedly"),
+            Ok(Err(e)) => Err(e.context("interface thread failed")),
+            Err(_) => Err(harvest_panic(interface_handle)
+                .context("interface thread exited unexpectedly")),
         },
         recv(signal) -> res => match res {
             // Requested shutdown — not a fault; the caller exits zero.
@@ -618,255 +620,9 @@ fn supervise(
     }
 }
 
-/// Run one trigger's wait-then-stage-then-announce flow. A window that stays in
-/// one recording yields one clip; one that straddles a rollover yields one
-/// segment per source file (`<base>_NN.mcap`). The single `Recorded` announces
-/// every segment in `filenames`.
-fn handle_trigger(
-    trig: r2r::momentedge_msgs::msg::Trigger,
-    cfg: Arc<Config>,
-    recorded_pub: Publisher<r2r::momentedge_msgs::msg::Recorded>,
-    tailer: Arc<Tailer>,
-    coverage: Arc<Watch<Coverage>>,
-    extract_tx: Sender<StageJob>,
-) -> anyhow::Result<()> {
-    let trigger_ns = time_to_ns(&trig.trigger_time);
-    let start_ns = trigger_ns.saturating_sub(trig.preroll);
-    let end_ns = trigger_ns.saturating_add(trig.postroll);
-    info!(
-        "trigger name={:?} window=[{start_ns}, {end_ns}] preroll={} postroll={}",
-        trig.name, trig.preroll, trig.postroll
-    );
-
-    let base_out_path = cfg
-        .out_dir
-        .join(format!("{trigger_ns}_{}.mcap", sanitize(&trig.name)));
-    let segments = record_clip(
-        &tailer,
-        start_ns,
-        end_ns,
-        base_out_path,
-        &coverage,
-        cfg.grace(),
-        &extract_tx,
-    )?;
-
-    let mut filenames = Vec::with_capacity(segments.len());
-    for stats in &segments {
-        info!(
-            "clip {} written: {} msgs from {} extents, {:.1} MiB",
-            stats.out_path.display(),
-            stats.messages_copied,
-            stats.extents_read,
-            stats.bytes_copied as f64 / 1_048_576.0,
-        );
-        if stats.records_skipped > 0 || stats.chunks_dropped > 0 {
-            warn!(
-                "clip {} is missing data over damage in the recording: \
-                 {} records skipped, {} chunks dropped",
-                stats.out_path.display(),
-                stats.records_skipped,
-                stats.chunks_dropped,
-            );
-        }
-        filenames.push(stats.out_path.to_string_lossy().into_owned());
-    }
-    if segments.len() > 1 {
-        info!(
-            "trigger name={:?} spanned a rollover into {} segments: {filenames:?}",
-            trig.name,
-            segments.len(),
-        );
-    }
-
-    let recorded = r2r::momentedge_msgs::msg::Recorded {
-        name: trig.name.clone(),
-        filenames: filenames.clone(),
-        description: trig.description.clone(),
-        trigger_time: trig.trigger_time.clone(),
-        preroll: trig.preroll,
-    };
-    recorded_pub.publish(&recorded)?;
-    info!(
-        "emitted {RECORDED_TOPIC} name={:?} filenames={filenames:?}",
-        trig.name
-    );
-    Ok(())
-}
-
-/// The decode-free, ROS-free core of [`handle_trigger`]: wait out the postroll
-/// wall floor, wait for the tail's collection-wide coverage to reach the window
-/// end (bounded by `grace`), then take one multi-file snapshot and stage one
-/// segment per source recording.
-///
-/// A window inside one recording yields a single segment; one straddling a
-/// rollover (a bag split or restart clipper indexed while running) yields one
-/// segment per source file, recovered from the tail's retained collection.
-/// Empty segments are dropped when the window produced real data elsewhere, but
-/// one segment is always kept so an all-empty window (a rollover gap, all
-/// relevant files pruned, or nothing recorded yet) still announces a valid clip.
-/// Segments are named only once the count is known: a single segment keeps the
-/// bare `<base>.mcap`, several get one `<base>_NN.mcap` per file. Every returned
-/// [`clip::ClipStats`] names a durable file, so the caller may announce them all.
-fn record_clip(
-    tailer: &Arc<Tailer>,
-    start_ns: u64,
-    end_ns: u64,
-    base_out_path: PathBuf,
-    coverage: &Watch<Coverage>,
-    grace: Duration,
-    extract_tx: &Sender<StageJob>,
-) -> anyhow::Result<Vec<clip::ClipStats>> {
-    // 1. Postroll wall floor: never cut before the wall clock passes the window
-    //    end. `checked_sub` reads the clock once per iteration, so a clock that
-    //    crosses `end_ns` between the check and the sleep cannot underflow.
-    while let Some(remaining) = end_ns.checked_sub(now_ns()).filter(|n| *n > 0) {
-        thread::sleep(Duration::from_nanos(remaining));
-    }
-
-    // 2. Coverage: wait until the collection-wide high-water reaches the window
-    //    end, bounded by `grace`. A window inside a recording is already covered
-    //    (its high-water is past `end_ns` at the footer, or as soon as the scan
-    //    reaches it); only a window whose end is past the last recorded message
-    //    with no successor — a clean stop — waits out the full grace.
-    if !coverage.wait_timeout_for(grace, |c| c.high_water_ns >= end_ns) {
-        warn!(
-            "window end {end_ns} still uncovered after {grace:?}; \
-             cutting the clip from what is on disk"
-        );
-    }
-
-    // 3. One multi-file snapshot — each plan pins its own recording's Arc<File>,
-    //    so a retention prune or rollover after this cannot pull the bytes out.
-    let plans = tailer.plan_window(start_ns, end_ns);
-
-    // 4. Stage one segment per plan (FIFO worker pool), or one empty segment
-    //    when no recording covers the window — the empty path needs no source
-    //    file (a channelless MCAP is just magic + summary + footer).
-    let mut staged: Vec<clip::StagedClip> = if plans.is_empty() {
-        vec![stage_segment(
-            extract_tx,
-            WindowPlan::empty(),
-            start_ns,
-            end_ns,
-            &base_out_path,
-        )?]
-    } else {
-        let mut v = Vec::with_capacity(plans.len());
-        for plan in plans {
-            v.push(stage_segment(
-                extract_tx,
-                plan,
-                start_ns,
-                end_ns,
-                &base_out_path,
-            )?);
-        }
-        v
-    };
-
-    // 5. Drop empty segments when the window produced real data elsewhere, but
-    //    keep one so an all-empty window still announces a valid clip.
-    if staged.len() > 1 {
-        if staged.iter().any(|c| !c.is_empty()) {
-            staged.retain(|c| !c.is_empty());
-        } else {
-            staged.truncate(1);
-        }
-    }
-
-    // 6. Publish the staged segments, naming them only now the count is known:
-    //    one segment keeps the bare name, several get one `_NN` per source file.
-    let n = staged.len();
-    let mut stats = Vec::with_capacity(n);
-    for (i, mut clip) in staged.into_iter().enumerate() {
-        if n > 1 {
-            clip.set_final_name(segment_name(&base_out_path, i));
-        }
-        stats.push(clip::publish_clip(clip)?);
-    }
-    Ok(stats)
-}
-
-/// Queue one segment's copy on the staging workers and block on the reply. The
-/// plan is the handler's snapshot of one source recording, so a job that waits
-/// in the FIFO queue still copies the recording it was taken from.
-fn stage_segment(
-    extract_tx: &Sender<StageJob>,
-    plan: WindowPlan,
-    start_ns: u64,
-    end_ns: u64,
-    out_path: &Path,
-) -> anyhow::Result<clip::StagedClip> {
-    let (reply_tx, reply_rx) = bounded(1);
-    extract_tx
-        .send(StageJob {
-            plan,
-            start_ns,
-            end_ns,
-            out_path: out_path.to_path_buf(),
-            reply: reply_tx,
-        })
-        .map_err(|_| anyhow::anyhow!("the staging workers are gone"))?;
-    reply_rx
-        .recv()
-        .map_err(|_| anyhow::anyhow!("the staging worker dropped the job"))?
-}
-
-/// `<base>` with a zero-padded `_NN` segment index inserted before the
-/// extension (`clip.mcap` → `clip_00.mcap`), for a window that spanned a
-/// rollover and writes one segment per source file.
-fn segment_name(base: &Path, idx: usize) -> std::ffi::OsString {
-    let stem = base.file_stem().unwrap_or_default().to_string_lossy();
-    let ext = base
-        .extension()
-        .map(|e| format!(".{}", e.to_string_lossy()))
-        .unwrap_or_default();
-    std::ffi::OsString::from(format!("{stem}_{idx:02}{ext}"))
-}
-
-/// Nanoseconds since the Unix epoch on the system clock.
-fn now_ns() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
-}
-
-/// Flatten a `builtin_interfaces/Time` to nanoseconds since the epoch on the
-/// system clock (no `use_sim_time`).
-fn time_to_ns(t: &r2r::builtin_interfaces::msg::Time) -> u64 {
-    t.sec.max(0) as u64 * 1_000_000_000 + t.nanosec as u64
-}
-
-/// Make a trigger name safe to embed in a filename: keep alphanumerics, `-`,
-/// `_` and `.`; everything else (notably `/`) becomes `_`.
-fn sanitize(name: &str) -> String {
-    let s: String = name
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if s.is_empty() {
-        "unnamed".to_string()
-    } else {
-        s
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The clip compression the recorder's default (zstd) maps to; the unit
-    /// tests drive the extraction worker pool through the same codec the
-    /// recorder uses by default.
-    const TEST_COMPRESSION: Option<mcap::Compression> = Some(mcap::Compression::Zstd);
 
     /// Parse a `Config` from an explicit argv through the same env-prefixed
     /// command `load_config` builds, so the tests exercise the real wiring.
@@ -941,26 +697,20 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_replaces_separators_and_whitespace() {
-        // The slash replacement is the safety property: a trigger name can
-        // never introduce a path component into <trigger_ns>_<name>.mcap.
-        assert_eq!(sanitize("a/b c"), "a_b_c");
-        assert_eq!(sanitize("../escape"), ".._escape");
-        assert_eq!(sanitize(""), "unnamed");
-    }
-
-    #[test]
-    fn time_to_ns_flattens_and_clamps() {
-        let t = r2r::builtin_interfaces::msg::Time {
-            sec: 2,
-            nanosec: 500,
-        };
-        assert_eq!(time_to_ns(&t), 2_000_000_500);
-        let neg = r2r::builtin_interfaces::msg::Time {
-            sec: -5,
-            nanosec: 250,
-        };
-        assert_eq!(time_to_ns(&neg), 250);
+    fn config_interface_defaults_to_ros_and_parses_mcap() {
+        // Default is the ROS interface; --interface selects mcap; an unknown
+        // value is rejected. The flag also gets the MOMENTEDGE_INTERFACE env.
+        assert_eq!(
+            parse_from(["clipper"]).unwrap().interface,
+            InterfaceKind::Ros
+        );
+        assert_eq!(
+            parse_from(["clipper", "--interface", "mcap"])
+                .unwrap()
+                .interface,
+            InterfaceKind::Mcap
+        );
+        assert!(parse_from(["clipper", "--interface", "bogus"]).is_err());
     }
 
     #[test]
@@ -996,7 +746,7 @@ mod tests {
             Err(anyhow::anyhow!("scan of X faulted at offset 42"))
         });
 
-        let err = supervise(tail, pending(), pending(), no_signal()).unwrap_err();
+        let err = supervise(tail, pending(), no_signal()).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("tail thread"),
@@ -1009,35 +759,56 @@ mod tests {
     }
 
     #[test]
-    fn supervise_reports_consumer_end() {
-        // A consumer thread that exits cleanly (stream ended or explicit
-        // return) is an error: the recorder stops receiving triggers with no
-        // noise. The other arms are parked as "pending forever" to isolate
-        // the consumer signal.
-        let consumer = spawn_supervised("trigger-consumer", || {});
+    fn supervise_reports_interface_end() {
+        // An interface thread that exits cleanly (its trigger source ended) is
+        // an error: the recorder stops acting on triggers with no noise. The
+        // other arms are parked as "pending forever" to isolate it.
+        let interface = spawn_supervised("interface", || -> anyhow::Result<()> { Ok(()) });
 
-        let err = supervise(pending(), pending(), consumer, no_signal()).unwrap_err();
+        let err = supervise(pending(), interface, no_signal()).unwrap_err();
         assert!(
-            format!("{err:#}").contains("trigger consumer"),
-            "error must name the trigger consumer, got: {err:#}"
+            format!("{err:#}").contains("interface thread"),
+            "error must name the interface thread, got: {err:#}"
         );
     }
 
     #[test]
-    fn supervise_reports_consumer_panic() {
-        // A panicking consumer drops its result sender without a send; the
+    fn supervise_carries_interface_failure_cause() {
+        // The interface thread resolves a typed anyhow::Result; a fault comes
+        // back as a received Err, wrapped so the chain names the interface
+        // thread AND carries the root cause for the operator.
+        let interface = spawn_supervised("interface", || -> anyhow::Result<()> {
+            Err(anyhow::anyhow!("the trigger subscription stream ended"))
+        });
+
+        let err = supervise(pending(), interface, no_signal()).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("interface thread"),
+            "error must name the interface thread, got: {msg}"
+        );
+        assert!(
+            msg.contains("subscription stream ended"),
+            "error must carry the interface fault root cause, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn supervise_reports_interface_panic() {
+        // A panicking interface drops its result sender without a send; the
         // disconnect routes through the join handle so the formatted chain
         // carries the panic payload and the operator knows what went wrong.
         let prev_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
-        let consumer: Supervised<()> = spawn_supervised("trigger-consumer", || panic!("boom"));
+        let interface: Supervised<anyhow::Result<()>> =
+            spawn_supervised("interface", || -> anyhow::Result<()> { panic!("boom") });
 
-        let err = supervise(pending(), pending(), consumer, no_signal()).unwrap_err();
+        let err = supervise(pending(), interface, no_signal()).unwrap_err();
         std::panic::set_hook(prev_hook);
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("trigger consumer"),
-            "error must name the trigger consumer, got: {msg}"
+            msg.contains("interface thread"),
+            "error must name the interface thread, got: {msg}"
         );
         assert!(
             msg.contains("boom") || msg.contains("panic"),
@@ -1052,23 +823,10 @@ mod tests {
         // silently if not caught.
         let tail = spawn_supervised("tail", || -> anyhow::Result<()> { Ok(()) });
 
-        let err = supervise(tail, pending(), pending(), no_signal()).unwrap_err();
+        let err = supervise(tail, pending(), no_signal()).unwrap_err();
         assert!(
             format!("{err:#}").contains("tail thread"),
             "error must name the tail thread, got: {err:#}"
-        );
-    }
-
-    #[test]
-    fn supervise_reports_spin_end() {
-        // The spin thread exiting means the node is no longer pumping
-        // messages: triggers silently stop arriving.
-        let spin = spawn_supervised("node-spin", || {});
-
-        let err = supervise(pending(), spin, pending(), no_signal()).unwrap_err();
-        assert!(
-            format!("{err:#}").contains("node spin thread"),
-            "error must name the node spin thread, got: {err:#}"
         );
     }
 
@@ -1080,7 +838,7 @@ mod tests {
         let (sig_tx, sig_rx) = bounded(1);
         sig_tx.send(SIGINT).unwrap();
 
-        let result = supervise(pending(), pending(), pending(), sig_rx);
+        let result = supervise(pending(), pending(), sig_rx);
         assert!(
             result.is_ok(),
             "a signal must return Ok(()), got: {result:?}"
@@ -1097,368 +855,11 @@ mod tests {
         let (sig_tx, sig_rx) = bounded::<i32>(1);
         drop(sig_tx);
 
-        let err = supervise(pending(), pending(), pending(), sig_rx).unwrap_err();
+        let err = supervise(pending(), pending(), sig_rx).unwrap_err();
         assert!(
             format!("{err:#}").contains("signal handler"),
             "error must name the signal handler, got: {err:#}"
         );
-    }
-
-    use crate::clip::tests::read_clip;
-    use crate::tail::tests::{scan_to_end, test_dir, write_recording, write_unfinished_recording};
-
-    #[test]
-    fn record_clip_grace_timeout_cuts_what_is_on_disk() -> anyhow::Result<()> {
-        let root = test_dir("grace")?;
-        let (tailer, coverage) = Tailer::new();
-        let extract_tx = spawn_stage_workers(1, TEST_COMPRESSION);
-
-        // The window end is far in the past on the wall clock (no postroll
-        // sleep), but coverage never reaches it — no recording was ever
-        // discovered. The grace timeout must fire and cut a valid empty clip
-        // instead of hanging or erroring.
-        let stats = record_clip(
-            &tailer,
-            0,
-            1_000,
-            root.join("clip.mcap"),
-            &coverage,
-            Duration::from_millis(50),
-            &extract_tx,
-        )?;
-
-        assert_eq!(stats.len(), 1, "no recording yields a single empty segment");
-        assert_eq!(stats[0].messages_copied, 0);
-        assert!(read_clip(&stats[0].out_path)?.is_empty());
-
-        std::fs::remove_dir_all(root)?;
-        Ok(())
-    }
-
-    #[test]
-    fn record_clip_completes_once_coverage_arrives() -> anyhow::Result<()> {
-        let root = test_dir("cov")?;
-        let rec = root.join("rec.mcap");
-        write_recording(&rec, false, &[("/t", 100), ("/t", 900), ("/t", 2_000)])?;
-
-        // The tail discovers and scans the recording a little later, as a
-        // live tail would; record_clip must block on the coverage watch until
-        // a message at/after the window end (1_000) is on disk.
-        let (tailer, coverage) = Tailer::new();
-        let scanner = tailer.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(50));
-            let file = Arc::new(std::fs::File::open(&rec).unwrap());
-            scanner.attach(file.clone());
-            scan_to_end(&scanner, &file, 8).unwrap();
-        });
-
-        let extract_tx = spawn_stage_workers(1, TEST_COMPRESSION);
-        let stats = record_clip(
-            &tailer,
-            100,
-            1_000,
-            root.join("clip.mcap"),
-            &coverage,
-            Duration::from_secs(10),
-            &extract_tx,
-        )?;
-
-        assert_eq!(stats.len(), 1);
-        assert_eq!(stats[0].messages_copied, 2);
-        assert_eq!(
-            read_clip(&stats[0].out_path)?,
-            vec![("/t".to_string(), 100), ("/t".to_string(), 900)]
-        );
-
-        std::fs::remove_dir_all(root)?;
-        Ok(())
-    }
-
-    #[test]
-    fn record_clip_waits_out_the_postroll() -> anyhow::Result<()> {
-        let root = test_dir("postroll")?;
-        let rec = root.join("rec.mcap");
-        let now = now_ns();
-        // One message inside the window, one past the window end so coverage
-        // is already satisfied — only the wall-clock wait holds the cut back.
-        write_recording(&rec, false, &[("/t", now), ("/t", now + 300_000_000)])?;
-
-        let (tailer, coverage) = Tailer::new();
-        let file = Arc::new(std::fs::File::open(&rec)?);
-        tailer.attach(file.clone());
-        scan_to_end(&tailer, &file, 8)?;
-
-        let extract_tx = spawn_stage_workers(1, TEST_COMPRESSION);
-        let end_ns = now + 150_000_000; // 150 ms past the trigger stamp
-        let started = std::time::Instant::now();
-        let stats = record_clip(
-            &tailer,
-            now.saturating_sub(1_000_000_000),
-            end_ns,
-            root.join("clip.mcap"),
-            &coverage,
-            Duration::from_secs(10),
-            &extract_tx,
-        )?;
-
-        assert!(
-            started.elapsed() >= Duration::from_millis(50),
-            "the cut must wait for the wall clock to pass the window end"
-        );
-        assert_eq!(stats.len(), 1);
-        assert_eq!(stats[0].messages_copied, 1, "the future message is outside");
-
-        std::fs::remove_dir_all(root)?;
-        Ok(())
-    }
-
-    #[test]
-    fn record_clip_cuts_a_stopped_recorder_on_grace() -> anyhow::Result<()> {
-        let root = test_dir("ended")?;
-        let rec = root.join("rec.mcap");
-        write_recording(&rec, false, &[("/t", 100), ("/t", 200)])?;
-
-        // A stopped recorder (footer on disk) whose high-water (200) stays below
-        // the window end: there is no ended short-circuit, so the coverage wait
-        // runs out the (short) grace and then cuts what is on disk. The grace is
-        // the only bound — the postroll floor is already in the past here.
-        let (tailer, coverage) = Tailer::new();
-        let file = Arc::new(std::fs::File::open(&rec)?);
-        tailer.attach(file.clone());
-        scan_to_end(&tailer, &file, 8)?;
-
-        let extract_tx = spawn_stage_workers(1, TEST_COMPRESSION);
-        let grace = Duration::from_millis(200);
-        let started = std::time::Instant::now();
-        let stats = record_clip(
-            &tailer,
-            50,
-            1_000_000,
-            root.join("clip.mcap"),
-            &coverage,
-            grace,
-            &extract_tx,
-        )?;
-
-        assert!(
-            started.elapsed() >= grace,
-            "an uncovered window end waits out the grace before cutting"
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "the grace is the bound — it does not hang"
-        );
-        assert_eq!(stats.len(), 1);
-        assert_eq!(stats[0].messages_copied, 2);
-
-        std::fs::remove_dir_all(root)?;
-        Ok(())
-    }
-
-    #[test]
-    fn coverage_exactly_at_the_window_end_releases_the_wait() -> anyhow::Result<()> {
-        let root = test_dir("cov-eq")?;
-        let rec = root.join("rec.mcap");
-        // A live (unfinished) recording whose newest message sits EXACTLY at
-        // the window end: `high_water >= end` must release the wait without
-        // the ended flag and without burning the grace timeout.
-        write_unfinished_recording(&rec, "/t", &[100, 1_000])?;
-
-        let (tailer, coverage) = Tailer::new();
-        let file = Arc::new(std::fs::File::open(&rec)?);
-        tailer.attach(file.clone());
-        scan_to_end(&tailer, &file, 8)?;
-        assert_eq!(coverage.get().high_water_ns, 1_000);
-
-        let extract_tx = spawn_stage_workers(1, TEST_COMPRESSION);
-        let started = std::time::Instant::now();
-        let stats = record_clip(
-            &tailer,
-            0,
-            1_000,
-            root.join("clip.mcap"),
-            &coverage,
-            Duration::from_secs(30),
-            &extract_tx,
-        )?;
-
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "high_water == end satisfies the wait (>=, not >)"
-        );
-        assert_eq!(stats.len(), 1);
-        assert_eq!(
-            stats[0].messages_copied, 2,
-            "the boundary message is inside"
-        );
-
-        std::fs::remove_dir_all(root)?;
-        Ok(())
-    }
-
-    #[test]
-    fn concurrent_overlapping_triggers_serialize_and_take_distinct_paths() -> anyhow::Result<()> {
-        let root = test_dir("overlap")?;
-        let rec = root.join("rec.mcap");
-        write_recording(
-            &rec,
-            false,
-            &[("/t", 100), ("/t", 200), ("/t", 300), ("/t", 400)],
-        )?;
-
-        let (tailer, coverage) = Tailer::new();
-        let file = Arc::new(std::fs::File::open(&rec)?);
-        tailer.attach(file.clone());
-        scan_to_end(&tailer, &file, 8)?;
-
-        // Two overlapping windows racing for the same out path and a single
-        // staging worker: the copies serialize FIFO, the second writer lands on
-        // a `_1` sibling at publish, and both clips come out complete. Neither
-        // window straddles a rollover, so each is a single segment.
-        let extract_tx = spawn_stage_workers(1, TEST_COMPRESSION);
-        let out = root.join("clip.mcap");
-        let cut = |start_ns: u64, end_ns: u64| {
-            let tailer = tailer.clone();
-            let coverage = coverage.clone();
-            let extract_tx = extract_tx.clone();
-            let out = out.clone();
-            std::thread::spawn(move || {
-                record_clip(
-                    &tailer,
-                    start_ns,
-                    end_ns,
-                    out,
-                    &coverage,
-                    Duration::from_secs(30),
-                    &extract_tx,
-                )
-            })
-        };
-        let (ha, hb) = (cut(100, 300), cut(200, 400));
-        let a = ha.join().unwrap()?;
-        let b = hb.join().unwrap()?;
-        assert_eq!((a.len(), b.len()), (1, 1), "each window is one segment");
-        let (a, b) = (&a[0], &b[0]);
-
-        assert_ne!(
-            a.out_path, b.out_path,
-            "two writers must never share a file"
-        );
-        let mut paths = vec![a.out_path.clone(), b.out_path.clone()];
-        paths.sort();
-        assert_eq!(paths, vec![out, root.join("clip_1.mcap")]);
-        assert_eq!(
-            read_clip(&a.out_path)?,
-            vec![
-                ("/t".to_string(), 100),
-                ("/t".to_string(), 200),
-                ("/t".to_string(), 300),
-            ]
-        );
-        assert_eq!(
-            read_clip(&b.out_path)?,
-            vec![
-                ("/t".to_string(), 200),
-                ("/t".to_string(), 300),
-                ("/t".to_string(), 400),
-            ]
-        );
-
-        std::fs::remove_dir_all(root)?;
-        Ok(())
-    }
-
-    /// Two segments staged through the worker pool for the same base name
-    /// publish to distinct files: the first claims the bare name, the second
-    /// resolves to the `_1` sibling. The staging copies run FIFO on the worker
-    /// channel; the name collision is settled at publish, on the handler thread.
-    #[test]
-    fn staged_segments_publish_to_distinct_paths() -> anyhow::Result<()> {
-        let root = test_dir("fifo")?;
-        let rec = root.join("rec.mcap");
-        write_recording(&rec, false, &[("/t", 100), ("/t", 200)])?;
-
-        let (tailer, _coverage) = Tailer::new();
-        let file = Arc::new(std::fs::File::open(&rec)?);
-        tailer.attach(file.clone());
-        scan_to_end(&tailer, &file, 8)?;
-
-        let extract_tx = spawn_stage_workers(1, TEST_COMPRESSION);
-        let out = root.join("clip.mcap");
-        let plan = || {
-            tailer
-                .plan_window(0, 300)
-                .into_iter()
-                .next()
-                .expect("the recording covers the window")
-        };
-        let first = stage_segment(&extract_tx, plan(), 0, 300, &out)?;
-        let second = stage_segment(&extract_tx, plan(), 0, 300, &out)?;
-
-        let a = clip::publish_clip(first)?;
-        let b = clip::publish_clip(second)?;
-        assert_eq!(a.out_path, out, "the first published claims the name");
-        assert_eq!(
-            b.out_path,
-            root.join("clip_1.mcap"),
-            "the second resolves against the taken name"
-        );
-        assert_eq!(a.messages_copied, 2);
-        assert_eq!(b.messages_copied, 2);
-
-        std::fs::remove_dir_all(root)?;
-        Ok(())
-    }
-
-    #[test]
-    fn record_clip_recovers_across_a_rollover_into_two_segments() -> anyhow::Result<()> {
-        // Two finished recordings clipper indexed while running (a split): one
-        // `record_clip` over a window straddling the boundary stages one segment
-        // per source file, published as `<base>_00.mcap` and `<base>_01.mcap`,
-        // each a complete clip.
-        let root = test_dir("two-seg")?;
-        let split0 = root.join("rec_0.mcap");
-        let split1 = root.join("rec_1.mcap");
-        write_recording(&split0, false, &[("/t", 1_000), ("/t", 2_000)])?;
-        write_recording(&split1, false, &[("/t", 5_000), ("/t", 6_000)])?;
-
-        let (tailer, coverage) = Tailer::new();
-        tailer.index_recording(&split0);
-        tailer.index_recording(&split1);
-        crate::tail::tests::drain(&tailer)?;
-
-        let extract_tx = spawn_stage_workers(1, TEST_COMPRESSION);
-        let base = root.join("clip.mcap");
-        let stats = record_clip(
-            &tailer,
-            1_500,
-            5_500,
-            base,
-            &coverage,
-            Duration::from_secs(30),
-            &extract_tx,
-        )?;
-
-        assert_eq!(stats.len(), 2, "a straddling window yields two segments");
-        let mut paths: Vec<_> = stats.iter().map(|s| s.out_path.clone()).collect();
-        paths.sort();
-        assert_eq!(
-            paths,
-            vec![root.join("clip_00.mcap"), root.join("clip_01.mcap")]
-        );
-        // The segments tile the window: split0's tail, then split1's head.
-        assert_eq!(
-            read_clip(&root.join("clip_00.mcap"))?,
-            vec![("/t".to_string(), 2_000)]
-        );
-        assert_eq!(
-            read_clip(&root.join("clip_01.mcap"))?,
-            vec![("/t".to_string(), 5_000)]
-        );
-
-        std::fs::remove_dir_all(root)?;
-        Ok(())
     }
 
     /// Admission at the limit, rejection above it, and slot reuse — the

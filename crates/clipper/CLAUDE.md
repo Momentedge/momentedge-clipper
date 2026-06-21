@@ -8,15 +8,29 @@ A *triggered* clip recorder over a **continuous `ros2 bag record`** output. It k
 ros2 bag record (scripts/record.sh) ──▶ ./record/<bag>_0.mcap   (one growing file)
                                     ──▶ ./record/<bag>_1.mcap   (next split, on rollover)
         ▲ each file discovered, kept open, and tailed (incremental scan)
-clipper ◀── /events/momentedge/trigger ── trigger-pub (or any publisher)
+clipper ◀── trigger ── EITHER /events/momentedge/trigger (ros interface)
+        │              OR read out of the tailed ./record/*.mcap (mcap interface)
         │ cuts [trigger_time-preroll, trigger_time+postroll]
         │   one recording  → ./clipped/<trigger_ns>_<name>.mcap
         │   rollover split → ./clipped/<trigger_ns>_<name>_00.mcap + _01.mcap …
-        └──▶ /events/momentedge/recorded  (filenames[] lists every segment)
+        └──▶ completion: ros → /events/momentedge/recorded (filenames[] lists
+             every segment); mcap → the clip's atomic move into ./clipped is
+             the only signal (no Recorded published)
 ```
 
+The trigger and the completion are paired into one **interface**, selected by
+`--interface {ros|mcap}` (default `ros`); the two interfaces are mutually
+exclusive and clipper drives exactly one per run. The `ros` interface
+subscribes on a ROS node and publishes `Recorded`; the `mcap` interface reads
+triggers out of the recording clipper already tails and runs ROS-free, with the
+clip's move into `out_dir` as the only completion signal. See "The interface
+abstraction" below.
+
 `record.sh` is a standalone `ros2 bag record` — this binary never
-spawns it. The two communicate only through the files.
+spawns it. The two communicate only through the files. Under the `mcap`
+interface that file path is also the *trigger* path: the continuous recording
+must capture the trigger topic (`ros2 bag record --all`) so clipper can lift the
+triggers back out of it.
 
 ## Why tailing a live MCAP is sound (`tail.rs`)
 
@@ -57,6 +71,16 @@ Per top-level `Message` record only the 14-byte prefix is read (channel id,
 sequence, `log_time`); bodies are first touched at extraction. The same
 "decode only the timestamp" discipline as the rest of the workspace, applied
 to file tailing.
+
+The one exception is an **opt-in trigger tap**, enabled only under the `mcap`
+interface (`Tailer::with_trigger_tap`). With the tap on, the scan additionally
+reads the *full body* of every message on the configured trigger topic, lifting
+it as a raw `(message_encoding, body, log_time)` triple the MCAP interface
+decodes by `message_encoding`; the tap learns the trigger topic's channel IDs
+from the same registry pass, so a body is read only for a message it has already
+matched to that topic. With the tap disabled — the `ros` interface, the default
+— the scan is byte-for-byte the timestamp-only walk above: no message body is
+ever read.
 
 **Damage in the recording is survivable up to the point of framing desync.**
 The scan tolerates localized damage the same way extraction does (see "The copy
@@ -126,12 +150,14 @@ silently skipped; the iterator has already advanced past it.
 
 ## Per-trigger flow (`handle_trigger` / `record_clip`)
 
-Each admitted `momentedge_msgs/Trigger` is handled on its own thread, so
-overlapping windows are cut concurrently against the shared tail. Admission
-is bounded: at most `MAX_ACTIVE_TRIGGERS` (16) handlers may be active at once,
-and a trigger that arrives while all of them are is rejected — logged with
-`error!` and otherwise ignored: no handler runs, no clip is extracted, and no
-`momentedge_msgs/Recorded` is published.
+Each admitted trigger is handled on its own thread, so overlapping windows are
+cut concurrently against the shared tail. The handler (`handler.rs`) is generic
+over the [`Announce`](#the-interface-abstraction) the active interface supplies
+and knows only the neutral `Trigger`/`Completion` contract — nothing of ROS or
+any wire encoding. Admission is bounded: at most `MAX_ACTIVE_TRIGGERS` (16)
+handlers may be active at once, and a trigger that arrives while all of them are
+is rejected — logged with `error!` and otherwise ignored: no handler runs, no
+clip is extracted, and no completion is announced.
 
 1. **Wait out the postroll.** Sleep until the system clock passes
    `trigger_time + postroll`. `checked_sub` reads the clock once per
@@ -161,9 +187,13 @@ and a trigger that arrives while all of them are is rejected — logged with
    single segment keeps the bare `<trigger_ns>_<name>.mcap`; multiple segments
    get `<base>_00.mcap`, `<base>_01.mcap`, … Each is atomically published into
    `out_dir` via `hard_link` + unlink.
-6. **Announce** by publishing one `momentedge_msgs/Recorded` with all segment
-   paths in `filenames[]` — only after every segment is in `out_dir` and
-   fsynced, so every announced path is already crash-durable.
+6. **Announce** a single `Completion` (the trigger echo plus all segment paths)
+   through the active interface's announcer — only after every segment is in
+   `out_dir` and fsynced, so every announced path is already crash-durable. The
+   `ros` interface turns the `Completion` into one `momentedge_msgs/Recorded`
+   published on `/events/momentedge/recorded`; the `mcap` interface's announcer
+   is a no-op — the segments' atomic move into `out_dir` (step 5) is the only
+   completion signal, with the per-clip `info!` lines as the log.
 
 ## The copy is direct (`clip.rs`)
 
@@ -248,35 +278,99 @@ into clips as-is — only a CDR decode downstream would notice.
 ## Time base
 
 `log_time`, the trigger stamp, and the wait clock are all nanoseconds on the
-system clock — this assumes the default (no `use_sim_time`). `time_to_ns`
-flattens a `builtin_interfaces/Time` stamp to that scale (`sec * 1e9 +
-nanosec`).
+system clock — this assumes the default (no `use_sim_time`). The trigger stamp
+is the neutral `Stamp` (`trigger.rs`), a `builtin_interfaces/Time` flattened to
+its `sec`/`nanosec` fields free of `r2r`; `Stamp::ns()` flattens it to that
+scale (`sec.max(0) * 1e9 + nanosec`, negative seconds clamped to 0). The same
+arithmetic anchors the window identically whether the trigger arrived live over
+ROS or was decoded out of the tailed MCAP.
 
-## Topics and types
+## The two interfaces
+
+The trigger input and the completion output are one unit — an **interface** —
+chosen by `--interface {ros|mcap}` (default `ros`). The two are mutually
+exclusive; clipper drives exactly one per run. No `rosbag2_interfaces`
+subscription either way — coverage always comes from the file itself.
+
+**`ros`** (the default, the deployed path) talks to the ROS graph:
 
 | Direction | Topic | Type |
 |---|---|---|
 | in | `/events/momentedge/trigger` | `momentedge_msgs/Trigger` |
 | out | `/events/momentedge/recorded` | `momentedge_msgs/Recorded` |
 
-No `rosbag2_interfaces` subscription — coverage comes from the file itself.
+It subscribes to the trigger topic on a ROS node and publishes one `Recorded`
+per finished clip, with every segment path in `filenames[]`.
+
+**`mcap`** has no ROS surface at all. Its trigger *input* is the tailed
+recording itself: the continuous `ros2 bag record` (run `--all`) captures the
+trigger topic, and the tail's opt-in trigger tap lifts each trigger message
+back out by `message_encoding` (see "The interface abstraction"). Its
+completion *output* is the clip's atomic move into `out_dir` — there is no
+`Recorded` topic and nothing is published; the per-clip `info!` log lines are
+the only completion record. It runs fully ROS-free at runtime: no ROS
+`Context`/`Node`, no spin thread, no subscription.
+
+## The interface abstraction
+
+The recorder is decoupled into four layers around one neutral boundary, so the
+clip-cutting half never learns of ROS or any wire encoding and the
+outside-facing half is the only place either appears:
+
+- **`trigger.rs`** — the neutral contract: `Trigger`, `Stamp`, `TriggerRecord`
+  (the MCAP message record carrying an undecoded trigger), `Completion`, and the
+  `Announce` trait. It pulls in neither `r2r` nor `mcap` — only `serde`, so
+  `Trigger`/`Stamp` derive `Deserialize` for the `json` decode shape — so either
+  side can change without dragging the other along.
+- **`decode.rs`** — the `DecoderFactory` + `TriggerDecoder`. `for_encoding`
+  maps an MCAP channel's `message_encoding` to a decoder, dispatching over
+  two encodings, both decodable with dependencies already in the closure (no
+  new ones):
+  - **`cdr`** (the ROS2 default) via `r2r`'s rmw deserialization — the linked
+    rmw library only, never a ROS `Context`/`Node`/executor, so it works in the
+    fully ROS-free MCAP interface. r2r's generated `Trigger` maps onto the
+    domain `Trigger` through a `From` impl shared with the live ROS path.
+  - **`json`** via `serde_json` — a first-class peer of `cdr`, so a writer
+    interleaving a trigger into the bag is never forced to serialize as CDR;
+    the domain `Trigger` derives `Deserialize`, so serde reads straight into it.
+
+  `cbor`, schema-bound `protobuf`/`flatbuffer`, `ros1`, and any unknown encoding
+  return an error the interface logs and skips — one undecodable trigger never
+  stops the recorder.
+- **`interface.rs`** — the `trait Interface` (generic, dispatched statically,
+  no `Box<dyn>`), with `RosInterface` (owns the node and its own internal spin
+  thread) and `McapInterface` (drains the tail's trigger tap and decodes each
+  raw trigger), plus the two announcers: `RosAnnouncer` (publishes `Recorded`)
+  and `NullAnnouncer` (no-op). An interface produces decoded `Trigger`s and owns
+  the completion half through its `Announce`r.
+- **`handler.rs`** — `handle_trigger` (generic over `Announce`), `record_clip`,
+  and the staging worker pool: the ROS- and encoding-agnostic clip-cutting half,
+  speaking only the `Trigger`/`Completion` contract.
+
+`main.rs` wires it together: it builds the selected interface, and a generic
+`drive<I: Interface>` runs the recorder and supervises the tail, the one
+interface thread, and the signal forwarder.
 
 ## Concurrency
 
-**Thread inventory.** Four singleton threads and the staging worker pool
+**Thread inventory.** Three singleton threads and the staging worker pool
 run for the process's lifetime, plus one short-lived thread per admitted
 trigger:
 
 - **`tail`** — runs `Tailer::run`; discovers recordings via
   `NewFileWatchIterator`, performs all blocking file IO for the incremental
-  scan, and prunes the collection every poll.
-- **`node-spin`** — the node's single owner; loops `node.spin_once(10 ms)` to
-  pump the DDS executor and feed the typed streams. Because the node is owned
-  here, no other thread touches it.
-- **`trigger-consumer`** — drains the typed `Trigger` subscription with
-  `futures::executor::block_on` on the stream, so the stream is consumed on
-  this thread without an async runtime. For each admitted trigger it spawns a
-  named `trigger-<ns>` handler thread.
+  scan, and prunes the collection every poll. Under the `mcap` interface it
+  also forwards each tapped trigger to the interface thread (the trigger tap).
+- **`interface`** — runs `iface.run`, the single owner of the active
+  interface's trigger source. For the **ROS** interface this thread internally
+  owns *both* the node spin (a `node-spin` worker looping `node.spin_once(10
+  ms)` to pump the DDS executor) *and* the subscription drain (a `trigger-drain`
+  worker draining the typed `Trigger` stream with `futures::executor::block_on`),
+  running them concurrently and returning when either resolves — so the driver
+  supervises one uniform interface thread regardless of mode. For the **MCAP**
+  interface this thread drains the tail's trigger tap, decoding each raw trigger
+  by its `message_encoding`. For each decoded trigger it fires the per-trigger
+  callback, which admits and spawns a named `trigger-<ns>` handler thread.
 - **`stage-N`** (N = 0 .. `extract_parallelism − 1`) — the staging worker
   pool; each worker loops on the shared FIFO `StageJob` channel, runs
   `clip::stage_clip`, and replies a `StagedClip`. The handler publishes the
@@ -287,7 +381,9 @@ trigger:
   wait/snapshot/stage/publish/announce flow for one trigger; exits when the
   clip is published or an error is logged.
 
-The `Recorded` publisher is `Clone` and is shared into each handler thread.
+The announcer the handler uses is `Clone + Send` and is moved into each handler
+thread (`RosAnnouncer` for the ROS interface, the no-op `NullAnnouncer` for the
+MCAP interface).
 
 **Admission.** `Admission` is an `AtomicUsize` counter with a fixed `limit`
 (`MAX_ACTIVE_TRIGGERS` = 16). The consumer calls `try_acquire` before spawning
@@ -318,29 +414,34 @@ and coverage waiting are always concurrent.
 **`supervise()`.** Each long-lived companion thread is started with
 `spawn_supervised`: the closure sends its return value over a `bounded(1)`
 channel before returning; a panic unwinds without sending, dropping the sender.
-`supervise` uses `crossbeam_channel::select!` on four arms:
+`supervise` uses `crossbeam_channel::select!` on three arms:
 
 1. **tail channel** — receives `anyhow::Result<()>`. `Ok(())` is an unexpected
    exit (the loop never returns on its own); `Err(e)` wraps the scan-fault root
    cause under "tail thread failed". A disconnect (panic) harvests the join
    handle for the payload under "tail thread exited unexpectedly".
-2. **spin channel** — receives `()`. Any result (clean exit or panic/disconnect)
-   is an error naming the node spin thread.
-3. **consumer channel** — receives `()`. Same shape, names the trigger consumer.
-4. **signal channel** — receives `i32` (SIGINT or SIGTERM). A delivered signal
+2. **interface channel** — receives `anyhow::Result<()>`. `Ok(())` is an
+   unexpected exit (the interface drains its trigger source for the process's
+   lifetime); `Err(e)` wraps the fault under "interface thread failed"; a
+   disconnect (panic) harvests the handle under "interface thread exited
+   unexpectedly". This one arm covers both interfaces — the ROS interface's
+   internal node spin and subscription drain are supervised *inside* `iface.run`
+   and surface here as a single interface fault, so a dead spin thread (which
+   would otherwise silently stall trigger delivery) is never lost.
+3. **signal channel** — receives `i32` (SIGINT or SIGTERM). A delivered signal
    is the requested, orderly stop: `supervise` returns `Ok(())` and `main`
    exits zero. A disconnect (signal forwarder thread died) is an error naming
    the signal handler — losing it silently would mean SIGINT could never trigger
    a clean shutdown.
 
-A dead tailer silently degrades every clip to a grace-timeout cut; a dead spin
-thread silently stops delivering triggers; a dead consumer silently stops acting
-on them — all three must run for the process's lifetime, so any of them ending
-is non-zero exit for a supervisor to restart.
+A dead tailer silently degrades every clip to a grace-timeout cut; a dead
+interface thread silently stops delivering and acting on triggers — both must
+run for the process's lifetime, so either ending is non-zero exit for a
+supervisor to restart.
 
 **Process-exit teardown.** `main` returning ends the process, which kills all
-remaining threads — the immortal spin/tail loops, parked handler threads, and
-any in-flight extraction. That is safe by construction: the capturing-dir reset
+remaining threads — the immortal tail and interface loops, parked handler
+threads, and any in-flight extraction. That is safe by construction: the capturing-dir reset
 at startup reclaims any stranded staged file, and `out_dir` only ever holds
 complete clips. There is no explicit runtime teardown step.
 
@@ -390,6 +491,12 @@ rationale.
   restart (mid-window and pre-trigger), a restart that lands after the window
   ends (producing a valid empty clip), and the no-recovery guarantee — a file
   still on disk after replacement contributes nothing to any subsequent clip.
+- **The MCAP interface is exercised end to end** (`mcap_interface_*`): clipper
+  runs `--interface mcap`, fully ROS-free, against a `ros2 bag record --all`
+  that captures a ROS-published trigger into the bag. clipper lifts that trigger
+  back out of the recording it tails, cuts the clip, and signals completion by
+  the file's appearance in `out_dir` — there is no `Recorded` topic to echo, so
+  the assertion is on the clipped file rather than a published message.
 
 ## Retention
 
@@ -442,3 +549,7 @@ the one `ENV_PREFIX` constant. clap's `env` feature provides the per-arg env
 fallback and `string` lets the runtime-built env names be set on the args. The
 flags, env vars, and defaults are tabulated in the
 [README](../../README.md#configuration).
+
+The interface seam is one such flag: `--interface {ros|mcap}` (env
+`MOMENTEDGE_INTERFACE`, default `ros`), a clap `ValueEnum` over `InterfaceKind`
+that picks the active [interface](#the-two-interfaces) at startup.

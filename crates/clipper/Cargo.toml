@@ -35,6 +35,13 @@ clap.workspace = true
 # Logging via the `log` facade; pretty_env_logger is the backend (honours RUST_LOG).
 log.workspace = true
 pretty_env_logger.workspace = true
+# Trigger payload decoders for the MCAP interface (src/decode.rs), dispatched on
+# a channel's message_encoding. Both are already in the dependency closure
+# transitively, so declaring them direct adds no crates to the build: serde +
+# serde_json decode `json` triggers. (`cdr` needs no new dependency — r2r's rmw
+# deserialization.)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 # Dev-dependencies serve the live e2e suite (tests/e2e.rs + tests/harness/);
 # the inline unit tests use only the crate's own dependencies.
