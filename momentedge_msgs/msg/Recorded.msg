@@ -1,4 +1,4 @@
-# Emitted on /events/edgestream/recorded once a triggered clip has been written
+# Emitted on /events/momentedge/recorded once a triggered clip has been written
 # to disk, echoing the originating trigger's identity.
 
 string name                            # trigger identifier this clip was recorded for
