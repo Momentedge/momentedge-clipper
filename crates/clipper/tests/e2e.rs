@@ -162,6 +162,62 @@ fn mcap_interface_reads_trigger_from_the_recording() {
     );
 }
 
+/// The MCAP interface over a chunked recording (clipper-535): with the deployed
+/// `zstd_fast` profile the trigger lands inside a chunk that is only visible once
+/// flushed, so the test stops the recorder after the window to flush the footer.
+/// clipper — ROS-free on `--interface mcap` — then reads the trigger out of the
+/// chunk, decodes it (CDR), and cuts the clip. Exercises the chunk-interior tap
+/// path end to end, the path a write-through bag never takes.
+#[rstest]
+fn mcap_interface_reads_a_chunk_interior_trigger() {
+    if !require_e2e() {
+        return;
+    }
+    let env = TestEnv::new();
+    let mut recorder = env.start_recorder("zstd_fast", 0);
+    let _source = env.start_source(SRC_TOPIC, SRC_RATE);
+    env.wait_for_recording(Duration::from_secs(60));
+    let mut extractor = env.start_extractor_mcap(15);
+
+    // Lay down at least a preroll's worth of data before triggering.
+    std::thread::sleep(Duration::from_secs(3));
+
+    let trigger_ns = now_ns();
+    let (preroll, postroll) = (2 * SEC, 3 * SEC);
+    // Publish without the inline receipt wait — the chunk holding the trigger is
+    // not on disk yet, so clipper cannot read it until the flush below.
+    env.publish_trigger_into_bag("mcap-chunk", trigger_ns, preroll, postroll);
+
+    // Stop the recorder after the window so its footer flushes; clipper then
+    // reads the trigger (and the window data) out of the now-complete file and
+    // the `ended` recording releases the coverage wait deterministically.
+    let end_ns = trigger_ns + postroll;
+    let now = now_ns();
+    if end_ns > now {
+        std::thread::sleep(Duration::from_nanos(end_ns - now) + Duration::from_secs(1));
+    }
+    recorder.stop(libc::SIGINT, Duration::from_secs(30));
+
+    // No Recorded on the mcap interface — wait for the clip itself to appear.
+    let clip = env.wait_for_clip(
+        &format!("{trigger_ns}_mcap-chunk.mcap"),
+        Duration::from_secs(60),
+    );
+
+    let msgs = read_clip(&clip);
+    assert!(!msgs.is_empty(), "the clip must hold the recorded window");
+    assert_clip_within_window(&msgs, trigger_ns - preroll, trigger_ns + postroll);
+    assert!(
+        msgs.iter().any(|(topic, _)| topic == SRC_TOPIC),
+        "the source topic must be in the clip"
+    );
+    env.assert_capturing_drained();
+    assert!(
+        extractor.is_running(),
+        "the ROS-free extractor must outlive the cut"
+    );
+}
+
 /// Restart during operation: the recorder is stopped and relaunched (the
 /// record script wipes the bag dir), the extractor must re-discover the new
 /// recording and keep cutting clips for later triggers.

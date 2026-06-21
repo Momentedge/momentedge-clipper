@@ -253,3 +253,111 @@ pub(crate) struct NullAnnouncer;
 impl Announce for NullAnnouncer {
     fn announce(&self, _completion: &Completion) {}
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use crossbeam_channel::unbounded;
+
+    use super::*;
+    use crate::trigger::Stamp;
+
+    /// CDR-serialize a `momentedge_msgs/Trigger` the way rosbag2 writes it, so a
+    /// [`TriggerRecord`] with `message_encoding = "cdr"` decodes back to it.
+    fn cdr_trigger_bytes(name: &str) -> Vec<u8> {
+        use r2r::WrappedTypesupport;
+        r2r::momentedge_msgs::msg::Trigger {
+            name: name.to_string(),
+            description: "e2e".to_string(),
+            trigger_time: r2r::builtin_interfaces::msg::Time { sec: 1, nanosec: 2 },
+            preroll: 10,
+            postroll: 20,
+        }
+        .to_serialized_bytes()
+        .expect("serialize")
+    }
+
+    fn raw(encoding: &str, body: Vec<u8>, log_time: u64) -> TriggerRecord {
+        TriggerRecord {
+            message_encoding: encoding.to_string(),
+            body,
+            log_time,
+        }
+    }
+
+    /// The McapInterface decodes each tapped record by its `message_encoding` and
+    /// fires the callback once per decoded trigger, in order.
+    #[test]
+    fn mcap_interface_decodes_and_fires_each_trigger() {
+        let (tx, rx) = unbounded();
+        tx.send(raw("cdr", cdr_trigger_bytes("first"), 100))
+            .unwrap();
+        tx.send(raw("cdr", cdr_trigger_bytes("second"), 200))
+            .unwrap();
+        // Drop the sender so `run` drains the buffered records and returns.
+        drop(tx);
+
+        let fired: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = fired.clone();
+        let iface = McapInterface::new(rx);
+        // `run` bails when the tap closes — expected, the records are drained first.
+        let _ = iface.run(move |t| sink.lock().unwrap().push(t.name));
+
+        assert_eq!(*fired.lock().unwrap(), vec!["first", "second"]);
+    }
+
+    /// The failure path: an undecodable record (unknown encoding or malformed
+    /// body) is logged and skipped, never fatal — the good triggers around it
+    /// still fire.
+    #[test]
+    fn mcap_interface_skips_undecodable_triggers_and_keeps_going() {
+        let (tx, rx) = unbounded();
+        // Unknown encoding — no decoder.
+        tx.send(raw("ros1", b"whatever".to_vec(), 1)).unwrap();
+        // Known encoding, malformed body — decode fails.
+        tx.send(raw("cdr", b"not-a-valid-cdr-trigger".to_vec(), 2))
+            .unwrap();
+        // Malformed JSON — decode fails.
+        tx.send(raw("json", b"{ this is not json".to_vec(), 3))
+            .unwrap();
+        // One good record survives the bad ones on either side.
+        tx.send(raw("cdr", cdr_trigger_bytes("survivor"), 4))
+            .unwrap();
+        drop(tx);
+
+        let fired: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = fired.clone();
+        let iface = McapInterface::new(rx);
+        let _ = iface.run(move |t| sink.lock().unwrap().push(t.name));
+
+        assert_eq!(
+            *fired.lock().unwrap(),
+            vec!["survivor"],
+            "only the one decodable trigger fires; the three bad ones are skipped"
+        );
+    }
+
+    /// A `Completion` maps field-for-field onto the r2r `Recorded` the ROS
+    /// interface publishes, its `Stamp` onto the nested `builtin_interfaces/Time`.
+    #[test]
+    fn completion_maps_onto_recorded() {
+        let completion = Completion {
+            name: "evt".to_string(),
+            filenames: vec!["/out/a.mcap".to_string(), "/out/b.mcap".to_string()],
+            description: "two segments".to_string(),
+            trigger_time: Stamp {
+                sec: 7,
+                nanosec: 250,
+            },
+            preroll: 1_000,
+        };
+        let recorded = r2r::momentedge_msgs::msg::Recorded::from(&completion);
+        assert_eq!(recorded.name, "evt");
+        assert_eq!(recorded.filenames, completion.filenames);
+        assert_eq!(recorded.description, "two segments");
+        assert_eq!(recorded.trigger_time.sec, 7);
+        assert_eq!(recorded.trigger_time.nanosec, 250);
+        assert_eq!(recorded.preroll, 1_000);
+    }
+}
