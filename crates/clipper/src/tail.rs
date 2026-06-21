@@ -91,7 +91,7 @@ const TAIL_POLL: Duration = Duration::from_millis(50);
 /// step of the scan-fault backoff (see [`SCAN_BACKOFF_CAP`]).
 const DISCOVER_POLL: Duration = Duration::from_millis(200);
 
-/// How many consecutive faulted scan passes [`Tailer::tail_file`] tolerates
+/// How many consecutive faulted scan passes [`Tailer::run`] tolerates
 /// before giving up on a recording and returning an error. A fault is a
 /// framing desync with no resync point (an oversized record length, or an IO
 /// error reading a record); skipped localized damage is not a fault and never

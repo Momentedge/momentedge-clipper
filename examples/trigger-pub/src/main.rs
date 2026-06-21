@@ -1,6 +1,6 @@
 //! Periodic `/events/momentedge/trigger` publisher.
 //!
-//! Emits a `momentedge_msgs/Trigger` every `--period` seconds (5 s by default)
+//! Emits a `momentedge_msgs/Trigger` every `--period` seconds (1 s by default)
 //! so the triggered recorder (`clipper`) has something to react to during
 //! development. Each trigger's `trigger_time` is stamped with the current
 //! RosTime at publish — the "original timestamp" the pre/post-roll window is cut
@@ -8,11 +8,14 @@
 //! trigger's arrival time.
 //!
 //! Flags (all optional):
-//!   --period <secs>       seconds between triggers          (default 1)
-//!   --preroll <ns>        nanoseconds kept before the stamp (default: random per trigger)
-//!   --postroll <ns>       nanoseconds kept after the stamp  (default: random per trigger)
-//!   --name <prefix>       trigger name prefix; a counter is appended (default "periodic")
-//!   --description <text>  free-form description carried in the trigger
+//!
+//! ```text
+//! --period <secs>       seconds between triggers          (default 1)
+//! --preroll <ns>        nanoseconds kept before the stamp (default: random per trigger)
+//! --postroll <ns>       nanoseconds kept after the stamp  (default: random per trigger)
+//! --name <prefix>       trigger name prefix; a counter is appended (default "periodic")
+//! --description <text>  free-form description carried in the trigger
+//! ```
 //!
 //! When `--preroll`/`--postroll` are omitted, each trigger draws a fresh window
 //! independently — a random whole number of seconds in `[1, 10]` — so the

@@ -41,28 +41,14 @@
 //! orderly exit 0). Clip copies run on a fixed pool of `extract_parallelism`
 //! worker threads consuming one FIFO job channel.
 //!
-//! Configuration is parsed by clap (`Config`): each setting is a CLI flag that
-//! falls back to a `MOMENTEDGE_<KEY>` environment variable, then to a built-in
-//! default — a CLI flag wins over the env var, which wins over the default. The
-//! `MOMENTEDGE_*` env names are derived from one prefix applied to every field
-//! (`with_env_prefix`). `--help` lists the flags and `--version` prints the
-//! version. Settings (all optional):
-//!   --record-dir   bag directory of the continuous recording (default ./record)
-//!   --out-dir      where clips are written                   (default ./clipped)
-//!   --interface    trigger source + completion sink: ros (subscribe + publish
-//!                  Recorded) or mcap (read triggers from the tailed file,
-//!                  ROS-free, the clip's move into out-dir the signal)
-//!                  (default ros)
-//!   --grace-secs   how long past the window end to wait for coverage
-//!                  before cutting from what is on disk (default 30; must
-//!                  exceed the recorder's flush latency — for a chunked
-//!                  recording roughly chunk size / aggregate data rate)
-//!   --extract-parallelism  extraction worker threads (default 1: copies
-//!                  queue FIFO — the bulk copy competes with the recorder's
-//!                  writes for disk bandwidth; waiting is always concurrent)
-//!   --clip-compression  codec for written clips: none, lz4, or zstd
-//!                  (default zstd) — the choice is explicit, not inherited
-//!                  from the mcap crate default
+//! Configuration is parsed by clap into [`Config`]: each setting is a CLI flag
+//! that falls back to a `MOMENTEDGE_<KEY>` environment variable, then to a
+//! built-in default — the CLI flag wins over the env var, which wins over the
+//! default. The `MOMENTEDGE_*` env names are derived from one prefix applied to
+//! every field ([`with_env_prefix`]). `--help` lists the flags and `--version`
+//! prints the version; [`Config`]'s field docs are that `--help` text and the
+//! authoritative per-flag reference (the README configuration table is the
+//! user-facing copy of the same set).
 //!
 //! Logging uses the `log` facade with a pretty_env_logger backend; `RUST_LOG`
 //! controls verbosity.
@@ -175,7 +161,7 @@ impl std::fmt::Display for InterfaceKind {
     }
 }
 
-/// Recorder configuration, parsed by clap from CLI flags with a `CLIPPER_*`
+/// Recorder configuration, parsed by clap from CLI flags with a `MOMENTEDGE_*`
 /// environment-variable fallback per field (see [`load_config`]). The field doc
 /// comments are the `--help` text: the first line is the short help, the rest is
 /// shown under `--help`.
@@ -284,7 +270,7 @@ fn with_env_prefix(cmd: clap::Command) -> clap::Command {
 }
 
 /// Parse [`Config`] from the command line, each field falling back to its
-/// `CLIPPER_*` environment variable and then its default (CLI > env > default).
+/// `MOMENTEDGE_*` environment variable and then its default (CLI > env > default).
 /// clap prints `--help`/`--version` and any parse error, then exits the process,
 /// so this returns only a fully-populated config.
 fn load_config() -> Config {
