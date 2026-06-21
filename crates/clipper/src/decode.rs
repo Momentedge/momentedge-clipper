@@ -1,5 +1,5 @@
-//! Decoding a [`TriggerRecord`]'s payload into a domain [`Trigger`] by
-//! dispatching on its MCAP `message_encoding`.
+//! Decoding a [`TriggerRecord`](crate::trigger::TriggerRecord)'s payload into a
+//! domain [`Trigger`] by dispatching on its MCAP `message_encoding`.
 //!
 //! [`DecoderFactory::for_encoding`] maps an encoding string to a
 //! [`TriggerDecoder`], so a writer interleaving a trigger into an MCAP is never
