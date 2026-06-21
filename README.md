@@ -1,498 +1,220 @@
 # Momentedge Clipper
 
-Event-triggered clips from a continuous ROS 2 recording 
-The data worth keeping is sparse, but you can't know an event mattered until after it's started — and a useful clip needs the lead-up, not just the aftermath. That preroll only exists if the data was already on disk when the event fired. 
-momentedge-clipper turns an ordinary ros2 bag record into an on-demand event recorder. It runs alongside the recorder, tails the growing MCAP file, and on each trigger cuts a standalone clip covering the window around the event — the seconds before it is included, not just after. Recording stays rosbag2's job; clipping is ours. The two never talk except through the file. If the strategy, example code is offered to handle recorded buffer size and rewrite disk to prevent disk fill up (a pseudo circular buffer set up). 
+> Event-triggered clips from a continuous ROS 2 recording — including the
+> seconds *before* the event.
 
-Why this approach
-Recording and deciding-what-matters are different jobs with different change rates, and the split is deliberate:
-- The recorder stays untouched. It keeps its own config, lifecycle, tooling, and support story. You can add, upgrade, or remove the clipper without touching the thing that captures your data — which matters on a robot, where the recording path is the last thing you want churning.
-- MCAP in, MCAP out. Clips are standard, complete MCAP files — readable by Foxglove, the mcap CLI, and rosbag2 replay. No vendor format on either side.
-- The clipper is small on purpose. Decode-free byte copying, sequential IO, plain OS threads, no async runtime, a fail-fast supervisor. It's built to be pinned at a version and frozen on a robot without frequent updates.
-- Triggers are just a topic. Anything that can publish momentedge_msgs/Trigger — a fault detector, a watchdog, an operator button, your own perception stack — can drive it. The clipper has no opinion about when to capture; it only answers "give me the window around time T."
+On a robot the data worth keeping is sparse: most of the time nothing
+interesting happens. But you can't know an event mattered until after it has
+already started — and a useful clip needs the lead-up, not just the aftermath.
+That **preroll** only exists if the data was already on disk when the event
+fired.
 
-A **triggered clip recorder** for ROS2, written in Rust. It keeps a continuous
-on-disk `ros2 bag record` running and, on each trigger event, cuts a short clip
-out of it — copying MCAP messages straight through without decoding their
-bodies. The recorder is one crate, with an example trigger source alongside it:
+**Momentedge Clipper** turns an ordinary `ros2 bag record` into an on-demand
+event recorder. It runs alongside the recorder, tails the growing MCAP file, and
+on each trigger cuts a standalone clip covering a window around the event —
+`[trigger_time − preroll, trigger_time + postroll]`. Recording stays rosbag2's
+job; clipping is clipper's. The two never talk except through the file on disk.
 
-- **`clipper`** — the recorder. It tails a collection of MCAP recordings and,
-  for each trigger, bulk-copies the messages in the trigger's pre/post window
-  into a standalone clip (or one segment per source file when the window spans
-  a rollover), then announces the result. See
-  [Triggered recording](#triggered-recording).
-- **`trigger-pub`** — an example trigger source
-  ([`examples/trigger-pub`](examples/trigger-pub/README.md)), standing in for a
-  real one. It periodically publishes `momentedge_msgs/Trigger` so you can
-  exercise the recorder end to end.
+- **MCAP in, MCAP out.** Clips are standard, complete MCAP files — readable by
+  [Foxglove](https://foxglove.dev/), the `mcap` CLI, and `ros2 bag` replay. No
+  vendor format on either side.
+- **Decode-free.** clipper copies message bytes straight through; it never
+  deserializes message bodies, so it is agnostic to your message types.
+- **Triggers are just a topic.** Anything that can publish
+  `momentedge_msgs/Trigger` — a fault detector, a watchdog, an operator button,
+  your perception stack — can drive it.
+- **Small and frozen-friendly.** Plain OS threads, sequential IO, no async
+  runtime, fail-fast supervision. Built to be pinned at a version and left
+  running on a robot.
 
-It is a testing pad, not a finished tool.
+## How it works
 
-## Prerequisites
+clipper is a standalone application that sits beside a continuous
+`ros2 bag record`:
 
-- **Nix** with flakes enabled. The dev shell provides ROS2 via
-  [`nix-ros-overlay`](https://github.com/lopsided98/nix-ros-overlay) and pulls
-  prebuilt packages from `ros.cachix.org` (nixpkgs has no ROS2). One distro per
-  shell, selected at the command line — `nix develop` is Jazzy (the default);
-  `nix develop .#humble`, `.#lyrical`, and `.#rolling` select the others. The
-  `nix develop` and `cargo` commands below take a `.#<distro>` selector to pick
-  one. The recorder builds and the e2e suite run on **humble**, **jazzy**, and
-  **lyrical** — the recovery tests discover recordings by mtime and assert on
-  path-free log needles, so lyrical's timestamped rosbag2 filenames do not break
-  them (beads `clipper-7ys`); **rolling** gets a working ROS2 shell but cannot
-  build the Rust crates (an `r2r` limitation — see "Integration tests" below).
-- **System Rust** (`cargo`/`rustc` on your `PATH`). The flake intentionally does
-  not provide a Rust toolchain.
-- **A data source** — the in-repo synthetic camera ([`sim/`](sim/README.md)),
-  which publishes a gscam test pattern raw + H.265, or the sibling repo
-  `../ros2_sources`, which replays a bag of recorded sensor data onto live
-  ROS2 topics. The sim camera rides in the Jazzy, Humble, Lyrical, and Rolling
-  shells (`nix develop` or `nix develop .#humble` / `.#lyrical` / `.#rolling`).
-  On Rolling the camera runs but the recorder does not (an `r2r` limitation —
-  see "Integration tests" below), so use Lyrical for the full sim + recorder
-  workflow. The recorder, the e2e suite, and deployment never touch the sim
-  camera, so they are unaffected.
-
-## Binary cache
-
-The flake registers two substituters (`nixConfig` in `flake.nix`):
-`ros.cachix.org` for the upstream ROS2 packages, and
-`https://cache.stfl.dev/momentedge` — a self-hosted
-[attic](https://github.com/zhaofengli/attic) cache (backed by Cloudflare R2)
-that holds the project's ROS2 closure. Both are public: **pulling needs no
-credentials**, so a fresh checkout substitutes the ROS2 closure instead of
-compiling it from source.
-
-The substituters apply only once nix accepts the flake's `nixConfig`. Trusted
-users get this automatically; everyone else passes `--accept-flake-config` (or
-adds the two substituters and their public keys to `nix.conf`).
-
-Pushing to momentedge is for maintainers and CI and needs an attic token:
-
-```bash
-attic login momentedge https://cache.stfl.dev <token>
-attic push momentedge <store-path>
+```
+  trigger source                              ros2 bag record  (continuous, --all)
+  (fault / button / perception)                       │
+        │  momentedge_msgs/Trigger                     ▼
+        │  on /events/momentedge/trigger        ./record/<bag>.mcap   (one growing file)
+        ▼                                              │
+     clipper ◀──────────────── tails (keeps the file open) ──────────┘
+        │
+        ├── copies [trigger_time − preroll, trigger_time + postroll] ──▶ ./clipped/<trigger_ns>_<name>.mcap
+        │
+        └── announces ──▶ /events/momentedge/recorded   (momentedge_msgs/Recorded, lists every file written)
 ```
 
-CI populates it automatically — the token lives in the `ATTIC_TOKEN` repository
-secret.
+1. **Tail.** clipper keeps the growing MCAP file open and incrementally scans
+   the new bytes, decoding nothing but each message's timestamp. A clip can be
+   cut the moment its data is physically on disk.
+2. **Listen.** It waits for a `momentedge_msgs/Trigger` on
+   `/events/momentedge/trigger`, carrying a reference time and a pre/post window.
+3. **Copy.** It copies every message whose timestamp falls in
+   `[trigger_time − preroll, trigger_time + postroll]` into a standalone clip,
+   then announces the result on `/events/momentedge/recorded`.
+
+Because the recording is already on disk, the preroll — the data from *before*
+the trigger — is there to copy.
 
 ## Quickstart
 
-```bash
-# 1. Enter the ROS2 + C-toolchain shell (direnv users: `direnv allow`)
-nix develop
-
-# 2. Build the recorder
-cargo build
-```
-
-To see the recorder work you need a data source plus a continuous recording and
-a trigger source. Run each in its own shell (all inside `nix develop`, sharing
-RMW + `ROS_DOMAIN_ID`):
+You need three things, each in its own shell sharing one ROS 2 environment
+(`RMW_IMPLEMENTATION` and `ROS_DOMAIN_ID` must match): a continuous recording,
+clipper, and a trigger.
 
 ```bash
-# 1. data source — replay a bag (see ../ros2_sources/REPLAY.md)
-cd ../ros2_sources && nix develop --command ros2 bag play --loop bags/example-011-ugv-ds.mcap
+# 1. Continuous recording → ./record (one growing MCAP file)
+ros2 bag record --all --storage mcap --output ./record
+#    or ./scripts/record.sh for storage-tuned defaults
 
-# 2. continuous recording → ./record (one growing file)
-nix develop --command ./scripts/record.sh
+# 2. clipper, tailing ./record, writing clips to ./clipped
+clipper --record-dir ./record --out-dir ./clipped --clip-compression zstd
+#    from a source checkout: cargo run -p clipper -- --record-dir ./record --out-dir ./clipped
 
-# 3. tailing recorder → ./clipped
-nix develop --command cargo run -p clipper
-
-# 4. fire a trigger every 1 s (random 1-10 s preroll/postroll per trigger)
-nix develop --command cargo run -p trigger-pub
+# 3. Fire a trigger: 5 s before and 5 s after "now"
+ros2 topic pub --once /events/momentedge/trigger momentedge_msgs/msg/Trigger \
+  "{name: clip1, trigger_time: {sec: $(date +%s), nanosec: 0}, preroll: 5000000000, postroll: 5000000000}"
 ```
 
-The data source, the recording, and the recorder must share the same middleware
-and domain (`RMW_IMPLEMENTATION=rmw_fastrtps_cpp`, `ROS_DOMAIN_ID=0`); each
-repo's dev shell sets these for you.
+A clip lands at `./clipped/<trigger_ns>_clip1.mcap` and a
+`momentedge_msgs/Recorded` is published on `/events/momentedge/recorded`.
+Inspect it with `ros2 bag info ./clipped/<file>.mcap` or open it in Foxglove.
 
-A healthy run drops one or more clips into `./clipped` for each trigger and
-publishes a `momentedge_msgs/Recorded` announcement on
-`/events/momentedge/recorded` naming every file written. A window inside one
-recording produces `<trigger_ns>_<name>.mcap`; one spanning a rollover produces
-`<trigger_ns>_<name>_00.mcap`, `_01.mcap`, etc. Inspect a clip with
-`ros2 bag info clipped/<file>.mcap`.
+For a continuous test trigger source during development, run the bundled
+[`trigger-pub`](examples/trigger-pub/README.md) example instead of step 3.
 
-## Triggered recording
+## Installation
 
-The recorder keeps a continuous on-disk recording open and extracts short clips
-from it on demand, tailing a **collection of MCAP recordings** — the current
-growing file plus any finished recordings (splits or restarts) it has indexed
-while running. Clip latency is bounded by the recorder's write-through latency
-rather than any split duration.
+### From a release (recommended for deployment)
 
-```
-ros2 bag record ──growing mcap──▶ ./record/<bag>_0.mcap
-       ▲ kept open + tailed     ▶ ./record/<bag>_1.mcap  (split, if any)
-clipper ◀── /events/momentedge/trigger ── trigger-pub
-       ├──▶ ./clipped/<trigger_ns>_<name>.mcap          (window in one recording)
-       ├──▶ ./clipped/<trigger_ns>_<name>_00.mcap  ─┐  (window spanning a rollover)
-       ├──▶ ./clipped/<trigger_ns>_<name>_01.mcap  ─┘
-       └──▶ /events/momentedge/recorded
-```
-
-- **`ros2 bag record`** (via `scripts/record.sh`) records every live topic into
-  one growing MCAP file under `./record`. It runs standalone — `clipper` never
-  starts it. `./record` is gitignored and not pruned, so the file grows until
-  you stop recording or clear it.
-
-  The script's storage defaults (`--storage-preset-profile zstd_fast
-  --max-cache-size` 100 MiB) trade tail latency for size; the
-  [`examples/continuous`](examples/continuous/README.md) setup explains the two
-  knobs and the low-latency `fastwrite --max-cache-size 0` alternative.
-- **`clipper`** listens on `/events/momentedge/trigger`
-  (`momentedge_msgs/Trigger`: `name`, `description`, `trigger_time`, and the
-  `preroll`/`postroll` windows in nanoseconds). For each trigger it waits until
-  the recording collection covers the window `[trigger_time - preroll,
-  trigger_time + postroll]` (or the grace timeout elapses), then bulk-copies
-  every message in that window into one or more clips and publishes
-  `momentedge_msgs/Recorded` on `/events/momentedge/recorded`. The copy re-emits
-  raw MCAP message bytes — channels and schemas are carried over, message bodies
-  are never decoded.
-
-  **Clip naming.** A window that falls inside a single recording produces one
-  file: `./clipped/<trigger_ns>_<name>.mcap`. A window that straddles a rollover
-  (a rosbag2 bag split or a recorder restart that clipper indexed while running)
-  produces one segment per source file: `<trigger_ns>_<name>_00.mcap`,
-  `_01.mcap`, and so on, tiling the window in time order. The
-  `momentedge_msgs/Recorded` message carries every segment path in its
-  `string[] filenames` field. Every file named in `filenames` is already on disk
-  and crash-durable before the announcement is published.
-- **`trigger-pub`** publishes a trigger every 1 s (configurable), stamping
-  `trigger_time` with the current time — a development stand-in for a real
-  trigger source. With no `--preroll`/`--postroll` flags it draws each side a
-  random 1–10 s window per trigger; pass either flag to pin it.
-
-Ctrl-C stops the recorder cleanly (exit zero); any internal fault exits non-zero
-for a supervisor to restart.
-
-### The two interfaces
-
-How a trigger reaches `clipper` and how it signals a finished clip are one
-choice — the **interface**, set by `--interface {ros|mcap}` (default `ros`). The
-two are mutually exclusive; `clipper` runs exactly one per launch.
-
-- **`ros`** (the default) is the topic-driven path above: it subscribes to
-  `/events/momentedge/trigger` and publishes `momentedge_msgs/Recorded` on
-  `/events/momentedge/recorded` for each clip. This is the deployed path.
-- **`mcap`** reads triggers straight out of the recording `clipper` already
-  tails — run `ros2 bag record --all` so the continuous recording captures the
-  trigger topic, and `clipper` lifts each trigger back out of it, decoding it by
-  the MCAP channel's `message_encoding` (`cdr` or `json`). It runs
-  ROS-free: no node, subscription, or publisher. It announces nothing on any
-  topic — a finished clip is signalled by the file appearing in `--out-dir`, so
-  watch that directory or the log lines for completion.
-
-Both cut identical clips; only the trigger and completion edges differ. The
-window is still anchored on each trigger's `trigger_time`. For the interface
-seam's design — the neutral trigger/completion contract, the decoder dispatch,
-and the ROS-free MCAP path — see
-[`crates/clipper/CLAUDE.md`](crates/clipper/CLAUDE.md).
-
-### Configuration
-
-`clipper` is configured by CLI flags, each with a `MOMENTEDGE_*` environment
-fallback and a built-in default: a flag overrides the env var, which overrides
-the default. `clipper --help` lists them and `clipper --version` prints the
-version. All settings are optional:
-
-| Flag | Env var | Default | Meaning |
-|---|---|---|---|
-| `--record-dir` | `MOMENTEDGE_RECORD_DIR` | `./record` | bag directory of the continuous recording |
-| `--out-dir` | `MOMENTEDGE_OUT_DIR` | `./clipped` | where clips are written |
-| `--interface` | `MOMENTEDGE_INTERFACE` | `ros` | where triggers come from and completions go: `ros` (subscribe to the trigger topic, publish `Recorded`) or `mcap` (read triggers out of the tailed recording, ROS-free, signal completion by the clip's move into `out-dir`) — see [The two interfaces](#the-two-interfaces) |
-| `--grace-secs` | `MOMENTEDGE_GRACE_SECS` | `30` | wait past the window end for coverage before cutting |
-| `--extract-parallelism` | `MOMENTEDGE_EXTRACT_PARALLELISM` | `1` | concurrent clip copies (1 = one at a time, FIFO) |
-| `--clip-compression` | `MOMENTEDGE_CLIP_COMPRESSION` | `zstd` | codec for written clips: `none`, `lz4`, or `zstd` (zstd = smallest, lz4 = faster, none = no recompression) |
-| `--watch-old-files-duration` | `MOMENTEDGE_WATCH_OLD_FILES_DURATION` | `600` | seconds to keep a finished (split/restart) recording indexed and its file descriptor open so a trigger's preroll can still reach into it; set this comfortably above the largest preroll any trigger will request |
-| `--delete-old-files` | `MOMENTEDGE_DELETE_OLD_FILES` | `false` | when set, a prune also unlinks the expired `.mcap` from disk (off by default — clipper does not own the recordings; `ros2 bag record` does) |
-
-For example, `clipper --grace-secs 60` and `MOMENTEDGE_GRACE_SECS=60 clipper`
-are equivalent.
-
-At most 16 triggers are handled concurrently — a fixed bound, not a config key.
-A trigger that arrives while all 16 handler slots are occupied is rejected: a
-logged error is emitted and the trigger produces no clip and no
-`/events/momentedge/recorded` announcement.
-
-clipper also reads chunked recordings (record.sh's default `zstd_fast` profile,
-or any `STORAGE_PRESET` / `MAX_CACHE_SIZE` override), but `grace_secs` must then
-be sized to the resulting flush latency (roughly chunk size / aggregate data
-rate); see [`examples/continuous`](examples/continuous/README.md). Every
-file visible in `out_dir` is a complete, crash-durable clip; the
-`/events/momentedge/recorded` announce always names an already-written file. The
-single recording file has no retention — it grows until you stop recording.
-
-For the internal design — thread model, tailing mechanics, atomic clip
-publication, recorder restart handling, and damage tolerance — see
-[`crates/clipper/ARCHITECTURE.md`](crates/clipper/ARCHITECTURE.md).
-
-## Tests and coverage
-
-Tests run with plain `cargo test` inside the dev shell. Line/branch coverage
-comes from [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov). Like
-Rust itself it is not part of this flake — it and the `llvm-tools` toolchain
-component it needs (`llvm-cov`/`llvm-profdata`, discovered via the rustc
-sysroot) come from the system:
+Each [GitHub release](../../releases) attaches two Debian packages per ROS 2
+distro. Install both on a host running the matching distro (Humble packages on a
+Humble host, Jazzy on Jazzy, …):
 
 ```bash
-# Summary table on stdout (clipper carries the test suite)
-nix develop --command cargo llvm-cov -p clipper
-
-# Browsable HTML report → target/llvm-cov/html/index.html
-nix develop --command cargo llvm-cov -p clipper --html
-
-# lcov output for editor/CI integration
-nix develop --command cargo llvm-cov -p clipper --lcov --output-path lcov.info
-```
-
-Coverage builds are instrumented and use their own target directory
-(`target/llvm-cov-target`), so they neither clobber nor reuse the normal
-`cargo build` cache — expect a full rebuild on the first run. `trigger-pub` has
-no tests, so the suite is `clipper`'s.
-
-### Integration tests (live ROS2 e2e)
-
-`crates/clipper/tests/e2e.rs` drives the real stack end to end: a
-real `ros2 bag record` (matching the production `scripts/record.sh` invocation),
-CLI-published triggers, and a `ros2 topic echo` listener for the
-`Recorded` announcements. The matrix covers:
-
-- The fastwrite and zstd_fast storage profiles (happy path per profile).
-- Recorder restarts between triggers and inside an open trigger window (clean
-  restart, deletion-then-restart, deletion before the trigger), each recovered
-  across the boundary as one segment per source file.
-- Deletion of the recording without a restart (mid-window and pre-trigger): the
-  grace cut recovers the data scanned before the deletion.
-- A restart after the window closes: the closing recording, kept in the
-  collection, is recovered even though its file is gone from disk.
-- A window straddling an in-run rosbag2 split, recovered as one segment per
-  source file (the headline cross-file recovery; preroll reaches the prior file).
-- Grace-timeout degraded paths and offline/live recording corruption.
-
-The suite is gated on `CLIPPER_E2E`: unset (plain `cargo test`,
-`cargo llvm-cov`) every e2e test prints a skip notice and passes, so the
-commands above are unaffected. With the gate set, a missing prerequisite (no
-`ros2` on PATH, `momentedge_msgs` not resolvable) fails loudly instead of
-skipping.
-
-[cargo-nextest](https://nexte.st/) is a hard prerequisite for the gated run —
-like Rust itself it comes from the system, not this flake. Its `e2e` profile
-(`.config/nextest.toml`) runs each test in its own process, serializes the
-suite (one DDS graph and one disk at a time), and enforces per-test timeouts:
-
-```bash
-nix develop --command bash -c \
-  'CLIPPER_E2E=1 cargo nextest run -p clipper --profile e2e -E "binary(e2e)"'
-```
-
-Each test runs in its own `ROS_DOMAIN_ID` (band 80–101) with its own temp
-dirs, so a recorder already running on the host's domain 0 is unaffected.
-Expect a few minutes of wall clock: the tests sleep out real trigger windows
-against a live recording.
-
-The suite builds only `clipper` and drives the `ros2` CLI from the
-shell, so it runs under any distro whose shell builds. Select the distro's shell
-and give each its own target directory, since the r2r build artifacts link that
-distro's `rcl`/`rmw` and must not collide:
-
-```bash
-for d in humble jazzy lyrical; do
-  nix develop ".#$d" --command bash -c \
-    "CARGO_TARGET_DIR=target/e2e-$d CLIPPER_E2E=1 \
-     cargo nextest run -p clipper --profile e2e -E 'binary(e2e)'"
-done
-```
-
-The suite runs on **humble**, **jazzy**, and **lyrical** (the workspace pins
-[`r2r`](https://github.com/sequenceplanner/r2r) to its `0.9.6` git tag, which
-supports lyrical). The recovery tests discover recordings by mtime and assert on
-path-free log needles, so lyrical's timestamped rosbag2 bag filenames do not
-break them (beads `clipper-7ys`). **Rolling** selects and builds its ROS2 closure
-(`nix develop .#rolling` works) but cannot build the Rust crates: even r2r
-`0.9.6` references the `RMW_QOS_POLICY_LIVELINESS_MANUAL_BY_NODE` rmw enum
-variant that the current rolling has dropped (beads `clipper-2xb`). The r2r pin
-returns to a crates.io release once `0.9.6` is published there (beads
-`clipper-4rw`).
-
-CI runs this suite — build, unit tests, and the gated e2e — on every push across
-the three working distros; the mechanics and the local-`act` notes live in the
-`/ci` repo skill (`.claude/skills/ci/SKILL.md`).
-
-## Deployment (Jetson / native build)
-
-The recorder ships to an edge target — a Jetson running ROS2 Humble. The target
-runs the same ROS2 distro the recorder is built against, so the two binaries are
-compiled **natively on the target against its own ROS2 install**. There is no
-container and no bundled ROS: only `clipper` and `trigger-pub` are
-deployed, and rosbag2 with MCAP storage comes from the host's ROS2
-(`ros-humble-rosbag2-storage-mcap`), which the recorder reuses rather than
-shipping its own.
-
-What gets built is only the Rust code and the local `momentedge_msgs` interface
-package; `rcl`, `rmw_fastrtps_cpp`, the standard message packages, and rosbag2
-are the host's ROS2. Building against the host's own libraries is what makes the
-binaries ABI-compatible with the rest of its ROS graph (the camera node, rosbag2,
-…) — a binary built against a different ROS2 build would link different
-typesupport and not interoperate.
-
-### Build on the target
-
-Prerequisites (Ubuntu 22.04 / ROS2 Humble):
-
-```bash
-sudo apt install ros-humble-ros-base ros-humble-rosbag2-storage-mcap \
-                 ros-humble-rosbag2-transport ros-humble-ros2bag \
-                 ros-dev-tools clang libclang-dev
-# plus a Rust toolchain (rustup, or the distro cargo/rustc) on PATH
-```
-
-Then, from a checkout of this repo on the target:
-
-```bash
-./scripts/build-on-target.sh
-```
-
-It builds `momentedge_msgs` into a colcon overlay (`./install`) and compiles
-`clipper` + `trigger-pub` (`./target/release`) against
-`/opt/ros/humble`. Override the ROS install with
-`ROS_SETUP=/opt/ros/<distro>/setup.bash`.
-
-### Run
-
-The recorder is `scripts/record.sh` (continuous `ros2 bag record`) plus
-`clipper` via `scripts/run.sh`; [`examples/launch`](examples/launch/README.md)
-brings both up together with `ros2 launch`. The trigger publisher has a demo
-launcher too:
-
-```bash
-./examples/trigger-pub/start_demo_trigger_pub.sh   # demo trigger source (foreground)
-```
-
-Running natively, every ROS2 process shares the host `/dev/shm`, so FastDDS
-shared-memory transport works and discovery + data interop with the host's other
-Humble nodes is direct.
-
-### Install from a Debian package
-
-Each [GitHub release](../../releases) attaches the packages CI builds on native
-arm64 runners — per distro, two packages, each built the way ROS2 builds its kind:
-
-| Package | Built with | Installs to |
-|---|---|---|
-| `ros-<distro>-momentedge-msgs` | bloom | `/opt/ros/<distro>` |
-| `momentedge-clipper`           | cargo-deb | `/opt/momentedge-clipper` |
-
-`momentedge_msgs` is the ament interface package, packaged as a first-class ROS
-deb with bloom; `clipper` is the Rust recorder, packaged with cargo-deb (bloom has
-no cargo build type) declaring `Depends: ros-<distro>-momentedge-msgs,
-ros-<distro>-rmw-fastrtps-cpp, ros-<distro>-ros-base`.
-
-Install on the matching target (Humble packages on a Humble host, Jazzy on a Jazzy
-host). Pass both files so `apt` installs the msgs package and pulls the rest of the
-ROS runtime as dependencies:
-
-```bash
-# from the directory holding the two downloaded .deb files for your distro
 sudo apt install ./ros-humble-momentedge-msgs_*.deb ./momentedge-clipper_*.deb
-```
-
-The clipper binary carries no bundled overlay and no baked rpaths: its message
-typesupport is the `ros-<distro>-momentedge-msgs` package under `/opt/ros/<distro>`,
-resolved — like every ROS executable — through the distro's own `setup.bash`. So
-running it is the standard ROS source-then-run:
-
-```bash
-source /opt/ros/humble/setup.bash            # the matching distro + the msgs package
+source /opt/ros/humble/setup.bash
 /opt/momentedge-clipper/bin/clipper --help
 ```
 
-(A systemd unit deploys it the same way: source `/opt/ros/<distro>/setup.bash` in
-`ExecStart`, or set the equivalent `Environment=` / `LD_LIBRARY_PATH`.)
+`momentedge-clipper` resolves its message typesupport from the
+`ros-<distro>-momentedge-msgs` package through the distro's own `setup.bash`,
+like every ROS executable — no bundled overlay, no baked rpath.
 
-The clipper package ships only the recorder binary; the `momentedge_msgs`
-typesupport comes from its own package, and the continuous recording clipper tails
-comes from the host's own `ros2 bag record` (see "Triggered recording" above).
-Both packages are built natively against the matching apt ROS2 for ABI
-compatibility; see "Build on the target" above for the rationale.
+### From source
 
-### Retention
+clipper is a standard Rust workspace, but the build needs a ROS 2 environment
+(for `rcl`/`rmw` and the message typesupport):
 
-**Recording index retention.** clipper keeps finished recordings (splits or
-restarts it indexed while running) in memory with their file descriptors open
-for `--watch-old-files-duration` seconds (default 600 s = 10 min) so a
-trigger's preroll can reach into them. The tail prunes expired recordings every
-poll — whole files only, never the one currently being recorded. The prune
-releases the file descriptor and frees the index memory; by default it leaves
-the `.mcap` on disk for `ros2 bag record` or other consumers. Set
-`--delete-old-files` to have clipper also unlink expired recordings from disk,
-turning the watch duration into a real disk-cleanup horizon for the recording
-directory. Set `--watch-old-files-duration` comfortably above the largest
-preroll any trigger will request: a preroll that reaches past the watch floor
-may lose its oldest segment.
+- **Development:** a [Nix](https://nixos.org/) dev shell provides ROS 2 —
+  `nix develop --command cargo build`. See [CLAUDE.md](CLAUDE.md) for the
+  dev-shell and per-distro build details.
+- **On a deployment target:** `./scripts/build-on-target.sh` compiles `clipper`
+  and `momentedge_msgs` natively against the host's apt ROS 2 install (the
+  binaries are ABI-compatible with the rest of the host's ROS graph by
+  construction). See [ARCHITECTURE.md](ARCHITECTURE.md#deployment) for the
+  rationale.
 
-**Clip retention.** The clips clipper writes accumulate in `./clipped`. Prune
-old clips on a schedule (e.g. a cron running
-`find ./clipped -mindepth 1 -type f -mmin +1440 -delete`), and see
-[`examples/split-bags`](examples/split-bags/README.md) for bounding the
-recording itself with split bags. In-place hole-punch retention for the
-continuous file is tracked in beads (`clipper-wkg`).
+## Configuration
 
-## Layout
+`clipper` is configured by CLI flags, each with a `MOMENTEDGE_*` environment
+fallback and a built-in default: a flag overrides the env var, which overrides
+the default. `clipper --help` lists them; `clipper --version` prints the
+version. Everything is optional — `clipper` runs with no arguments.
 
-```
-crates/clipper/         # triggered clip recorder tailing one continuous mcap
-momentedge_msgs/        # local ROS2 interface package (Trigger, Recorded)
-sim/                    # synthetic gscam camera, raw + H.265 (sim/cam_sim.sh) — see sim/README.md
-nix/                    # flake package defs: momentedge-msgs, ros-env, binaries
-examples/               # setup guides (continuous, split-bags, launch) + the trigger-pub example
-examples/trigger-pub/   # r2r periodic trigger publisher (example) + start_demo_trigger_pub.sh
-scripts/record.sh       # continuous `ros2 bag record` → ./record (clipper's source)
-scripts/run.sh          # run clipper against ./record (matching options)
-scripts/build-on-target.sh  # native target build (momentedge_msgs overlay + binaries)
-flake.nix               # per-distro ROS2 dev shells (humble/jazzy/lyrical/rolling) + nix-built binaries
-```
+| Flag | Env var | Default | Meaning |
+|---|---|---|---|
+| `--record-dir` | `MOMENTEDGE_RECORD_DIR` | `./record` | bag directory of the continuous recording to tail |
+| `--out-dir` | `MOMENTEDGE_OUT_DIR` | `./clipped` | where finished clips are written |
+| `--interface` | `MOMENTEDGE_INTERFACE` | `ros` | how triggers arrive and completions are signalled: `ros` or `mcap` (see [below](#two-ways-in-ros-and-mcap)) |
+| `--grace-secs` | `MOMENTEDGE_GRACE_SECS` | `30` | how long past the window end to wait for the recording to cover it before cutting from what is on disk |
+| `--clip-compression` | `MOMENTEDGE_CLIP_COMPRESSION` | `zstd` | codec for written clips: `none`, `lz4`, or `zstd` (smallest) |
+| `--extract-parallelism` | `MOMENTEDGE_EXTRACT_PARALLELISM` | `1` | concurrent clip copies (1 = one at a time, FIFO) |
+| `--watch-old-files-duration` | `MOMENTEDGE_WATCH_OLD_FILES_DURATION` | `600` | seconds to keep a finished (split/restart) recording indexed so a trigger's preroll can still reach into it; set comfortably above the largest preroll any trigger will request |
+| `--delete-old-files` | `MOMENTEDGE_DELETE_OLD_FILES` | `false` | also unlink an expired `.mcap` from disk when it is pruned (off by default — clipper does not own the recordings) |
 
-`scripts/record.sh` is the continuous `ros2 bag record` clipper tails: every
-live topic into one growing MCAP file under `./record`, with storage defaults
-suited to tailing. `scripts/run.sh` starts `clipper` against the same directory.
-The [`examples/`](examples/) guides cover the continuous (clipper) setup, split
-bags with pruning, and bringing both up with `ros2 launch`:
+`--grace-secs` must exceed the recorder's flush latency: near zero for an
+unchunked `fastwrite` recording, roughly one chunk-fill for a chunked profile.
+The [`examples/continuous`](examples/continuous/README.md) guide explains the
+recorder's latency-vs-size knobs and how to size `--grace-secs` against them.
 
-```bash
-./scripts/record.sh   # continuous --all → ./record
-./scripts/run.sh      # clipper --record-dir ./record → ./clipped
-```
+## The trigger interface
 
-## Issue tracking
+A trigger is a `momentedge_msgs/Trigger` message:
 
-This repo tracks issues with [beads](https://github.com/steveyegge/beads)
-(`bd`). Issues live in a Dolt database that syncs through a **dedicated private
-remote** (`github.com/Momentedge/momentedge-clipper-dolt`), kept out of this
-code repo. The `.beads/` directory here holds only the beads configuration and
-the remote pointer (`sync.remote` in `.beads/config.yaml`); the database itself
-is local to each clone (gitignored), and the git-hook wiring that keeps it in
-sync is per-clone local config that `git clone` does not carry. A fresh clone
-therefore starts with no issues until you hydrate it:
+| Field | Type | Meaning |
+|---|---|---|
+| `name` | `string` | trigger identifier; becomes part of the clip filename |
+| `description` | `string` | optional free-form context |
+| `trigger_time` | `builtin_interfaces/Time` | reference stamp the window is centred on |
+| `preroll` | `uint64` | nanoseconds before `trigger_time` to keep |
+| `postroll` | `uint64` | nanoseconds after `trigger_time` to keep |
 
-```bash
-bd dolt pull        # create the local DB and pull every issue from the remote
-bd hooks install    # wire the beads git hooks so git pull/push auto-sync issues
-```
+For each finished clip, clipper publishes a `momentedge_msgs/Recorded` on
+`/events/momentedge/recorded`, echoing the trigger's `name`, `description`, and
+`trigger_time` and listing every file written in its `string[] filenames`. Every
+path it names is already complete and crash-durable on disk.
 
-`bd dolt pull` builds the local Dolt database from scratch on first run, so a
-clone needs neither a pre-existing database nor the `.beads/issues.jsonl`
-export to recover its issues. After hydrating, `bd ready` / `bd list` work and
-the hooks keep the local database in step with the remote on every `git pull`
-and `git push`. The `bd` workflow and conventions are in
-[`CLAUDE.md`](CLAUDE.md).
+**Clip naming.** A window that falls inside a single recording produces one
+file, `<trigger_ns>_<name>.mcap`. A window that straddles a rollover (a rosbag2
+bag split or a recorder restart clipper observed while running) produces one
+segment per source file — `<trigger_ns>_<name>_00.mcap`, `_01.mcap`, … — tiling
+the window in time order, all listed in `filenames`.
 
-## For contributors and agents
+### Two ways in: `ros` and `mcap`
 
-Implementation rationale, concurrency design, and build mechanics live in the
-`CLAUDE.md` files: [`CLAUDE.md`](CLAUDE.md) for the shared model and workspace,
-the recorder crate ([`clipper`](crates/clipper/CLAUDE.md)), and the example
-trigger source ([`trigger-pub`](examples/trigger-pub/CLAUDE.md)).
+How a trigger reaches clipper and how completion is signalled is one choice, set
+by `--interface` (default `ros`). clipper runs exactly one interface per launch.
+
+- **`ros`** (the default, deployed path) subscribes to
+  `/events/momentedge/trigger` and publishes `momentedge_msgs/Recorded` on
+  `/events/momentedge/recorded`.
+- **`mcap`** reads triggers straight out of the recording clipper already tails
+  (run `ros2 bag record --all` so the trigger topic is captured) and runs
+  **ROS-free** — no node, subscription, or publisher. A finished clip is
+  signalled only by the file appearing in `--out-dir`.
+
+Both cut identical clips; only the trigger and completion edges differ.
+
+## Operational notes
+
+- **Lifecycle.** Ctrl-C (SIGINT/SIGTERM) stops clipper cleanly with exit 0. Any
+  internal fault — a dead tail thread, an unrecoverable scan fault — exits
+  non-zero so a process supervisor (systemd, …) restarts it.
+- **No startup back-indexing.** clipper recovers only rollovers it observed
+  during its own run. A recording already on disk before clipper started
+  contributes nothing to a trigger fired afterwards.
+- **Retention is the recorder's job.** The continuous recording grows until you
+  stop or split it; clipper never prunes the file it is tailing. See
+  [`examples/split-bags`](examples/split-bags/README.md) for bounding the
+  recording, and prune `./clipped` on your own schedule.
+- **Concurrency cap.** Up to 16 triggers are handled at once; a trigger arriving
+  while all 16 slots are busy is rejected with a logged error and produces no
+  clip and no `Recorded` announcement. Automation waiting on the announcement
+  should treat its absence — and the logged error — as a dropped trigger.
+
+## Examples
+
+Setup guides for the recording + clipper stack live under
+[`examples/`](examples/README.md):
+
+| Guide | What it covers |
+|---|---|
+| [`continuous/`](examples/continuous/README.md) | one growing MCAP file (the pairing clipper is built for) + the latency/size knobs |
+| [`split-bags/`](examples/split-bags/README.md) | split recording with pruning for retention |
+| [`launch/`](examples/launch/README.md) | recorder + clipper brought up together with `ros2 launch` |
+| [`trigger-pub/`](examples/trigger-pub/README.md) | an example trigger source for development |
+
+## Documentation
+
+- **[ARCHITECTURE.md](ARCHITECTURE.md)** — the technical overview: thread model,
+  tailing mechanics, atomic clip publication, restart/rollover recovery, damage
+  tolerance, and the deployment build model.
+- **[CLAUDE.md](CLAUDE.md)** and **[crates/clipper/CLAUDE.md](crates/clipper/CLAUDE.md)**
+  — contributor and agent notes: workspace layout, build mechanics, and the
+  recorder's internal design.
+
+## License
+
+Licensed under the [Apache License 2.0](LICENSE).

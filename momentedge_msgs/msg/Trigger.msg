@@ -1,5 +1,5 @@
 # Request to extract a clip from the continuously recording rosbag2 around a
-# reference timestamp. Published on /events/edgestream/trigger.
+# reference timestamp. Published on /events/momentedge/trigger.
 
 string name                            # trigger identifier; part of the output filename
 string description                     # optional free-form context, may be empty

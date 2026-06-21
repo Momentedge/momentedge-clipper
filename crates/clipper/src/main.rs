@@ -106,6 +106,14 @@ const RECORDED_TOPIC: &str = "/events/momentedge/recorded";
 /// This constant is therefore a flood-sanity bound on thread and announcement
 /// growth, not a resource budget; 16 comfortably exceeds any legitimate
 /// concurrent burst.
+///
+/// **Failure mode for downstream automation.** A rejected trigger produces no
+/// `Recorded` announcement, and there is no negative acknowledgement on the
+/// wire: a consumer waiting on `/events/momentedge/recorded` to learn that a
+/// clip was written simply never hears back for that trigger and would hang if
+/// it blocks on the reply. The `error!` log line is the *only* signal that a
+/// trigger was dropped, so alerting on it is how an operator detects a
+/// sustained trigger flood that is outrunning the recorder.
 const MAX_ACTIVE_TRIGGERS: usize = 16;
 
 /// Compression codec for written clips, the clap surface of the otherwise
