@@ -322,7 +322,9 @@ fn sanitize(name: &str) -> String {
 mod tests {
     use super::*;
     use crate::clip::tests::read_clip;
-    use crate::tail::tests::{scan_to_end, test_dir, write_recording, write_unfinished_recording};
+    use crate::tail::tests::{
+        drain, scan_to_end, test_dir, write_recording, write_unfinished_recording,
+    };
 
     /// The clip compression the recorder's default (zstd) maps to; the unit
     /// tests drive the extraction worker pool through the same codec the
@@ -686,6 +688,243 @@ mod tests {
         assert_eq!(
             read_clip(&root.join("clip_01.mcap"))?,
             vec![("/t".to_string(), 5_000)]
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// A capturing [`Announce`] that records every completion it is handed, so a
+    /// test can assert what `handle_trigger` announced.
+    #[derive(Clone)]
+    struct CapturingAnnouncer(Arc<std::sync::Mutex<Vec<Completion>>>);
+    impl Announce for CapturingAnnouncer {
+        fn announce(&self, completion: &Completion) {
+            self.0.lock().unwrap().push(completion.clone());
+        }
+    }
+
+    /// End to end through the public handler entry point: `handle_trigger` turns a
+    /// neutral [`Trigger`] into a clip on disk and announces one [`Completion`]
+    /// naming it. Exercises the whole flow the interfaces share — window math,
+    /// staging, naming, and the announce hand-off — independent of ROS/encoding.
+    #[test]
+    fn handle_trigger_cuts_a_clip_and_announces_it() -> anyhow::Result<()> {
+        let root = test_dir("handle-trigger")?;
+        let out_dir = root.join("out");
+        let rec = root.join("rec.mcap");
+        // Two messages inside the window [0, 1000], one past it so coverage is
+        // already satisfied and the cut does not wait out the grace.
+        write_recording(&rec, false, &[("/t", 100), ("/t", 900), ("/t", 2_000)])?;
+
+        clip::reset_capturing_dir(&out_dir)?;
+        let (tailer, coverage) = Tailer::new();
+        let file = Arc::new(std::fs::File::open(&rec)?);
+        tailer.attach(file.clone());
+        scan_to_end(&tailer, &file, 8)?;
+        let extract_tx = spawn_stage_workers(1, TEST_COMPRESSION);
+
+        let cfg = Arc::new(
+            <Config as clap::Parser>::try_parse_from([
+                "clipper",
+                "--out-dir",
+                out_dir.to_str().unwrap(),
+                "--grace-secs",
+                "5",
+            ])
+            .unwrap(),
+        );
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let announcer = CapturingAnnouncer(captured.clone());
+
+        let trig = Trigger {
+            name: "evt".to_string(),
+            description: "hi".to_string(),
+            trigger_time: crate::trigger::Stamp {
+                sec: 0,
+                nanosec: 500,
+            },
+            preroll: 500,
+            postroll: 500,
+        };
+        handle_trigger(trig, cfg, tailer, coverage, extract_tx, announcer)?;
+
+        let done = captured.lock().unwrap();
+        assert_eq!(done.len(), 1, "exactly one completion is announced");
+        assert_eq!(done[0].name, "evt");
+        assert_eq!(
+            done[0].filenames.len(),
+            1,
+            "one segment — window in one file"
+        );
+        let clip_path = std::path::Path::new(&done[0].filenames[0]);
+        assert!(clip_path.is_file(), "the announced clip exists on disk");
+        assert_eq!(
+            read_clip(clip_path)?,
+            vec![("/t".to_string(), 100), ("/t".to_string(), 900)],
+            "the clip holds exactly the in-window messages"
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// `handle_trigger` with a window spanning two source recordings logs the
+    /// rollover info line (lines 144-149) and announces a `Completion` carrying
+    /// both segment filenames. Models the same two-file setup as
+    /// `record_clip_recovers_across_a_rollover_into_two_segments` but drives
+    /// the full `handle_trigger` entry point so the per-segment `info!` loop
+    /// and the `segments.len() > 1` branch are both exercised.
+    #[test]
+    fn handle_trigger_announces_two_segments_across_a_rollover() -> anyhow::Result<()> {
+        let root = test_dir("ht-rollover")?;
+        let out_dir = root.join("out");
+        let split0 = root.join("rec_0.mcap");
+        let split1 = root.join("rec_1.mcap");
+        // Two finished recordings: split0 ends at 2_000, split1 starts at 5_000.
+        // The trigger window [1_500, 5_500] straddles the gap.
+        write_recording(&split0, false, &[("/t", 1_000), ("/t", 2_000)])?;
+        write_recording(&split1, false, &[("/t", 5_000), ("/t", 6_000)])?;
+
+        clip::reset_capturing_dir(&out_dir)?;
+        let (tailer, coverage) = Tailer::new();
+        tailer.index_recording(&split0);
+        tailer.index_recording(&split1);
+        drain(&tailer)?;
+
+        let extract_tx = spawn_stage_workers(1, TEST_COMPRESSION);
+        let cfg = Arc::new(
+            <Config as clap::Parser>::try_parse_from([
+                "clipper",
+                "--out-dir",
+                out_dir.to_str().unwrap(),
+                "--grace-secs",
+                "5",
+            ])
+            .unwrap(),
+        );
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let announcer = CapturingAnnouncer(captured.clone());
+
+        // trigger_time = 3_500 ns, preroll = 2_000 ns, postroll = 2_000 ns
+        // → window [1_500, 5_500]
+        let trig = Trigger {
+            name: "rollover".to_string(),
+            description: String::new(),
+            trigger_time: crate::trigger::Stamp {
+                sec: 0,
+                nanosec: 3_500,
+            },
+            preroll: 2_000,
+            postroll: 2_000,
+        };
+        handle_trigger(trig, cfg, tailer, coverage, extract_tx, announcer)?;
+
+        let done = captured.lock().unwrap();
+        assert_eq!(done.len(), 1, "one completion per trigger");
+        assert_eq!(done[0].name, "rollover");
+        assert_eq!(
+            done[0].filenames.len(),
+            2,
+            "a rollover window must announce two segments"
+        );
+        // Both announced paths must exist on disk and be valid clips.
+        for name in &done[0].filenames {
+            let p = std::path::Path::new(name);
+            assert!(p.is_file(), "announced segment {name} must be on disk");
+            assert!(
+                !read_clip(p)?.is_empty(),
+                "each segment must hold at least one message"
+            );
+        }
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// `record_clip` with two source recordings where BOTH segments are empty
+    /// keeps exactly one of them (lines 238-240): truncating to 1 rather than
+    /// dropping all so an all-empty window still announces a valid clip.
+    #[test]
+    fn record_clip_all_empty_multi_segment_keeps_one() -> anyhow::Result<()> {
+        let root = test_dir("all-empty")?;
+        let split0 = root.join("rec_0.mcap");
+        let split1 = root.join("rec_1.mcap");
+        // Two recordings whose messages all fall far outside the narrow window
+        // [500, 600]: both staged segments will be empty (messages_copied == 0).
+        write_recording(&split0, false, &[("/t", 1_000), ("/t", 2_000)])?;
+        write_recording(&split1, false, &[("/t", 5_000), ("/t", 6_000)])?;
+
+        let (tailer, coverage) = Tailer::new();
+        tailer.index_recording(&split0);
+        tailer.index_recording(&split1);
+        drain(&tailer)?;
+
+        let extract_tx = spawn_stage_workers(1, TEST_COMPRESSION);
+        let base = root.join("clip.mcap");
+        let stats = record_clip(
+            &tailer,
+            500,
+            600,
+            base.clone(),
+            &coverage,
+            Duration::from_secs(30),
+            &extract_tx,
+        )?;
+
+        // Both segments are empty, so truncate(1) keeps exactly one.
+        assert_eq!(
+            stats.len(),
+            1,
+            "an all-empty multi-segment window keeps exactly one segment"
+        );
+        assert_eq!(stats[0].messages_copied, 0, "the kept segment is empty");
+        assert!(read_clip(&stats[0].out_path)?.is_empty());
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// `record_clip` with two source recordings where only one segment carries
+    /// data drops the empty segment (lines 236-237): the `retain(!is_empty)`
+    /// branch fires so the announced clip list contains only the non-empty one.
+    #[test]
+    fn record_clip_drops_empty_segment_when_other_has_data() -> anyhow::Result<()> {
+        let root = test_dir("drop-empty")?;
+        let split0 = root.join("rec_0.mcap");
+        let split1 = root.join("rec_1.mcap");
+        // split0 has messages inside the window [1_500, 5_500]; split1 does not.
+        write_recording(&split0, false, &[("/t", 1_000), ("/t", 2_000)])?;
+        write_recording(&split1, false, &[("/t", 8_000), ("/t", 9_000)])?;
+
+        let (tailer, coverage) = Tailer::new();
+        tailer.index_recording(&split0);
+        tailer.index_recording(&split1);
+        drain(&tailer)?;
+
+        let extract_tx = spawn_stage_workers(1, TEST_COMPRESSION);
+        let base = root.join("clip.mcap");
+        let stats = record_clip(
+            &tailer,
+            1_500,
+            5_500,
+            base.clone(),
+            &coverage,
+            Duration::from_secs(30),
+            &extract_tx,
+        )?;
+
+        // split0 contributes message at 2_000; split1's messages are outside.
+        // The empty split1 segment is dropped; only the data-carrying segment remains.
+        assert_eq!(
+            stats.len(),
+            1,
+            "the empty trailing segment is dropped when another carries data"
+        );
+        assert_eq!(stats[0].messages_copied, 1);
+        assert_eq!(
+            read_clip(&stats[0].out_path)?,
+            vec![("/t".to_string(), 2_000)]
         );
 
         std::fs::remove_dir_all(root)?;

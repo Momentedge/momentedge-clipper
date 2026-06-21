@@ -478,6 +478,36 @@ impl TestEnv {
         preroll_ns: u64,
         postroll_ns: u64,
     ) {
+        self.publish_trigger_into_bag(name, trigger_ns, preroll_ns, postroll_ns);
+
+        // clipper logs `trigger name="<name>"` the moment it decodes the trigger
+        // out of the tailed MCAP — the receipt confirmation for the mcap path.
+        // Sound only when the trigger is visible promptly (an unchunked,
+        // write-through bag); a chunked bag holds it until a flush, so those
+        // tests publish with `publish_trigger_into_bag` and confirm via the clip.
+        let extractor_log = self.log_dir().join("extractor.log");
+        let needle = format!("trigger name=\"{name}\"");
+        assert!(
+            wait_for_file_contains(&extractor_log, &needle, Duration::from_secs(30)),
+            "clipper never logged receipt of the in-bag trigger {name:?}; see {}",
+            extractor_log.display(),
+        );
+    }
+
+    /// Publish one `Trigger` into the recording without waiting for clipper to
+    /// read it back. For a chunked recording the trigger is only visible after a
+    /// flush (e.g. the recorder is stopped later in the test), so receipt cannot
+    /// be confirmed inline — the caller confirms end to end via
+    /// [`Self::wait_for_clip`]. Publishes exactly once (`--once`, `-w 1` for the
+    /// recorder subscriber); a republish would write a second trigger record and
+    /// cut a duplicate clip.
+    pub fn publish_trigger_into_bag(
+        &self,
+        name: &str,
+        trigger_ns: u64,
+        preroll_ns: u64,
+        postroll_ns: u64,
+    ) {
         let sec = (trigger_ns / 1_000_000_000) as i64;
         let nanosec = trigger_ns % 1_000_000_000;
         let yaml = format!(
@@ -502,16 +532,6 @@ impl TestEnv {
             panic!("trigger publish {name} did not complete");
         });
         assert!(status.success(), "trigger publish {name} failed: {status}");
-
-        // clipper logs `trigger name="<name>"` the moment it decodes the trigger
-        // out of the tailed MCAP — the receipt confirmation for the mcap path.
-        let extractor_log = self.log_dir().join("extractor.log");
-        let needle = format!("trigger name=\"{name}\"");
-        assert!(
-            wait_for_file_contains(&extractor_log, &needle, Duration::from_secs(30)),
-            "clipper never logged receipt of the in-bag trigger {name:?}; see {}",
-            extractor_log.display(),
-        );
     }
 
     /// Poll `out_dir` for the clip a cut produces, returning its path once it

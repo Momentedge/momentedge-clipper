@@ -1414,4 +1414,94 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(root)?;
         Ok(())
     }
+
+    /// `reset_capturing_dir` treats `NotFound` as success (the directory simply
+    /// did not exist yet) but propagates any other IO error — for example when
+    /// the `.capturing` path already exists as a regular file rather than a
+    /// directory, causing `remove_dir_all` to fail with `ENOTDIR` on Linux.
+    #[test]
+    fn reset_fails_when_capturing_path_is_a_file() -> Result<()> {
+        let root = test_dir("clip-reset-file")?;
+        let out = root.join("clips");
+        std::fs::create_dir_all(&out)?;
+        // Place a plain file where the capturing directory should be.
+        let capturing = out.join(".capturing");
+        std::fs::write(&capturing, b"I am a file, not a directory")?;
+
+        // `remove_dir_all` on a regular file path fails with ENOTDIR (not
+        // NotFound), so `reset_capturing_dir` must surface that as an error.
+        let err = reset_capturing_dir(&out).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("clearing capturing dir"),
+            "unexpected error message: {err:#}"
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// Dropping a `StagedClip` whose staged file was externally removed before
+    /// the drop logs a warning rather than panicking. The `Drop` impl's
+    /// `remove_file` will fail with `NotFound`; that failure must be swallowed
+    /// as a warning, not propagated (drops must not panic/unwind).
+    #[test]
+    fn dropping_staged_clip_after_staged_file_removed_does_not_panic() -> Result<()> {
+        let root = test_dir("clip-drop-missing")?;
+        let rec = root.join("rec.mcap");
+        write_recording(&rec, false, &[("/t", 10)])?;
+        let tailer = tail_whole(&rec)?;
+
+        let out = root.join("clip.mcap");
+        let plan = plan_one(&tailer, 0, 100);
+        let staged = stage_clip(&plan, &out, 0, 100, TEST_COMPRESSION)?;
+
+        // Simulate the staged file disappearing (e.g. an admin removed it or
+        // the capturing dir was wiped) before `Drop` runs its cleanup.
+        std::fs::remove_file(&staged.staged_path)?;
+
+        // Drop must not panic even though the file is gone; the warn! arm on
+        // line 133 fires instead.
+        drop(staged);
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// When two concurrent stages aim at the same desired filename inside the
+    /// capturing directory, `create_new_file` (`with_suffix_retry` for staging)
+    /// resolves the collision with a `_1` suffix — the second stage lands with
+    /// a different capturing name. This covers the suffix-retry warn! path in
+    /// `with_suffix_retry` (lines 358-361) for the staging side.
+    #[test]
+    fn concurrent_stages_to_same_name_get_distinct_capturing_files() -> Result<()> {
+        let root = test_dir("clip-stage-collision")?;
+        let rec = root.join("rec.mcap");
+        write_recording(&rec, false, &[("/t", 10), ("/t", 20)])?;
+        let tailer = tail_whole(&rec)?;
+
+        let out = root.join("clip.mcap");
+        let plan = plan_one(&tailer, 0, 100);
+
+        // Stage the same desired name twice without publishing between them;
+        // both clips land in the capturing dir, each under a distinct path.
+        let first = stage_clip(&plan, &out, 0, 100, TEST_COMPRESSION)?;
+        let second = stage_clip(&plan, &out, 0, 100, TEST_COMPRESSION)?;
+
+        assert_ne!(
+            first.staged_path, second.staged_path,
+            "concurrent stages must get distinct staging paths"
+        );
+        assert!(first.staged_path.exists());
+        assert!(second.staged_path.exists());
+
+        // Both staged files are valid, complete clips.
+        assert_eq!(read_clip(&first.staged_path)?.len(), 2);
+        assert_eq!(read_clip(&second.staged_path)?.len(), 2);
+
+        drop(first);
+        drop(second);
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
 }

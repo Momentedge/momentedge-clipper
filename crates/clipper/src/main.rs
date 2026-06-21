@@ -916,6 +916,23 @@ mod tests {
         Ok(())
     }
 
+    /// `ClipCompression::to_mcap` maps each variant to the expected
+    /// `mcap::Compression` option: `None` yields uncompressed, `Zstd` and `Lz4`
+    /// yield their named codecs.
+    #[test]
+    fn clip_compression_to_mcap_maps_all_variants() {
+        // `mcap::Compression` is not `PartialEq`, so match the option shape.
+        assert!(ClipCompression::None.to_mcap().is_none());
+        assert!(matches!(
+            ClipCompression::Zstd.to_mcap(),
+            Some(mcap::Compression::Zstd)
+        ));
+        assert!(matches!(
+            ClipCompression::Lz4.to_mcap(),
+            Some(mcap::Compression::Lz4)
+        ));
+    }
+
     /// A panicking handler must return its permit: the admission bound would
     /// otherwise ratchet down with every panic until every trigger is
     /// rejected. The permit is held by the handler thread and returns on

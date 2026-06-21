@@ -2400,4 +2400,143 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(root)?;
         Ok(())
     }
+
+    // ── trigger tap ─────────────────────────────────────────────────────────
+
+    /// A top-level message on the tapped topic is lifted whole as a
+    /// `TriggerRecord` and sent down the tap the instant its framing is read;
+    /// messages on other topics contribute only their timestamp.
+    #[test]
+    fn tap_lifts_a_top_level_trigger_message() -> Result<()> {
+        let root = test_dir("tap-toplevel")?;
+        let path = root.join("rec.mcap");
+        write_raw(
+            &path,
+            &[
+                raw_record(op::CHANNEL, &channel_body(1, 0, "/trig", "cdr")),
+                raw_record(op::MESSAGE, &message_body(1, 0, 500, b"PAYLOAD")),
+                raw_record(op::CHANNEL, &channel_body(2, 0, "/data", "cdr")),
+                raw_record(op::MESSAGE, &message_body(2, 0, 600, b"ignored")),
+            ],
+        )?;
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let (tailer, _coverage) = Tailer::with_trigger_tap("/trig", tx);
+        let file = attached(&tailer, &path)?;
+        scan_to_end(&tailer, &file, MAGIC.len() as u64)?;
+
+        let lifted: Vec<_> = rx.try_iter().collect();
+        assert_eq!(lifted.len(), 1, "only the trigger-topic message is lifted");
+        assert_eq!(lifted[0].message_encoding, "cdr");
+        assert_eq!(lifted[0].body, b"PAYLOAD");
+        assert_eq!(lifted[0].log_time, 500);
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// A message on the tapped topic that lives inside a chunk is lifted too, but
+    /// only after the chunk iterates cleanly (real chunked writer, valid CRC).
+    #[test]
+    fn tap_lifts_a_chunk_interior_trigger_message() -> Result<()> {
+        let root = test_dir("tap-chunk")?;
+        let path = root.join("rec.mcap");
+        write_recording(&path, true, &[("/trig", 700), ("/data", 800)])?;
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let (tailer, _coverage) = Tailer::with_trigger_tap("/trig", tx);
+        let file = Arc::new(File::open(&path)?);
+        tailer.attach(file.clone());
+        scan_to_end(&tailer, &file, MAGIC.len() as u64)?;
+
+        let lifted: Vec<_> = rx.try_iter().collect();
+        assert_eq!(lifted.len(), 1, "the chunk-interior trigger is lifted");
+        assert_eq!(lifted[0].message_encoding, "cdr");
+        assert_eq!(lifted[0].body, b"payload");
+        assert_eq!(lifted[0].log_time, 700);
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// The failure path for the chunk's all-or-nothing staging: a trigger lifted
+    /// from inside a chunk that then fails its CRC must never reach the tap. The
+    /// sub-delta is discarded whole, so the staged trigger is dropped with it; a
+    /// good trigger after the chunk still lifts.
+    #[test]
+    fn a_damaged_chunk_lifts_no_trigger() -> Result<()> {
+        let root = test_dir("tap-bad-chunk")?;
+        let path = root.join("rec.mcap");
+        let chunk = chunk_body(
+            "",
+            0xDEAD_BEEF, // not the real interior CRC — ChunkReader fails at the end
+            &[
+                raw_record(op::CHANNEL, &channel_body(1, 0, "/trig", "cdr")),
+                raw_record(op::MESSAGE, &message_body(1, 0, 500, b"DROPPED")),
+            ],
+        );
+        write_raw(
+            &path,
+            &[
+                raw_record(op::CHUNK, &chunk),
+                raw_record(op::CHANNEL, &channel_body(2, 0, "/trig", "cdr")),
+                raw_record(op::MESSAGE, &message_body(2, 0, 900, b"GOOD")),
+            ],
+        )?;
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let (tailer, _coverage) = Tailer::with_trigger_tap("/trig", tx);
+        let file = attached(&tailer, &path)?;
+        scan_to_end(&tailer, &file, MAGIC.len() as u64)?;
+
+        let lifted: Vec<_> = rx.try_iter().collect();
+        assert_eq!(
+            lifted.len(),
+            1,
+            "the damaged chunk's trigger is dropped; only the post-chunk one lifts"
+        );
+        assert_eq!(lifted[0].body, b"GOOD");
+        assert_eq!(lifted[0].log_time, 900);
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// A trigger-topic message shorter than the 22-byte fixed fields carries no
+    /// payload to lift: its timestamp still advances coverage, but no
+    /// `TriggerRecord` is sent (a warning, the framing intact).
+    #[test]
+    fn a_runt_trigger_message_lifts_nothing() -> Result<()> {
+        let root = test_dir("tap-runt")?;
+        let path = root.join("rec.mcap");
+        let mut runt = Vec::new();
+        runt.extend_from_slice(&1u16.to_le_bytes()); // channel_id
+        runt.extend_from_slice(&0u32.to_le_bytes()); // sequence
+        runt.extend_from_slice(&500u64.to_le_bytes()); // log_time — 14 bytes, < 22
+        write_raw(
+            &path,
+            &[
+                raw_record(op::CHANNEL, &channel_body(1, 0, "/trig", "cdr")),
+                raw_record(op::MESSAGE, &runt),
+            ],
+        )?;
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let (tailer, coverage) = Tailer::with_trigger_tap("/trig", tx);
+        let file = attached(&tailer, &path)?;
+        scan_to_end(&tailer, &file, MAGIC.len() as u64)?;
+
+        assert!(
+            rx.try_iter().next().is_none(),
+            "a runt trigger message lifts no TriggerRecord"
+        );
+        assert_eq!(
+            coverage.get().high_water_ns,
+            500,
+            "but its timestamp still advances coverage"
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
 }

@@ -271,6 +271,10 @@ mod tests {
         let root = test_dir("seeded")?;
         let _a = touch_after(&root, "a.mcap")?;
         let _b = touch_after(&root, "b.mcap")?;
+        // A non-mcap sidecar (rosbag2 writes a metadata.yaml beside the bags):
+        // seeding skips it, exercising `mcap_id`'s non-mcap path, and it never
+        // affects what later files are yielded.
+        let _meta = touch_after(&root, "metadata.yaml")?;
         // Seeded past everything present: the backlog is skipped.
         let mut it = NewFileWatchIterator::seeded(&root);
         assert_eq!(it.next(), None, "pre-existing files are not yielded");
@@ -300,4 +304,12 @@ mod tests {
         std::fs::remove_dir_all(root)?;
         Ok(())
     }
+
+    // Line 97 (`continue` when `std::fs::metadata` fails on a candidate entry
+    // in `next()`) is not covered: triggering a metadata failure on Linux
+    // requires either a filesystem that surfaces it (e.g. a FUSE error) or
+    // removing the file in the narrow window between `read_dir` and `metadata`,
+    // which is an inherent race. The path is defensive (a transient error retries
+    // on the next call) and has no observable side effect beyond skipping the
+    // entry, so it cannot be asserted without OS-level fault injection.
 }
