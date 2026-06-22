@@ -2303,7 +2303,7 @@ pub(crate) mod tests {
         write_recording(&good, false, &[("/t", 1_000)])?;
 
         // Poll the coverage watch until the replacement is fully indexed.
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
             {
                 let cov = coverage.get();
@@ -2354,7 +2354,7 @@ pub(crate) mod tests {
             std::thread::spawn(move || runner.run(&dir, Duration::from_secs(u64::MAX), false));
 
         // The tail discovers and indexes split 0.
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
         while coverage.get().high_water_ns != 1_000 {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -2368,7 +2368,7 @@ pub(crate) mod tests {
         let split1 = root.join("rec_1.mcap");
         write_recording(&split1, false, &[("/t", 5_000)])?;
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
         while coverage.get().high_water_ns != 5_000 {
             assert!(
                 std::time::Instant::now() < deadline,

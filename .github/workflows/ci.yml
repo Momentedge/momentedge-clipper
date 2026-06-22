@@ -108,6 +108,13 @@ jobs:
             accept-flake-config = true
             extra-substituters = https://ros.cachix.org
             extra-trusted-public-keys = ros.cachix.org-1:dSyZxI8geDCJrwgvCOHDoAfOm5sV1wCPjBkKL+38Rvo=
+            # Harden cache.nixos.org substitution on loaded runners. The large
+            # sim-distro NARs (gtk4, ffmpeg, sdl) drop mid-transfer over HTTP/2
+            # ("framing layer" resets); curl's resume then hits a fatal,
+            # un-retried 416, defeating the per-file retry. Forcing HTTP/1.1
+            # avoids the framing resets, and a couple more attempts cover the rest.
+            http2 = false
+            download-attempts = 7
 
       # Installs the attic client, logs in with the ATTIC_TOKEN repo secret, and
       # registers the self-hosted momentedge cache (cache.stfl.dev) as a
