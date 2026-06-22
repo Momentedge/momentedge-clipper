@@ -188,11 +188,18 @@ impl TestEnv {
         self.spawn_recorder(&["--all"], preset, cache, true, 0)
     }
 
-    /// [`Self::start_recorder`] restricted to exactly `topics` (via
-    /// `--topics`), for tests that must keep ambient topics (`/rosout`, the
-    /// trigger) out of the recording.
+    /// [`Self::start_recorder`] restricted to exactly `topics`, for tests that
+    /// must keep ambient topics (`/rosout`, the trigger) out of the recording.
     pub fn start_recorder_topics(&self, topics: &[&str], preset: &str, cache: u64) -> Proc {
-        let mut selection = vec!["--topics"];
+        // `ros2 bag record`'s topic-list spelling differs across distros: humble
+        // takes the topics positionally and has no `--topics` flag, while lyrical
+        // dropped the positional form and requires `--topics`; jazzy accepts both
+        // but warns the positional form is deprecated. The distro is fixed at
+        // build time via the `ros_distro` cfg (see build.rs), so this dispatch
+        // costs nothing at run time and needs no environment variable set.
+        let mut selection: Vec<&str> = Vec::new();
+        #[cfg(not(ros_distro = "humble"))]
+        selection.push("--topics");
         selection.extend_from_slice(topics);
         // A topic-restricted recorder does not subscribe to the trigger topic,
         // so the extractor is the sole trigger subscriber (`fire_trigger` -w 1).
