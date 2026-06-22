@@ -1,6 +1,6 @@
-# Builds and unit-tests the recorder (clipper) against every working ROS2
-# distro on each push. A separate `fmt` job checks workspace formatting
-# (rustfmt) in parallel.
+# Builds, unit-tests, and runs the live ROS2 e2e suite for the recorder
+# (clipper) against every working ROS2 distro on each push. A separate `fmt`
+# job checks workspace formatting (rustfmt) in parallel.
 #
 # Each distro is one matrix leg. A leg enters that distro's nix dev shell
 # (`nix develop .#<distro>`) — which supplies the ROS2 closure, r2r codegen
@@ -14,8 +14,9 @@
 # Scope: only clipper is built and tested (trigger-pub is not in CI).
 # Distros: humble, jazzy, lyrical — the three the Rust crates build under
 # (rolling cannot build r2r 0.9.6; see README "Integration tests"). The e2e step
-# below skips the one inherently flaky test on every leg (via an env gate) and
-# one more on lyrical (via the filterset); the matrix comment explains why.
+# below runs the full suite on every leg under the `e2e` nextest profile,
+# skipping only the one inherently flaky live-corruption test (via an env gate);
+# the matrix comment explains why.
 
 name: CI
 
@@ -168,11 +169,11 @@ jobs:
       # timeout-bounded by the `e2e` nextest profile (.config/nextest.toml).
       # CLIPPER_E2E_SKIP_FLAKY=1 makes the in-test skip_flaky() gate skip the
       # flaky live-corruption race (see the matrix comment above).
-      # - name: E2E tests
-      #   run: |
-      #     nix develop ".#${{ matrix.distro }}" --command \
-      #       env CLIPPER_E2E=1 CLIPPER_E2E_SKIP_FLAKY=1 cargo nextest run --locked -p clipper \
-      #       --profile e2e -E '${{ matrix.e2e_filter }}'
+      - name: E2E tests
+        run: |
+          nix develop ".#${{ matrix.distro }}" --command \
+            env CLIPPER_E2E=1 CLIPPER_E2E_SKIP_FLAKY=1 cargo nextest run --locked -p clipper \
+            --profile e2e -E '${{ matrix.e2e_filter }}'
 
       # Pushes the entire /nix/store to momentedge so the full ROS2 closure lands
       # in the cache even on a complete GitHub-cache restore when nothing is
