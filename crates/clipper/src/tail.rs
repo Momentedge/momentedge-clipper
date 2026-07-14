@@ -20,7 +20,7 @@
 //!   recordings carry these *inside* chunks, so chunks are decompressed during
 //!   the tail; an unchunked recording (the fastwrite storage profile) pays no
 //!   such cost.
-//! * **Coverage watch** — the highest `log_time` seen plus an "ended" flag
+//! * **Coverage watch** — the collection-wide highest `log_time` seen
 //!   ([`Coverage`]); a trigger handler waits on it until the recording provably
 //!   covers its window end.
 //!
@@ -68,7 +68,7 @@ use crossbeam_channel::Sender;
 use log::{info, warn};
 use mcap::records::Record;
 
-use crate::trigger::TriggerRecord;
+use crate::trigger::{TriggerRecord, now_ns};
 use crate::watch::Watch;
 
 /// The 8 magic bytes opening (and, after `finish`, closing) every MCAP file.
@@ -541,26 +541,17 @@ impl ScanDelta {
         });
     }
 
-    /// Lift one trigger-topic message into a [`TriggerRecord`] and emit it. The
-    /// two scan sites that find a trigger — a chunk-interior message
-    /// ([`Self::absorb_parsed`]) and a top-level message
-    /// ([`Tailer::scan_available`]) — funnel through here so the record is built
-    /// one way; they differ only in how each obtains `body` (a decoded chunk
-    /// `Cow` vs. a direct file read).
-    fn capture_trigger(&mut self, message_encoding: String, body: Vec<u8>, log_time: u64) {
-        self.emit_trigger(TriggerRecord {
-            message_encoding,
-            body,
-            log_time,
-        });
-    }
-
     /// Route one lifted trigger by the delta's [`TriggerSink`]: the top-level
     /// delta's [`TriggerSink::Live`] sends it straight down the tap now; a chunk
     /// sub-delta's [`TriggerSink::Staged`] holds it until [`Self::absorb_chunk`]
     /// re-emits it through the parent once the chunk's CRC verifies — a damaged
     /// chunk emits nothing. The send is best-effort: a full or closed tap never
     /// stalls the scan.
+    ///
+    /// The two scan sites that find a trigger — a chunk-interior message
+    /// ([`Self::absorb_parsed`]) and a top-level message
+    /// ([`Tailer::scan_available`]) — both arrive here; they differ only in how
+    /// each obtains the body (a decoded chunk `Cow` vs. a direct file read).
     fn emit_trigger(&mut self, rec: TriggerRecord) {
         match &mut self.trigger_sink {
             // The live tap. `send` fails only when the receiver — the MCAP
@@ -615,7 +606,11 @@ impl ScanDelta {
                 // its timestamp, its body untouched. Inside a chunk sub-delta this
                 // stages the trigger (TriggerSink::Staged) until the CRC clears.
                 if let Some(encoding) = self.trigger_channels.get(&header.channel_id).cloned() {
-                    self.capture_trigger(encoding, data.into_owned(), header.log_time);
+                    self.emit_trigger(TriggerRecord {
+                        message_encoding: encoding,
+                        body: data.into_owned(),
+                        log_time: header.log_time,
+                    });
                 }
             }
             _ => {}
@@ -1109,9 +1104,13 @@ impl Tailer {
                                     break;
                                 }
                                 // A top-level record is durable the instant its
-                                // framing is read, so capture_trigger sends it
-                                // straight down the tap (no chunk CRC to clear).
-                                delta.capture_trigger(encoding, payload, log_time);
+                                // framing is read, so this goes straight down the
+                                // tap (no chunk CRC to clear).
+                                delta.emit_trigger(TriggerRecord {
+                                    message_encoding: encoding,
+                                    body: payload,
+                                    log_time,
+                                });
                             } else {
                                 warn!(
                                     "trigger message at {offset} is only {len} B; no payload to decode"
@@ -1216,9 +1215,8 @@ fn newest_mcap(dir: &Path) -> Option<PathBuf> {
 
 /// Whether `path` no longer resolves to `file`'s open inode — the file vanished
 /// (the record script wiped the bag dir) or was replaced by a restart's fresh
-/// inode. This is the narrowed survivor of the old whole-directory `superseded`
-/// check: *"is **my** file still live"*, not *"is there a newer file"* — the
-/// [`crate::discover::NewFileWatchIterator`] owns the latter. The open
+/// inode. The question is *"is **my** file still live"*, not *"is there a newer
+/// file"* — the [`crate::discover::NewFileWatchIterator`] owns the latter. The open
 /// `Arc<File>` keeps the old inode readable regardless, so the final scan still
 /// drains every complete record before the recording is retired. A `NotFound` on
 /// `path` means the file is gone; any other stat error propagates.
@@ -1229,15 +1227,6 @@ fn inode_changed(path: &Path, file: &File) -> Result<bool> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
         Err(e) => Err(e).with_context(|| format!("stat {}", path.display())),
     }
-}
-
-/// Nanoseconds since the Unix epoch on the system clock — the same base as
-/// message `log_time`, for computing the retention watch floor.
-fn now_ns() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos().min(u64::MAX as u128) as u64)
-        .unwrap_or(0)
 }
 
 fn file_len(file: &File) -> Result<u64> {

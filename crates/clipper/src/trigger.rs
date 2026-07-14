@@ -21,7 +21,7 @@ use serde::Deserialize;
 /// A `builtin_interfaces/Time` flattened to its two fields, free of `r2r`. The
 /// trigger's window is cut around this stamp (`clipper-535`); a follow-up
 /// (`clipper-qo3`) migrates the anchor to a transport timestamp.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 pub struct Stamp {
     pub sec: i32,
     pub nanosec: u32,
@@ -35,6 +35,19 @@ impl Stamp {
     pub fn ns(&self) -> u64 {
         (self.sec.max(0) as u64) * 1_000_000_000 + self.nanosec as u64
     }
+}
+
+/// Nanoseconds since the Unix epoch on the system clock — the one time base the
+/// recorder reads the clock through. The same scale as a message's `log_time`
+/// and [`Stamp::ns`], so the postroll wait (`handler`) and the retention floor
+/// (`tail`) compare against recorded times without conversion. Saturates at
+/// `u64::MAX` and reports 0 for a pre-epoch clock, so neither can wrap into a
+/// small value that would silently misplace a window.
+pub fn now_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos().min(u64::MAX as u128) as u64)
+        .unwrap_or(0)
 }
 
 /// A decoded trigger: the clip-window request the handler acts on, independent
@@ -59,7 +72,7 @@ pub struct Trigger {
 /// the message payload bytes, and the record's `log_time`. The name marks it as
 /// the MCAP record type — the raw input the MCAP interface turns into a
 /// [`Trigger`] by dispatching on `message_encoding`
-/// ([`crate::decode::DecoderFactory`]); the tail emits them without decoding
+/// ([`crate::decode::decode_trigger`]); the tail emits them without decoding
 /// anything but the framing.
 #[derive(Clone, Debug)]
 pub struct TriggerRecord {

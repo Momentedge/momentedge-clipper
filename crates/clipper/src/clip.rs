@@ -57,7 +57,7 @@ pub struct ClipStats {
 /// A clip is assembled here and moved out only once complete; observers of the
 /// final directory therefore never see an in-progress or footer-less file. A
 /// subdirectory (not a sibling) guarantees the same filesystem, so the
-/// stage-two move is a true atomic rename rather than a copy.
+/// stage-two move is a true atomic link rather than a cross-device copy.
 const CAPTURING_DIR: &str = ".capturing";
 
 /// Prepare a fresh capturing directory under `out_dir`, to be called once at

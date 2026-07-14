@@ -1,11 +1,13 @@
-//! Triggered clip recorder reading ONE continuous MCAP file.
+//! Triggered clip recorder tailing a continuous MCAP recording.
 //!
 //! A continuous `ros2 bag record` (started separately — see the README and
-//! `scripts/record.sh`) writes a single growing MCAP file. This
-//! binary keeps that file open and tails it ([`tail`]): an incremental scan
-//! over the record framing that maintains a byte-extent index, a
-//! schema/channel registry, and a coverage watch (the highest `log_time` on
-//! disk). There are no bag splits and no `/events/write_split` dependency.
+//! `scripts/record.sh`) writes a growing MCAP file, rolling over to a
+//! successor on a bag split. This binary discovers each recording, keeps it
+//! open, and tails it ([`tail`]): an incremental scan over the record framing
+//! that maintains a byte-extent index, a schema/channel registry, and a
+//! collection-wide coverage watch (the highest `log_time` on disk). Rollovers
+//! are recovered from the files themselves — there is no
+//! `/events/write_split` dependency.
 //!
 //! A trigger requests the window `[trigger_time - preroll, trigger_time +
 //! postroll]`: the [`handler`] waits until the wall clock passes the window end,
@@ -58,6 +60,7 @@ mod decode;
 mod discover;
 mod handler;
 mod interface;
+mod supervision;
 mod tail;
 mod trigger;
 mod watch;
@@ -65,7 +68,7 @@ mod watch;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::thread::{self, JoinHandle};
+use std::thread;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -74,6 +77,7 @@ use crossbeam_channel::{Receiver, Sender, bounded, select, unbounded};
 use interface::{Interface, McapInterface, RosInterface};
 use log::{error, info, warn};
 use signal_hook::consts::{SIGINT, SIGTERM};
+use supervision::{Supervised, harvest_panic, spawn_supervised};
 use tail::{Coverage, Tailer};
 use trigger::Trigger;
 use watch::Watch;
@@ -278,57 +282,6 @@ fn load_config() -> Config {
     Config::from_arg_matches(&matches).unwrap_or_else(|e| e.exit())
 }
 
-/// One supervised thread: the channel its closure's return value arrives on,
-/// and the join handle [`supervise`] harvests a panic payload from after a
-/// disconnect.
-type Supervised<T> = (Receiver<T>, JoinHandle<()>);
-
-/// Spawn a named thread whose return value arrives on the paired channel.
-///
-/// [`supervise`] selects on that channel: a received value is the thread's
-/// verdict (clean return or typed error); a disconnect without a value means
-/// the closure unwound (panicked) before it could send, and the join handle
-/// then carries the payload.
-fn spawn_supervised<T: Send + 'static>(
-    name: &str,
-    f: impl FnOnce() -> T + Send + 'static,
-) -> Supervised<T> {
-    let (tx, rx) = bounded(1);
-    let handle = thread::Builder::new()
-        .name(name.to_string())
-        .spawn(move || {
-            // The send fails only when supervision is already gone, and the
-            // value is then moot.
-            let _ = tx.send(f());
-        })
-        .expect("spawning thread");
-    (rx, handle)
-}
-
-/// Render a panic payload (from [`JoinHandle::join`] or
-/// [`std::panic::catch_unwind`]) as text: panics carry a `&str` or `String`
-/// message in practice; anything else gets a placeholder.
-fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
-    payload
-        .downcast_ref::<&str>()
-        .map(|s| s.to_string())
-        .or_else(|| payload.downcast_ref::<String>().cloned())
-        .unwrap_or_else(|| "non-string panic payload".to_string())
-}
-
-/// The error for a supervised thread whose result channel disconnected
-/// without a value: the closure unwound before it could send, so the join —
-/// immediate, the disconnect proves the thread is already dead — carries the
-/// panic payload.
-fn harvest_panic(handle: JoinHandle<()>) -> anyhow::Error {
-    match handle.join() {
-        Err(payload) => anyhow::anyhow!("thread panicked: {}", panic_text(payload.as_ref())),
-        // Unreachable for spawn_supervised threads (a returning closure always
-        // sends first), but a sane shape regardless.
-        Ok(()) => anyhow::anyhow!("thread exited without reporting a result"),
-    }
-}
-
 /// Deliver SIGINT/SIGTERM as a message on the returned channel: a dedicated
 /// thread blocks on signal-hook's iterator and forwards the first shutdown
 /// signal for [`supervise`] to select on. Both signals mean the same
@@ -395,14 +348,15 @@ impl Drop for AdmissionPermit {
     }
 }
 
-/// Entry point and supervisor. Spawns the long-lived threads — tail, node
-/// spin, trigger consumer, the extraction worker pool, and the signal
-/// forwarder — then blocks in [`supervise`] until a shutdown signal (exit 0)
-/// or the first dead critical thread (exit non-zero, for a supervisor to
-/// restart the process).
+/// Entry point and supervisor. Spawns the long-lived threads — the tail, the
+/// interface (which owns its own trigger source, and for ROS its node spin),
+/// the staging worker pool, and the signal forwarder — then blocks in
+/// [`supervise`] until a shutdown signal (exit 0) or the first dead critical
+/// thread (exit non-zero, for a supervisor to restart the process).
 ///
 /// Returning ends the process, which kills the remaining threads: the
-/// immortal spin/tail loops, parked handlers, and any in-flight extraction.
+/// immortal tail and interface loops, parked handlers, and any in-flight
+/// extraction.
 /// That is safe for clips by construction — the capturing-dir reset at
 /// startup reclaims any stranded staged file, and `out_dir` only ever holds
 /// complete clips.
@@ -454,7 +408,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         InterfaceKind::Mcap => {
             let (tx, rx) = unbounded();
             let (tailer, coverage) = Tailer::with_trigger_tap(TRIGGER_TOPIC, tx);
-            let iface = McapInterface::new(rx);
+            let iface = McapInterface::new(TRIGGER_TOPIC, rx);
             drive(iface, cfg, tailer, coverage, extract_tx, admission)
         }
     };
@@ -487,7 +441,10 @@ fn drive<I: Interface>(
     // The callback the interface fires per decoded Trigger. `Fn` + `Send`: it is
     // moved into the single interface thread and called from there, never shared.
     let fire = {
-        let cfg = cfg.clone();
+        // The seam: the handler half reads only these two settings, so unpack
+        // them here rather than handing the CLI parser's `Config` down.
+        let out_dir = cfg.out_dir.clone();
+        let grace = cfg.grace();
         let tailer = tailer.clone();
         let coverage = coverage.clone();
         let extract_tx = extract_tx.clone();
@@ -502,7 +459,7 @@ fn drive<I: Interface>(
                 );
                 return;
             };
-            let cfg = cfg.clone();
+            let out_dir = out_dir.clone();
             let tailer = tailer.clone();
             let coverage = coverage.clone();
             let extract_tx = extract_tx.clone();
@@ -514,9 +471,9 @@ fn drive<I: Interface>(
                 .name(format!("trigger-{}", trig.trigger_time.ns()))
                 .spawn(move || {
                     let _permit = permit;
-                    if let Err(e) =
-                        handler::handle_trigger(trig, cfg, tailer, coverage, extract_tx, announcer)
-                    {
+                    if let Err(e) = handler::handle_trigger(
+                        trig, &out_dir, grace, tailer, coverage, extract_tx, announcer,
+                    ) {
                         error!("trigger handling failed: {e:#}");
                     }
                 });
@@ -653,6 +610,11 @@ mod tests {
             "3",
             "--clip-compression",
             "lz4",
+            "--interface",
+            "mcap",
+            "--watch-old-files-duration",
+            "90",
+            "--delete-old-files",
         ])
         .unwrap();
         assert_eq!(cfg.record_dir, PathBuf::from("/data/record"));
@@ -660,40 +622,46 @@ mod tests {
         assert_eq!(cfg.grace(), Duration::from_secs(7));
         assert_eq!(cfg.extract_parallelism, 3);
         assert_eq!(cfg.clip_compression, ClipCompression::Lz4);
+        assert_eq!(cfg.interface, InterfaceKind::Mcap);
+        assert_eq!(cfg.watch_old_files(), Duration::from_secs(90));
+        assert!(cfg.delete_old_files);
     }
 
+    /// `with_env_prefix` binds every argument generically, so assert the
+    /// invariant generically: each one carries `MOMENTEDGE_<FIELD>`, and the
+    /// auto-generated `--help`/`--version` carry none. Written over
+    /// `get_arguments()` rather than a hand-listed set so a field added to
+    /// `Config` is covered the moment it exists — a per-field list would silently
+    /// leave the newest field, the one most likely to be mis-wired, untested.
     #[test]
-    fn env_prefix_binds_clipper_names_to_every_field() {
+    fn env_prefix_binds_a_momentedge_name_to_every_field() {
         let cmd = with_env_prefix(Config::command());
-        let env_of = |id: &str| {
-            cmd.get_arguments()
-                .find(|a| a.get_id().as_str() == id)
-                .and_then(|a| a.get_env())
-                .map(|e| e.to_string_lossy().into_owned())
-        };
+        let mut bound = 0;
+        for arg in cmd.get_arguments() {
+            let id = arg.get_id().as_str();
+            let env = arg.get_env().map(|e| e.to_string_lossy().into_owned());
+            if matches!(id, "help" | "version") {
+                assert_eq!(env, None, "{id} must keep clap's own handling");
+                continue;
+            }
+            assert_eq!(
+                env.as_deref(),
+                Some(format!("MOMENTEDGE_{}", id.to_uppercase()).as_str()),
+                "{id} must fall back to its MOMENTEDGE_* env var",
+            );
+            bound += 1;
+        }
         assert_eq!(
-            env_of("record_dir").as_deref(),
-            Some("MOMENTEDGE_RECORD_DIR")
-        );
-        assert_eq!(env_of("out_dir").as_deref(), Some("MOMENTEDGE_OUT_DIR"));
-        assert_eq!(
-            env_of("grace_secs").as_deref(),
-            Some("MOMENTEDGE_GRACE_SECS")
-        );
-        assert_eq!(
-            env_of("extract_parallelism").as_deref(),
-            Some("MOMENTEDGE_EXTRACT_PARALLELISM")
-        );
-        assert_eq!(
-            env_of("clip_compression").as_deref(),
-            Some("MOMENTEDGE_CLIP_COMPRESSION")
+            bound, 8,
+            "every Config field is bound (update on a new field)"
         );
     }
 
     #[test]
     fn config_interface_defaults_to_ros_and_parses_mcap() {
         // Default is the ROS interface; --interface selects mcap; an unknown
-        // value is rejected. The flag also gets the MOMENTEDGE_INTERFACE env.
+        // value is rejected. (Its MOMENTEDGE_INTERFACE env fallback is covered by
+        // env_prefix_binds_a_momentedge_name_to_every_field.)
         assert_eq!(
             parse_from(["clipper"]).unwrap().interface,
             InterfaceKind::Ros

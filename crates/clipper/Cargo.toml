@@ -22,9 +22,11 @@ futures.workspace = true
 crossbeam-channel.workspace = true
 # SIGINT/SIGTERM delivered as a message on a channel `supervise` selects on.
 signal-hook.workspace = true
-# MCAP record parsing (`parse_record`, `read::LinearReader::sans_magic`,
-# `read::ChunkReader`) for the tail scan and extraction, and `Writer` for the
-# clip output (schemas/channels by content, summary + footer on `finish`).
+# MCAP record parsing (`parse_record`, `read::ChunkReader`) for the tail scan
+# and extraction — the scan and the copy own their own opcode + length framing,
+# so the halt-on-first-error `LinearReader` is deliberately unused (see
+# src/clip.rs) — and `Writer` for the clip output (schemas/channels by content,
+# summary + footer on `finish`).
 mcap.workspace = true
 # Error plumbing for the tail and extraction paths.
 anyhow.workspace = true

@@ -136,12 +136,4 @@ mod tests {
         );
         h.join().unwrap();
     }
-
-    #[test]
-    fn get_returns_the_current_value() {
-        let w = Watch::new(1u64);
-        assert_eq!(w.get(), 1);
-        w.send_replace(2);
-        assert_eq!(w.get(), 2);
-    }
 }

@@ -40,8 +40,9 @@ the local ROS 2 interface package defining `Trigger`/`Recorded`.
 | `src/handler.rs` | The ROS- and encoding-agnostic per-trigger flow and the staging worker pool |
 | `src/clip.rs` | Window extraction: read planned extents, assemble and atomically publish a standalone MCAP clip |
 | `src/interface.rs` | `trait Interface` + the `ros` and `mcap` implementations and their announcers |
-| `src/decode.rs` | `DecoderFactory`/`TriggerDecoder`: map an MCAP `message_encoding` (`cdr`, `json`) to a trigger decoder |
-| `src/trigger.rs` | The neutral contract: `Trigger`, `Stamp`, `TriggerRecord`, `Completion`, the `Announce` trait |
+| `src/decode.rs` | `decode_trigger`: decode a trigger payload by its MCAP `message_encoding` (`cdr`, `json`) |
+| `src/trigger.rs` | The neutral contract: `Trigger`, `Stamp`, `TriggerRecord`, `Completion`, the `Announce` trait, `now_ns` |
+| `src/supervision.rs` | `spawn_supervised`/`harvest_panic`: pair each long-lived thread with a channel carrying its verdict |
 | `src/watch.rs` | `Watch<T>`: a `Mutex` + `Condvar` primitive for coverage notification |
 
 ## Data flow
