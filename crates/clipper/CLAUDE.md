@@ -322,10 +322,10 @@ outside-facing half is the only place either appears:
   `Announce` trait. It pulls in neither `r2r` nor `mcap` — only `serde`, so
   `Trigger`/`Stamp` derive `Deserialize` for the `json` decode shape — so either
   side can change without dragging the other along.
-- **`decode.rs`** — the `DecoderFactory` + `TriggerDecoder`. `for_encoding`
-  maps an MCAP channel's `message_encoding` to a decoder, dispatching over
-  two encodings, both decodable with dependencies already in the closure (no
-  new ones):
+- **`decode.rs`** — `decode_trigger`, which decodes one trigger payload
+  according to its MCAP channel's `message_encoding`, dispatching over two
+  encodings, both decodable with dependencies already in the closure (no new
+  ones):
   - **`cdr`** (the ROS2 default) via `r2r`'s rmw deserialization — the linked
     rmw library only, never a ROS `Context`/`Node`/executor, so it works in the
     fully ROS-free MCAP interface. r2r's generated `Trigger` maps onto the

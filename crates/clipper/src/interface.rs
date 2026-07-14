@@ -10,7 +10,7 @@
 //!   own spin thread, so the driver supervises one uniform interface thread in
 //!   either mode.
 //! - [`McapInterface`] drains [`TriggerRecord`]s the tail lifts out of the recorded
-//!   MCAP, decoding each by `message_encoding` ([`DecoderFactory`]). It touches
+//!   MCAP, decoding each by `message_encoding` ([`decode_trigger`]). It touches
 //!   no ROS node, executor, or subscription — the recorder runs ROS-free in this
 //!   mode. Completion is implicit: the clip's atomic move into `out_dir` is the
 //!   signal, so its [`Announce`]r is a no-op.
@@ -19,6 +19,7 @@
 //! whichever interface is active.
 
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -28,7 +29,8 @@ use futures::stream::{Stream, StreamExt};
 use log::{error, info, warn};
 use r2r::{Publisher, QosProfile};
 
-use crate::decode::DecoderFactory;
+use crate::decode::decode_trigger;
+use crate::supervision::{harvest_panic, spawn_supervised};
 use crate::trigger::{Announce, Completion, Trigger, TriggerRecord};
 
 /// One active interface to the outside world: a trigger source paired with its
@@ -79,7 +81,10 @@ impl RosInterface {
         Ok(RosInterface {
             node,
             sub: Box::pin(sub),
-            announcer: RosAnnouncer { recorded_pub },
+            announcer: RosAnnouncer {
+                recorded_pub,
+                recorded_topic: recorded_topic.into(),
+            },
         })
     }
 }
@@ -108,12 +113,12 @@ impl Interface for RosInterface {
             mut node, mut sub, ..
         } = self;
 
-        let spin = crate::spawn_supervised("node-spin", move || {
+        let spin = spawn_supervised("node-spin", move || {
             loop {
                 node.spin_once(Duration::from_millis(10));
             }
         });
-        let drain = crate::spawn_supervised("trigger-drain", move || -> anyhow::Result<()> {
+        let drain = spawn_supervised("trigger-drain", move || -> anyhow::Result<()> {
             while let Some(t) = block_on(sub.next()) {
                 // `t.into()` is the shared r2r-Trigger -> domain-Trigger conversion
                 // (the `From` impl in `crate::decode`).
@@ -127,12 +132,12 @@ impl Interface for RosInterface {
         select! {
             recv(spin_rx) -> res => match res {
                 Ok(()) => anyhow::bail!("node spin thread exited unexpectedly"),
-                Err(_) => Err(crate::harvest_panic(spin_handle)
+                Err(_) => Err(harvest_panic(spin_handle)
                     .context("node spin thread exited unexpectedly")),
             },
             recv(drain_rx) -> res => match res {
                 Ok(r) => r.context("trigger drain ended"),
-                Err(_) => Err(crate::harvest_panic(drain_handle)
+                Err(_) => Err(harvest_panic(drain_handle)
                     .context("trigger drain thread exited unexpectedly")),
             },
         }
@@ -162,10 +167,13 @@ impl From<&Completion> for r2r::momentedge_msgs::msg::Recorded {
 }
 
 /// The ROS completion sink: publishes a `momentedge_msgs/Recorded` per finished
-/// clip. `Clone` (the r2r `Publisher` is) so every handler thread holds its own.
+/// clip. `Clone` (the r2r `Publisher` is) so every handler thread holds its own;
+/// the topic it publishes on rides along as an `Arc<str>` so the logs name the
+/// topic this announcer was actually built with.
 #[derive(Clone)]
 pub(crate) struct RosAnnouncer {
     recorded_pub: Publisher<r2r::momentedge_msgs::msg::Recorded>,
+    recorded_topic: Arc<str>,
 }
 
 impl Announce for RosAnnouncer {
@@ -174,14 +182,11 @@ impl Announce for RosAnnouncer {
         match self.recorded_pub.publish(&recorded) {
             Ok(()) => info!(
                 "emitted {} name={:?} filenames={:?}",
-                crate::RECORDED_TOPIC,
-                completion.name,
-                completion.filenames,
+                self.recorded_topic, completion.name, completion.filenames,
             ),
             Err(e) => error!(
                 "publishing {} for name={:?} failed: {e}",
-                crate::RECORDED_TOPIC,
-                completion.name,
+                self.recorded_topic, completion.name,
             ),
         }
     }
@@ -194,12 +199,19 @@ impl Announce for RosAnnouncer {
 /// — no node, executor, or subscription.
 pub(crate) struct McapInterface {
     triggers: Receiver<TriggerRecord>,
+    /// The topic the tap was wired to — carried only so a skipped trigger names
+    /// the topic it actually came off.
+    trigger_topic: Arc<str>,
 }
 
 impl McapInterface {
-    /// Drive from the tail's decode-free trigger tap (`Tailer::with_trigger_tap`).
-    pub(crate) fn new(triggers: Receiver<TriggerRecord>) -> Self {
-        McapInterface { triggers }
+    /// Drive from the tail's decode-free trigger tap (`Tailer::with_trigger_tap`),
+    /// which taps `trigger_topic`.
+    pub(crate) fn new(trigger_topic: &str, triggers: Receiver<TriggerRecord>) -> Self {
+        McapInterface {
+            triggers,
+            trigger_topic: trigger_topic.into(),
+        }
     }
 }
 
@@ -223,9 +235,7 @@ impl Interface for McapInterface {
         F: Fn(Trigger) + Send + 'static,
     {
         for raw in self.triggers.iter() {
-            match DecoderFactory::for_encoding(&raw.message_encoding)
-                .and_then(|decoder| decoder.decode(&raw.body))
-            {
+            match decode_trigger(&raw.message_encoding, &raw.body) {
                 Ok(trigger) => {
                     info!(
                         "MCAP trigger name={:?} encoding={} log_time={}",
@@ -235,8 +245,7 @@ impl Interface for McapInterface {
                 }
                 Err(e) => warn!(
                     "skipping an MCAP trigger on {} (encoding={}): {e:#}",
-                    crate::TRIGGER_TOPIC,
-                    raw.message_encoding,
+                    self.trigger_topic, raw.message_encoding,
                 ),
             }
         }
@@ -300,7 +309,7 @@ mod tests {
 
         let fired: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = fired.clone();
-        let iface = McapInterface::new(rx);
+        let iface = McapInterface::new(crate::TRIGGER_TOPIC, rx);
         // `run` bails when the tap closes — expected, the records are drained first.
         let _ = iface.run(move |t| sink.lock().unwrap().push(t.name));
 
@@ -328,7 +337,7 @@ mod tests {
 
         let fired: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = fired.clone();
-        let iface = McapInterface::new(rx);
+        let iface = McapInterface::new(crate::TRIGGER_TOPIC, rx);
         let _ = iface.run(move |t| sink.lock().unwrap().push(t.name));
 
         assert_eq!(

@@ -11,15 +11,16 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use crossbeam_channel::{Sender, bounded, unbounded};
 use log::{info, warn};
 
+use crate::clip;
+use crate::supervision::panic_text;
 use crate::tail::{Coverage, Tailer, WindowPlan};
-use crate::trigger::{Announce, Completion, Trigger};
+use crate::trigger::{Announce, Completion, Trigger, now_ns};
 use crate::watch::Watch;
-use crate::{Config, clip, panic_text};
 
 /// One queued clip-segment staging: the window-plan snapshot the handler took
 /// for one source recording, the window bounds for the message-time filter, the
@@ -38,7 +39,7 @@ pub(crate) struct StageJob {
 /// Spawn the fixed staging worker pool: `parallelism` threads consuming one
 /// shared FIFO channel. With the default single worker the bulk copies serialize
 /// in submission order — staging reads compete with the recorder's writes for
-/// disk bandwidth (see [`Config::extract_parallelism`]).
+/// disk bandwidth (see the `--extract-parallelism` flag).
 ///
 /// Each worker runs only [`clip::stage_clip`] — the bulk copy into the capturing
 /// dir — and replies the [`clip::StagedClip`]; the handler publishes it once it
@@ -92,9 +93,13 @@ pub(crate) fn spawn_stage_workers(
 /// interface publishes a `Recorded`, the MCAP interface does nothing (the clip's
 /// atomic move into `out_dir` is the signal). The handler is otherwise identical
 /// either way — it knows only the neutral [`Trigger`]/[`Completion`] contract.
+///
+/// `out_dir` and `grace` are the only configuration this half reads; the driver
+/// unpacks them at the seam so nothing below it depends on the CLI parser.
 pub(crate) fn handle_trigger<A: Announce>(
     trig: Trigger,
-    cfg: Arc<Config>,
+    out_dir: &Path,
+    grace: Duration,
     tailer: Arc<Tailer>,
     coverage: Arc<Watch<Coverage>>,
     extract_tx: Sender<StageJob>,
@@ -108,16 +113,14 @@ pub(crate) fn handle_trigger<A: Announce>(
         trig.name, trig.preroll, trig.postroll
     );
 
-    let base_out_path = cfg
-        .out_dir
-        .join(format!("{trigger_ns}_{}.mcap", sanitize(&trig.name)));
+    let base_out_path = out_dir.join(format!("{trigger_ns}_{}.mcap", sanitize(&trig.name)));
     let segments = record_clip(
         &tailer,
         start_ns,
         end_ns,
         base_out_path,
         &coverage,
-        cfg.grace(),
+        grace,
         &extract_tx,
     )?;
 
@@ -288,14 +291,6 @@ fn segment_name(base: &Path, idx: usize) -> std::ffi::OsString {
         .map(|e| format!(".{}", e.to_string_lossy()))
         .unwrap_or_default();
     std::ffi::OsString::from(format!("{stem}_{idx:02}{ext}"))
-}
-
-/// Nanoseconds since the Unix epoch on the system clock.
-fn now_ns() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
 }
 
 /// Make a trigger name safe to embed in a filename: keep alphanumerics, `-`,
@@ -724,16 +719,6 @@ mod tests {
         scan_to_end(&tailer, &file, 8)?;
         let extract_tx = spawn_stage_workers(1, TEST_COMPRESSION);
 
-        let cfg = Arc::new(
-            <Config as clap::Parser>::try_parse_from([
-                "clipper",
-                "--out-dir",
-                out_dir.to_str().unwrap(),
-                "--grace-secs",
-                "5",
-            ])
-            .unwrap(),
-        );
         let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
         let announcer = CapturingAnnouncer(captured.clone());
 
@@ -747,7 +732,15 @@ mod tests {
             preroll: 500,
             postroll: 500,
         };
-        handle_trigger(trig, cfg, tailer, coverage, extract_tx, announcer)?;
+        handle_trigger(
+            trig,
+            &out_dir,
+            Duration::from_secs(5),
+            tailer,
+            coverage,
+            extract_tx,
+            announcer,
+        )?;
 
         let done = captured.lock().unwrap();
         assert_eq!(done.len(), 1, "exactly one completion is announced");
@@ -793,16 +786,6 @@ mod tests {
         drain(&tailer)?;
 
         let extract_tx = spawn_stage_workers(1, TEST_COMPRESSION);
-        let cfg = Arc::new(
-            <Config as clap::Parser>::try_parse_from([
-                "clipper",
-                "--out-dir",
-                out_dir.to_str().unwrap(),
-                "--grace-secs",
-                "5",
-            ])
-            .unwrap(),
-        );
         let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
         let announcer = CapturingAnnouncer(captured.clone());
 
@@ -818,7 +801,15 @@ mod tests {
             preroll: 2_000,
             postroll: 2_000,
         };
-        handle_trigger(trig, cfg, tailer, coverage, extract_tx, announcer)?;
+        handle_trigger(
+            trig,
+            &out_dir,
+            Duration::from_secs(5),
+            tailer,
+            coverage,
+            extract_tx,
+            announcer,
+        )?;
 
         let done = captured.lock().unwrap();
         assert_eq!(done.len(), 1, "one completion per trigger");
