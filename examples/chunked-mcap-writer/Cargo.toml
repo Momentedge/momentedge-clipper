@@ -1,0 +1,24 @@
+[package]
+name = "chunked-mcap-writer"
+# A minimal example, not a published crate.
+publish = false
+# A workspace member (see the root Cargo.toml), so it inherits the shared
+# version/edition and the `[workspace.dependencies]` versions via `.workspace =
+# true`, like the other crates. It carries no r2r dependency — it writes JSON,
+# not CDR — so it builds and runs without the ROS toolchain.
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+# The MCAP writer — its buffered chunk mode is the whole point of the example.
+# The crate's default features include `zstd`, which `Compression::Zstd` needs.
+mcap.workspace = true
+anyhow.workspace = true
+# CLI flags (just --out). Only the derive is used.
+clap.workspace = true
+# JSON payloads: serde derive for the pose struct and the trigger payload,
+# serde_json to serialise.
+serde.workspace = true
+serde_json.workspace = true
+# Finalise the file cleanly on Ctrl+C (already a workspace dependency).
+signal-hook.workspace = true

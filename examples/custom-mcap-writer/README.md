@@ -30,7 +30,11 @@ so every message is its own complete top-level `Message` record — appended
 once and never rewritten, readable the instant it hits disk. That is the same
 append-only contract rosbag2's fastwrite profile gives clipper in production.
 Unchunked output carries no per-chunk compression and no chunk-level index;
-`mcap recover` can add indexes to a finished file if needed.
+`mcap recover` can add indexes to a finished file if needed. The sibling
+[`chunked-mcap-writer`](../chunked-mcap-writer/README.md) keeps the output
+tailable the same way — buffered chunks assembled fully in memory
+(`disable_seeking(true)`) and appended as one complete record — while trading
+a little visibility latency for zstd compression.
 
 ## What it writes
 

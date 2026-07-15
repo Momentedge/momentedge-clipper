@@ -23,3 +23,9 @@ root is the minimal continuous setup; the guides expand on it.
   `momentedge_msgs/Trigger` message. The producer-side half of capture-time
   windowing — the fixture the live e2e suite drives clipper against — and a
   from-scratch how-to for writing MCAP.
+- [`chunked-mcap-writer/`](chunked-mcap-writer/README.md) — a minimal standalone
+  program that writes **tailable** chunked, zstd-compressed MCAP with the `mcap`
+  crate (no ROS): buffered chunks (`use_chunks(true)` + `disable_seeking(true)`)
+  append each chunk as one complete record, so clipper tails the output live.
+  The compressed counterpart to `custom-mcap-writer`'s unchunked, lowest-latency
+  output.

@@ -113,15 +113,23 @@ since the previous pass. Two MCAP properties make this sound:
 
 Both properties are a producer requirement in disguise: a recording clipper can
 tail live must append complete records only and never seek back to rewrite one
-already on disk. The Rust `mcap` crate's chunked writer (`use_chunks(true)`, its
-default) breaks this — it writes each `Chunk` record's header with a
-placeholder length (`u64::MAX`) and back-patches the true length only once the
-chunk closes, so the file is parseable only after that patch lands and cannot
-be tailed live. `rosbag2` satisfies the requirement on every profile (the
-unchunked `fastwrite` profile has no chunks to back-patch; its chunked profiles
-write each chunk record atomically, never seeking back mid-chunk);
+already on disk — the contract is "append complete records", not "never chunk".
+The Rust `mcap` crate's default chunked writer (`use_chunks(true)`) breaks it:
+it writes each `Chunk` record's header with a placeholder length (`u64::MAX`)
+and back-patches the true length only once the chunk closes, so the file is
+parseable only after that patch lands and cannot be tailed live. `rosbag2`
+satisfies the requirement on every profile (the unchunked `fastwrite` profile
+has no chunks to back-patch; its chunked profiles write each chunk record
+atomically, never seeking back mid-chunk).
+
+Two examples show compliant producers.
 [`examples/custom-mcap-writer`](examples/custom-mcap-writer/README.md) writes
-with `use_chunks(false)` for the same reason.
+unchunked (`use_chunks(false)`) — every message its own complete top-level
+record, for the lowest visibility latency.
+[`examples/chunked-mcap-writer`](examples/chunked-mcap-writer/README.md) writes
+buffered chunks (`use_chunks(true)` + `disable_seeking(true)`) — each chunk is
+assembled in memory and appended as one complete record, so the output is
+zstd-compressed yet still tailable.
 
 Each pass maintains three artefacts per recording, plus one collection-wide
 watch:

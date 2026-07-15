@@ -57,7 +57,11 @@ placeholder could ever produce — no valid record reaches it under
 `MAX_RECORD_LEN` — that one length is special-cased to name the cause instead
 of reading as bare corruption: "record at offset {offset} declares u64::MAX
 bytes — an unpatched length from a seek-back (chunked) writer? such a recording
-cannot be tailed until it is finalised". This is also why the scan never waits
+cannot be tailed until it is finalised". (The compliant chunked configuration —
+buffered chunks via `disable_seeking(true)`, which appends each chunk as one
+complete record — is demonstrated by
+[`examples/chunked-mcap-writer`](../../examples/chunked-mcap-writer/README.md).)
+This is also why the scan never waits
 out an over-`MAX_RECORD_LEN` length instead of faulting on it: `u64::MAX` (or
 anything else past the ceiling) has no path to becoming a valid record, so
 retrying it as though it were a transient stall would only delay the identical
