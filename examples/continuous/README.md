@@ -8,7 +8,7 @@ keeps that file open and cuts clips from it on each trigger.
 ros2 bag record --all ──one growing mcap──▶ ./record/<bag>_0.mcap
        ▲ kept open + tailed
 clipper ◀── /events/momentedge/trigger
-       ├──▶ ./clipped/<trigger_ns>_<name>.mcap
+       ├──▶ ./clipped/<anchor_ns>_<name>.mcap
        └──▶ /events/momentedge/recorded
 ```
 

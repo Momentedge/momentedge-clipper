@@ -16,3 +16,10 @@ root is the minimal continuous setup; the guides expand on it.
 - [`trigger-pub/`](trigger-pub/README.md) — an example trigger source: a small
   r2r node that publishes `momentedge_msgs/Trigger` periodically, so you can
   exercise the recorder without a real trigger publisher.
+- [`custom-mcap-writer/`](custom-mcap-writer/README.md) — a minimal standalone
+  program that writes an MCAP file directly with the `mcap` crate (no ROS): two
+  JSON data channels (a typed struct and a raw JSON string) each carrying a
+  capture timestamp in `publish_time`, plus an optional synthetic
+  `momentedge_msgs/Trigger` message. The producer-side half of capture-time
+  windowing — the fixture the live e2e suite drives clipper against — and a
+  from-scratch how-to for writing MCAP.

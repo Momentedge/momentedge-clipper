@@ -323,6 +323,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "custom-mcap-writer"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "mcap",
+ "serde",
+ "serde_json",
+ "signal-hook",
+]
+
+[[package]]
 name = "darling"
 version = "0.21.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -69,29 +69,35 @@ fn trigger_produces_clip_and_announcement(
     std::thread::sleep(Duration::from_secs(3));
 
     let mut listener = env.start_recorded_listener("clip");
-    let trigger_ns = now_ns();
+    // ros+log (the default) anchors the window on clipper's own subscription
+    // instant and rejects a non-zero trigger_time, so publish zero and read the
+    // resolved anchor back out of the announced clip name.
+    let fired_ns = now_ns();
     let (preroll, postroll) = (2 * SEC, 3 * SEC);
-    env.fire_trigger("e2e-clip", trigger_ns, preroll, postroll);
+    env.fire_trigger("e2e-clip", preroll, postroll);
 
     if stop_recorder_to_flush {
-        let end_ns = trigger_ns + postroll;
+        // The real window end is the subscription-instant anchor plus postroll —
+        // a second or so past `fired_ns + postroll` — so stop with extra margin.
+        let end_ns = fired_ns + postroll;
         let now = now_ns();
         if end_ns > now {
-            std::thread::sleep(Duration::from_nanos(end_ns - now) + Duration::from_secs(1));
+            std::thread::sleep(Duration::from_nanos(end_ns - now) + Duration::from_secs(2));
         }
         recorder.stop(libc::SIGINT, Duration::from_secs(30));
     }
 
     let recorded = wait_for_recorded(&mut listener, Duration::from_secs(grace_secs + 40));
 
-    // The announcement echoes the trigger and names exactly the clip path the
-    // contract promises.
+    // The announcement echoes the trigger and names the clip on the resolved
+    // anchor (clipper's subscription instant, encoded in the filename).
     assert_eq!(recorded.name, "e2e-clip");
-    let expected = env.out_dir().join(format!("{trigger_ns}_e2e-clip.mcap"));
+    let anchor = anchor_from_clip(Path::new(recorded.only()));
+    let expected = env.out_dir().join(format!("{anchor}_e2e-clip.mcap"));
     assert_eq!(
         Path::new(recorded.only()),
         expected,
-        "announced filename must be <out_dir>/<trigger_ns>_<name>.mcap"
+        "announced filename must be <out_dir>/<anchor_ns>_<name>.mcap"
     );
 
     // Final-path visibility: the announced file already exists, is a
@@ -99,13 +105,66 @@ fn trigger_produces_clip_and_announcement(
     // in-window messages, and includes the source topic.
     let msgs = read_clip(Path::new(recorded.only()));
     assert!(!msgs.is_empty(), "the clip must hold the recorded window");
-    assert_clip_within_window(&msgs, trigger_ns - preroll, trigger_ns + postroll);
+    let (ws, we) = announced_window(&recorded, preroll, postroll);
+    assert_clip_within_window(&msgs, ws, we);
     assert!(
         msgs.iter().any(|(topic, _)| topic == SRC_TOPIC),
         "the source topic must be in the clip, got topics: {:?}",
         msgs.iter()
             .map(|(t, _)| t)
             .collect::<std::collections::HashSet<_>>(),
+    );
+    env.assert_capturing_drained();
+    assert!(extractor.is_running(), "the extractor must outlive the cut");
+}
+
+/// The ROS interface on `--time-source publish` anchors the window on the
+/// trigger's own `trigger_time` — the one cell of the matrix that reads it — so a
+/// publisher can request a clip around an instant in the recent past. The clip's
+/// name carries exactly that anchor, and the cut holds the recorded data around
+/// it. (The other three cells reject a non-zero `trigger_time`; here it is the
+/// anchor, so it is accepted.)
+#[rstest]
+fn trigger_produces_clip_ros_publish_anchors_on_trigger_time() {
+    if !require_e2e() {
+        return;
+    }
+    let env = TestEnv::new();
+    let _recorder = env.start_recorder("fastwrite", 0);
+    let _source = env.start_source(SRC_TOPIC, SRC_RATE);
+    env.wait_for_recording(Duration::from_secs(60));
+    let mut extractor = env.start_extractor_src(30, "publish");
+
+    // Lay down several seconds of data, then request a window anchored a few
+    // seconds in the past — entirely over data already on disk.
+    std::thread::sleep(Duration::from_secs(5));
+
+    let mut listener = env.start_recorded_listener("ros-pub");
+    let anchor = now_ns() - 3 * SEC;
+    let (preroll, postroll) = (2 * SEC, 2 * SEC);
+    env.fire_trigger_stamped("ros-pub", anchor, preroll, postroll);
+
+    let recorded = wait_for_recorded(&mut listener, Duration::from_secs(60));
+    assert_eq!(recorded.name, "ros-pub");
+    // ros+publish anchors on the payload trigger_time, so the clip name carries
+    // exactly the requested anchor — not clipper's subscription instant.
+    assert_eq!(
+        anchor_from_clip(Path::new(recorded.only())),
+        anchor,
+        "the clip name must carry the requested trigger_time as its anchor"
+    );
+    let msgs = read_clip(Path::new(recorded.only()));
+    assert!(
+        !msgs.is_empty(),
+        "the past-anchored window must hold recorded data"
+    );
+    // The window selects on publish_time; read_clip reports log_time (which
+    // rosbag2 stamps a transport hop later), so a tight log-time window
+    // assertion would race that gap — the anchor-name check above is the
+    // publish-domain proof.
+    assert!(
+        msgs.iter().any(|(topic, _)| topic == SRC_TOPIC),
+        "the source topic must be in the clip"
     );
     env.assert_capturing_drained();
     assert!(extractor.is_running(), "the extractor must outlive the cut");
@@ -135,22 +194,22 @@ fn mcap_interface_reads_trigger_from_the_recording() {
     // Lay down at least a preroll's worth of data before triggering.
     std::thread::sleep(Duration::from_secs(3));
 
-    let trigger_ns = now_ns();
     let (preroll, postroll) = (2 * SEC, 3 * SEC);
-    env.fire_trigger_into_bag("mcap-clip", trigger_ns, preroll, postroll);
+    env.fire_trigger_into_bag("mcap-clip", preroll, postroll);
 
-    // No Recorded on the mcap interface — wait for the clip itself, named
-    // <trigger_ns>_<name>.mcap, to appear in out_dir.
-    let clip = env.wait_for_clip(
-        &format!("{trigger_ns}_mcap-clip.mcap"),
-        Duration::from_secs(60),
-    );
+    // No Recorded on the mcap interface — wait for the clip itself to appear in
+    // out_dir. The MCAP interface anchors the window on the trigger record's own
+    // log_time (the default --time-source), not the publisher's trigger_time, so
+    // the clip's `<anchor_ns>_<name>.mcap` name carries the record's log_time
+    // (which sits a hair after `trigger_ns`); locate it by name suffix.
+    let clip = env.wait_for_clip_matching("_mcap-clip.mcap", Duration::from_secs(60));
+    let anchor = anchor_from_clip(&clip);
 
     // The clip is a complete MCAP, holds only in-window data, and includes the
     // source topic — clipper cut the exact window the in-bag trigger asked for.
     let msgs = read_clip(&clip);
     assert!(!msgs.is_empty(), "the clip must hold the recorded window");
-    assert_clip_within_window(&msgs, trigger_ns - preroll, trigger_ns + postroll);
+    assert_clip_within_window(&msgs, anchor - preroll, anchor + postroll);
     assert!(
         msgs.iter().any(|(topic, _)| topic == SRC_TOPIC),
         "the source topic must be in the clip"
@@ -182,36 +241,187 @@ fn mcap_interface_reads_a_chunk_interior_trigger() {
     // Lay down at least a preroll's worth of data before triggering.
     std::thread::sleep(Duration::from_secs(3));
 
-    let trigger_ns = now_ns();
+    let fired_ns = now_ns();
     let (preroll, postroll) = (2 * SEC, 3 * SEC);
     // Publish without the inline receipt wait — the chunk holding the trigger is
     // not on disk yet, so clipper cannot read it until the flush below.
-    env.publish_trigger_into_bag("mcap-chunk", trigger_ns, preroll, postroll);
+    env.publish_trigger_into_bag("mcap-chunk", preroll, postroll);
 
     // Stop the recorder after the window so its footer flushes; clipper then
     // reads the trigger (and the window data) out of the now-complete file and
-    // the `ended` recording releases the coverage wait deterministically.
-    let end_ns = trigger_ns + postroll;
+    // the `ended` recording releases the coverage wait deterministically. The
+    // real window end is the record's log_time anchor plus postroll — a little
+    // past `fired_ns + postroll` — so stop with extra margin.
+    let end_ns = fired_ns + postroll;
     let now = now_ns();
     if end_ns > now {
-        std::thread::sleep(Duration::from_nanos(end_ns - now) + Duration::from_secs(1));
+        std::thread::sleep(Duration::from_nanos(end_ns - now) + Duration::from_secs(2));
     }
     recorder.stop(libc::SIGINT, Duration::from_secs(30));
 
     // No Recorded on the mcap interface — wait for the clip itself to appear.
-    let clip = env.wait_for_clip(
-        &format!("{trigger_ns}_mcap-chunk.mcap"),
-        Duration::from_secs(60),
-    );
+    // The anchor is the trigger record's own log_time (default --time-source),
+    // encoded in the clip name; locate the clip by name suffix.
+    let clip = env.wait_for_clip_matching("_mcap-chunk.mcap", Duration::from_secs(60));
+    let anchor = anchor_from_clip(&clip);
 
     let msgs = read_clip(&clip);
     assert!(!msgs.is_empty(), "the clip must hold the recorded window");
-    assert_clip_within_window(&msgs, trigger_ns - preroll, trigger_ns + postroll);
+    assert_clip_within_window(&msgs, anchor - preroll, anchor + postroll);
     assert!(
         msgs.iter().any(|(topic, _)| topic == SRC_TOPIC),
         "the source topic must be in the clip"
     );
     env.assert_capturing_drained();
+    assert!(
+        extractor.is_running(),
+        "the ROS-free extractor must outlive the cut"
+    );
+}
+
+/// `--time-source` selects the clip window's clock domain end to end, ROS-free.
+/// A synthetic recording (written with the mcap crate — no `ros2 bag record`)
+/// carries source messages whose `publish_time` runs 3 s ahead of their
+/// `log_time`, plus a `json` trigger anchored at `now` on both its stamps, so the
+/// window is `[now − 2 s, now + 2 s]` either way. Windowed on `log` the clip
+/// holds the messages whose `log_time` is in the window; on `publish` a different
+/// set — the ones whose `publish_time` is in the window. clipper reads the json
+/// trigger out of the file it tails; no ros2 stack runs.
+///
+/// The `_secs` cases carry the per-domain expected source-message offsets from
+/// the trigger (in seconds): on `log`, `log_time` in `[−2, +2]`; on `publish`,
+/// `publish_time` (`log + 3 s`) in `[−2, +2]`, i.e. `log_time` in `[−5, −1]`.
+#[rstest]
+#[case::log("log", &[-2, -1, 0, 1, 2])]
+#[case::publish("publish", &[-4, -3, -2, -1])]
+fn time_source_selects_the_window_clock_domain(
+    #[case] source: &str,
+    #[case] expected_offsets: &[i64],
+) {
+    if !require_e2e() {
+        return;
+    }
+    let env = TestEnv::new();
+    // An empty record dir at startup, so the tail discovers the synthetic file as
+    // a live new recording — the trigger tap fires only for recordings indexed
+    // live — then reads the trigger out of it.
+    std::fs::create_dir_all(env.record_dir()).expect("creating the record dir");
+    let mut extractor = env.start_extractor_mcap_src(15, source);
+
+    // Timestamps sit near `now` so retention (floor = now − watch) never ages the
+    // recording out. The trigger anchors at `now` on both stamps; source messages
+    // straddle it at log_time = now + k s for k in −4..=3, publish = log + 3 s.
+    let now = now_ns() as i64;
+    let at = |k: i64| (now + k * SEC as i64) as u64;
+    let src: Vec<(u64, u64)> = (-4..=3).map(|k| (at(k), at(k) + 3 * SEC)).collect();
+    let staged = env.record_dir().join(".synthetic.tmp");
+    let recording = env.record_dir().join("synthetic_0.mcap");
+    write_time_source_recording(&staged, SRC_TOPIC, &src, "ts", at(0), at(0), 2 * SEC, 2 * SEC);
+    // Rename so the tail only ever sees a complete file (its `.tmp` extension
+    // also keeps discovery from picking it up mid-write).
+    std::fs::rename(&staged, &recording).expect("publishing the synthetic recording");
+
+    let clip = env.wait_for_clip_matching("_ts.mcap", Duration::from_secs(60));
+    let mut got: Vec<u64> = read_clip(&clip)
+        .into_iter()
+        .filter(|(topic, _)| topic == SRC_TOPIC)
+        .map(|(_, log_time)| log_time)
+        .collect();
+    got.sort_unstable();
+    got.dedup();
+    let expected: Vec<u64> = expected_offsets.iter().map(|&k| at(k)).collect();
+    assert_eq!(
+        got, expected,
+        "--time-source {source} selected the wrong source messages"
+    );
+    assert!(
+        extractor.is_running(),
+        "the ROS-free extractor must outlive the cut"
+    );
+}
+
+/// Live capture-time windowing end to end (clipper-7jg): the momentedge
+/// `custom-mcap-writer` appends a growing, unchunked recording while clipper
+/// tails it `--interface mcap`, and the trigger clipper lifts back out of that
+/// file drives the cut. Every data message's `publish_time` trails its
+/// `log_time` by the writer's 3 s `--publish-offset-ms`, and the trigger's
+/// ±2 s window is anchored on the trigger record's own stamp per `--time-source`:
+/// its `log_time` under `log`, its `publish_time` (3 s earlier) under `publish`.
+/// The 3 s offset dwarfs the 2 s window half-width, so the two domains window
+/// provably differently over the same data — under `publish` every clip
+/// message's `publish_time` is in the window while some message's `log_time` is
+/// not, and symmetrically under `log`. This is the live-writer sibling of
+/// `time_source_selects_the_window_clock_domain` (which windows a synthetic
+/// pre-written file); both run ROS-free at runtime — no ros2 stack, clipper
+/// reads the `json` trigger straight out of the file it tails.
+#[rstest]
+#[case::log("log")]
+#[case::publish("publish")]
+fn live_writer_capture_time_windowing(#[case] time_source: &str) {
+    if !require_e2e() {
+        return;
+    }
+    let env = TestEnv::new();
+    // An empty record dir at startup so the tail discovers the writer's growing
+    // file as a live new recording — the trigger tap fires only for recordings
+    // indexed live — then lifts the json trigger out of it.
+    std::fs::create_dir_all(env.record_dir()).expect("creating the record dir");
+    let mut extractor = env.start_extractor_mcap_src(6, time_source);
+
+    // The writer appends rec_0.mcap for 5 s: 50 Hz data whose publish_time
+    // trails log_time by 3 s, and one json trigger 1.5 s in. The 3 s offset is
+    // comfortably larger than the ±2 s window, so the log and publish domains
+    // select provably different windows over the same messages. clipper cuts as
+    // the file grows under it; grace (6 s) is a backstop the natural coverage
+    // (reached ~3.5 s in, well inside the 5 s run) clears first.
+    let (offset_ns, half_window_ns) = (3 * SEC, 2 * SEC);
+    let _writer = env.start_writer("rec_0.mcap", 5.0, 1500, offset_ns / 1_000_000);
+
+    // No Recorded on the mcap interface — wait for the clip itself. Its name
+    // carries the resolved anchor (the trigger record's log_time or publish_time
+    // per --time-source); the writer names its trigger "custom-mcap-writer-example".
+    let clip = env.wait_for_clip_matching("_custom-mcap-writer-example.mcap", Duration::from_secs(60));
+    let anchor = anchor_from_clip(&clip);
+    let (ws, we) = (anchor - half_window_ns, anchor + half_window_ns);
+
+    // Read both stamps per message: the discriminator is which one the window
+    // was applied to. The clip must be a complete MCAP holding captured data.
+    let msgs = read_clip_stamps(&clip);
+    assert!(!msgs.is_empty(), "the clip must hold the windowed data");
+    let data: Vec<&(String, u64, u64)> =
+        msgs.iter().filter(|(topic, _, _)| topic != TRIGGER_TOPIC).collect();
+    assert!(!data.is_empty(), "the clip must hold captured data messages");
+
+    // `selected` is the stamp --time-source windowed on; `other` is the
+    // contrasting stamp, offset 3 s away and so out of the same numeric window
+    // for the data straddling the anchor. Tuple layout: (topic, log_time, publish_time).
+    let windowed_on_publish = time_source == "publish";
+    let selected = |m: &(String, u64, u64)| if windowed_on_publish { m.2 } else { m.1 };
+    let other = |m: &(String, u64, u64)| if windowed_on_publish { m.1 } else { m.2 };
+
+    // Every message the cut kept lies inside the window on the SELECTED stamp —
+    // clipper windowed on the right clock domain (a cut on the wrong stamp would
+    // leak the offset-shifted messages out of this bound).
+    for m in &msgs {
+        let s = selected(m);
+        assert!(
+            (ws..=we).contains(&s),
+            "--time-source {time_source}: message on {} at selected stamp {s} \
+             outside window [{ws}, {we}]",
+            m.0,
+        );
+    }
+    // ... and the 3 s offset put real captured data outside that same numeric
+    // window on the OTHER stamp — proof the two domains genuinely differ (offset
+    // ≫ window slack), not merely relabel the same set.
+    assert!(
+        data.iter().any(|m| !(ws..=we).contains(&other(m))),
+        "--time-source {time_source}: no data message's contrasting stamp fell \
+         outside the window [{ws}, {we}] — the log/publish domains must differ by \
+         the 3 s offset, stamps {:?}",
+        data.iter().map(|m| (other(m), selected(m))).collect::<Vec<_>>(),
+    );
+
     assert!(
         extractor.is_running(),
         "the ROS-free extractor must outlive the cut"
@@ -235,8 +445,7 @@ fn recorder_restart_recovers_and_keeps_extracting() {
 
     // Trigger #1 against the first recording.
     let mut listener1 = env.start_recorded_listener("first");
-    let t1 = now_ns();
-    env.fire_trigger("restart-1", t1, 2 * SEC, 2 * SEC);
+    env.fire_trigger("restart-1", 2 * SEC, 2 * SEC);
     let r1 = wait_for_recorded(&mut listener1, Duration::from_secs(60));
     assert!(!read_clip(Path::new(r1.only())).is_empty());
 
@@ -251,13 +460,13 @@ fn recorder_restart_recovers_and_keeps_extracting() {
 
     // Trigger #2 against the new recording.
     let mut listener2 = env.start_recorded_listener("second");
-    let t2 = now_ns();
-    env.fire_trigger("restart-2", t2, 2 * SEC, 2 * SEC);
+    env.fire_trigger("restart-2", 2 * SEC, 2 * SEC);
     let r2 = wait_for_recorded(&mut listener2, Duration::from_secs(60));
     assert_eq!(r2.name, "restart-2");
     let msgs = read_clip(Path::new(r2.only()));
     assert!(!msgs.is_empty(), "the post-restart clip must hold data");
-    assert_clip_within_window(&msgs, t2 - 2 * SEC, t2 + 2 * SEC);
+    let (ws, we) = announced_window(&r2, 2 * SEC, 2 * SEC);
+    assert_clip_within_window(&msgs, ws, we);
     assert!(msgs.iter().any(|(topic, _)| topic == SRC_TOPIC));
     env.assert_capturing_drained();
     assert!(extractor.is_running());
@@ -321,7 +530,7 @@ fn recorder_restart_inside_the_window_recovers_across_the_boundary(#[case] delet
     // sequence with data time to spare; the precondition after the relaunch
     // checks that it did.
     let (preroll, postroll) = (8 * SEC, 15 * SEC);
-    env.fire_trigger("restart-inside", trigger_ns, preroll, postroll);
+    env.fire_trigger("restart-inside", preroll, postroll);
 
     // Two seconds of the window lie down before the restart; that data is the
     // closing recording's part the cut recovers across the boundary.
@@ -348,7 +557,8 @@ fn recorder_restart_inside_the_window_recovers_across_the_boundary(#[case] delet
         !msgs.is_empty(),
         "the recovered window must hold data from both sides of the restart"
     );
-    assert_clip_within_window(&msgs, trigger_ns - preroll, trigger_ns + postroll);
+    let (ws, we) = announced_window(&recorded, preroll, postroll);
+    assert_clip_within_window(&msgs, ws, we);
     assert!(
         msgs.iter().any(|(_, log_time)| *log_time < restart_ns),
         "the closing recording's pre-restart data must be recovered: no stamp \
@@ -382,8 +592,7 @@ fn recorder_killed_mid_trigger_still_announces_via_grace_cut() {
     std::thread::sleep(Duration::from_secs(2));
 
     let mut listener = env.start_recorded_listener("grace");
-    let t = now_ns();
-    env.fire_trigger("mid-kill", t, SEC, 8 * SEC);
+    env.fire_trigger("mid-kill", SEC, 8 * SEC);
 
     // Kill the recorder inside the postroll: the file freezes mid-window, no
     // footer is ever written, coverage stalls below the window end.
@@ -403,7 +612,8 @@ fn recorder_killed_mid_trigger_still_announces_via_grace_cut() {
         !msgs.is_empty(),
         "data recorded before the kill lies in the window"
     );
-    assert_clip_within_window(&msgs, t - SEC, t + 8 * SEC);
+    let (ws, we) = announced_window(&r, SEC, 8 * SEC);
+    assert_clip_within_window(&msgs, ws, we);
     assert!(
         extractor.is_running(),
         "a dead recorder mid-trigger must not take the extractor down"
@@ -451,8 +661,7 @@ fn recording_deleted_without_restart_grace_cuts_the_old_data(
     // seconds the window has to span to still cover pre-deletion data.
     let (preroll, postroll) = (8 * SEC, 6 * SEC);
     let mut listener = env.start_recorded_listener("deleted");
-    let t = now_ns();
-    env.fire_trigger("deleted", t, preroll, postroll);
+    env.fire_trigger("deleted", preroll, postroll);
 
     if !delete_before_the_trigger {
         std::thread::sleep(Duration::from_secs(2));
@@ -477,7 +686,8 @@ fn recording_deleted_without_restart_grace_cuts_the_old_data(
         !msgs.is_empty(),
         "the data scanned before the deletion lies in the window"
     );
-    assert_clip_within_window(&msgs, t - preroll, t + postroll);
+    let (ws, we) = announced_window(&r, preroll, postroll);
+    assert_clip_within_window(&msgs, ws, we);
     env.assert_capturing_drained();
     assert!(
         extractor.is_running(),
@@ -505,9 +715,13 @@ fn restart_after_the_window_ended_recovers_the_closing_recording() {
     std::thread::sleep(Duration::from_secs(3));
 
     let mut listener = env.start_recorded_listener("post-window");
+    // `t` is the pre-publish instant, a conservative floor for the resolved
+    // anchor (clipper's subscription instant, a second or so later): the
+    // positive control and the end-of-window sleep below use it, and the clip's
+    // window is read back from its announced name.
     let t = now_ns();
     let (preroll, postroll) = (2 * SEC, 4 * SEC);
-    env.fire_trigger("post-window", t, preroll, postroll);
+    env.fire_trigger("post-window", preroll, postroll);
 
     // Freeze coverage inside the window. Positive control, read before the
     // deletion: the recording demonstrably holds data inside the window, so
@@ -525,11 +739,13 @@ fn restart_after_the_window_ended_recovers_the_closing_recording() {
 
     // Let the window end while the tail idles re-discovering — the handler
     // enters its grace wait — then restart: the relaunch lands after the
-    // window end but well inside the grace.
+    // window end but well inside the grace. The extra margin clears the gap
+    // between `t` and the later resolved anchor (so the real window end has
+    // passed before the restart).
     let end_ns = t + postroll;
     let now = now_ns();
     if end_ns > now {
-        std::thread::sleep(Duration::from_nanos(end_ns - now) + Duration::from_secs(1));
+        std::thread::sleep(Duration::from_nanos(end_ns - now) + Duration::from_secs(3));
     }
     let (_recorder2, _) = env.restart_recorder(&mut recorder, &extractor, "fastwrite", 0);
 
@@ -540,7 +756,8 @@ fn restart_after_the_window_ended_recovers_the_closing_recording() {
         "the closing recording's window data must be recovered from the \
          retained index, even though the replacement holds nothing in-window"
     );
-    assert_clip_within_window(&msgs, t - preroll, t + postroll);
+    let (ws, we) = announced_window(&r, preroll, postroll);
+    assert_clip_within_window(&msgs, ws, we);
     env.assert_capturing_drained();
     assert!(
         extractor.is_running(),
@@ -568,10 +785,9 @@ fn window_straddling_an_in_run_split_recovers_both_sides() {
     std::thread::sleep(Duration::from_secs(7));
 
     let mut listener = env.start_recorded_listener("straddle");
-    let trigger_ns = now_ns();
-    // ±4 s spans at least one 3 s split boundary on each side of the stamp.
+    // ±4 s spans at least one 3 s split boundary on each side of the anchor.
     let (preroll, postroll) = (4 * SEC, 4 * SEC);
-    env.fire_trigger("straddle", trigger_ns, preroll, postroll);
+    env.fire_trigger("straddle", preroll, postroll);
 
     let recorded = wait_for_recorded(&mut listener, Duration::from_secs(60));
     assert_eq!(recorded.name, "straddle");
@@ -581,8 +797,10 @@ fn window_straddling_an_in_run_split_recovers_both_sides() {
          got {:?}",
         recorded.filenames,
     );
-    // Every segment is published under the `<base>_NN.mcap` naming and is a
-    // complete, in-window MCAP.
+    // Every segment is published under the `<anchor_ns>_<name>_NN.mcap` naming
+    // (the anchor is clipper's subscription instant, encoded in the name) and is
+    // a complete, in-window MCAP.
+    let anchor = anchor_from_clip(Path::new(&recorded.filenames[0]));
     for f in &recorded.filenames {
         let name = Path::new(f)
             .file_name()
@@ -590,13 +808,14 @@ fn window_straddling_an_in_run_split_recovers_both_sides() {
             .to_string_lossy()
             .into_owned();
         assert!(
-            name.starts_with(&format!("{trigger_ns}_straddle_")),
-            "segment {name} must carry the {{trigger_ns}}_{{name}}_NN suffix"
+            name.starts_with(&format!("{anchor}_straddle_")),
+            "segment {name} must carry the <anchor_ns>_<name>_NN naming"
         );
     }
     let msgs = read_all(&recorded);
     assert!(!msgs.is_empty(), "the recovered window must hold data");
-    assert_clip_within_window(&msgs, trigger_ns - preroll, trigger_ns + postroll);
+    let (ws, we) = announced_window(&recorded, preroll, postroll);
+    assert_clip_within_window(&msgs, ws, we);
     assert!(
         msgs.iter().any(|(topic, _)| topic == SRC_TOPIC),
         "the source topic must be in the recovered window"
@@ -641,11 +860,10 @@ fn quiet_topics_grace_timeout_cut() {
     std::thread::sleep(Duration::from_secs(3));
 
     let mut listener = env.start_recorded_listener("quiet");
-    let t = now_ns();
     // Stop the source, then fire a trigger whose window extends past the
-    // last data: coverage can never reach t + postroll.
+    // last data: coverage can never reach the window end.
     source.stop(libc::SIGTERM, Duration::from_secs(10));
-    env.fire_trigger("quiet", t, 2 * SEC, 6 * SEC);
+    env.fire_trigger("quiet", 2 * SEC, 6 * SEC);
 
     let r = wait_for_recorded(&mut listener, Duration::from_secs(60));
     assert!(
@@ -657,7 +875,8 @@ fn quiet_topics_grace_timeout_cut() {
         !msgs.is_empty(),
         "the preroll data recorded before the quiet period lies in the window"
     );
-    assert_clip_within_window(&msgs, t - 2 * SEC, t + 6 * SEC);
+    let (ws, we) = announced_window(&r, 2 * SEC, 6 * SEC);
+    assert_clip_within_window(&msgs, ws, we);
     env.assert_capturing_drained();
     assert!(extractor.is_running());
 }
@@ -743,16 +962,16 @@ fn corrupt_tail_health_live() {
     // extraction aborts per-trigger (no announcement) while the process
     // stays up, or the scan faulted and the process fail-fast exited.
     let mut listener_a = env.start_recorded_listener("over-damage");
-    let ta = now_ns();
     if !extractor.is_running() {
         fail_fast(&mut extractor);
         return;
     }
-    env.fire_trigger("over-damage", ta, 60 * SEC, SEC);
+    env.fire_trigger("over-damage", 60 * SEC, SEC);
     if let Some(a) = try_wait_for_recorded(&mut listener_a, Duration::from_secs(30)) {
         // Whatever the damage did, an announced file is a complete MCAP.
         let msgs = read_clip(Path::new(a.only()));
-        assert_clip_within_window(&msgs, ta - 60 * SEC, ta + SEC);
+        let (ws, we) = announced_window(&a, 60 * SEC, SEC);
+        assert_clip_within_window(&msgs, ws, we);
     }
     if !extractor.is_running() {
         fail_fast(&mut extractor);
@@ -762,15 +981,15 @@ fn corrupt_tail_health_live() {
     // Health proof: a fresh window past the damage must still announce.
     std::thread::sleep(Duration::from_secs(2));
     let mut listener_b = env.start_recorded_listener("post-damage");
-    let tb = now_ns();
-    env.fire_trigger("post-damage", tb, SEC, SEC);
+    env.fire_trigger("post-damage", SEC, SEC);
     let b = wait_for_recorded(&mut listener_b, Duration::from_secs(60));
     let msgs = read_clip(Path::new(b.only()));
     assert!(
         !msgs.is_empty(),
         "a window over undamaged data must still produce a full clip"
     );
-    assert_clip_within_window(&msgs, tb - SEC, tb + SEC);
+    let (ws, we) = announced_window(&b, SEC, SEC);
+    assert_clip_within_window(&msgs, ws, we);
     assert!(
         extractor.is_running(),
         "localized damage must not take the extractor down"

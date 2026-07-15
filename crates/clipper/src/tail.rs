@@ -12,21 +12,27 @@
 //! extraction ([`crate::clip`]):
 //!
 //! * **Extent index** — contiguous byte ranges of the file (closed at
-//!   [`EXTENT_CAP_BYTES`]) with the min/max `log_time` of the messages they
-//!   hold. A clip reads only the extents overlapping its window, so cutting a
-//!   clip never rescans the file.
+//!   [`EXTENT_CAP_BYTES`]) carrying the min/max `log_time` and `publish_time`
+//!   of the messages they hold. A clip reads only the extents whose span on the
+//!   active time source overlaps its window, so cutting a clip never rescans
+//!   the file.
 //! * **Schema/channel registry** — every `Schema`/`Channel` record seen, keyed
 //!   by the file's channel ID (unique within one continuous file). Chunked
 //!   recordings carry these *inside* chunks, so chunks are decompressed during
 //!   the tail; an unchunked recording (the fastwrite storage profile) pays no
 //!   such cost.
-//! * **Coverage watch** — the collection-wide highest `log_time` seen
-//!   ([`Coverage`]); a trigger handler waits on it until the recording provably
-//!   covers its window end.
+//! * **Coverage watch** — the collection-wide highest `log_time` and
+//!   `publish_time` seen ([`Coverage`]); a trigger handler waits on the active
+//!   time source's mark until the recording reaches its window end (a
+//!   completeness proof on `log`, a liveness signal on `publish`).
 //!
-//! Only the 14-byte prefix of each top-level `Message` record is read during
-//! the tail (channel id, sequence, `log_time`); message bodies are first
-//! touched by the extraction. The same "decode only the timestamp" discipline
+//! Only the 22-byte fixed header of each top-level `Message` record is read
+//! during the tail (channel id, sequence, `log_time`, `publish_time`); message
+//! bodies are first touched by the extraction. The window's clock domain is
+//! selectable (`--time-source`): `log_time` is the default base, `publish_time`
+//! the alternative, and the gap between the two — the recorder's queue backlog
+//! plus the producer's clock skew — is observable either way. The
+//! same "decode only the timestamps" discipline
 //! as the rest of the workspace, applied to file tailing. The one exception is
 //! an opt-in trigger tap ([`Tailer::with_trigger_tap`], wired only by the MCAP
 //! interface): when set, the scan also lifts the full body of messages on the
@@ -65,9 +71,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use crossbeam_channel::Sender;
-use log::{info, warn};
+use log::{debug, info, warn};
 use mcap::records::Record;
 
+use crate::TimeSource;
 use crate::trigger::{TriggerRecord, now_ns};
 use crate::watch::Watch;
 
@@ -137,6 +144,77 @@ pub struct ChannelDef {
     pub schema: Option<SchemaDef>,
 }
 
+/// The inclusive minimum and maximum of one timestamp source over a set of
+/// messages.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Span {
+    pub min: u64,
+    pub max: u64,
+}
+
+impl Span {
+    fn point(t: u64) -> Self {
+        Span { min: t, max: t }
+    }
+
+    fn extend(&mut self, t: u64) {
+        self.min = self.min.min(t);
+        self.max = self.max.max(t);
+    }
+
+    fn merge(&mut self, other: Span) {
+        self.min = self.min.min(other.min);
+        self.max = self.max.max(other.max);
+    }
+}
+
+/// The `log_time` and `publish_time` spans of a set of messages, carried
+/// together because both come from the same message header. Both spans are
+/// exact: either may drive extent overlap and coverage, selected by the active
+/// [`TimeSource`]. Retention reads only `log` — a producer must not be able to
+/// drive file deletion through `publish_time`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stamps {
+    pub log: Span,
+    pub publish: Span,
+}
+
+impl Stamps {
+    fn point(log: u64, publish: u64) -> Self {
+        Stamps {
+            log: Span::point(log),
+            publish: Span::point(publish),
+        }
+    }
+
+    fn extend(&mut self, log: u64, publish: u64) {
+        self.log.extend(log);
+        self.publish.extend(publish);
+    }
+
+    fn merge(&mut self, other: Stamps) {
+        self.log.merge(other.log);
+        self.publish.merge(other.publish);
+    }
+}
+
+/// The span of `log_time − publish_time` over a set of messages — the
+/// recorder's queue backlog plus the producer's clock skew, in nanoseconds
+/// (signed: a `publish_time` past its `log_time` reads negative). Accumulated
+/// per scan pass and logged at debug; no windowing reads it.
+#[derive(Clone, Copy, Debug)]
+struct Skew {
+    min: i128,
+    max: i128,
+}
+
+impl Skew {
+    fn observe(&mut self, gap: i128) {
+        self.min = self.min.min(gap);
+        self.max = self.max.max(gap);
+    }
+}
+
 /// A contiguous byte range of the recording, aligned to top-level record
 /// boundaries, with the time bounds of the messages it holds. `time` is `None`
 /// while the range carries no timed record (e.g. only schema/channel records).
@@ -144,37 +222,67 @@ pub struct ChannelDef {
 pub struct Extent {
     pub offset: u64,
     pub len: u64,
-    pub time: Option<(u64, u64)>,
+    pub time: Option<Stamps>,
 }
 
 impl Extent {
-    /// Whether any message in the extent can fall inside `[start_ns, end_ns]`.
-    /// Exact, not heuristic: the bounds are the actual min/max of the extent's
-    /// messages, so a message in the window implies its extent overlaps it.
-    fn overlaps(&self, start_ns: u64, end_ns: u64) -> bool {
-        self.time
-            .is_some_and(|(min, max)| max >= start_ns && min <= end_ns)
+    /// Whether any message in the extent can fall inside `[start_ns, end_ns]` on
+    /// the windowing `source`. Exact, not heuristic: the bounds are the actual
+    /// min/max of the extent's messages on that source, so a message in the
+    /// window implies its extent overlaps it. `source` picks which of the two
+    /// carried spans to test — `log` or `publish`.
+    fn overlaps(&self, start_ns: u64, end_ns: u64, source: TimeSource) -> bool {
+        self.time.is_some_and(|s| {
+            let span = match source {
+                TimeSource::Log => s.log,
+                TimeSource::Publish => s.publish,
+            };
+            span.max >= start_ns && span.min <= end_ns
+        })
     }
 }
 
-/// How far the recordings provably reach: the highest message `log_time` the
-/// tail has seen on disk, across the whole collection of indexed recordings.
+/// How far the recordings provably reach on each time source: the highest
+/// message stamp the tail has seen on disk, across the whole collection of
+/// indexed recordings. A handler waits on the high-water of the source its
+/// window lives in.
 ///
-/// "Provably" rests on two properties. First an ordering assumption: messages
-/// land in a file in (approximately) non-decreasing `log_time` order. rosbag2
-/// has that shape — one writer, `log_time` stamped at receive — up to
-/// millisecond-scale interleaving between concurrent subscription callbacks,
-/// which the flush and extraction latency in front of every cut dwarfs. Second,
-/// the tail scans strictly in order, one `current` recording at a time, oldest
-/// first, finishing each before the next: a later file's coverage can never
-/// advance before an earlier file is complete. So a collection-wide high-water
-/// at or past a window end implies the window's messages are on disk in
-/// whichever recording holds them — no per-file coverage is needed. The mark is
+/// **`log`** (`high_water_ns`) is a *completeness* proof. It rests on two
+/// properties. First an ordering assumption: messages land in a file in
+/// (approximately) non-decreasing `log_time` order. rosbag2 has that shape — one
+/// writer, `log_time` stamped at receive — up to millisecond-scale interleaving
+/// between concurrent subscription callbacks, which the flush and extraction
+/// latency in front of every cut dwarfs. Second, the tail scans strictly in
+/// order, one `current` recording at a time, oldest first, finishing each before
+/// the next: a later file's coverage can never advance before an earlier file is
+/// complete. So a collection-wide high-water at or past a window end implies the
+/// window's messages are on disk in whichever recording holds them. The mark is
 /// monotonic across retention prunes: a pruned file is below the watch floor and
 /// never held the maximum, so dropping it never lowers the high-water.
+///
+/// **`publish`** (`publish_high_water_ns`) is a *liveness* signal only.
+/// `publish_time` carries no ordering guarantee — out-of-order is normal steady
+/// state — so a high-water past a window end does not prove every in-window
+/// message is on disk: a message can still arrive later with an in-window
+/// `publish_time` and be lost from a clip already cut. It advances the same way
+/// `log` does and never regresses (the watch only raises it), so a handler's
+/// wait is stable; `grace_secs` bounds the wait when the publish stream goes
+/// quiet.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Coverage {
     pub high_water_ns: u64,
+    pub publish_high_water_ns: u64,
+}
+
+impl Coverage {
+    /// The high-water for the windowing `source`: `log`'s completeness
+    /// high-water, or `publish`'s liveness high-water.
+    pub fn for_source(&self, source: TimeSource) -> u64 {
+        match source {
+            TimeSource::Log => self.high_water_ns,
+            TimeSource::Publish => self.publish_high_water_ns,
+        }
+    }
 }
 
 /// A snapshot for one clip: the open recording, the extents overlapping the
@@ -220,29 +328,27 @@ enum RecordingState {
     Ended,
 }
 
-/// The `log_time` span of the messages indexed in one recording. `has_messages`
-/// is false until the first timed record lands, distinguishing "no data" from
-/// "data at time 0". Drives both window overlap and retention (`max_log_time`
-/// against the watch floor). `log_time` only — `publish_time` is deferred
-/// (beads clipper-75k).
+/// The `log_time` and `publish_time` spans of the messages indexed in one
+/// recording. `has_messages` is false until the first timed record lands,
+/// distinguishing "no data" from "data at time 0". Either span drives window
+/// overlap and coverage, selected by the active time source; retention ages on
+/// `log.max` alone (against the watch floor), whatever the window's source.
 #[derive(Clone, Copy, Debug, Default)]
 struct TimeBounds {
-    min_log_time: u64,
-    max_log_time: u64,
+    log: Span,
+    publish: Span,
     has_messages: bool,
 }
 
 impl TimeBounds {
-    fn absorb(&mut self, min: u64, max: u64) {
+    fn absorb(&mut self, stamps: Stamps) {
         if self.has_messages {
-            self.min_log_time = self.min_log_time.min(min);
-            self.max_log_time = self.max_log_time.max(max);
+            self.log.merge(stamps.log);
+            self.publish.merge(stamps.publish);
         } else {
-            *self = TimeBounds {
-                min_log_time: min,
-                max_log_time: max,
-                has_messages: true,
-            };
+            self.log = stamps.log;
+            self.publish = stamps.publish;
+            self.has_messages = true;
         }
     }
 }
@@ -305,20 +411,20 @@ impl RecordingIndex {
         self.extents.extend(delta.closed);
         self.open = delta.open;
         for extent in self.extents.iter().chain(self.open.iter()) {
-            if let Some((min, max)) = extent.time {
-                self.bounds.absorb(min, max);
+            if let Some(stamps) = extent.time {
+                self.bounds.absorb(stamps);
             }
         }
     }
 
     /// A single-file [`WindowPlan`] over this recording's extents overlapping
-    /// `[start_ns, end_ns]`, or `None` if none do.
-    fn plan(&self, start_ns: u64, end_ns: u64) -> Option<WindowPlan> {
+    /// `[start_ns, end_ns]` on `source`, or `None` if none do.
+    fn plan(&self, start_ns: u64, end_ns: u64, source: TimeSource) -> Option<WindowPlan> {
         let extents: Vec<Extent> = self
             .extents
             .iter()
             .chain(self.open.iter())
-            .filter(|e| e.overlaps(start_ns, end_ns))
+            .filter(|e| e.overlaps(start_ns, end_ns, source))
             .copied()
             .collect();
         (!extents.is_empty()).then(|| WindowPlan {
@@ -407,13 +513,13 @@ impl TailState {
     }
 
     /// One single-file [`WindowPlan`] per recording overlapping
-    /// `[start_ns, end_ns]`, oldest first. Empty when no recording covers the
-    /// window (a rollover gap, all relevant files pruned, or nothing indexed
-    /// yet) — the caller then stages one empty clip.
-    fn plan_window(&self, start_ns: u64, end_ns: u64) -> Vec<WindowPlan> {
+    /// `[start_ns, end_ns]` on `source`, oldest first. Empty when no recording
+    /// covers the window (a rollover gap, all relevant files pruned, or nothing
+    /// indexed yet) — the caller then stages one empty clip.
+    fn plan_window(&self, start_ns: u64, end_ns: u64, source: TimeSource) -> Vec<WindowPlan> {
         self.recordings
             .iter()
-            .filter_map(|r| r.plan(start_ns, end_ns))
+            .filter_map(|r| r.plan(start_ns, end_ns, source))
             .collect()
     }
 
@@ -429,7 +535,7 @@ impl TailState {
             let expired = r.state == RecordingState::Ended
                 && Some(r.id) != self.current
                 && r.bounds.has_messages
-                && r.bounds.max_log_time < floor_ns;
+                && r.bounds.log.max < floor_ns;
             if expired {
                 pruned.push(r.path.clone());
             }
@@ -439,12 +545,25 @@ impl TailState {
     }
 
     /// The collection-wide high-water `log_time` — the maximum over all indexed
-    /// recordings.
+    /// recordings. The completeness proof for `log`-domain windows.
     fn high_water_ns(&self) -> u64 {
         self.recordings
             .iter()
             .filter(|r| r.bounds.has_messages)
-            .map(|r| r.bounds.max_log_time)
+            .map(|r| r.bounds.log.max)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// The collection-wide high-water `publish_time` — the maximum over all
+    /// indexed recordings. A liveness signal for `publish`-domain windows only:
+    /// `publish_time` has no ordering guarantee, so this does not prove every
+    /// in-window message is on disk (see [`Coverage`]).
+    fn publish_high_water_ns(&self) -> u64 {
+        self.recordings
+            .iter()
+            .filter(|r| r.bounds.has_messages)
+            .map(|r| r.bounds.publish.max)
             .max()
             .unwrap_or(0)
     }
@@ -505,11 +624,18 @@ enum TriggerSink {
 struct ScanDelta {
     closed: Vec<Extent>,
     open: Option<Extent>,
-    /// min/max log_time of records absorbed since the last extent extension.
-    pending_time: Option<(u64, u64)>,
+    /// min/max of both stamps for the records absorbed since the last extent
+    /// extension, folded into the open extent by [`Self::extend_extent`].
+    pending_time: Option<Stamps>,
     schemas: Vec<(u16, SchemaDef)>,
     channels: Vec<RawChannel>,
+    /// The highest `log_time` this pass saw — the log half of the coverage
+    /// watch. The publish half derives from the recording bounds
+    /// (`TailState::publish_high_water_ns`), not from a delta field.
     high_water_ns: u64,
+    /// min/max of `log_time − publish_time` over the messages this pass folded.
+    /// `None` until the first message; logged once per pass at debug.
+    skew: Option<Skew>,
     /// The trigger topic to lift, seeded from the tailer. `None` disables the
     /// tap, so the fields below stay empty/idle and the scan never reads a body.
     trigger_topic: Option<String>,
@@ -533,11 +659,22 @@ struct RawChannel {
 }
 
 impl ScanDelta {
-    fn absorb_time(&mut self, log_time: u64) {
+    fn absorb_time(&mut self, log_time: u64, publish_time: u64) {
         self.high_water_ns = self.high_water_ns.max(log_time);
         self.pending_time = Some(match self.pending_time {
-            Some((min, max)) => (min.min(log_time), max.max(log_time)),
-            None => (log_time, log_time),
+            Some(mut s) => {
+                s.extend(log_time, publish_time);
+                s
+            }
+            None => Stamps::point(log_time, publish_time),
+        });
+        let gap = log_time as i128 - publish_time as i128;
+        self.skew = Some(match self.skew {
+            Some(mut sk) => {
+                sk.observe(gap);
+                sk
+            }
+            None => Skew { min: gap, max: gap },
         });
     }
 
@@ -600,7 +737,7 @@ impl ScanDelta {
                 });
             }
             Record::Message { header, data } => {
-                self.absorb_time(header.log_time);
+                self.absorb_time(header.log_time, header.publish_time);
                 // A message on a trigger channel is lifted whole (its body is the
                 // serialized Trigger payload); any other message contributes only
                 // its timestamp, its body untouched. Inside a chunk sub-delta this
@@ -610,6 +747,7 @@ impl ScanDelta {
                         message_encoding: encoding,
                         body: data.into_owned(),
                         log_time: header.log_time,
+                        publish_time: header.publish_time,
                     });
                 }
             }
@@ -661,10 +799,23 @@ impl ScanDelta {
                 self.emit_trigger(rec);
             }
         }
-        if let Some((min, max)) = sub.pending_time {
+        if let Some(sub_stamps) = sub.pending_time {
             self.pending_time = Some(match self.pending_time {
-                Some((omin, omax)) => (omin.min(min), omax.max(max)),
-                None => (min, max),
+                Some(mut s) => {
+                    s.merge(sub_stamps);
+                    s
+                }
+                None => sub_stamps,
+            });
+        }
+        if let Some(sub_skew) = sub.skew {
+            self.skew = Some(match self.skew {
+                Some(mut sk) => {
+                    sk.observe(sub_skew.min);
+                    sk.observe(sub_skew.max);
+                    sk
+                }
+                None => sub_skew,
             });
         }
         Ok(())
@@ -680,10 +831,13 @@ impl ScanDelta {
             time: None,
         });
         open.len = record_end - open.offset;
-        if let Some((min, max)) = self.pending_time.take() {
+        if let Some(stamps) = self.pending_time.take() {
             open.time = Some(match open.time {
-                Some((omin, omax)) => (omin.min(min), omax.max(max)),
-                None => (min, max),
+                Some(mut existing) => {
+                    existing.merge(stamps);
+                    existing
+                }
+                None => stamps,
             });
         }
         if open.len >= EXTENT_CAP_BYTES {
@@ -730,11 +884,14 @@ impl Tailer {
     }
 
     /// Snapshot one single-file plan per recording overlapping
-    /// `[start_ns, end_ns]`, oldest first. A window inside one recording yields
-    /// one plan; one straddling a rollover yields one per source file. Empty
-    /// when no indexed recording covers the window.
-    pub fn plan_window(&self, start_ns: u64, end_ns: u64) -> Vec<WindowPlan> {
-        self.state.lock().unwrap().plan_window(start_ns, end_ns)
+    /// `[start_ns, end_ns]` on `source`, oldest first. A window inside one
+    /// recording yields one plan; one straddling a rollover yields one per source
+    /// file. Empty when no indexed recording covers the window.
+    pub fn plan_window(&self, start_ns: u64, end_ns: u64, source: TimeSource) -> Vec<WindowPlan> {
+        self.state
+            .lock()
+            .unwrap()
+            .plan_window(start_ns, end_ns, source)
     }
 
     /// Tail forever: follow the directory's recordings as a time-ordered
@@ -954,9 +1111,10 @@ impl Tailer {
 
     /// Publish one scan pass's delta to the `current` recording — its registry,
     /// extents, and time bounds — record its new scan offset, and refresh the
-    /// collection-wide coverage high-water (monotonic; never lowered). The brief
-    /// state lock is the only one a handler's `plan_window` can contend on; the
-    /// file IO above ran with no lock held.
+    /// collection-wide coverage high-waters (both `log` and `publish`, each
+    /// monotonic in the watch; never lowered). The brief state lock is the only
+    /// one a handler's `plan_window` can contend on; the file IO above ran with
+    /// no lock held.
     fn apply_to_current(&self, delta: ScanDelta, offset: u64) {
         // Triggers were already sent straight down the tap as the scan lifted
         // them ([`ScanDelta::emit_trigger`]); apply only publishes the index and
@@ -964,7 +1122,7 @@ impl Tailer {
         // still cannot cut its clip until coverage reaches the window end, and
         // coverage advances only here — so the cut never races ahead of the
         // index it reads.
-        let hw = {
+        let (hw, phw) = {
             let mut st = self.state.lock().unwrap();
             if let Some(id) = st.current
                 && let Some(r) = st.recording_mut(id)
@@ -972,15 +1130,24 @@ impl Tailer {
                 r.apply_delta(delta);
                 r.offset = offset;
             }
-            st.high_water_ns()
+            (st.high_water_ns(), st.publish_high_water_ns())
         };
         self.coverage.send_if_modified(|c| {
+            // Each high-water advances independently and never regresses, so a
+            // handler waiting on either source sees a stable, monotonic mark. The
+            // publish mark can rise past the log mark (out-of-order publish
+            // times), which is exactly the liveness signal a publish window waits
+            // on.
+            let mut changed = false;
             if hw > c.high_water_ns {
                 c.high_water_ns = hw;
-                true
-            } else {
-                false
+                changed = true;
             }
+            if phw > c.publish_high_water_ns {
+                c.publish_high_water_ns = phw;
+                changed = true;
+            }
+            changed
         });
     }
 
@@ -1043,9 +1210,21 @@ impl Tailer {
             let opcode = hdr[0];
             let len = u64::from_le_bytes(hdr[1..9].try_into().unwrap());
             if len > MAX_RECORD_LEN {
-                fault = Some(anyhow::anyhow!(
-                    "record at offset {offset} declares {len} bytes; framing desynchronised?"
-                ));
+                // u64::MAX is the placeholder a seek-back (chunked) writer leaves
+                // in a Chunk header until it back-patches the real length at chunk
+                // close — a recording written that way is unreadable mid-write, so
+                // name the cause rather than implying corruption.
+                fault = Some(if len == u64::MAX {
+                    anyhow::anyhow!(
+                        "record at offset {offset} declares u64::MAX bytes — an \
+                         unpatched length from a seek-back (chunked) writer? such \
+                         a recording cannot be tailed until it is finalised"
+                    )
+                } else {
+                    anyhow::anyhow!(
+                        "record at offset {offset} declares {len} bytes; framing desynchronised?"
+                    )
+                });
                 break;
             }
             let end = offset + 9 + len;
@@ -1074,57 +1253,56 @@ impl Tailer {
                     }
                 }
                 op::MESSAGE => {
-                    // Decode the 14-byte prefix: channel_id u16, sequence u32,
-                    // log_time u64 (all LE). A message on a trigger channel also
-                    // has its payload (past the 22-byte fixed fields) lifted out;
-                    // every other body stays untouched until extraction.
-                    if len >= 14 {
-                        let mut prefix = [0u8; 14];
-                        if let Err(e) = file.read_exact_at(&mut prefix, offset + 9) {
+                    // Decode the 22-byte fixed header in one read: channel_id
+                    // u16, sequence u32, log_time u64, publish_time u64 (all
+                    // LE). A message on a trigger channel also has its payload
+                    // (past those 22 fixed fields) lifted out; every other body
+                    // stays untouched until extraction.
+                    if len >= 22 {
+                        let mut header = [0u8; 22];
+                        if let Err(e) = file.read_exact_at(&mut header, offset + 9) {
                             fault = Some(anyhow::Error::new(e).context(format!(
-                                "reading message prefix at {offset}; framing desynchronised?"
+                                "reading message header at {offset}; framing desynchronised?"
                             )));
                             break;
                         }
-                        let channel_id = u16::from_le_bytes(prefix[0..2].try_into().unwrap());
-                        let log_time = u64::from_le_bytes(prefix[6..14].try_into().unwrap());
-                        delta.absorb_time(log_time);
+                        let channel_id = u16::from_le_bytes(header[0..2].try_into().unwrap());
+                        let log_time = u64::from_le_bytes(header[6..14].try_into().unwrap());
+                        let publish_time = u64::from_le_bytes(header[14..22].try_into().unwrap());
+                        delta.absorb_time(log_time, publish_time);
 
                         if let Some(encoding) = delta.trigger_channels.get(&channel_id).cloned() {
-                            // The payload follows the 22-byte fixed fields. A
-                            // conformant Message is >= 22 B; a shorter trigger
-                            // record carries no payload to decode and is skipped
-                            // (a warning), the framing intact.
-                            if len >= 22 {
-                                let mut payload = vec![0u8; (len - 22) as usize];
-                                if let Err(e) = file.read_exact_at(&mut payload, offset + 9 + 22) {
-                                    fault = Some(anyhow::Error::new(e).context(format!(
-                                        "reading trigger payload at {offset}; framing desynchronised?"
-                                    )));
-                                    break;
-                                }
-                                // A top-level record is durable the instant its
-                                // framing is read, so this goes straight down the
-                                // tap (no chunk CRC to clear).
-                                delta.emit_trigger(TriggerRecord {
-                                    message_encoding: encoding,
-                                    body: payload,
-                                    log_time,
-                                });
-                            } else {
-                                warn!(
-                                    "trigger message at {offset} is only {len} B; no payload to decode"
-                                );
+                            // The payload follows the 22-byte fixed fields; an
+                            // exactly-22-byte trigger message lifts an empty
+                            // body.
+                            let mut payload = vec![0u8; (len - 22) as usize];
+                            if let Err(e) = file.read_exact_at(&mut payload, offset + 9 + 22) {
+                                fault = Some(anyhow::Error::new(e).context(format!(
+                                    "reading trigger payload at {offset}; framing desynchronised?"
+                                )));
+                                break;
                             }
+                            // A top-level record is durable the instant its
+                            // framing is read, so this goes straight down the
+                            // tap (no chunk CRC to clear).
+                            delta.emit_trigger(TriggerRecord {
+                                message_encoding: encoding,
+                                body: payload,
+                                log_time,
+                                publish_time,
+                            });
                         }
                     } else {
-                        // A conformant Message body is >= 22 bytes (its fixed
-                        // fields alone); below 14 not even log_time exists.
-                        // No writer produces this — corrupt or mis-framed
-                        // data. The record is still consumed (the framing is
-                        // self-consistent), but its time cannot count toward
-                        // extent bounds or coverage.
-                        warn!("message record at {offset} is only {len} B; no timestamp to index");
+                        // A conformant Message body is >= 22 bytes — its fixed
+                        // header alone. A shorter one cannot yield both stamps,
+                        // so it is skipped like other localized damage: the
+                        // record is still consumed (the framing is
+                        // self-consistent), but its time counts toward neither
+                        // extent bounds nor coverage.
+                        warn!(
+                            "message record at {offset} is only {len} B; \
+                             the 22-byte fixed header is incomplete, skipping it"
+                        );
                     }
                 }
                 op::CHUNK => {
@@ -1160,6 +1338,12 @@ impl Tailer {
             offset = end;
         }
 
+        if let Some(skew) = delta.skew {
+            debug!(
+                "scan pass to offset {offset}: log-vs-publish skew spans [{} ns, {} ns]",
+                skew.min, skew.max
+            );
+        }
         self.apply_to_current(delta, offset);
         ScanProgress {
             offset,
@@ -1339,12 +1523,25 @@ pub(crate) mod tests {
         Ok(file)
     }
 
-    /// The single plan a one-recording test cuts from: [`Tailer::plan_window`]
-    /// returns one plan per overlapping recording, and these tests index one, so
-    /// its `Vec` holds at most one; no overlap becomes an empty plan.
+    /// The single plan a one-recording test cuts from on the `log` domain: most
+    /// tests window on `log_time`, so this defaults there; [`plan_one_src`] takes
+    /// an explicit source. [`Tailer::plan_window`] returns one plan per
+    /// overlapping recording, and these tests index one, so its `Vec` holds at
+    /// most one; no overlap becomes an empty plan.
     pub(crate) fn plan_one(tailer: &Tailer, start_ns: u64, end_ns: u64) -> WindowPlan {
+        plan_one_src(tailer, start_ns, end_ns, TimeSource::Log)
+    }
+
+    /// [`plan_one`] on an explicit windowing `source`, for the domain-selection
+    /// tests.
+    pub(crate) fn plan_one_src(
+        tailer: &Tailer,
+        start_ns: u64,
+        end_ns: u64,
+        source: TimeSource,
+    ) -> WindowPlan {
         tailer
-            .plan_window(start_ns, end_ns)
+            .plan_window(start_ns, end_ns, source)
             .into_iter()
             .next()
             .unwrap_or_else(WindowPlan::empty)
@@ -1469,20 +1666,43 @@ pub(crate) mod tests {
         rec
     }
 
-    /// A conformant `Message` record body (22 fixed bytes + payload).
+    /// A conformant `Message` record body (22 fixed bytes + payload) whose
+    /// `publish_time` equals its `log_time` — the common case for tests that do
+    /// not exercise the log/publish split.
     pub(crate) fn message_body(
         channel_id: u16,
         sequence: u32,
         log_time: u64,
         payload: &[u8],
     ) -> Vec<u8> {
+        message_body_pub(channel_id, sequence, log_time, log_time, payload)
+    }
+
+    /// A conformant `Message` record body with an independent `publish_time`,
+    /// for tests asserting the tail carries both stamps.
+    pub(crate) fn message_body_pub(
+        channel_id: u16,
+        sequence: u32,
+        log_time: u64,
+        publish_time: u64,
+        payload: &[u8],
+    ) -> Vec<u8> {
         let mut body = Vec::new();
         body.extend_from_slice(&channel_id.to_le_bytes());
         body.extend_from_slice(&sequence.to_le_bytes());
         body.extend_from_slice(&log_time.to_le_bytes());
-        body.extend_from_slice(&log_time.to_le_bytes()); // publish_time
+        body.extend_from_slice(&publish_time.to_le_bytes());
         body.extend_from_slice(payload);
         body
+    }
+
+    /// A [`Stamps`] with equal `log` and `publish` spans — the shape every
+    /// helper that stamps `publish_time = log_time` produces.
+    fn same_stamps(min: u64, max: u64) -> Stamps {
+        Stamps {
+            log: Span { min, max },
+            publish: Span { min, max },
+        }
     }
 
     /// A `Channel` record body (id, schema_id, topic, encoding, empty metadata).
@@ -1689,6 +1909,33 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// A declared length of exactly u64::MAX is the placeholder a seek-back
+    /// (chunked) writer leaves in a Chunk header until it back-patches the real
+    /// value, so the fault names that cause instead of implying corruption.
+    #[test]
+    fn unpatched_placeholder_length_fault_names_the_seek_back_writer() -> Result<()> {
+        let root = test_dir("placeholder")?;
+        let path = root.join("rec.mcap");
+        let mut bytes = MAGIC.to_vec();
+        bytes.push(op::CHUNK);
+        bytes.extend_from_slice(&u64::MAX.to_le_bytes());
+        std::fs::write(&path, bytes)?;
+
+        let (tailer, _coverage) = Tailer::new();
+        let file = attached(&tailer, &path)?;
+        let progress = scan_to_end(&tailer, &file, MAGIC.len() as u64)?;
+
+        let fault = progress.fault.expect("the placeholder length must fault");
+        let msg = format!("{fault:#}");
+        assert!(
+            msg.contains("u64::MAX") && msg.contains("seek-back"),
+            "fault must name the unpatched seek-back placeholder: {msg}"
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
     #[test]
     fn corrupt_chunk_is_skipped_without_poisoning_the_scan() -> Result<()> {
         let root = test_dir("badchunk")?;
@@ -1779,12 +2026,12 @@ pub(crate) mod tests {
             !plan.channels.contains_key(&1),
             "the failed chunk's channel must not register"
         );
-        // No extent may claim the dropped message's time (500); only the good
-        // post-chunk message (700) is in the bounds.
+        // No extent may claim the dropped message's log_time (500); only the
+        // good post-chunk message (700) is in the bounds.
         for e in &plan.extents {
-            if let Some((min, max)) = e.time {
+            if let Some(s) = e.time {
                 assert!(
-                    !(min <= 500 && 500 <= max),
+                    !(s.log.min <= 500 && 500 <= s.log.max),
                     "extent {e:?} must not cover the dropped message's time"
                 );
             }
@@ -1910,7 +2157,7 @@ pub(crate) mod tests {
         assert_eq!(plan.extents.len(), 1);
         assert_eq!(
             plan.extents[0].time,
-            Some((42, 42)),
+            Some(same_stamps(42, 42)),
             "the runt contributes no time bound"
         );
 
@@ -1963,7 +2210,7 @@ pub(crate) mod tests {
         );
         let plan = plan_one(&tailer, 40, 60);
         assert_eq!(plan.extents.len(), 1, "the late stamp widens the bounds");
-        assert_eq!(plan.extents[0].time, Some((50, 100)));
+        assert_eq!(plan.extents[0].time, Some(same_stamps(50, 100)));
 
         std::fs::remove_dir_all(root)?;
         Ok(())
@@ -2031,11 +2278,11 @@ pub(crate) mod tests {
         assert_eq!(coverage.get().high_water_ns, 6_000);
 
         // A window inside one file plans exactly one source.
-        assert_eq!(tailer.plan_window(900, 2_100).len(), 1);
-        assert_eq!(tailer.plan_window(4_900, 6_100).len(), 1);
+        assert_eq!(tailer.plan_window(900, 2_100, TimeSource::Log).len(), 1);
+        assert_eq!(tailer.plan_window(4_900, 6_100, TimeSource::Log).len(), 1);
 
         // A window straddling the rollover plans both, oldest first.
-        let plans = tailer.plan_window(1_500, 5_500);
+        let plans = tailer.plan_window(1_500, 5_500, TimeSource::Log);
         assert_eq!(plans.len(), 2, "the straddling window plans both files");
         assert!(plans.iter().all(|p| !p.extents.is_empty()));
 
@@ -2059,7 +2306,7 @@ pub(crate) mod tests {
 
         // An in-flight extraction holds its own clone of split0's file handle:
         // pruning the index entry must not pull the bytes out from under it.
-        let in_flight = tailer.plan_window(900, 1_100);
+        let in_flight = tailer.plan_window(900, 1_100, TimeSource::Log);
         assert_eq!(in_flight.len(), 1, "split0 is plannable before the prune");
 
         // Prune with a floor above split0's data (1_000) but below split1's
@@ -2069,11 +2316,11 @@ pub(crate) mod tests {
         assert_eq!(dropped, vec![split0.clone()], "the aged file is pruned");
 
         assert!(
-            tailer.plan_window(900, 1_100).is_empty(),
+            tailer.plan_window(900, 1_100, TimeSource::Log).is_empty(),
             "split0's index is gone after the prune"
         );
         assert!(
-            !tailer.plan_window(8_900, 9_100).is_empty(),
+            !tailer.plan_window(8_900, 9_100, TimeSource::Log).is_empty(),
             "split1 is retained"
         );
 
@@ -2106,7 +2353,7 @@ pub(crate) mod tests {
         // Even a floor far above its data does not drop the file being recorded.
         let dropped = tailer.state.lock().unwrap().prune(u64::MAX);
         assert!(dropped.is_empty(), "the current file is never pruned");
-        assert!(!tailer.plan_window(900, 1_100).is_empty());
+        assert!(!tailer.plan_window(900, 1_100, TimeSource::Log).is_empty());
 
         std::fs::remove_dir_all(root)?;
         Ok(())
@@ -2379,7 +2626,7 @@ pub(crate) mod tests {
         );
         // A window straddling the boundary plans both source files.
         assert_eq!(
-            tailer.plan_window(900, 5_100).len(),
+            tailer.plan_window(900, 5_100, TimeSource::Log).len(),
             2,
             "a straddling window recovers both splits"
         );
@@ -2491,9 +2738,10 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    /// A trigger-topic message shorter than the 22-byte fixed fields carries no
-    /// payload to lift: its timestamp still advances coverage, but no
-    /// `TriggerRecord` is sent (a warning, the framing intact).
+    /// A trigger-topic message shorter than the 22-byte fixed header cannot
+    /// yield both stamps, so it is skipped like other localized damage: no
+    /// `TriggerRecord` is lifted and its time reaches neither coverage nor the
+    /// extent bounds (a warning, the framing intact).
     #[test]
     fn a_runt_trigger_message_lifts_nothing() -> Result<()> {
         let root = test_dir("tap-runt")?;
@@ -2521,8 +2769,219 @@ pub(crate) mod tests {
         );
         assert_eq!(
             coverage.get().high_water_ns,
-            500,
-            "but its timestamp still advances coverage"
+            0,
+            "a header too short for both stamps is skipped, advancing nothing"
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// The extent index and the recording's [`TimeBounds`] carry the min/max of
+    /// both `log_time` and `publish_time`, independently. `log_time` ascends
+    /// while `publish_time` is out of order, so the two spans differ and neither
+    /// contaminates the other. Coverage stays `log_time` only.
+    #[test]
+    fn extent_and_bounds_carry_both_stamps() -> Result<()> {
+        let root = test_dir("both-stamps")?;
+        let path = root.join("rec.mcap");
+        write_raw(
+            &path,
+            &[
+                raw_record(op::CHANNEL, &channel_body(1, 0, "/t", "cdr")),
+                raw_record(op::MESSAGE, &message_body_pub(1, 0, 100, 1_000, b"a")),
+                raw_record(op::MESSAGE, &message_body_pub(1, 1, 200, 900, b"b")),
+                raw_record(op::MESSAGE, &message_body_pub(1, 2, 300, 1_100, b"c")),
+            ],
+        )?;
+
+        let (tailer, coverage) = Tailer::new();
+        let file = attached(&tailer, &path)?;
+        scan_to_end(&tailer, &file, MAGIC.len() as u64)?;
+
+        // Coverage is the max log_time, never a publish_time.
+        assert_eq!(coverage.get().high_water_ns, 300);
+
+        let plan = plan_one(&tailer, 0, u64::MAX);
+        assert_eq!(plan.extents.len(), 1, "the three messages fit one extent");
+        assert_eq!(
+            plan.extents[0].time,
+            Some(Stamps {
+                log: Span { min: 100, max: 300 },
+                publish: Span {
+                    min: 900,
+                    max: 1_100,
+                },
+            }),
+            "the extent carries min/max of both stamps independently"
+        );
+
+        // The recording's TimeBounds carry both spans too.
+        let bounds = {
+            let st = tailer.state.lock().unwrap();
+            st.recordings.front().expect("one recording indexed").bounds
+        };
+        assert_eq!(bounds.log, Span { min: 100, max: 300 });
+        assert_eq!(
+            bounds.publish,
+            Span {
+                min: 900,
+                max: 1_100
+            }
+        );
+        assert!(bounds.has_messages);
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// A `Message` whose body holds `log_time` but stops short of the full
+    /// 22-byte fixed header (`len` in `[14, 21]`) cannot yield both stamps, so
+    /// it is skipped like other localized damage: consumed via its intact
+    /// framing, contributing to neither coverage nor the extent bounds. The
+    /// good message behind the two runts still indexes.
+    #[test]
+    fn a_message_missing_publish_time_is_skipped_cleanly() -> Result<()> {
+        let root = test_dir("short-header")?;
+        let path = root.join("rec.mcap");
+        // 21 bytes: the full log fields plus a publish_time one byte short.
+        let mut short21 = Vec::new();
+        short21.extend_from_slice(&1u16.to_le_bytes()); // channel_id
+        short21.extend_from_slice(&0u32.to_le_bytes()); // sequence
+        short21.extend_from_slice(&400u64.to_le_bytes()); // log_time
+        short21.extend_from_slice(&[0u8; 7]); // publish_time, one byte short
+        // 14 bytes: log_time present, publish_time entirely absent.
+        let mut short14 = Vec::new();
+        short14.extend_from_slice(&1u16.to_le_bytes()); // channel_id
+        short14.extend_from_slice(&0u32.to_le_bytes()); // sequence
+        short14.extend_from_slice(&500u64.to_le_bytes()); // log_time only
+        write_raw(
+            &path,
+            &[
+                raw_record(op::CHANNEL, &channel_body(1, 0, "/t", "cdr")),
+                raw_record(op::MESSAGE, &short21),
+                raw_record(op::MESSAGE, &short14),
+                raw_record(op::MESSAGE, &message_body_pub(1, 3, 700, 650, b"good")),
+            ],
+        )?;
+
+        let (tailer, coverage) = Tailer::new();
+        let file = attached(&tailer, &path)?;
+        let progress = scan_to_end(&tailer, &file, MAGIC.len() as u64)?;
+        assert_eq!(
+            progress.offset,
+            file.metadata()?.len(),
+            "both runts and the good message are all consumed"
+        );
+        assert_eq!(
+            coverage.get().high_water_ns,
+            700,
+            "neither short-header record advances coverage"
+        );
+
+        let plan = plan_one(&tailer, 0, u64::MAX);
+        assert_eq!(plan.extents.len(), 1);
+        assert_eq!(
+            plan.extents[0].time,
+            Some(Stamps {
+                log: Span { min: 700, max: 700 },
+                publish: Span { min: 650, max: 650 },
+            }),
+            "the short-header records fold no time into the bounds"
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// Extent overlap and coverage both track the windowing [`TimeSource`]. A
+    /// recording whose log and publish spans are disjoint plans its extent for a
+    /// log window over the log span but not for the same window on `publish`, and
+    /// vice versa; coverage carries a high-water for each domain.
+    #[test]
+    fn extent_overlap_and_coverage_track_the_time_source() -> Result<()> {
+        let root = test_dir("overlap-domain")?;
+        let path = root.join("rec.mcap");
+        // log_time 100/200/300; publish_time 900/1000/1100 — disjoint ranges.
+        write_raw(
+            &path,
+            &[
+                raw_record(op::CHANNEL, &channel_body(1, 0, "/t", "cdr")),
+                raw_record(op::MESSAGE, &message_body_pub(1, 0, 100, 900, b"a")),
+                raw_record(op::MESSAGE, &message_body_pub(1, 1, 200, 1_000, b"b")),
+                raw_record(op::MESSAGE, &message_body_pub(1, 2, 300, 1_100, b"c")),
+            ],
+        )?;
+
+        let (tailer, coverage) = Tailer::new();
+        let file = attached(&tailer, &path)?;
+        scan_to_end(&tailer, &file, MAGIC.len() as u64)?;
+
+        // Coverage carries an independent high-water per domain.
+        assert_eq!(coverage.get().high_water_ns, 300);
+        assert_eq!(coverage.get().publish_high_water_ns, 1_100);
+
+        // A window over the log span plans the extent on `log` but not on
+        // `publish`; a window over the publish span does the reverse.
+        assert!(
+            !plan_one_src(&tailer, 250, 400, TimeSource::Log)
+                .extents
+                .is_empty(),
+            "log window over the log span plans the extent"
+        );
+        assert!(
+            plan_one_src(&tailer, 250, 400, TimeSource::Publish)
+                .extents
+                .is_empty(),
+            "the same window on publish misses the elsewhere publish span"
+        );
+        assert!(
+            !plan_one_src(&tailer, 950, 1_050, TimeSource::Publish)
+                .extents
+                .is_empty(),
+            "publish window over the publish span plans the extent"
+        );
+        assert!(
+            plan_one_src(&tailer, 950, 1_050, TimeSource::Log)
+                .extents
+                .is_empty(),
+            "the same window on log misses the elsewhere log span"
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// Retention ages a recording on `log_time`, never `publish_time`: a floor
+    /// above the log max prunes the file even when its publish max is far higher.
+    /// A producer must not be able to keep a file alive (or force its deletion)
+    /// by what it writes into `publish_time`.
+    #[test]
+    fn retention_prunes_on_log_time_regardless_of_publish_time() -> Result<()> {
+        let root = test_dir("retention-domain")?;
+        let path = root.join("rec.mcap");
+        // log_time 1_000, publish_time 9_000, then a DataEnd so the scan ends and
+        // the recording is retirable.
+        write_raw(
+            &path,
+            &[
+                raw_record(op::CHANNEL, &channel_body(1, 0, "/t", "cdr")),
+                raw_record(op::MESSAGE, &message_body_pub(1, 0, 1_000, 9_000, b"x")),
+                raw_record(op::DATA_END, &[]),
+            ],
+        )?;
+
+        let (tailer, _coverage) = Tailer::new();
+        tailer.index_recording(&path);
+        drain(&tailer)?;
+
+        // Floor 5_000 sits above the log max (1_000) but below the publish max
+        // (9_000): retention ages on log_time, so the recording is pruned.
+        let dropped = tailer.state.lock().unwrap().prune(5_000);
+        assert_eq!(
+            dropped,
+            vec![path.clone()],
+            "retention ages on log_time, ignoring the higher publish_time"
         );
 
         std::fs::remove_dir_all(root)?;

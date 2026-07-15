@@ -8,17 +8,23 @@ one. Built on [r2r](https://github.com/sequenceplanner/r2r); no async runtime.
 
 ## Behaviour
 
-A plain loop: every `--period` seconds (default 1) it stamps `trigger_time` with
-the current RosTime, fills in an incrementing `name` (`<prefix>-<n>`), the
-`--description`, and the `--preroll`/`--postroll` windows (nanoseconds), and
-publishes. With `--preroll`/`--postroll` omitted, each iteration draws that side
-a fresh random whole-second window in `[1, 10]` s, pre and post independently, so
-the recorder sees varied clip lengths; pass either flag to pin that side to a
-fixed nanosecond value.
+A plain loop: every `--period` seconds (default 1) it fills in an incrementing
+`name` (`<prefix>-<n>`), the `--description`, the `--preroll`/`--postroll`
+windows (nanoseconds), and a zero `trigger_time`, and publishes. With
+`--preroll`/`--postroll` omitted, each iteration draws that side a fresh random
+whole-second window in `[1, 10]` s, pre and post independently, so the recorder
+sees varied clip lengths; pass either flag to pin that side to a fixed nanosecond
+value.
+
+`trigger_time` is zero by default because clipper reads it only under
+`--interface ros --time-source publish`; every other cell anchors the window on
+the recorder's own receipt instant and rejects a trigger that sets
+`trigger_time`. Pass `--stamp-trigger-time` to stamp it with the current RosTime
+at publish — the publish-domain anchor for a `--time-source publish` clipper.
 
 Flags (all optional): `--period <secs>`, `--preroll <ns>`, `--postroll <ns>`,
-`--name <prefix>`, `--description <text>`. `RUST_LOG` controls verbosity
-(default `info`).
+`--name <prefix>`, `--description <text>`, `--stamp-trigger-time`. `RUST_LOG`
+controls verbosity (default `info`).
 
 ## Run
 

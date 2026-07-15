@@ -159,7 +159,7 @@ jobs:
         run: nix develop ".#${{ matrix.distro }}" --command true
 
       - name: Build
-        run: nix develop ".#${{ matrix.distro }}" --command cargo build --locked -p clipper
+        run: nix develop ".#${{ matrix.distro }}" --command cargo build --locked -p clipper -p custom-mcap-writer
 
       - name: Unit tests
         run: nix develop ".#${{ matrix.distro }}" --command cargo nextest run --locked -p clipper -E 'not binary(e2e)'

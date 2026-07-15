@@ -18,9 +18,12 @@
 
 use serde::Deserialize;
 
-/// A `builtin_interfaces/Time` flattened to its two fields, free of `r2r`. The
-/// trigger's window is cut around this stamp (`clipper-535`); a follow-up
-/// (`clipper-qo3`) migrates the anchor to a transport timestamp.
+/// A `builtin_interfaces/Time` flattened to its two fields, free of `r2r`. It is
+/// the publisher's own publish-domain timestamp (`trigger_time`), one possible
+/// source of a window's anchor: read only by the ros interface under the
+/// `publish` time source. Every other interface × time-source cell resolves the
+/// anchor from a transport stamp and rejects a non-zero `trigger_time` (see
+/// [`crate::interface`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 pub struct Stamp {
     pub sec: i32,
@@ -69,16 +72,18 @@ pub struct Trigger {
 
 /// One trigger-topic MCAP message record, lifted out of the tailed recording
 /// undecoded: the channel's wire encoding (`message_encoding` — `cdr`/`json`/…),
-/// the message payload bytes, and the record's `log_time`. The name marks it as
-/// the MCAP record type — the raw input the MCAP interface turns into a
-/// [`Trigger`] by dispatching on `message_encoding`
-/// ([`crate::decode::decode_trigger`]); the tail emits them without decoding
-/// anything but the framing.
+/// the message payload bytes, and the record's two stamps (`log_time`,
+/// `publish_time`). The name marks it as the MCAP record type — the raw input
+/// the MCAP interface turns into a [`Trigger`] by dispatching on
+/// `message_encoding` ([`crate::decode::decode_trigger`]); the tail emits them
+/// without decoding anything but the framing. The MCAP interface anchors the
+/// window on one of the two stamps per `--time-source`.
 #[derive(Clone, Debug)]
 pub struct TriggerRecord {
     pub message_encoding: String,
     pub body: Vec<u8>,
     pub log_time: u64,
+    pub publish_time: u64,
 }
 
 /// What the handler emits once a clip is durable: the trigger echo plus the
