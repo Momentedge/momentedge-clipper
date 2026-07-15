@@ -2,19 +2,26 @@
 //!
 //! Emits a `momentedge_msgs/Trigger` every `--period` seconds (1 s by default)
 //! so the triggered recorder (`clipper`) has something to react to during
-//! development. Each trigger's `trigger_time` is stamped with the current
-//! RosTime at publish — the "original timestamp" the pre/post-roll window is cut
-//! around, the stamp the recorder centres its window on rather than the
-//! trigger's arrival time.
+//! development.
+//!
+//! `trigger_time` is left zero by default. clipper reads `trigger_time` only
+//! under `--interface ros --time-source publish`; every other cell (including the
+//! default `--time-source log`) anchors the window on the recorder's own receipt
+//! instant and *rejects* a trigger that sets `trigger_time`, so the default dev
+//! loop must send zero. Pass `--stamp-trigger-time` to stamp it with the current
+//! RosTime at publish — the publish-domain anchor a `--time-source publish` run
+//! centres its window on.
 //!
 //! Flags (all optional):
 //!
 //! ```text
-//! --period <secs>       seconds between triggers          (default 1)
-//! --preroll <ns>        nanoseconds kept before the stamp (default: random per trigger)
-//! --postroll <ns>       nanoseconds kept after the stamp  (default: random per trigger)
-//! --name <prefix>       trigger name prefix; a counter is appended (default "periodic")
-//! --description <text>  free-form description carried in the trigger
+//! --period <secs>        seconds between triggers          (default 1)
+//! --preroll <ns>         nanoseconds kept before the anchor (default: random per trigger)
+//! --postroll <ns>        nanoseconds kept after the anchor  (default: random per trigger)
+//! --name <prefix>        trigger name prefix; a counter is appended (default "periodic")
+//! --description <text>   free-form description carried in the trigger
+//! --stamp-trigger-time   stamp trigger_time with RosTime at publish (for
+//!                        --time-source publish); off by default (trigger_time=0)
 //! ```
 //!
 //! When `--preroll`/`--postroll` are omitted, each trigger draws a fresh window
@@ -40,6 +47,10 @@ struct Args {
     postroll: Option<u64>,
     name: String,
     description: String,
+    /// Stamp `trigger_time` with RosTime at publish. Off by default: only
+    /// `--interface ros --time-source publish` reads `trigger_time`; the other
+    /// cells reject a non-zero one, so the default sends zero.
+    stamp_trigger_time: bool,
 }
 
 impl Default for Args {
@@ -50,6 +61,7 @@ impl Default for Args {
             postroll: None,
             name: "periodic".to_string(),
             description: "periodic test trigger".to_string(),
+            stamp_trigger_time: false,
         }
     }
 }
@@ -67,6 +79,7 @@ fn parse_args() -> Args {
             "--postroll" => args.postroll = Some(value().parse().expect("--postroll: u64 ns")),
             "--name" => args.name = value(),
             "--description" => args.description = value(),
+            "--stamp-trigger-time" => args.stamp_trigger_time = true,
             other => panic!("unknown flag: {other}"),
         }
     }
@@ -93,7 +106,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "/events/momentedge/trigger",
         QosProfile::default(),
     )?;
-    // RosTime clock: the trigger_time stamp the recorder centres its window on.
+    // RosTime clock — sampled into trigger_time only when --stamp-trigger-time
+    // is set (the publish-domain anchor).
     let mut clock = r2r::Clock::create(r2r::ClockType::RosTime)?;
 
     let describe_roll = |fixed: Option<u64>| match fixed {
@@ -113,8 +127,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut counter: u64 = 0;
     loop {
-        let now = clock.get_now()?;
-        let trigger_time = r2r::Clock::to_builtin_time(&now);
+        // Zero unless --stamp-trigger-time: clipper reads trigger_time only under
+        // --interface ros --time-source publish and rejects a non-zero one in
+        // every other cell.
+        let trigger_time = if args.stamp_trigger_time {
+            r2r::Clock::to_builtin_time(&clock.get_now()?)
+        } else {
+            r2r::builtin_interfaces::msg::Time { sec: 0, nanosec: 0 }
+        };
         let name = format!("{}-{counter}", args.name);
         let preroll = resolve_roll(args.preroll);
         let postroll = resolve_roll(args.postroll);

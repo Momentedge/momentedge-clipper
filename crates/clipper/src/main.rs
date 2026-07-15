@@ -74,7 +74,7 @@ use std::time::Duration;
 use anyhow::Context;
 use clap::{CommandFactory, FromArgMatches, Parser, ValueEnum};
 use crossbeam_channel::{Receiver, Sender, bounded, select, unbounded};
-use interface::{Interface, McapInterface, RosInterface};
+use interface::{Anchor, Interface, McapInterface, RosInterface};
 use log::{error, info, warn};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use supervision::{Supervised, harvest_panic, spawn_supervised};
@@ -165,6 +165,38 @@ impl std::fmt::Display for InterfaceKind {
     }
 }
 
+/// The clock domain a clip's whole window lives in, chosen by `--time-source`.
+/// It governs the anchor, which messages fall inside the window, which extents
+/// are read, and the coverage a handler waits on — and nothing else (retention
+/// ages files on `log_time`, the postroll floor is the wall clock). clipper
+/// never interprets what a producer wrote into `publish_time`; it windows on
+/// whatever is there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+pub(crate) enum TimeSource {
+    /// Window on each message's `log_time` — when the producer received it.
+    /// Approximately non-decreasing in file order, so coverage on it is a
+    /// completeness proof. The default.
+    #[default]
+    Log,
+    /// Window on each message's `publish_time` — whatever the producer put
+    /// there (a DDS source timestamp, a capture time). Publish times may arrive
+    /// out of order, so coverage on it is a liveness signal, not a completeness
+    /// proof: a message can land after the cut with an in-window `publish_time`
+    /// and be lost. `--grace-secs` bounds the wait.
+    Publish,
+}
+
+impl std::fmt::Display for TimeSource {
+    /// Render as the clap value name (`log`/`publish`) so the `--help` default
+    /// and the accepted flag values share the `ValueEnum` possible-value names.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.to_possible_value()
+            .expect("no TimeSource variant is skipped")
+            .get_name()
+            .fmt(f)
+    }
+}
+
 /// Recorder configuration, parsed by clap from CLI flags with a `MOMENTEDGE_*`
 /// environment-variable fallback per field (see [`load_config`]). The field doc
 /// comments are the `--help` text: the first line is the short help, the rest is
@@ -217,6 +249,19 @@ struct Config {
     /// node, subscription, or publish. Exactly one interface is active per run.
     #[arg(long, value_enum, default_value_t = InterfaceKind::Ros)]
     interface: InterfaceKind,
+
+    /// Clock domain the clip window lives in: `log` or `publish`.
+    ///
+    /// `log` (the default) windows on each message's `log_time` — when the
+    /// producer received it — the completeness-proof clock. `publish` windows on
+    /// each message's `publish_time` — whatever the producer wrote there (a DDS
+    /// source timestamp, a capture time); clipper never interprets it. Publish
+    /// times can arrive out of order, so a message may land after the cut with an
+    /// in-window `publish_time` and be lost — `--grace-secs` bounds the wait.
+    /// The flag governs the anchor, window membership, extent selection, and the
+    /// coverage a handler waits on; retention still ages files on `log_time`.
+    #[arg(long, value_enum, default_value_t = TimeSource::Log)]
+    time_source: TimeSource,
 
     /// Seconds to keep a finished recording indexed (and its fd open) for clip
     /// preroll.
@@ -378,8 +423,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // One staging worker per allowed concurrent clip copy; see
     // Config::extract_parallelism. The clip compression codec is process-global,
     // captured in the workers.
-    let extract_tx =
-        handler::spawn_stage_workers(cfg.extract_parallelism, cfg.clip_compression.to_mcap());
+    let extract_tx = handler::spawn_stage_workers(
+        cfg.extract_parallelism,
+        cfg.clip_compression.to_mcap(),
+        cfg.time_source,
+    );
 
     // Admission gate for trigger handlers; see [`Admission`].
     let admission = Admission::new(MAX_ACTIVE_TRIGGERS);
@@ -402,17 +450,125 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let result = match cfg.interface {
         InterfaceKind::Ros => {
             let (tailer, coverage) = Tailer::new();
-            let iface = RosInterface::new(TRIGGER_TOPIC, RECORDED_TOPIC)?;
+            let iface = RosInterface::new(TRIGGER_TOPIC, RECORDED_TOPIC, cfg.time_source)?;
             drive(iface, cfg, tailer, coverage, extract_tx, admission)
         }
         InterfaceKind::Mcap => {
             let (tx, rx) = unbounded();
             let (tailer, coverage) = Tailer::with_trigger_tap(TRIGGER_TOPIC, tx);
-            let iface = McapInterface::new(TRIGGER_TOPIC, rx);
+            let iface = McapInterface::new(TRIGGER_TOPIC, rx, cfg.time_source);
             drive(iface, cfg, tailer, coverage, extract_tx, admission)
         }
     };
     result.map_err(Into::into)
+}
+
+/// The largest `preroll` or `postroll` a trigger may request, in nanoseconds
+/// (30 minutes). A window wider than this is a malformed or runaway request, not
+/// a real clip; the cap bounds how far a cut reaches back into the retained
+/// recordings and how long a handler parks. The exact value is accepted.
+const MAX_ROLL_NS: u64 = 1_800_000_000_000; // 30 * 60 * 1e9
+
+/// The largest amount a resolved anchor may sit in the future of `now`, in
+/// nanoseconds (30 minutes — the same horizon as [`MAX_ROLL_NS`], since both
+/// bound how long one trigger can wedge a handler). The anchor drives the
+/// postroll wall-floor sleep (`anchor + postroll`), so an anchor far in the
+/// future parks a handler for that long; a wildly future anchor is a producer
+/// clock fault or a hostile record stamp, never a real request. The guard is on
+/// the *resolved* anchor, whatever cell produced it: `--interface ros
+/// --time-source log` resolves it to `now` and always passes, while a
+/// `ros`+`publish` `trigger_time` or a tail record's own stamp is exactly what it
+/// bites on.
+const MAX_ANCHOR_FUTURE_SKEW_NS: u64 = 1_800_000_000_000; // 30 * 60 * 1e9
+
+/// The largest trigger `name`, in bytes. The name is embedded in the clip
+/// pathname `<anchor_ns>_<name>.mcap`, so it is bounded and kept filename-safe
+/// (see [`validate_name`]).
+const MAX_TRIGGER_NAME_LEN: usize = 128;
+
+/// The trigger-admission gate: whether a resolved trigger is cut into a clip, or
+/// the reason it is rejected. Every incoming trigger passes through here (in the
+/// interface-fired callback) before any handler work; a rejection logs at
+/// `error!` and produces no clip and no `Recorded`. `now_ns` is the current
+/// system clock, passed in so the gate stays a pure function (the future-skew
+/// guard is the only clock-relative check). The checks, any one of which
+/// rejects:
+///
+/// - **`trigger_time` in a cell that ignores it.** Exactly one cell of the
+///   interface × `--time-source` matrix reads `trigger_time` — `--interface ros
+///   --time-source publish`, where it *is* the anchor ([`Anchor::from_trigger_time`]);
+///   every other cell anchors on a transport stamp. Sending `trigger_time` where
+///   it is ignored would silently anchor the window on the trigger's arrival
+///   rather than the requested instant, so it is refused loudly. `trigger_time == 0`
+///   is always accepted.
+/// - **`preroll`/`postroll` past [`MAX_ROLL_NS`].**
+/// - **A resolved anchor more than [`MAX_ANCHOR_FUTURE_SKEW_NS`] past `now`.**
+///   The anchor — not `trigger_time` specifically — is the guarded value, since
+///   it is what parks a handler through its postroll sleep whatever cell resolved
+///   it.
+/// - **A `name` that is empty, past [`MAX_TRIGGER_NAME_LEN`], or unsafe to embed
+///   in the clip pathname** (see [`validate_name`]).
+fn validate_trigger(trig: &Trigger, anchor: Anchor, now_ns: u64) -> Result<(), String> {
+    if !anchor.from_trigger_time && trig.trigger_time.ns() != 0 {
+        return Err(format!(
+            "name={:?} sets trigger_time={} but the active interface and \
+             --time-source anchor on a transport stamp and ignore it; send \
+             trigger_time=0",
+            trig.name,
+            trig.trigger_time.ns(),
+        ));
+    }
+    if trig.preroll > MAX_ROLL_NS {
+        return Err(format!(
+            "name={:?} preroll={} ns exceeds the {MAX_ROLL_NS} ns maximum",
+            trig.name, trig.preroll,
+        ));
+    }
+    if trig.postroll > MAX_ROLL_NS {
+        return Err(format!(
+            "name={:?} postroll={} ns exceeds the {MAX_ROLL_NS} ns maximum",
+            trig.name, trig.postroll,
+        ));
+    }
+    if anchor.ns > now_ns.saturating_add(MAX_ANCHOR_FUTURE_SKEW_NS) {
+        return Err(format!(
+            "name={:?} anchor {} ns is more than {MAX_ANCHOR_FUTURE_SKEW_NS} ns \
+             past now ({now_ns} ns)",
+            trig.name, anchor.ns,
+        ));
+    }
+    if let Err(why) = validate_name(&trig.name) {
+        return Err(format!("name={:?} {why}", trig.name));
+    }
+    Ok(())
+}
+
+/// Reject a trigger `name` that cannot be safely embedded in the clip pathname
+/// `<anchor_ns>_<name>.mcap`. [`handler::sanitize`] maps stray characters to `_`
+/// at clip creation, but structural hazards — an empty name, a path separator or
+/// NUL, a leading dot (a hidden file), or an embedded `..` (a parent-directory
+/// escape) — are refused whole here rather than silently rewritten, so a
+/// malformed request never reaches the filesystem in a surprising shape.
+fn validate_name(name: &str) -> Result<(), &'static str> {
+    if name.is_empty() {
+        return Err("is empty");
+    }
+    if name.len() > MAX_TRIGGER_NAME_LEN {
+        return Err("exceeds the name length limit");
+    }
+    if name.contains('\0') {
+        return Err("contains a NUL byte");
+    }
+    if name.contains('/') || name.contains('\\') {
+        return Err("contains a path separator");
+    }
+    if name.starts_with('.') {
+        return Err("starts with a dot");
+    }
+    if name.contains("..") {
+        return Err("contains '..'");
+    }
+    Ok(())
 }
 
 /// Wire one interface to the tail and run the recorder for the process's
@@ -441,21 +597,33 @@ fn drive<I: Interface>(
     // The callback the interface fires per decoded Trigger. `Fn` + `Send`: it is
     // moved into the single interface thread and called from there, never shared.
     let fire = {
-        // The seam: the handler half reads only these two settings, so unpack
-        // them here rather than handing the CLI parser's `Config` down.
+        // The seam: the handler half reads only these settings, so unpack them
+        // here rather than handing the CLI parser's `Config` down. The interface
+        // resolves each trigger's `anchor_ns` (the window centre) — the ROS
+        // interface from `trigger_time`, the MCAP interface from the trigger
+        // record's own stamp on the active `--time-source` — and the handler
+        // takes that resolved anchor rather than re-deriving one.
         let out_dir = cfg.out_dir.clone();
         let grace = cfg.grace();
+        let time_source = cfg.time_source;
         let tailer = tailer.clone();
         let coverage = coverage.clone();
         let extract_tx = extract_tx.clone();
         let admission = admission.clone();
-        move |trig: Trigger| {
+        move |trig: Trigger, anchor: Anchor| {
+            // The single validation gate every resolved trigger passes before a
+            // handler is spawned. A rejected trigger cuts no clip and announces
+            // nothing — the `error!` log is its only trace.
+            if let Err(reason) = validate_trigger(&trig, anchor, trigger::now_ns()) {
+                error!("trigger rejected: {reason}");
+                return;
+            }
+            let anchor_ns = anchor.ns;
             let Some(permit) = admission.clone().try_acquire() else {
                 error!(
                     "trigger rejected: all {MAX_ACTIVE_TRIGGERS} trigger handlers are busy; \
-                     ignoring name={:?} trigger_time={}",
+                     ignoring name={:?} anchor={anchor_ns}",
                     trig.name,
-                    trig.trigger_time.ns(),
                 );
                 return;
             };
@@ -468,11 +636,12 @@ fn drive<I: Interface>(
             // does not tear down the interface loop, and a panic dies with the
             // handler's own thread (its permit returns on drop either way).
             let spawned = thread::Builder::new()
-                .name(format!("trigger-{}", trig.trigger_time.ns()))
+                .name(format!("trigger-{anchor_ns}"))
                 .spawn(move || {
                     let _permit = permit;
                     if let Err(e) = handler::handle_trigger(
-                        trig, &out_dir, grace, tailer, coverage, extract_tx, announcer,
+                        trig, anchor_ns, &out_dir, grace, tailer, coverage, extract_tx, announcer,
+                        time_source,
                     ) {
                         error!("trigger handling failed: {e:#}");
                     }
@@ -594,6 +763,7 @@ mod tests {
         assert_eq!(cfg.grace(), Duration::from_secs(30));
         assert_eq!(cfg.extract_parallelism, 1);
         assert_eq!(cfg.clip_compression, ClipCompression::Zstd);
+        assert_eq!(cfg.time_source, TimeSource::Log);
     }
 
     #[test]
@@ -612,6 +782,8 @@ mod tests {
             "lz4",
             "--interface",
             "mcap",
+            "--time-source",
+            "publish",
             "--watch-old-files-duration",
             "90",
             "--delete-old-files",
@@ -623,6 +795,7 @@ mod tests {
         assert_eq!(cfg.extract_parallelism, 3);
         assert_eq!(cfg.clip_compression, ClipCompression::Lz4);
         assert_eq!(cfg.interface, InterfaceKind::Mcap);
+        assert_eq!(cfg.time_source, TimeSource::Publish);
         assert_eq!(cfg.watch_old_files(), Duration::from_secs(90));
         assert!(cfg.delete_old_files);
     }
@@ -652,7 +825,7 @@ mod tests {
             bound += 1;
         }
         assert_eq!(
-            bound, 8,
+            bound, 9,
             "every Config field is bound (update on a new field)"
         );
     }
@@ -673,6 +846,24 @@ mod tests {
             InterfaceKind::Mcap
         );
         assert!(parse_from(["clipper", "--interface", "bogus"]).is_err());
+    }
+
+    #[test]
+    fn config_time_source_defaults_to_log_and_parses_publish() {
+        // Default is the log domain; --time-source selects publish; an unknown
+        // value is rejected. (Its MOMENTEDGE_TIME_SOURCE env fallback is covered
+        // by env_prefix_binds_a_momentedge_name_to_every_field.)
+        assert_eq!(
+            parse_from(["clipper"]).unwrap().time_source,
+            TimeSource::Log
+        );
+        assert_eq!(
+            parse_from(["clipper", "--time-source", "publish"])
+                .unwrap()
+                .time_source,
+            TimeSource::Publish
+        );
+        assert!(parse_from(["clipper", "--time-source", "bogus"]).is_err());
     }
 
     #[test]
@@ -923,5 +1114,168 @@ mod tests {
             "the panicked handler's permit must be free again"
         );
         Ok(())
+    }
+
+    /// A representative "now" for the pure-function gate tests — far past every
+    /// small anchor the trigger_time tests use, so only the future-skew tests
+    /// approach the horizon.
+    const TEST_NOW: u64 = 1_000_000_000_000_000_000;
+
+    /// An admissible anchor at `TEST_NOW` from a transport stamp (not
+    /// `trigger_time`): the shape the field tests vary one axis away from.
+    fn valid_anchor() -> Anchor {
+        Anchor {
+            ns: TEST_NOW,
+            from_trigger_time: false,
+        }
+    }
+
+    /// A fully valid domain `Trigger` — accepted by `validate_trigger` with
+    /// `valid_anchor()` at `TEST_NOW`; a test mutates one field to probe a bound.
+    fn valid_trigger() -> Trigger {
+        Trigger {
+            name: "evt".to_string(),
+            description: String::new(),
+            trigger_time: trigger::Stamp { sec: 0, nanosec: 0 },
+            preroll: 0,
+            postroll: 0,
+        }
+    }
+
+    /// [`valid_trigger`] with a chosen `trigger_time`, for the matrix cell tests.
+    fn trigger_with_time(trigger_time_ns: u64) -> Trigger {
+        Trigger {
+            trigger_time: trigger::Stamp {
+                sec: (trigger_time_ns / 1_000_000_000) as i32,
+                nanosec: (trigger_time_ns % 1_000_000_000) as u32,
+            },
+            ..valid_trigger()
+        }
+    }
+
+    /// A cell that ignores `trigger_time` (the anchor is not `from_trigger_time`
+    /// — ros+log, mcap+log, mcap+publish) rejects a non-zero `trigger_time` and
+    /// accepts zero.
+    #[test]
+    fn validate_rejects_trigger_time_in_an_ignoring_cell() {
+        let ignoring = Anchor {
+            ns: 5,
+            from_trigger_time: false,
+        };
+        assert!(
+            validate_trigger(&trigger_with_time(0), ignoring, TEST_NOW).is_ok(),
+            "trigger_time=0 is accepted where the field is ignored"
+        );
+        assert!(
+            validate_trigger(&trigger_with_time(7_000_000_250), ignoring, TEST_NOW).is_err(),
+            "a non-zero trigger_time is rejected where the field is ignored"
+        );
+    }
+
+    /// The one reading cell (ros+publish, the anchor *is* `from_trigger_time`)
+    /// accepts any `trigger_time` — it is the window anchor there.
+    #[test]
+    fn validate_accepts_trigger_time_in_the_reading_cell() {
+        let reading = Anchor {
+            ns: 7_000_000_250,
+            from_trigger_time: true,
+        };
+        assert!(validate_trigger(&trigger_with_time(7_000_000_250), reading, TEST_NOW).is_ok());
+        assert!(
+            validate_trigger(&trigger_with_time(0), reading, TEST_NOW).is_ok(),
+            "trigger_time=0 anchors the window at the epoch, but that is the \
+             publisher's choice, not a rejected one"
+        );
+    }
+
+    /// `preroll` and `postroll` are each accepted exactly at [`MAX_ROLL_NS`] and
+    /// rejected one nanosecond above it.
+    #[test]
+    fn validate_bounds_preroll_and_postroll() {
+        let ok = |trig: &Trigger| validate_trigger(trig, valid_anchor(), TEST_NOW).is_ok();
+
+        let mut t = valid_trigger();
+        t.preroll = MAX_ROLL_NS;
+        assert!(ok(&t), "preroll exactly at the maximum is accepted");
+        t.preroll = MAX_ROLL_NS + 1;
+        assert!(!ok(&t), "preroll one ns over the maximum is rejected");
+
+        let mut t = valid_trigger();
+        t.postroll = MAX_ROLL_NS;
+        assert!(ok(&t), "postroll exactly at the maximum is accepted");
+        t.postroll = MAX_ROLL_NS + 1;
+        assert!(!ok(&t), "postroll one ns over the maximum is rejected");
+    }
+
+    /// The future-skew guard is on the *resolved anchor*: accepted exactly at the
+    /// horizon, rejected beyond it, whatever cell produced the anchor.
+    #[test]
+    fn validate_guards_the_resolved_anchor_against_future_skew() {
+        let check = |anchor: Anchor| validate_trigger(&valid_trigger(), anchor, TEST_NOW);
+        let at = |ns: u64, from_trigger_time: bool| Anchor {
+            ns,
+            from_trigger_time,
+        };
+
+        assert!(
+            check(at(TEST_NOW + MAX_ANCHOR_FUTURE_SKEW_NS, false)).is_ok(),
+            "an anchor exactly at the future horizon is accepted"
+        );
+        assert!(
+            check(at(TEST_NOW + MAX_ANCHOR_FUTURE_SKEW_NS + 1, false)).is_err(),
+            "an anchor one ns past the horizon is rejected"
+        );
+        // The guard bites whatever cell resolved the anchor — a pathological
+        // far-future ros+publish `trigger_time` and a hostile mcap record stamp
+        // alike.
+        let far_future = TEST_NOW + 10 * MAX_ANCHOR_FUTURE_SKEW_NS;
+        assert!(
+            check(at(far_future, true)).is_err(),
+            "a far-future ros+publish trigger_time anchor is rejected"
+        );
+        assert!(
+            check(at(far_future, false)).is_err(),
+            "a far-future mcap record-stamp anchor is rejected"
+        );
+        assert!(
+            check(at(TEST_NOW - 1, false)).is_ok(),
+            "a past anchor is fine"
+        );
+    }
+
+    /// A trigger `name` is accepted plain and exactly at [`MAX_TRIGGER_NAME_LEN`],
+    /// and rejected when over-length, empty, or carrying a filename hazard (a
+    /// path separator, NUL, leading dot, or embedded `..`).
+    #[test]
+    fn validate_rejects_unsafe_and_oversized_names() {
+        let with_name = |name: &str| {
+            let mut t = valid_trigger();
+            t.name = name.to_string();
+            validate_trigger(&t, valid_anchor(), TEST_NOW)
+        };
+
+        assert!(with_name("evt-1").is_ok(), "a plain name is accepted");
+        assert!(
+            with_name(&"a".repeat(MAX_TRIGGER_NAME_LEN)).is_ok(),
+            "a name exactly at the length limit is accepted"
+        );
+        assert!(
+            with_name(&"a".repeat(MAX_TRIGGER_NAME_LEN + 1)).is_err(),
+            "a name one byte over the limit is rejected"
+        );
+        assert!(with_name("").is_err(), "an empty name is rejected");
+        assert!(with_name("a/b").is_err(), "a path separator is rejected");
+        assert!(with_name("a\\b").is_err(), "a backslash is rejected");
+        assert!(with_name("a\0b").is_err(), "a NUL byte is rejected");
+        assert!(with_name(".hidden").is_err(), "a leading dot is rejected");
+        assert!(with_name("..").is_err(), "'..' is rejected");
+        assert!(
+            with_name("../escape").is_err(),
+            "path traversal is rejected"
+        );
+        assert!(
+            with_name("a..b").is_err(),
+            "an embedded '..' is rejected"
+        );
     }
 }

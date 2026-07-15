@@ -10,9 +10,9 @@ ros2 bag record (scripts/record.sh) ──▶ ./record/<bag>_0.mcap   (one growi
         ▲ each file discovered, kept open, and tailed (incremental scan)
 clipper ◀── trigger ── EITHER /events/momentedge/trigger (ros interface)
         │              OR read out of the tailed ./record/*.mcap (mcap interface)
-        │ cuts [trigger_time-preroll, trigger_time+postroll]
-        │   one recording  → ./clipped/<trigger_ns>_<name>.mcap
-        │   rollover split → ./clipped/<trigger_ns>_<name>_00.mcap + _01.mcap …
+        │ cuts [anchor-preroll, anchor+postroll]  (anchor resolved per cell)
+        │   one recording  → ./clipped/<anchor_ns>_<name>.mcap
+        │   rollover split → ./clipped/<anchor_ns>_<name>_00.mcap + _01.mcap …
         └──▶ completion: ros → /events/momentedge/recorded (filenames[] lists
              every segment); mcap → the clip's atomic move into ./clipped is
              the only signal (no Recorded published)
@@ -45,13 +45,35 @@ Two properties carry the whole design:
    file is indistinguishable from a crash-truncated one, which MCAP readers are
    designed to tolerate.
 
+Both properties are a producer requirement in disguise — append complete
+records, never seek back to rewrite one (the producer-facing statement lives in
+[ARCHITECTURE.md](../../ARCHITECTURE.md#tailing-a-live-mcap)). The Rust `mcap`
+crate's chunked writer (`use_chunks(true)`, its default) is exactly the
+violation: it leaves a `Chunk` header's length as the placeholder `u64::MAX`
+until the chunk closes and the true length is back-patched in, so a `len >
+MAX_RECORD_LEN` framing fault (below) is guaranteed the moment the scan meets
+one mid-write. Because `u64::MAX` is a value only a seek-back writer's
+placeholder could ever produce — no valid record reaches it under
+`MAX_RECORD_LEN` — that one length is special-cased to name the cause instead
+of reading as bare corruption: "record at offset {offset} declares u64::MAX
+bytes — an unpatched length from a seek-back (chunked) writer? such a recording
+cannot be tailed until it is finalised". This is also why the scan never waits
+out an over-`MAX_RECORD_LEN` length instead of faulting on it: `u64::MAX` (or
+anything else past the ceiling) has no path to becoming a valid record, so
+retrying it as though it were a transient stall would only delay the identical
+fault. Treating it as fatal once the retry budget below is exhausted is the
+deliberate choice: the alternative — waiting it out — would silently degrade
+every clip to a grace-timeout cut instead of failing fast.
+
 The tail keeps the recording open and never re-reads consumed bytes. Each pass
 yields three artefacts, shared with the per-trigger handlers:
 
-- **Extent index** — contiguous byte ranges (closed at 4 MiB) with the min/max
-  message `log_time` they hold. Extraction reads only the extents overlapping
-  its window; the overlap test is exact (real min/max, not a heuristic), so no
-  in-window message can be missed.
+- **Extent index** — contiguous byte ranges (closed at 4 MiB) carrying the
+  min/max `log_time` and `publish_time` of the messages they hold. Extraction
+  reads only the extents whose span on the active [time source](#time-source)
+  overlaps its window; the overlap test is exact on both spans (real min/max,
+  not a heuristic), so no in-window message can be missed on either clock
+  domain. Retention ages on the `log` span alone.
 - **Schema/channel registry** — owned copies of every `Schema`/`Channel`
   record, keyed by channel ID (unique within one continuous file). The MCAP
   spec puts a Schema before any Channel referencing it, so resolution always
@@ -61,22 +83,35 @@ yields three artefacts, shared with the per-trigger handlers:
   (zstd, lz4 and uncompressed chunks all work — mcap's default features);
   the default fastwrite profile is unchunked and skips that cost entirely.
 - **Coverage watch** — a `Watch<Coverage>` (`Mutex` + `Condvar`, `src/watch.rs`)
-  holding the collection-wide highest `log_time` (`high_water_ns`). Sound
-  because messages land in the file in (approximately) non-decreasing `log_time`
-  order — rosbag2's single writer stamps `log_time` at receive — and because the
-  tail scans recordings strictly oldest-first, one at a time, so a later
-  recording's coverage cannot advance before an earlier one is complete.
+  holding a collection-wide high-water per source: the highest `log_time`
+  (`high_water_ns`) and the highest `publish_time` (`publish_high_water_ns`). A
+  handler waits on the high-water of its window's [time source](#time-source).
+  The `log` high-water is a completeness proof — messages land in the file in
+  (approximately) non-decreasing `log_time` order (rosbag2's single writer stamps
+  `log_time` at receive) and the tail scans recordings strictly oldest-first, one
+  at a time, so a later recording's coverage cannot advance before an earlier one
+  is complete. The `publish` high-water is a liveness signal only: `publish_time`
+  has no ordering guarantee, so a message can arrive after a cut with an in-window
+  `publish_time` and be missing from that clip. Both rise independently and never
+  regress (the watch only raises each).
 
-Per top-level `Message` record only the 14-byte prefix is read (channel id,
-sequence, `log_time`); bodies are first touched at extraction. The same
-"decode only the timestamp" discipline as the rest of the workspace, applied
-to file tailing.
+Per top-level `Message` record only the 22-byte fixed header is read, in one
+read (channel id, sequence, `log_time`, `publish_time`); bodies are first
+touched at extraction. Both stamps are indexed so a window can live on either
+[time source](#time-source); the gap between the two — recorder queue backlog
+plus producer clock skew — is also observable (logged per scan pass at debug). A
+record too short
+to hold the full 22-byte header is skipped like other localized damage: warned
+and consumed via its intact framing, contributing to neither bounds nor
+coverage. The same "decode only the timestamps" discipline as the rest of the
+workspace, applied to file tailing.
 
 The one exception is an **opt-in trigger tap**, enabled only under the `mcap`
 interface (`Tailer::with_trigger_tap`). With the tap on, the scan additionally
 reads the *full body* of every message on the configured trigger topic, lifting
-it as a raw `(message_encoding, body, log_time)` triple the MCAP interface
-decodes by `message_encoding`; the tap learns the trigger topic's channel IDs
+it as a raw `(message_encoding, body, log_time, publish_time)` quadruple the
+MCAP interface decodes by `message_encoding` — the two record stamps are what
+the mcap interface resolves its anchor from; the tap learns the trigger topic's channel IDs
 from the same registry pass, so a body is read only for a message it has already
 matched to that topic. With the tap disabled — the `ros` interface, the default
 — the scan is byte-for-byte the timestamp-only walk above: no message body is
@@ -153,28 +188,32 @@ silently skipped; the iterator has already advanced past it.
 Each admitted trigger is handled on its own thread, so overlapping windows are
 cut concurrently against the shared tail. The handler (`handler.rs`) is generic
 over the [`Announce`](#the-interface-abstraction) the active interface supplies
-and knows only the neutral `Trigger`/`Completion` contract — nothing of ROS or
-any wire encoding. Admission is bounded: at most `MAX_ACTIVE_TRIGGERS` (16)
-handlers may be active at once, and a trigger that arrives while all of them are
-is rejected — logged with `error!` and otherwise ignored: no handler runs, no
-clip is extracted, and no completion is announced.
+and knows only the neutral `Trigger`/`Completion` contract plus the window's
+`anchor_ns` and [time source](#time-source) — nothing of ROS or any wire
+encoding. The interface resolves the `anchor_ns` (the window centre) and hands it
+in; the handler never derives an anchor itself. Admission is bounded: at most
+`MAX_ACTIVE_TRIGGERS` (16) handlers may be active at once, and a trigger that
+arrives while all of them are is rejected — logged with `error!` and otherwise
+ignored: no handler runs, no clip is extracted, and no completion is announced.
 
 1. **Wait out the postroll.** Sleep until the system clock passes
-   `trigger_time + postroll`. `checked_sub` reads the clock once per
-   iteration, so a clock that crosses `end_ns` between the check and the sleep
-   cannot underflow.
-2. **Wait for coverage.** Block on the collection-wide coverage watch until
-   `high_water_ns >= end_ns`. A grace timeout (`grace_secs`, default 30 s)
-   bounds the wait; on timeout the clip is cut from what exists, with a
-   warning. A window whose end falls inside an already-scanned recording is
-   satisfied as soon as the scan reaches `end_ns` (or at the footer), so
-   only a window whose end is past the last recorded message with no successor
-   waits out the full grace. The grace must exceed the recorder's flush
-   latency: near zero for the fastwrite profile, roughly one chunk fill
-   (chunk size / aggregate data rate) for chunked profiles.
-3. **Multi-file snapshot.** Call `tailer.plan_window(start_ns, end_ns)` once,
-   producing a `Vec<WindowPlan>` — one plan per recording whose extents overlap
-   the window, oldest first. Each plan carries its own `Arc<File>` clone, so a
+   `anchor + postroll`. The wall floor is always the system clock, whatever the
+   time source. `checked_sub` reads the clock once per iteration, so a clock that
+   crosses `end_ns` between the check and the sleep cannot underflow.
+2. **Wait for coverage.** Block on the collection-wide coverage watch until the
+   window's source high-water reaches `end_ns` (`c.for_source(time_source)`). A
+   grace timeout (`grace_secs`, default 30 s) bounds the wait; on timeout the clip
+   is cut from what exists, with a warning. On `log` a window whose end falls
+   inside an already-scanned recording is satisfied as soon as the scan reaches
+   `end_ns` (or at the footer), so only a window whose end is past the last
+   recorded message with no successor waits out the full grace; on `publish` the
+   high-water is a liveness signal, so a later out-of-order message can still be
+   missed. The grace must exceed the recorder's flush latency: near zero for the
+   fastwrite profile, roughly one chunk fill (chunk size / aggregate data rate)
+   for chunked profiles.
+3. **Multi-file snapshot.** Call `tailer.plan_window(start_ns, end_ns,
+   time_source)` once, producing a `Vec<WindowPlan>` — one plan per recording
+   whose extents overlap the window on the active time source, oldest first. Each plan carries its own `Arc<File>` clone, so a
    retention prune or rollover after this snapshot cannot pull the bytes out.
 4. **Stage** via the staging worker pool (`extract_parallelism` `stage-N`
    threads, default 1): one `StageJob` per plan is enqueued on the shared FIFO
@@ -184,7 +223,7 @@ clip is extracted, and no completion is announced.
    produces a valid (possibly empty) clip.
 5. **Publish.** Empty segments are dropped when the window produced real data
    elsewhere (one is kept if all are empty). The count determines naming: a
-   single segment keeps the bare `<trigger_ns>_<name>.mcap`; multiple segments
+   single segment keeps the bare `<anchor_ns>_<name>.mcap`; multiple segments
    get `<base>_00.mcap`, `<base>_01.mcap`, … Each is atomically published into
    `out_dir` via `hard_link` + unlink.
 6. **Announce** a single `Completion` (the trigger echo plus all segment paths)
@@ -277,13 +316,71 @@ into clips as-is — only a CDR decode downstream would notice.
 
 ## Time base
 
-`log_time`, the trigger stamp, and the wait clock are all nanoseconds on the
-system clock — this assumes the default (no `use_sim_time`). The trigger stamp
-is the neutral `Stamp` (`trigger.rs`), a `builtin_interfaces/Time` flattened to
-its `sec`/`nanosec` fields free of `r2r`; `Stamp::ns()` flattens it to that
-scale (`sec.max(0) * 1e9 + nanosec`, negative seconds clamped to 0). The same
-arithmetic anchors the window identically whether the trigger arrived live over
-ROS or was decoded out of the tailed MCAP.
+`log_time`, `publish_time`, the trigger stamp, and the wait clock are all
+nanoseconds on the system clock — this assumes the default (no `use_sim_time`).
+The trigger stamp is the neutral `Stamp` (`trigger.rs`), a
+`builtin_interfaces/Time` flattened to its `sec`/`nanosec` fields free of `r2r`;
+`Stamp::ns()` flattens it to that scale (`sec.max(0) * 1e9 + nanosec`, negative
+seconds clamped to 0). The same arithmetic anchors the window identically whether
+the trigger arrived live over ROS or was decoded out of the tailed MCAP.
+
+## Time source
+
+`--time-source` (`log` or `publish`, default `log`; `TimeSource` in `main.rs`,
+threaded through the handler, tail, and clip) picks the clock domain the whole
+window lives in: the anchor, which messages fall inside, which extents are read
+(`Extent::overlaps` / `plan_window` on the source's `Span`), and which coverage
+high-water the wait blocks on (`Coverage::for_source`). It governs nothing else —
+retention ages files on `log_time` (`TimeBounds.log.max`) whatever the window's
+source, and the postroll floor is the wall clock. clipper never interprets
+`publish_time`; it windows on the raw value, so `publish` coverage is a liveness
+signal, not a completeness proof (out-of-order publish times are normal). On ROS 2
+Humble `publish_time = log_time` verbatim, so `publish` is a no-op there.
+
+**The anchor seam.** The interface resolves each trigger's [`Anchor`] (in
+`interface.rs`) — the instant the window centres on, plus whether it came from
+`trigger_time` — and passes it to the driver's `fire` callback, which hands
+`anchor.ns` to `handle_trigger` for both the window bounds and the output name
+`<anchor_ns>_<name>.mcap`. The four interface × `--time-source` cells resolve it:
+
+|                    | `--time-source log`             | `--time-source publish`      |
+| ------------------ | ------------------------------- | ---------------------------- |
+| **`--interface ros`**  | `now_ns()` at the subscription | the trigger's `trigger_time` |
+| **`--interface mcap`** | the record's `log_time`        | the record's `publish_time`  |
+
+`resolve_ros_anchor` and `resolve_mcap_anchor` (in `interface.rs`) do the
+resolution; a live ROS trigger has no record stamp and r2r surfaces no wire
+timestamp, so ROS anchors on `now` or the publisher's `trigger_time`. The
+`Completion` echoes the trigger's `trigger_time` unchanged.
+
+**The admission gate.** `validate_trigger(trig, anchor, now_ns)` in `main.rs` is
+the single gate every resolved trigger passes in the `fire` callback before any
+handler work — a pure function (the clock is passed in) so its cases are
+exhaustively unit-tested. Any failing check logs at `error!` and drops the
+trigger: no handler spawned, no clip, no `Recorded`. All limits are named consts
+in `main.rs`; each value exactly at its bound is accepted:
+
+- **`trigger_time` in a cell that ignores it.** `trigger_time` is read in exactly
+  one cell — `ros` + `publish` (`Anchor::from_trigger_time`); every other cell
+  anchors on a transport stamp. A non-zero `trigger_time` where it is ignored is
+  rejected: sending it there would silently anchor the window on the trigger's
+  arrival rather than the requested instant — a deferred-window request lost
+  without a trace. `trigger_time == 0` is always accepted.
+- **`preroll`/`postroll` past `MAX_ROLL_NS`** (30 min) — bounds how far a cut
+  reaches into the retained recordings and how long a handler parks.
+- **A resolved anchor more than `MAX_ANCHOR_FUTURE_SKEW_NS` (30 min) past `now`.**
+  The guarded value is the *resolved anchor*, not `trigger_time` — the anchor is
+  what parks a handler through its postroll wall-floor sleep (`anchor + postroll`)
+  whatever cell resolved it, so a far-future anchor (a producer clock fault or a
+  hostile record stamp) would wedge a handler. `ros`+`log` resolves the anchor to
+  `now` and always passes; the guard bites on a `ros`+`publish` `trigger_time` and
+  on a tail record's own stamp.
+- **A `name` that is empty, past `MAX_TRIGGER_NAME_LEN` (128 B), or unsafe in the
+  clip pathname** (`validate_name`: no path separator, NUL, leading dot, or `..`).
+  `handler::sanitize` still maps stray characters to `_` at clip creation; the
+  structural hazards are refused whole here rather than silently rewritten.
+
+[`Anchor`]: src/interface.rs
 
 ## The two interfaces
 
@@ -497,21 +594,35 @@ rationale.
   back out of the recording it tails, cuts the clip, and signals completion by
   the file's appearance in `out_dir` — there is no `Recorded` topic to echo, so
   the assertion is on the clipped file rather than a published message.
+- **Capture-time windowing is proved against a live momentedge writer**
+  (`live_writer_capture_time_windowing`, ROS-free at runtime): clipper tails a
+  recording while `examples/custom-mcap-writer` appends it, with every
+  `publish_time` deliberately offset from `log_time`. Per `--time-source` case
+  the clip's every message is in-window on the *selected* stamp while at least
+  one message is out-of-window on the *contrasting* stamp — jointly impossible
+  unless the two clock domains genuinely select different message sets. The
+  writer binary is resolved beside `CARGO_BIN_EXE_clipper` (built on demand if
+  absent), so the case needs no extra build step.
 
 ## Retention
 
 The tail prunes `Ended` recordings every poll (not only at rollover). A
-recording is pruned when its `max_log_time` is older than
+recording is pruned when its max `log_time` (`bounds.log.max`) is older than
 `now - watch_old_files_duration` (default 600 s, env
-`MOMENTEDGE_WATCH_OLD_FILES_DURATION`). Pruning is file-granular — never the
-`current` recording, never mid-file. Dropping a `RecordingIndex` releases its
-`Arc<File>`, closing the descriptor once no in-flight plan still holds a clone.
-Running the prune every poll (rather than only at rollover) is what bounds open
-fds and index memory when the recorder stops splitting or goes idle.
+`MOMENTEDGE_WATCH_OLD_FILES_DURATION`). Retention always ages on `log_time`,
+whatever the window's [time source](#time-source): a producer must not be able to
+keep a file alive — or force its deletion — through what it writes into
+`publish_time`. Pruning is file-granular — never the `current` recording, never
+mid-file. Dropping a `RecordingIndex` releases its `Arc<File>`, closing the
+descriptor once no in-flight plan still holds a clone. Running the prune every
+poll (rather than only at rollover) is what bounds open fds and index memory when
+the recorder stops splitting or goes idle.
 
-`high_water_ns` is monotonic across prunes: a pruned file is below the watch
-floor and never held the collection maximum, so dropping it never lowers the
-high-water. Handlers never see coverage regress.
+`high_water_ns` (the `log` coverage) is monotonic across prunes: a pruned file is
+below the watch floor and never held the collection maximum, so dropping it never
+lowers the high-water. Handlers never see `log` coverage regress. The `publish`
+high-water is not tied to the retention floor, but the watch only ever raises it,
+so a handler waiting on it never sees it regress either.
 
 By default pruning forgets a recording in-memory only; the `.mcap` file remains
 on disk for `ros2 bag record` and other consumers. When `--delete-old-files` is

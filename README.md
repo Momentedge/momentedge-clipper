@@ -12,8 +12,9 @@ fired.
 **Momentedge Clipper** turns an ordinary `ros2 bag record` into an on-demand
 event recorder. It runs alongside the recorder, tails the growing MCAP file, and
 on each trigger cuts a standalone clip covering a window around the event —
-`[trigger_time − preroll, trigger_time + postroll]`. Recording stays rosbag2's
-job; clipping is clipper's. The two never talk except through the file on disk.
+`[anchor − preroll, anchor + postroll]`, where the anchor is the event instant
+the trigger resolves to. Recording stays rosbag2's job; clipping is clipper's.
+The two never talk except through the file on disk.
 
 - **MCAP in, MCAP out.** Clips are standard, complete MCAP files — readable by
   [Foxglove](https://foxglove.dev/), the `mcap` CLI, and `ros2 bag` replay. No
@@ -40,7 +41,7 @@ clipper is a standalone application that sits beside a continuous
         ▼                                              │
      clipper ◀──────────────── tails (keeps the file open) ──────────┘
         │
-        ├── copies [trigger_time − preroll, trigger_time + postroll] ──▶ ./clipped/<trigger_ns>_<name>.mcap
+        ├── copies [anchor − preroll, anchor + postroll] ──▶ ./clipped/<anchor_ns>_<name>.mcap
         │
         └── announces ──▶ /events/momentedge/recorded   (momentedge_msgs/Recorded, lists every file written)
 ```
@@ -49,10 +50,11 @@ clipper is a standalone application that sits beside a continuous
    the new bytes, decoding nothing but each message's timestamp. A clip can be
    cut the moment its data is physically on disk.
 2. **Listen.** It waits for a `momentedge_msgs/Trigger` on
-   `/events/momentedge/trigger`, carrying a reference time and a pre/post window.
+   `/events/momentedge/trigger`, carrying a name and a pre/post window; the
+   window's anchor is resolved per the [time source](#time-source-log-or-publish).
 3. **Copy.** It copies every message whose timestamp falls in
-   `[trigger_time − preroll, trigger_time + postroll]` into a standalone clip,
-   then announces the result on `/events/momentedge/recorded`.
+   `[anchor − preroll, anchor + postroll]` into a standalone clip, then announces
+   the result on `/events/momentedge/recorded`.
 
 Because the recording is already on disk, the preroll — the data from *before*
 the trigger — is there to copy.
@@ -72,12 +74,15 @@ ros2 bag record --all --storage mcap --output ./record
 clipper --record-dir ./record --out-dir ./clipped --clip-compression zstd
 #    from a source checkout: cargo run -p clipper -- --record-dir ./record --out-dir ./clipped
 
-# 3. Fire a trigger: 5 s before and 5 s after "now"
+# 3. Fire a trigger: 5 s before and 5 s after the instant clipper receives it.
+#    Under the default --time-source log the window anchors on clipper's own
+#    receipt instant, so trigger_time is 0 (a non-zero value is rejected here;
+#    only --interface ros --time-source publish reads it — see Time source).
 ros2 topic pub --once /events/momentedge/trigger momentedge_msgs/msg/Trigger \
-  "{name: clip1, trigger_time: {sec: $(date +%s), nanosec: 0}, preroll: 5000000000, postroll: 5000000000}"
+  "{name: clip1, trigger_time: {sec: 0, nanosec: 0}, preroll: 5000000000, postroll: 5000000000}"
 ```
 
-A clip lands at `./clipped/<trigger_ns>_clip1.mcap` and a
+A clip lands at `./clipped/<anchor_ns>_clip1.mcap` and a
 `momentedge_msgs/Recorded` is published on `/events/momentedge/recorded`.
 Inspect it with `ros2 bag info ./clipped/<file>.mcap` or open it in Foxglove.
 
@@ -128,6 +133,7 @@ version. Everything is optional — `clipper` runs with no arguments.
 | `--record-dir` | `MOMENTEDGE_RECORD_DIR` | `./record` | bag directory of the continuous recording to tail |
 | `--out-dir` | `MOMENTEDGE_OUT_DIR` | `./clipped` | where finished clips are written |
 | `--interface` | `MOMENTEDGE_INTERFACE` | `ros` | how triggers arrive and completions are signalled: `ros` or `mcap` (see [below](#two-ways-in-ros-and-mcap)) |
+| `--time-source` | `MOMENTEDGE_TIME_SOURCE` | `log` | clock domain the clip window lives in: `log` or `publish` (see [below](#time-source-log-or-publish)) |
 | `--grace-secs` | `MOMENTEDGE_GRACE_SECS` | `30` | how long past the window end to wait for the recording to cover it before cutting from what is on disk |
 | `--clip-compression` | `MOMENTEDGE_CLIP_COMPRESSION` | `zstd` | codec for written clips: `none`, `lz4`, or `zstd` (smallest) |
 | `--extract-parallelism` | `MOMENTEDGE_EXTRACT_PARALLELISM` | `1` | concurrent clip copies (1 = one at a time, FIFO) |
@@ -139,6 +145,59 @@ unchunked `fastwrite` recording, roughly one chunk-fill for a chunked profile.
 The [`examples/continuous`](examples/continuous/README.md) guide explains the
 recorder's latency-vs-size knobs and how to size `--grace-secs` against them.
 
+## Time source: `log` or `publish`
+
+`--time-source` picks the clock domain the **whole clip window** lives in — the
+anchor it centres on, which messages fall inside it, which bytes are read, and
+the coverage a cut waits for. Every MCAP message carries two stamps, and clipper
+windows on whichever the flag selects:
+
+- **`log`** (the default) — the message's `log_time`: when the producer received
+  it. One writer stamps every recording in receive order, so log times run
+  (approximately) non-decreasing on disk. Coverage on `log` is a *completeness*
+  proof: once it passes a window end, every in-window message is on disk.
+- **`publish`** — the message's `publish_time`: whatever the producer wrote
+  there. `ros2 bag record` fills it with the DDS source timestamp; a momentedge
+  writer fills it with the capture time (see
+  [`examples/custom-mcap-writer`](examples/custom-mcap-writer/README.md)). clipper
+  never interprets it — it windows on the raw value.
+
+### The anchor: which instant the window centres on
+
+The window centres on an **anchor** the active interface resolves from what it
+has. A live ROS trigger carries no recording stamp, so the ROS interface anchors
+on `now` or the publisher's `trigger_time`; an in-recording trigger carries its
+own stamps, so the MCAP interface anchors on those. The four
+interface × `--time-source` cells resolve it thus:
+
+| | `--time-source log` | `--time-source publish` |
+|---|---|---|
+| **`--interface ros`** | `now` at the subscription instant | the trigger's `trigger_time` |
+| **`--interface mcap`** | the trigger record's `log_time` | the trigger record's `publish_time` |
+
+**`trigger_time` is read in exactly one cell — `ros` + `publish`.** There it is
+the anchor: a publisher declaring its own publish-domain instant, standing in for
+the `publish_time` it cannot set on the wire, so a request like "clip around ten
+minutes ago" lands where it means to. Every other cell anchors on a transport
+stamp and **rejects** a trigger that sets a non-zero `trigger_time` — logging it
+at `error!` and cutting no clip — rather than silently dropping the field and
+mis-anchoring the window. A producer for those cells must send `trigger_time = 0`
+(the [`trigger-pub`](examples/trigger-pub/README.md) example does by default).
+
+Retention is unaffected by the flag — a recording is always aged out on its
+`log_time`, so a producer cannot drive file deletion through `publish_time`.
+
+**Publish coverage is a liveness signal, not a completeness proof.** Publish
+times carry no ordering guarantee; out-of-order arrival is normal. Under
+`--time-source publish` a message can land on disk *after* a cut with a
+`publish_time` that falls inside the window, and is then missing from that clip.
+`--grace-secs` bounds how long a cut waits, exactly as on `log`.
+
+**On Humble, `--time-source publish` is a no-op.** Humble's
+`rosbag2_storage_mcap` writes `publish_time = log_time` verbatim, so the two
+domains are identical there. It differs on Jazzy and newer (where `publish_time`
+is the DDS source timestamp) and for a momentedge writer (capture time).
+
 ## The trigger interface
 
 A trigger is a `momentedge_msgs/Trigger` message:
@@ -147,9 +206,23 @@ A trigger is a `momentedge_msgs/Trigger` message:
 |---|---|---|
 | `name` | `string` | trigger identifier; becomes part of the clip filename |
 | `description` | `string` | optional free-form context |
-| `trigger_time` | `builtin_interfaces/Time` | reference stamp the window is centred on |
-| `preroll` | `uint64` | nanoseconds before `trigger_time` to keep |
-| `postroll` | `uint64` | nanoseconds after `trigger_time` to keep |
+| `trigger_time` | `builtin_interfaces/Time` | publish-domain anchor; read only under `--interface ros --time-source publish` (see [the anchor matrix](#the-anchor-which-instant-the-window-centres-on)), must be `0` in every other cell |
+| `preroll` | `uint64` | nanoseconds before the anchor to keep |
+| `postroll` | `uint64` | nanoseconds after the anchor to keep |
+
+**Validation.** Every field is checked before any work; a trigger failing any
+check is logged at `error!` and ignored — no clip, no `Recorded`. The limits
+(each value exactly at its bound is accepted):
+
+- `preroll` and `postroll` — at most **30 minutes** (`1_800_000_000_000` ns) each.
+- The resolved **anchor** — at most **30 minutes** past the current clock. The
+  anchor drives the window's wait, so a far-future one (a producer clock fault or
+  a hostile record stamp) is refused rather than parking a handler for that long.
+- `name` — non-empty, at most **128 bytes**, and safe to embed in the clip
+  pathname: no path separator, NUL, leading `.`, or `..`.
+- `trigger_time` — `0` except in the one cell that reads it (`--interface ros
+  --time-source publish`); non-zero elsewhere is rejected (see
+  [the anchor matrix](#the-anchor-which-instant-the-window-centres-on)).
 
 For each finished clip, clipper publishes a `momentedge_msgs/Recorded` on
 `/events/momentedge/recorded`, echoing the trigger's `name`, `description`, and
@@ -157,10 +230,11 @@ For each finished clip, clipper publishes a `momentedge_msgs/Recorded` on
 path it names is already complete and crash-durable on disk.
 
 **Clip naming.** A window that falls inside a single recording produces one
-file, `<trigger_ns>_<name>.mcap`. A window that straddles a rollover (a rosbag2
-bag split or a recorder restart clipper observed while running) produces one
-segment per source file — `<trigger_ns>_<name>_00.mcap`, `_01.mcap`, … — tiling
-the window in time order, all listed in `filenames`.
+file, `<anchor_ns>_<name>.mcap`, where `<anchor_ns>` is the resolved window
+anchor. A window that straddles a rollover (a rosbag2 bag split or a recorder
+restart clipper observed while running) produces one segment per source file —
+`<anchor_ns>_<name>_00.mcap`, `_01.mcap`, … — tiling the window in time order,
+all listed in `filenames`.
 
 ### Two ways in: `ros` and `mcap`
 
@@ -205,6 +279,7 @@ Setup guides for the recording + clipper stack live under
 | [`split-bags/`](examples/split-bags/README.md) | split recording with pruning for retention |
 | [`launch/`](examples/launch/README.md) | recorder + clipper brought up together with `ros2 launch` |
 | [`trigger-pub/`](examples/trigger-pub/README.md) | an example trigger source for development |
+| [`custom-mcap-writer/`](examples/custom-mcap-writer/README.md) | a ROS-free MCAP writer that owns `publish_time` as a capture timestamp |
 
 ## Documentation
 

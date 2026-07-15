@@ -35,7 +35,17 @@ use anyhow::{Context, Result, bail};
 use log::{error, warn};
 use mcap::records::Record;
 
+use crate::TimeSource;
 use crate::tail::{ChannelDef, MAX_RECORD_LEN, WindowPlan, op};
+
+/// The stamp a message's window membership is tested on, per the window's
+/// [`TimeSource`]: its `log_time` or its `publish_time`.
+fn message_stamp(header: &mcap::records::MessageHeader, source: TimeSource) -> u64 {
+    match source {
+        TimeSource::Log => header.log_time,
+        TimeSource::Publish => header.publish_time,
+    }
+}
 
 /// Outcome of an extraction: where the clip actually landed (`out_path`
 /// carries a `_<n>` suffix when the desired name already existed) and the
@@ -164,7 +174,16 @@ pub fn extract_clip(
     end_ns: u64,
     compression: Option<mcap::Compression>,
 ) -> Result<ClipStats> {
-    let staged = stage_clip(plan, out_path, start_ns, end_ns, compression)?;
+    // The assembly tests window on `log_time`; the domain-selection test drives
+    // `stage_clip` with an explicit source directly.
+    let staged = stage_clip(
+        plan,
+        out_path,
+        start_ns,
+        end_ns,
+        compression,
+        TimeSource::Log,
+    )?;
     publish_clip(staged)
 }
 
@@ -181,6 +200,7 @@ pub fn stage_clip(
     start_ns: u64,
     end_ns: u64,
     compression: Option<mcap::Compression>,
+    time_source: TimeSource,
 ) -> Result<StagedClip> {
     let out_dir = out_path
         .parent()
@@ -195,7 +215,7 @@ pub fn stage_clip(
         .with_context(|| format!("creating capturing dir {}", capturing.display()))?;
 
     let (file, staged_path) = create_new_file(&capturing.join(&desired_name))?;
-    let stats = copy_window(plan, file, start_ns, end_ns, compression).inspect_err(|_| {
+    let stats = copy_window(plan, file, start_ns, end_ns, compression, time_source).inspect_err(|_| {
         // A failed copy must not leave a half-written, footer-less file even in
         // the capturing dir; the error itself is what the caller reports. No
         // `StagedClip` is constructed on this path, so its `Drop` cannot do it.
@@ -266,6 +286,7 @@ fn copy_window(
     start_ns: u64,
     end_ns: u64,
     compression: Option<mcap::Compression>,
+    time_source: TimeSource,
 ) -> Result<ClipStats> {
     let mut clip = ClipWriter {
         writer: mcap::WriteOptions::new()
@@ -276,6 +297,7 @@ fn copy_window(
         out_ids: HashMap::new(),
         start_ns,
         end_ns,
+        time_source,
         stats: ClipStats::default(),
     };
 
@@ -384,6 +406,9 @@ struct ClipWriter<'a> {
     out_ids: HashMap<u16, Option<u16>>,
     start_ns: u64,
     end_ns: u64,
+    /// The window's clock domain: which of each message's two stamps the
+    /// membership test compares against `[start_ns, end_ns]`.
+    time_source: TimeSource,
     stats: ClipStats,
 }
 
@@ -444,18 +469,18 @@ impl ClipWriter<'_> {
     /// say which of the chunk's bytes are damaged, so the whole chunk is
     /// dropped with an error log and counted. Output-side errors stay fatal.
     fn copy_chunk(&mut self, body: &[u8], at: usize) -> Result<()> {
-        let (start_ns, end_ns) = (self.start_ns, self.end_ns);
+        let (start_ns, end_ns, time_source) = (self.start_ns, self.end_ns, self.time_source);
         let mut pending: Vec<(mcap::records::MessageHeader, Vec<u8>)> = Vec::new();
         let salvage = (|| -> mcap::McapResult<()> {
             let Record::Chunk { header, data } = mcap::parse_record(op::CHUNK, body)? else {
                 unreachable!("a CHUNK opcode parses to Record::Chunk");
             };
             for rec in mcap::read::ChunkReader::new(header, &data)? {
-                if let Record::Message { header, data } = rec?
-                    && header.log_time >= start_ns
-                    && header.log_time <= end_ns
-                {
-                    pending.push((header, data.into_owned()));
+                if let Record::Message { header, data } = rec? {
+                    let stamp = message_stamp(&header, time_source);
+                    if stamp >= start_ns && stamp <= end_ns {
+                        pending.push((header, data.into_owned()));
+                    }
                 }
             }
             Ok(())
@@ -474,11 +499,13 @@ impl ClipWriter<'_> {
         Ok(())
     }
 
-    /// Write one message through if its `log_time` is in the window. A
-    /// message on a channel the recording never declared is skipped and
-    /// counted — there is no Schema/Channel to emit for it.
+    /// Write one message through if its windowing stamp is in the window. The
+    /// stamp is the message's `log_time` or `publish_time`, per the window's
+    /// [`TimeSource`]. A message on a channel the recording never declared is
+    /// skipped and counted — there is no Schema/Channel to emit for it.
     fn copy_message(&mut self, header: &mcap::records::MessageHeader, data: &[u8]) -> Result<()> {
-        if header.log_time < self.start_ns || header.log_time > self.end_ns {
+        let stamp = message_stamp(header, self.time_source);
+        if stamp < self.start_ns || stamp > self.end_ns {
             return Ok(());
         }
         let Some(channel_id) = self.output_channel_id(header.channel_id)? else {
@@ -539,17 +566,29 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::tail::tests::{
-        channel_body, message_body, raw_record, scan_to_end, test_dir, write_raw, write_recording,
-        write_recording_opts,
+        channel_body, message_body, message_body_pub, raw_record, scan_to_end, test_dir, write_raw,
+        write_recording, write_recording_opts,
     };
-    use crate::tail::{Extent, Tailer, WindowPlan, op};
+    use crate::tail::{Extent, Span, Stamps, Tailer, WindowPlan, op};
 
-    /// Plan the single source recording a clip test cuts from. These tests each
-    /// index one recording, so [`Tailer::plan_window`]'s `Vec` holds at most one
-    /// plan; an empty `Vec` (no recording yet) becomes an empty plan.
+    /// Plan the single source recording a clip test cuts from on the `log`
+    /// domain — the domain almost every clip test windows on; [`plan_one_src`]
+    /// takes an explicit source. These tests each index one recording, so
+    /// [`Tailer::plan_window`]'s `Vec` holds at most one plan; an empty `Vec` (no
+    /// recording yet) becomes an empty plan.
     fn plan_one(tailer: &Tailer, start_ns: u64, end_ns: u64) -> WindowPlan {
+        plan_one_src(tailer, start_ns, end_ns, TimeSource::Log)
+    }
+
+    /// [`plan_one`] on an explicit windowing `source`.
+    fn plan_one_src(
+        tailer: &Tailer,
+        start_ns: u64,
+        end_ns: u64,
+        source: TimeSource,
+    ) -> WindowPlan {
         tailer
-            .plan_window(start_ns, end_ns)
+            .plan_window(start_ns, end_ns, source)
             .into_iter()
             .next()
             .unwrap_or_else(WindowPlan::empty)
@@ -626,7 +665,7 @@ pub(crate) mod tests {
 
         // After stage 1 only: the final dir holds no clip, but the staged file
         // in the capturing dir is already complete and read_clip-valid.
-        let staged = stage_clip(&plan, &out, 0, 100, TEST_COMPRESSION)?;
+        let staged = stage_clip(&plan, &out, 0, 100, TEST_COMPRESSION, TimeSource::Log)?;
         assert!(
             !out.exists(),
             "the clip is invisible in the final dir before publication"
@@ -662,7 +701,7 @@ pub(crate) mod tests {
         // A staged clip abandoned without publishing — an early return or a
         // panic between the stages — must not strand the file in the capturing
         // dir; its `Drop` removes it, and nothing ever reaches the final dir.
-        let staged = stage_clip(&plan, &out, 0, 100, TEST_COMPRESSION)?;
+        let staged = stage_clip(&plan, &out, 0, 100, TEST_COMPRESSION, TimeSource::Log)?;
         assert!(staged.staged_path.exists(), "the staged file exists");
         drop(staged);
 
@@ -971,7 +1010,10 @@ pub(crate) mod tests {
             extents: vec![Extent {
                 offset: 0,
                 len: 64,
-                time: Some((0, u64::MAX)),
+                time: Some(Stamps {
+                    log: Span { min: 0, max: u64::MAX },
+                    publish: Span { min: 0, max: u64::MAX },
+                }),
             }],
             channels: HashMap::new(),
         };
@@ -1453,7 +1495,7 @@ pub(crate) mod tests {
 
         let out = root.join("clip.mcap");
         let plan = plan_one(&tailer, 0, 100);
-        let staged = stage_clip(&plan, &out, 0, 100, TEST_COMPRESSION)?;
+        let staged = stage_clip(&plan, &out, 0, 100, TEST_COMPRESSION, TimeSource::Log)?;
 
         // Simulate the staged file disappearing (e.g. an admin removed it or
         // the capturing dir was wiped) before `Drop` runs its cleanup.
@@ -1484,8 +1526,8 @@ pub(crate) mod tests {
 
         // Stage the same desired name twice without publishing between them;
         // both clips land in the capturing dir, each under a distinct path.
-        let first = stage_clip(&plan, &out, 0, 100, TEST_COMPRESSION)?;
-        let second = stage_clip(&plan, &out, 0, 100, TEST_COMPRESSION)?;
+        let first = stage_clip(&plan, &out, 0, 100, TEST_COMPRESSION, TimeSource::Log)?;
+        let second = stage_clip(&plan, &out, 0, 100, TEST_COMPRESSION, TimeSource::Log)?;
 
         assert_ne!(
             first.staged_path, second.staged_path,
@@ -1500,6 +1542,67 @@ pub(crate) mod tests {
 
         drop(first);
         drop(second);
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// Window membership is tested on the configured [`TimeSource`]: the same
+    /// window over the same recording copies a different message set under `log`
+    /// than under `publish`, because each message's two stamps disagree. The
+    /// extent overlap that plans the bytes is on the same domain.
+    #[test]
+    fn window_membership_selects_on_the_configured_time_source() -> Result<()> {
+        let root = test_dir("clip-domain")?;
+        let rec = root.join("rec.mcap");
+        // log_time ascends 100/200/300; publish_time is independent: 250/150/350.
+        write_raw(
+            &rec,
+            &[
+                raw_record(op::CHANNEL, &channel_body(1, 0, "/t", "cdr")),
+                raw_record(op::MESSAGE, &message_body_pub(1, 0, 100, 250, b"a")),
+                raw_record(op::MESSAGE, &message_body_pub(1, 1, 200, 150, b"b")),
+                raw_record(op::MESSAGE, &message_body_pub(1, 2, 300, 350, b"c")),
+            ],
+        )?;
+        let tailer = tail_whole(&rec)?;
+        let out = root.join("clip.mcap");
+
+        // The window [180, 320] selects different messages per domain: on `log`
+        // it holds log_times 200 and 300; on `publish` only the message
+        // published at 250 lands inside, and that message's log_time is 100.
+        let log_clip = publish_clip(stage_clip(
+            &plan_one_src(&tailer, 180, 320, TimeSource::Log),
+            &out,
+            180,
+            320,
+            TEST_COMPRESSION,
+            TimeSource::Log,
+        )?)?;
+        let mut log_times: Vec<u64> = read_clip(&log_clip.out_path)?
+            .into_iter()
+            .map(|(_, t)| t)
+            .collect();
+        log_times.sort_unstable();
+        assert_eq!(log_times, vec![200, 300], "log windows on log_time");
+
+        let pub_clip = publish_clip(stage_clip(
+            &plan_one_src(&tailer, 180, 320, TimeSource::Publish),
+            &out,
+            180,
+            320,
+            TEST_COMPRESSION,
+            TimeSource::Publish,
+        )?)?;
+        let pub_times: Vec<u64> = read_clip(&pub_clip.out_path)?
+            .into_iter()
+            .map(|(_, t)| t)
+            .collect();
+        assert_eq!(
+            pub_times,
+            vec![100],
+            "publish windows on publish_time; only the message published at 250 is inside"
+        );
 
         std::fs::remove_dir_all(root)?;
         Ok(())

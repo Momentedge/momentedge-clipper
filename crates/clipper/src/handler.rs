@@ -46,11 +46,13 @@ pub(crate) struct StageJob {
 /// knows the window's segment count. The window plan rides in the job: the
 /// handler snapshots it (one per source recording, pinning each file's
 /// `Arc<File>`), so the worker never touches the tailer. The clip compression
-/// codec is process-global, captured here. A panicking stage is caught and
-/// replied as an error — per-job isolation, the pool outlives it.
+/// codec and the window's `time_source` (which of each message's stamps the
+/// membership test reads) are process-global, captured here. A panicking stage
+/// is caught and replied as an error — per-job isolation, the pool outlives it.
 pub(crate) fn spawn_stage_workers(
     parallelism: usize,
     compression: Option<mcap::Compression>,
+    time_source: crate::TimeSource,
 ) -> Sender<StageJob> {
     let (tx, rx) = unbounded::<StageJob>();
     for i in 0..parallelism.max(1) {
@@ -66,6 +68,7 @@ pub(crate) fn spawn_stage_workers(
                             job.start_ns,
                             job.end_ns,
                             compression,
+                            time_source,
                         )
                     }))
                     .unwrap_or_else(|payload| {
@@ -94,26 +97,40 @@ pub(crate) fn spawn_stage_workers(
 /// atomic move into `out_dir` is the signal). The handler is otherwise identical
 /// either way — it knows only the neutral [`Trigger`]/[`Completion`] contract.
 ///
-/// `out_dir` and `grace` are the only configuration this half reads; the driver
-/// unpacks them at the seam so nothing below it depends on the CLI parser.
+/// `out_dir`, `grace`, and `time_source` are the only configuration this half
+/// reads; the driver unpacks them at the seam so nothing below it depends on the
+/// CLI parser. The window centres on `anchor_ns`, resolved by the interface per
+/// the interface × time-source anchor matrix (the ROS interface from the
+/// subscription instant under `log` or `trigger_time` under `publish`, the MCAP
+/// interface from the trigger record's own stamp on the active `time_source`);
+/// the same instant names the output clip. `time_source` is the clock domain the window lives in — it
+/// selects which extents are read, which messages fall inside, and which
+/// coverage the wait blocks on.
+// The arguments are the recorder's cohesive per-trigger inputs — the resolved
+// anchor, the neutral trigger, the shared tail/coverage/staging handles, the
+// announcer, and the two settings the seam unpacks. Bundling them into a struct
+// purely to satisfy the argument-count heuristic would add indirection without
+// making the seam clearer.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn handle_trigger<A: Announce>(
     trig: Trigger,
+    anchor_ns: u64,
     out_dir: &Path,
     grace: Duration,
     tailer: Arc<Tailer>,
     coverage: Arc<Watch<Coverage>>,
     extract_tx: Sender<StageJob>,
     announce: A,
+    time_source: crate::TimeSource,
 ) -> anyhow::Result<()> {
-    let trigger_ns = trig.trigger_time.ns();
-    let start_ns = trigger_ns.saturating_sub(trig.preroll);
-    let end_ns = trigger_ns.saturating_add(trig.postroll);
+    let start_ns = anchor_ns.saturating_sub(trig.preroll);
+    let end_ns = anchor_ns.saturating_add(trig.postroll);
     info!(
-        "trigger name={:?} window=[{start_ns}, {end_ns}] preroll={} postroll={}",
+        "trigger name={:?} source={time_source} window=[{start_ns}, {end_ns}] preroll={} postroll={}",
         trig.name, trig.preroll, trig.postroll
     );
 
-    let base_out_path = out_dir.join(format!("{trigger_ns}_{}.mcap", sanitize(&trig.name)));
+    let base_out_path = out_dir.join(format!("{anchor_ns}_{}.mcap", sanitize(&trig.name)));
     let segments = record_clip(
         &tailer,
         start_ns,
@@ -122,6 +139,7 @@ pub(crate) fn handle_trigger<A: Announce>(
         &coverage,
         grace,
         &extract_tx,
+        time_source,
     )?;
 
     let mut filenames = Vec::with_capacity(segments.len());
@@ -176,6 +194,9 @@ pub(crate) fn handle_trigger<A: Announce>(
 /// Segments are named only once the count is known: a single segment keeps the
 /// bare `<base>.mcap`, several get one `<base>_NN.mcap` per file. Every returned
 /// [`clip::ClipStats`] names a durable file, so the caller may announce them all.
+// Cohesive window inputs (bounds, the base path, the shared handles, and the
+// time source); see the note on [`handle_trigger`].
+#[allow(clippy::too_many_arguments)]
 fn record_clip(
     tailer: &Arc<Tailer>,
     start_ns: u64,
@@ -184,6 +205,7 @@ fn record_clip(
     coverage: &Watch<Coverage>,
     grace: Duration,
     extract_tx: &Sender<StageJob>,
+    time_source: crate::TimeSource,
 ) -> anyhow::Result<Vec<clip::ClipStats>> {
     // 1. Postroll wall floor: never cut before the wall clock passes the window
     //    end. `checked_sub` reads the clock once per iteration, so a clock that
@@ -192,21 +214,25 @@ fn record_clip(
         thread::sleep(Duration::from_nanos(remaining));
     }
 
-    // 2. Coverage: wait until the collection-wide high-water reaches the window
-    //    end, bounded by `grace`. A window inside a recording is already covered
-    //    (its high-water is past `end_ns` at the footer, or as soon as the scan
-    //    reaches it); only a window whose end is past the last recorded message
-    //    with no successor — a clean stop — waits out the full grace.
-    if !coverage.wait_timeout_for(grace, |c| c.high_water_ns >= end_ns) {
+    // 2. Coverage: wait until the collection-wide high-water on the window's
+    //    time source reaches the window end, bounded by `grace`. On `log` this
+    //    is a completeness proof — a window inside a recording is already
+    //    covered; only a window whose end is past the last recorded message with
+    //    no successor waits out the full grace. On `publish` it is a liveness
+    //    signal only: publish times may arrive out of order, so a message can
+    //    still land after the wait releases with an in-window `publish_time` and
+    //    be lost from the cut — `grace` bounds the wait either way.
+    if !coverage.wait_timeout_for(grace, |c| c.for_source(time_source) >= end_ns) {
         warn!(
             "window end {end_ns} still uncovered after {grace:?}; \
              cutting the clip from what is on disk"
         );
     }
 
-    // 3. One multi-file snapshot — each plan pins its own recording's Arc<File>,
-    //    so a retention prune or rollover after this cannot pull the bytes out.
-    let plans = tailer.plan_window(start_ns, end_ns);
+    // 3. One multi-file snapshot on the window's time source — each plan pins its
+    //    own recording's Arc<File>, so a retention prune or rollover after this
+    //    cannot pull the bytes out.
+    let plans = tailer.plan_window(start_ns, end_ns, time_source);
 
     // 4. Stage one segment per plan (FIFO worker pool), or one empty segment
     //    when no recording covers the window — the empty path needs no source
@@ -316,9 +342,12 @@ fn sanitize(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TimeSource;
     use crate::clip::tests::read_clip;
+    use crate::tail::op;
     use crate::tail::tests::{
-        drain, scan_to_end, test_dir, write_recording, write_unfinished_recording,
+        channel_body, drain, message_body_pub, raw_record, scan_to_end, test_dir, write_raw,
+        write_recording, write_unfinished_recording,
     };
 
     /// The clip compression the recorder's default (zstd) maps to; the unit
@@ -339,7 +368,7 @@ mod tests {
     fn record_clip_grace_timeout_cuts_what_is_on_disk() -> anyhow::Result<()> {
         let root = test_dir("grace")?;
         let (tailer, coverage) = Tailer::new();
-        let extract_tx = spawn_stage_workers(1, TEST_COMPRESSION);
+        let extract_tx = spawn_stage_workers(1, TEST_COMPRESSION, TimeSource::Log);
 
         // The window end is far in the past on the wall clock (no postroll
         // sleep), but coverage never reaches it — no recording was ever
@@ -353,6 +382,7 @@ mod tests {
             &coverage,
             Duration::from_millis(50),
             &extract_tx,
+            TimeSource::Log,
         )?;
 
         assert_eq!(stats.len(), 1, "no recording yields a single empty segment");
@@ -381,7 +411,7 @@ mod tests {
             scan_to_end(&scanner, &file, 8).unwrap();
         });
 
-        let extract_tx = spawn_stage_workers(1, TEST_COMPRESSION);
+        let extract_tx = spawn_stage_workers(1, TEST_COMPRESSION, TimeSource::Log);
         let stats = record_clip(
             &tailer,
             100,
@@ -390,6 +420,7 @@ mod tests {
             &coverage,
             Duration::from_secs(10),
             &extract_tx,
+            TimeSource::Log,
         )?;
 
         assert_eq!(stats.len(), 1);
@@ -417,7 +448,7 @@ mod tests {
         tailer.attach(file.clone());
         scan_to_end(&tailer, &file, 8)?;
 
-        let extract_tx = spawn_stage_workers(1, TEST_COMPRESSION);
+        let extract_tx = spawn_stage_workers(1, TEST_COMPRESSION, TimeSource::Log);
         let end_ns = now + 150_000_000; // 150 ms past the trigger stamp
         let started = std::time::Instant::now();
         let stats = record_clip(
@@ -428,6 +459,7 @@ mod tests {
             &coverage,
             Duration::from_secs(10),
             &extract_tx,
+            TimeSource::Log,
         )?;
 
         assert!(
@@ -456,7 +488,7 @@ mod tests {
         tailer.attach(file.clone());
         scan_to_end(&tailer, &file, 8)?;
 
-        let extract_tx = spawn_stage_workers(1, TEST_COMPRESSION);
+        let extract_tx = spawn_stage_workers(1, TEST_COMPRESSION, TimeSource::Log);
         let grace = Duration::from_millis(200);
         let started = std::time::Instant::now();
         let stats = record_clip(
@@ -467,6 +499,7 @@ mod tests {
             &coverage,
             grace,
             &extract_tx,
+            TimeSource::Log,
         )?;
 
         assert!(
@@ -499,7 +532,7 @@ mod tests {
         scan_to_end(&tailer, &file, 8)?;
         assert_eq!(coverage.get().high_water_ns, 1_000);
 
-        let extract_tx = spawn_stage_workers(1, TEST_COMPRESSION);
+        let extract_tx = spawn_stage_workers(1, TEST_COMPRESSION, TimeSource::Log);
         let started = std::time::Instant::now();
         let stats = record_clip(
             &tailer,
@@ -509,6 +542,7 @@ mod tests {
             &coverage,
             Duration::from_secs(30),
             &extract_tx,
+            TimeSource::Log,
         )?;
 
         assert!(
@@ -544,7 +578,7 @@ mod tests {
         // staging worker: the copies serialize FIFO, the second writer lands on
         // a `_1` sibling at publish, and both clips come out complete. Neither
         // window straddles a rollover, so each is a single segment.
-        let extract_tx = spawn_stage_workers(1, TEST_COMPRESSION);
+        let extract_tx = spawn_stage_workers(1, TEST_COMPRESSION, TimeSource::Log);
         let out = root.join("clip.mcap");
         let cut = |start_ns: u64, end_ns: u64| {
             let tailer = tailer.clone();
@@ -560,6 +594,7 @@ mod tests {
                     &coverage,
                     Duration::from_secs(30),
                     &extract_tx,
+                    TimeSource::Log,
                 )
             })
         };
@@ -612,11 +647,11 @@ mod tests {
         tailer.attach(file.clone());
         scan_to_end(&tailer, &file, 8)?;
 
-        let extract_tx = spawn_stage_workers(1, TEST_COMPRESSION);
+        let extract_tx = spawn_stage_workers(1, TEST_COMPRESSION, TimeSource::Log);
         let out = root.join("clip.mcap");
         let plan = || {
             tailer
-                .plan_window(0, 300)
+                .plan_window(0, 300, TimeSource::Log)
                 .into_iter()
                 .next()
                 .expect("the recording covers the window")
@@ -656,7 +691,7 @@ mod tests {
         tailer.index_recording(&split1);
         crate::tail::tests::drain(&tailer)?;
 
-        let extract_tx = spawn_stage_workers(1, TEST_COMPRESSION);
+        let extract_tx = spawn_stage_workers(1, TEST_COMPRESSION, TimeSource::Log);
         let base = root.join("clip.mcap");
         let stats = record_clip(
             &tailer,
@@ -666,6 +701,7 @@ mod tests {
             &coverage,
             Duration::from_secs(30),
             &extract_tx,
+            TimeSource::Log,
         )?;
 
         assert_eq!(stats.len(), 2, "a straddling window yields two segments");
@@ -717,7 +753,7 @@ mod tests {
         let file = Arc::new(std::fs::File::open(&rec)?);
         tailer.attach(file.clone());
         scan_to_end(&tailer, &file, 8)?;
-        let extract_tx = spawn_stage_workers(1, TEST_COMPRESSION);
+        let extract_tx = spawn_stage_workers(1, TEST_COMPRESSION, TimeSource::Log);
 
         let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
         let announcer = CapturingAnnouncer(captured.clone());
@@ -732,14 +768,19 @@ mod tests {
             preroll: 500,
             postroll: 500,
         };
+        // The generic handler takes the anchor the interface resolved; here that
+        // is the trigger's own stamp, so the window is [0, 1000].
+        let anchor_ns = trig.trigger_time.ns();
         handle_trigger(
             trig,
+            anchor_ns,
             &out_dir,
             Duration::from_secs(5),
             tailer,
             coverage,
             extract_tx,
             announcer,
+            TimeSource::Log,
         )?;
 
         let done = captured.lock().unwrap();
@@ -785,7 +826,7 @@ mod tests {
         tailer.index_recording(&split1);
         drain(&tailer)?;
 
-        let extract_tx = spawn_stage_workers(1, TEST_COMPRESSION);
+        let extract_tx = spawn_stage_workers(1, TEST_COMPRESSION, TimeSource::Log);
         let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
         let announcer = CapturingAnnouncer(captured.clone());
 
@@ -801,14 +842,18 @@ mod tests {
             preroll: 2_000,
             postroll: 2_000,
         };
+        // trigger_time = 3_500 ns is the resolved anchor → window [1_500, 5_500].
+        let anchor_ns = trig.trigger_time.ns();
         handle_trigger(
             trig,
+            anchor_ns,
             &out_dir,
             Duration::from_secs(5),
             tailer,
             coverage,
             extract_tx,
             announcer,
+            TimeSource::Log,
         )?;
 
         let done = captured.lock().unwrap();
@@ -851,7 +896,7 @@ mod tests {
         tailer.index_recording(&split1);
         drain(&tailer)?;
 
-        let extract_tx = spawn_stage_workers(1, TEST_COMPRESSION);
+        let extract_tx = spawn_stage_workers(1, TEST_COMPRESSION, TimeSource::Log);
         let base = root.join("clip.mcap");
         let stats = record_clip(
             &tailer,
@@ -861,6 +906,7 @@ mod tests {
             &coverage,
             Duration::from_secs(30),
             &extract_tx,
+            TimeSource::Log,
         )?;
 
         // Both segments are empty, so truncate(1) keeps exactly one.
@@ -893,7 +939,7 @@ mod tests {
         tailer.index_recording(&split1);
         drain(&tailer)?;
 
-        let extract_tx = spawn_stage_workers(1, TEST_COMPRESSION);
+        let extract_tx = spawn_stage_workers(1, TEST_COMPRESSION, TimeSource::Log);
         let base = root.join("clip.mcap");
         let stats = record_clip(
             &tailer,
@@ -903,6 +949,7 @@ mod tests {
             &coverage,
             Duration::from_secs(30),
             &extract_tx,
+            TimeSource::Log,
         )?;
 
         // split0 contributes message at 2_000; split1's messages are outside.
@@ -916,6 +963,61 @@ mod tests {
         assert_eq!(
             read_clip(&stats[0].out_path)?,
             vec![("/t".to_string(), 2_000)]
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// Coverage wait, extent overlap, and message selection all live on the
+    /// window's [`TimeSource`]. A recording whose publish times run far ahead of
+    /// its log times, windowed on `publish`: the handler blocks on the publish
+    /// high-water, plans the publish-overlapping extent, and copies exactly the
+    /// message whose `publish_time` is inside the window (retention is untouched
+    /// — that stays on `log_time`).
+    #[test]
+    fn record_clip_windows_and_waits_on_the_configured_time_source() -> anyhow::Result<()> {
+        let root = test_dir("cov-domain")?;
+        let rec = root.join("rec.mcap");
+        // log_time 100/200; publish_time 1_000/2_000 — the domains disagree.
+        write_raw(
+            &rec,
+            &[
+                raw_record(op::CHANNEL, &channel_body(1, 0, "/t", "cdr")),
+                raw_record(op::MESSAGE, &message_body_pub(1, 0, 100, 1_000, b"a")),
+                raw_record(op::MESSAGE, &message_body_pub(1, 1, 200, 2_000, b"b")),
+            ],
+        )?;
+
+        let (tailer, coverage) = Tailer::new();
+        let file = Arc::new(std::fs::File::open(&rec)?);
+        tailer.attach(file.clone());
+        scan_to_end(&tailer, &file, 8)?;
+        // Both high-waters are published independently: log 200, publish 2_000.
+        assert_eq!(coverage.get().high_water_ns, 200);
+        assert_eq!(coverage.get().publish_high_water_ns, 2_000);
+
+        let extract_tx = spawn_stage_workers(1, TEST_COMPRESSION, TimeSource::Publish);
+        // Window [900, 1_500] on `publish`: the publish high-water (2_000)
+        // satisfies the coverage wait, and only the message published at 1_000
+        // (log_time 100) falls inside — the log high-water (200) is nowhere near
+        // 1_500, so a log-domain wait would have timed out on the grace instead.
+        let stats = record_clip(
+            &tailer,
+            900,
+            1_500,
+            root.join("clip.mcap"),
+            &coverage,
+            Duration::from_secs(10),
+            &extract_tx,
+            TimeSource::Publish,
+        )?;
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].messages_copied, 1);
+        assert_eq!(
+            read_clip(&stats[0].out_path)?,
+            vec![("/t".to_string(), 100)],
+            "the publish window holds the message published at 1_000"
         );
 
         std::fs::remove_dir_all(root)?;

@@ -95,6 +95,49 @@ pub fn now_ns() -> u64 {
         .as_nanos() as u64
 }
 
+/// Absolute path to the built `custom-mcap-writer` example binary (the
+/// momentedge writer the live capture-time e2e drives). Every workspace binary
+/// lands in the same `target/<profile>/` directory as the clipper binary under
+/// test, so it is resolved beside `CARGO_BIN_EXE_clipper` rather than through a
+/// `CARGO_BIN_EXE_*` cargo sets only for the crate under test. If it is not
+/// there — the e2e run builds only `-p clipper`, not the example — it is built
+/// on demand into that same directory. The example carries no r2r/ROS
+/// dependency, so the build is a quick final link over the workspace's
+/// already-compiled crates.
+pub fn writer_bin() -> PathBuf {
+    let bin_dir = Path::new(env!("CARGO_BIN_EXE_clipper"))
+        .parent()
+        .expect("the clipper binary has a parent directory");
+    let writer = bin_dir.join("custom-mcap-writer");
+    if writer.is_file() {
+        return writer;
+    }
+    // Build it into the same target dir. The repo root holding the virtual
+    // workspace manifest is two levels above this crate's manifest.
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.toml");
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let mut build = Command::new(cargo);
+    build
+        .args(["build", "-p", "custom-mcap-writer"])
+        .arg("--manifest-path")
+        .arg(&manifest);
+    // Match the profile the test itself was built under, read off the binary
+    // dir name, so a `--release` e2e run finds the writer beside clipper.
+    if bin_dir.file_name().is_some_and(|n| n == "release") {
+        build.arg("--release");
+    }
+    let status = build
+        .status()
+        .expect("running cargo build for custom-mcap-writer");
+    assert!(status.success(), "building custom-mcap-writer failed: {status}");
+    assert!(
+        writer.is_file(),
+        "custom-mcap-writer not at {} after building it",
+        writer.display(),
+    );
+    writer
+}
+
 /// A `ROS_DOMAIN_ID` unique to this test: nextest runs each test in its own
 /// process, so a plain counter would restart identically everywhere — the PID
 /// disambiguates across test processes, the counter within one. Band 80–101
@@ -337,10 +380,17 @@ impl TestEnv {
     /// The binary under test, configured purely via `MOMENTEDGE_*` env onto
     /// this test's temp tree. Blocks until its "up" line is logged.
     pub fn start_extractor(&self, grace_secs: u64) -> Proc {
+        self.start_extractor_src(grace_secs, "log")
+    }
+
+    /// [`Self::start_extractor`] (the ROS interface, the default) on an explicit
+    /// `--time-source` (`MOMENTEDGE_TIME_SOURCE`) — `log` or `publish`.
+    pub fn start_extractor_src(&self, grace_secs: u64, time_source: &str) -> Proc {
         let mut cmd = self.command(env!("CARGO_BIN_EXE_clipper"));
         cmd.env("MOMENTEDGE_RECORD_DIR", self.record_dir())
             .env("MOMENTEDGE_OUT_DIR", self.out_dir())
-            .env("MOMENTEDGE_GRACE_SECS", grace_secs.to_string());
+            .env("MOMENTEDGE_GRACE_SECS", grace_secs.to_string())
+            .env("MOMENTEDGE_TIME_SOURCE", time_source);
         let proc = self.spawn("extractor", cmd);
         proc.expect_log("clipper up", Duration::from_secs(30));
         proc
@@ -351,14 +401,49 @@ impl TestEnv {
     /// ROS-free — no trigger subscription, no `Recorded` publish. Same temp-tree
     /// wiring as [`Self::start_extractor`], plus `MOMENTEDGE_INTERFACE=mcap`.
     pub fn start_extractor_mcap(&self, grace_secs: u64) -> Proc {
+        self.start_extractor_mcap_src(grace_secs, "log")
+    }
+
+    /// [`Self::start_extractor_mcap`] on an explicit `--time-source`
+    /// (`MOMENTEDGE_TIME_SOURCE`) — `log` or `publish` — for the domain-selection
+    /// e2e.
+    pub fn start_extractor_mcap_src(&self, grace_secs: u64, time_source: &str) -> Proc {
         let mut cmd = self.command(env!("CARGO_BIN_EXE_clipper"));
         cmd.env("MOMENTEDGE_RECORD_DIR", self.record_dir())
             .env("MOMENTEDGE_OUT_DIR", self.out_dir())
             .env("MOMENTEDGE_GRACE_SECS", grace_secs.to_string())
-            .env("MOMENTEDGE_INTERFACE", "mcap");
+            .env("MOMENTEDGE_INTERFACE", "mcap")
+            .env("MOMENTEDGE_TIME_SOURCE", time_source);
         let proc = self.spawn("extractor", cmd);
         proc.expect_log("clipper up", Duration::from_secs(30));
         proc
+    }
+
+    /// Spawn the momentedge `custom-mcap-writer` example appending an
+    /// unchunked, live-tailable recording into `record/<file_name>`:
+    /// `duration_secs` of data at the writer's default 50 Hz whose
+    /// `publish_time` trails `log_time` by `publish_offset_ms`, plus one
+    /// in-recording `json` `Trigger` emitted `trigger_after_ms` after startup.
+    /// The trigger's payload `trigger_time` stays zero and its record carries
+    /// the capture-domain anchor in its own `publish_time` (= `log_time −
+    /// publish_offset_ms`); its window is the writer's fixed ±2 s preroll and
+    /// postroll. The process runs until its duration elapses — clipper tails the
+    /// growing file the whole time — and is torn down with the [`Proc`] on drop.
+    pub fn start_writer(
+        &self,
+        file_name: &str,
+        duration_secs: f64,
+        trigger_after_ms: u64,
+        publish_offset_ms: u64,
+    ) -> Proc {
+        let out = self.record_dir().join(file_name);
+        let mut cmd = Command::new(writer_bin());
+        cmd.arg("--out")
+            .arg(&out)
+            .args(["--duration", &duration_secs.to_string()])
+            .args(["--trigger-after-ms", &trigger_after_ms.to_string()])
+            .args(["--publish-offset-ms", &publish_offset_ms.to_string()]);
+        self.spawn("writer", cmd)
     }
 
     /// A `ros2 topic echo --once` capturing the next `Recorded` announcement
@@ -383,7 +468,21 @@ impl TestEnv {
         proc
     }
 
-    /// Publish one `Trigger` and confirm the extractor actually received it.
+    /// Publish one `Trigger` with `trigger_time = 0` and confirm the extractor
+    /// received it. The ROS interface under the default `--time-source log`
+    /// anchors the window on clipper's own subscription instant and rejects a
+    /// non-zero `trigger_time` (which it ignores), so a test that windows on the
+    /// receipt instant sends zero. For a `--time-source publish` run — the one
+    /// cell that reads `trigger_time` as the anchor — use
+    /// [`Self::fire_trigger_stamped`].
+    pub fn fire_trigger(&self, name: &str, preroll_ns: u64, postroll_ns: u64) {
+        self.fire_trigger_stamped(name, 0, preroll_ns, postroll_ns);
+    }
+
+    /// Publish one `Trigger` with an explicit payload `trigger_time` and confirm
+    /// the extractor received it. Only `--interface ros --time-source publish`
+    /// reads `trigger_time` (as the window anchor); every other cell rejects a
+    /// non-zero one, so this is for the publish-domain ROS case.
     ///
     /// A bare `ros2 topic pub --once -w 1` waits for *one* matched subscription
     /// before its single publish. But the `--all` recorder also subscribes to
@@ -402,9 +501,15 @@ impl TestEnv {
     /// republish; re-firing is idempotent, since only a trigger the extractor
     /// receives cuts a clip. The wait is bounded by `wait_exit` rather than
     /// `--max-wait-time-secs`, Jazzy+ syntax Humble's `ros2 topic pub` rejects.
-    pub fn fire_trigger(&self, name: &str, trigger_ns: u64, preroll_ns: u64, postroll_ns: u64) {
-        let sec = (trigger_ns / 1_000_000_000) as i64;
-        let nanosec = trigger_ns % 1_000_000_000;
+    pub fn fire_trigger_stamped(
+        &self,
+        name: &str,
+        trigger_time_ns: u64,
+        preroll_ns: u64,
+        postroll_ns: u64,
+    ) {
+        let sec = (trigger_time_ns / 1_000_000_000) as i64;
+        let nanosec = trigger_time_ns % 1_000_000_000;
         let yaml = format!(
             "{{name: {name}, description: e2e, \
              trigger_time: {{sec: {sec}, nanosec: {nanosec}}}, \
@@ -478,14 +583,8 @@ impl TestEnv {
     /// it off the file. Publishes exactly once — a republish would write a second
     /// trigger record into the bag and cut a duplicate clip — then confirms
     /// clipper logged receipt after decoding it out of the MCAP.
-    pub fn fire_trigger_into_bag(
-        &self,
-        name: &str,
-        trigger_ns: u64,
-        preroll_ns: u64,
-        postroll_ns: u64,
-    ) {
-        self.publish_trigger_into_bag(name, trigger_ns, preroll_ns, postroll_ns);
+    pub fn fire_trigger_into_bag(&self, name: &str, preroll_ns: u64, postroll_ns: u64) {
+        self.publish_trigger_into_bag(name, preroll_ns, postroll_ns);
 
         // clipper logs `trigger name="<name>"` the moment it decodes the trigger
         // out of the tailed MCAP — the receipt confirmation for the mcap path.
@@ -505,21 +604,14 @@ impl TestEnv {
     /// read it back. For a chunked recording the trigger is only visible after a
     /// flush (e.g. the recorder is stopped later in the test), so receipt cannot
     /// be confirmed inline — the caller confirms end to end via
-    /// [`Self::wait_for_clip`]. Publishes exactly once (`--once`, `-w 1` for the
+    /// [`Self::wait_for_clip_matching`]. Publishes exactly once (`--once`, `-w 1` for the
     /// recorder subscriber); a republish would write a second trigger record and
-    /// cut a duplicate clip.
-    pub fn publish_trigger_into_bag(
-        &self,
-        name: &str,
-        trigger_ns: u64,
-        preroll_ns: u64,
-        postroll_ns: u64,
-    ) {
-        let sec = (trigger_ns / 1_000_000_000) as i64;
-        let nanosec = trigger_ns % 1_000_000_000;
+    /// cut a duplicate clip. `trigger_time` is zero: the MCAP interface anchors on
+    /// the trigger record's own stamp and rejects a non-zero `trigger_time`.
+    pub fn publish_trigger_into_bag(&self, name: &str, preroll_ns: u64, postroll_ns: u64) {
         let yaml = format!(
             "{{name: {name}, description: e2e, \
-             trigger_time: {{sec: {sec}, nanosec: {nanosec}}}, \
+             trigger_time: {{sec: 0, nanosec: 0}}, \
              preroll: {preroll_ns}, postroll: {postroll_ns}}}"
         );
         let mut cmd = self.command("ros2");
@@ -541,20 +633,134 @@ impl TestEnv {
         assert!(status.success(), "trigger publish {name} failed: {status}");
     }
 
-    /// Poll `out_dir` for the clip a cut produces, returning its path once it
-    /// appears. The MCAP interface publishes no `Recorded`, so the finished
-    /// clip's atomic appearance in `out_dir` is the only completion signal.
-    pub fn wait_for_clip(&self, file_name: &str, timeout: Duration) -> PathBuf {
-        let path = self.out_dir().join(file_name);
+    /// Poll `out_dir` for a finished clip whose file name ends with `suffix`,
+    /// returning its path. A clip is named `<anchor_ns>_<name>.mcap`, where the
+    /// anchor is the window centre the interface resolved — the trigger record's
+    /// own stamp under `--interface mcap`, not the publisher's `trigger_time`. A
+    /// test that does not know the exact anchor locates the clip by its
+    /// `_<name>.mcap` suffix.
+    pub fn wait_for_clip_matching(&self, suffix: &str, timeout: Duration) -> PathBuf {
         let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
-            if path.is_file() {
-                return path;
+        loop {
+            if let Ok(entries) = std::fs::read_dir(self.out_dir()) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.ends_with(suffix))
+                    {
+                        return path;
+                    }
+                }
+            }
+            if Instant::now() >= deadline {
+                panic!("no clip ending in {suffix:?} appeared in out_dir within {timeout:?}");
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        panic!("clip {} never appeared in out_dir", path.display());
     }
+}
+
+/// The anchor nanoseconds a clip file name encodes: `<anchor_ns>_<name>.mcap`.
+/// The window a clip was cut with is `[anchor - preroll, anchor + postroll]`, so
+/// a test that located the clip by name recovers the anchor to assert its
+/// window.
+pub fn anchor_from_clip(path: &Path) -> u64 {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.split('_').next())
+        .and_then(|digits| digits.parse().ok())
+        .unwrap_or_else(|| panic!("clip name has no leading anchor: {}", path.display()))
+}
+
+/// The inclusive `[start, end]` window a cut announced, read back from its first
+/// segment's `<anchor>_<name>.mcap` name. Under `--interface ros --time-source
+/// log` the anchor is clipper's own subscription instant — not the test's
+/// pre-publish `now()`, which the `ros2 topic pub` startup precedes by around a
+/// second — so window assertions recover the anchor from the announced clip
+/// rather than a captured timestamp.
+pub fn announced_window(recorded: &Recorded, preroll_ns: u64, postroll_ns: u64) -> (u64, u64) {
+    let anchor = anchor_from_clip(Path::new(&recorded.filenames[0]));
+    (anchor - preroll_ns, anchor + postroll_ns)
+}
+
+/// Write a finished synthetic MCAP for the `--time-source` e2e, using the mcap
+/// crate directly (no `ros2 bag record`): a source topic whose message headers
+/// carry both stamps explicitly, plus one `json`-encoded `momentedge_msgs/Trigger`
+/// on the trigger topic. Rename the result into the record dir so the tail
+/// discovers it as a live new recording and its trigger tap lifts the trigger.
+///
+/// `src_msgs` is one `(log_time, publish_time)` pair per source message; the
+/// trigger record's own two stamps are `trigger_log`/`trigger_publish` (the MCAP
+/// interface anchors the window on one of them per `--time-source`). The JSON
+/// `trigger_time` is left zero — the MCAP interface reads the record stamp, not
+/// the payload field.
+// A test fixture builder: each argument shapes a distinct part of the synthetic
+// recording, so a struct would only add ceremony.
+#[allow(clippy::too_many_arguments)]
+pub fn write_time_source_recording(
+    path: &Path,
+    src_topic: &str,
+    src_msgs: &[(u64, u64)],
+    trigger_name: &str,
+    trigger_log: u64,
+    trigger_publish: u64,
+    preroll_ns: u64,
+    postroll_ns: u64,
+) {
+    use std::collections::BTreeMap;
+    use std::io::BufWriter;
+
+    let file = File::create(path).expect("creating synthetic recording");
+    let mut writer = mcap::WriteOptions::new()
+        .use_chunks(false)
+        .compression(None)
+        .create(BufWriter::new(file))
+        .expect("opening mcap writer");
+
+    let src_schema = writer
+        .add_schema("std_msgs/msg/String", "ros2msg", b"string data")
+        .expect("adding source schema");
+    let src_channel = writer
+        .add_channel(src_schema, src_topic, "cdr", &BTreeMap::new())
+        .expect("adding source channel");
+    for (seq, (log_time, publish_time)) in src_msgs.iter().enumerate() {
+        writer
+            .write_to_known_channel(
+                &mcap::records::MessageHeader {
+                    channel_id: src_channel,
+                    sequence: seq as u32,
+                    log_time: *log_time,
+                    publish_time: *publish_time,
+                },
+                b"payload",
+            )
+            .expect("writing source message");
+    }
+
+    // The trigger record: a schemaless `json` channel on the trigger topic. The
+    // tail's tap lifts it and the MCAP interface decodes it with serde_json.
+    let trigger_channel = writer
+        .add_channel(0, TRIGGER_TOPIC, "json", &BTreeMap::new())
+        .expect("adding trigger channel");
+    let body = format!(
+        "{{\"name\":\"{trigger_name}\",\"description\":\"e2e\",\
+         \"trigger_time\":{{\"sec\":0,\"nanosec\":0}},\
+         \"preroll\":{preroll_ns},\"postroll\":{postroll_ns}}}"
+    );
+    writer
+        .write_to_known_channel(
+            &mcap::records::MessageHeader {
+                channel_id: trigger_channel,
+                sequence: src_msgs.len() as u32,
+                log_time: trigger_log,
+                publish_time: trigger_publish,
+            },
+            body.as_bytes(),
+        )
+        .expect("writing trigger message");
+    writer.finish().expect("finishing synthetic recording");
 }
 
 /// A child process in its own process group, killed group-wide on drop.
@@ -792,6 +998,30 @@ pub fn read_clip(path: &Path) -> Vec<(String, u64)> {
         .collect()
 }
 
+/// Read a finished clip back as `(topic, log_time, publish_time)` triples — the
+/// two-stamp form the capture-time windowing e2e asserts on, where the
+/// discriminator is which stamp `--time-source` applied the window to. Like
+/// [`read_clip`], `MessageStream` insists on a complete summary/footer/magic, so
+/// this doubles as the completeness check on the clip.
+pub fn read_clip_stamps(path: &Path) -> Vec<(String, u64, u64)> {
+    let buf = std::fs::read(path)
+        .unwrap_or_else(|e| panic!("reading announced clip {}: {e}", path.display()));
+    mcap::MessageStream::new(&buf)
+        .unwrap_or_else(|e| {
+            panic!(
+                "announced clip {} is not a complete MCAP: {e}",
+                path.display()
+            )
+        })
+        .map(|msg| {
+            let msg = msg.unwrap_or_else(|e| {
+                panic!("announced clip {} fails to parse: {e}", path.display())
+            });
+            (msg.channel.topic.clone(), msg.log_time, msg.publish_time)
+        })
+        .collect()
+}
+
 /// Every message in the clip lies inside the inclusive trigger window.
 pub fn assert_clip_within_window(msgs: &[(String, u64)], start_ns: u64, end_ns: u64) {
     for (topic, log_time) in msgs {
@@ -804,8 +1034,8 @@ pub fn assert_clip_within_window(msgs: &[(String, u64)], start_ns: u64, end_ns: 
 
 /// Walk the top-level record framing of a possibly unfinished (footer-less)
 /// recording and return the `log_time` of every complete top-level `Message`
-/// record — the 14-byte prefix read the extractor's tail performs, so this
-/// works on a live-copied file [`read_clip`] would reject. A torn final
+/// record — the same timestamp-only framing walk the extractor's tail performs,
+/// so this works on a live-copied file [`read_clip`] would reject. A torn final
 /// record ends the walk. Top-level only: messages inside `Chunk` records are
 /// not seen, which suffices for the suite's unchunked fastwrite recordings.
 pub fn partial_recording_stamps(path: &Path) -> Vec<u64> {

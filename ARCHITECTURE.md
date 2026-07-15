@@ -111,31 +111,48 @@ since the previous pass. Two MCAP properties make this sound:
    the next pass. An in-progress file is indistinguishable from a
    crash-truncated one, which MCAP readers are designed to tolerate.
 
+Both properties are a producer requirement in disguise: a recording clipper can
+tail live must append complete records only and never seek back to rewrite one
+already on disk. The Rust `mcap` crate's chunked writer (`use_chunks(true)`, its
+default) breaks this — it writes each `Chunk` record's header with a
+placeholder length (`u64::MAX`) and back-patches the true length only once the
+chunk closes, so the file is parseable only after that patch lands and cannot
+be tailed live. `rosbag2` satisfies the requirement on every profile (the
+unchunked `fastwrite` profile has no chunks to back-patch; its chunked profiles
+write each chunk record atomically, never seeking back mid-chunk);
+[`examples/custom-mcap-writer`](examples/custom-mcap-writer/README.md) writes
+with `use_chunks(false)` for the same reason.
+
 Each pass maintains three artefacts per recording, plus one collection-wide
 watch:
 
-- **Extent index** — contiguous byte ranges (capped at 4 MiB) with the min/max
-  message `log_time` they hold. Extraction reads only the extents overlapping
-  the requested window; the overlap test uses real min/max, so no in-window
-  message is missed.
+- **Extent index** — contiguous byte ranges (capped at 4 MiB) carrying the
+  min/max `log_time` and `publish_time` of the messages they hold. Extraction
+  reads only the extents whose stamp on the active `--time-source` overlaps the
+  requested window; the overlap test uses real min/max, so no in-window message
+  is missed. The window's [time source](#time-source) picks which of the two
+  spans the overlap and the message-membership test read.
 - **Schema/channel registry** — one owned `Schema`/`Channel` per channel ID,
   used by extraction to register channels in the output writer. Chunked
   recordings carry these inside chunks, so chunks are decompressed during the
   tail; the default unchunked `fastwrite` profile skips that cost.
-- **Coverage watch** (`Watch<Coverage>`) — the collection-wide maximum
-  `log_time` (`high_water_ns`). Trigger handlers block on it until it reaches
-  their window end.
+- **Coverage watch** (`Watch<Coverage>`) — a collection-wide high-water per
+  source: the maximum `log_time` (`high_water_ns`) and the maximum `publish_time`
+  (`publish_high_water_ns`). A trigger handler blocks on the high-water of the
+  source its window lives in. Each rises independently and never regresses.
 
-Only the 14-byte `Message` record prefix (channel id, sequence, `log_time`) is
-read during the tail; message bodies are first touched at extraction. The one
-exception is the opt-in **trigger tap** under the `mcap` interface, which also
-reads the full body of messages on the trigger topic.
+Only the 22-byte `Message` record fixed header (channel id, sequence,
+`log_time`, `publish_time`) is read during the tail, in one read; message bodies
+are first touched at extraction. Both stamps are carried through so a window can
+live on either. The one exception is the opt-in **trigger tap** under the `mcap`
+interface, which also reads the full body of messages on the trigger topic.
 
-**Coverage contract.** The tail trusts rosbag2's approximately non-decreasing
-`log_time` order (a single writer stamps `log_time` at receive). `grace_secs`
-absorbs flush latency; it is not a reordering budget — a message the recorder
-appends out of order after a window has already been cut is not guaranteed into
-that clip.
+**Coverage contract.** On `log` the tail trusts rosbag2's approximately
+non-decreasing `log_time` order (a single writer stamps `log_time` at receive),
+so the high-water is a completeness proof. On `publish` it is a liveness signal
+only: `publish_time` has no ordering guarantee, so a message can arrive after a
+cut with an in-window `publish_time` and be missing from that clip. `grace_secs`
+absorbs flush latency on either source; it is not a reordering budget.
 
 ## Recording collection
 
@@ -186,22 +203,26 @@ never see coverage regress.
 ## Per-trigger flow
 
 Each admitted trigger runs on its own `trigger-<ns>` thread, so overlapping
-windows are cut concurrently against the one shared tail:
+windows are cut concurrently against the one shared tail. The window centres on
+the `anchor_ns` the interface resolved (see [The two interfaces](#the-two-interfaces))
+and lives on the active `--time-source`:
 
 1. **Postroll wall floor.** Sleep until the system clock passes
-   `trigger_time + postroll`.
-2. **Coverage wait.** Block on the coverage watch until `high_water_ns ≥ end_ns`,
-   bounded by `grace_secs`. On timeout the clip is cut from whatever is on disk,
-   with a warning.
-3. **Multi-file snapshot.** `plan_window(start_ns, end_ns)` produces a
-   `Vec<WindowPlan>`, one per recording whose extents overlap the window, oldest
-   first. Each plan pins its recording's `Arc<File>`, so a later prune or
-   rollover cannot pull the bytes out.
+   `anchor + postroll`. The wall floor is always the system clock, whatever the
+   time source.
+2. **Coverage wait.** Block on the coverage watch until the window's source
+   high-water reaches `end_ns`, bounded by `grace_secs`. On timeout the clip is
+   cut from whatever is on disk, with a warning.
+3. **Multi-file snapshot.** `plan_window(start_ns, end_ns, source)` produces a
+   `Vec<WindowPlan>`, one per recording whose extents overlap the window on
+   `source`, oldest first. Each plan pins its recording's `Arc<File>`, so a later
+   prune or rollover cannot pull the bytes out.
 4. **Stage.** Enqueue one `StageJob` per plan on the FIFO staging channel and
-   block on each reply. A window covered by nothing still stages one empty plan,
-   so every trigger produces a valid (possibly empty) clip.
+   block on each reply. A worker copies each message whose stamp on `source` is
+   in the window. A window covered by nothing still stages one empty plan, so
+   every trigger produces a valid (possibly empty) clip.
 5. **Publish.** Drop empty segments when the window produced real data elsewhere.
-   One segment keeps the bare `<trigger_ns>_<name>.mcap`; multiple get
+   One segment keeps the bare `<anchor_ns>_<name>.mcap`; multiple get
    `_00`/`_01`/… suffixes. Each is published into `out_dir` atomically.
 6. **Announce** one completion through the active interface — only after every
    segment is in `out_dir` and fsynced, so every announced path is crash-durable.
@@ -266,6 +287,30 @@ any wire encoding:
   publishing `Recorded`) and `McapInterface` (drains the trigger tap, announces
   via a no-op — the clip's move into `out_dir` is the only signal).
 
+**The anchor seam.** An interface resolves each trigger's anchor — the instant
+its window centres on — and hands it to the handler alongside the neutral
+`Trigger`, so the clip-cutting half never derives an anchor itself. The four
+interface × `--time-source` cells resolve it thus:
+
+| | `--time-source log` | `--time-source publish` |
+|---|---|---|
+| **`--interface ros`** | `now` at the subscription instant | the trigger's `trigger_time` |
+| **`--interface mcap`** | the trigger record's `log_time` | the trigger record's `publish_time` |
+
+A live ROS trigger carries no recording stamp and r2r surfaces no wire timestamp,
+so the ROS interface anchors on `now` or the publisher's own `trigger_time`; an
+in-recording trigger carries its own stamps, the faithful ones since a publisher
+cannot align a wire timestamp to the recording's clock.
+
+**The rejection gate.** `trigger_time` is read in exactly one cell — `ros` +
+`publish` — where it is the anchor. Every other cell anchors on a transport stamp
+and *rejects* a trigger that sets a non-zero `trigger_time`: logged at `error!`,
+no clip cut, no `Recorded` — a single admission gate before any handler runs.
+Sending it where it is ignored would silently anchor the window on the trigger's
+arrival rather than the requested instant, so the request is refused loudly
+instead of mis-served. The `Completion` still echoes the trigger's `trigger_time`
+unchanged.
+
 `main.rs` wires the selected interface to the tail and runs a generic
 `drive<I: Interface>`. The `ros` interface talks to the ROS graph
 (`/events/momentedge/trigger` in, `/events/momentedge/recorded` out); the `mcap`
@@ -307,10 +352,26 @@ invisible to every MCAP reader and is copied into clips as-is.
 
 ## Time base
 
-MCAP `log_time`, the trigger stamp, and the wait clock are all nanoseconds on
-the system (ROS) clock — this assumes the default (no `use_sim_time`). The same
-arithmetic anchors the window identically whether the trigger arrived live over
-ROS or was decoded out of the tailed MCAP.
+MCAP `log_time`, `publish_time`, the trigger stamp, and the wait clock are all
+nanoseconds on the system (ROS) clock — this assumes the default (no
+`use_sim_time`). The same arithmetic anchors the window identically whether the
+trigger arrived live over ROS or was decoded out of the tailed MCAP.
+
+## Time source
+
+`--time-source` (`log` or `publish`, default `log`) selects the clock domain the
+whole window lives in: the anchor it centres on, which messages fall inside,
+which extents are read, and the coverage a cut waits for. It governs nothing
+else. Every MCAP message carries both stamps; the tail indexes both, and the
+window compares against whichever the flag selects. `log_time` is when the
+producer received the message (approximately ordered on disk, so its coverage is
+a completeness proof); `publish_time` is whatever the producer wrote — a DDS
+source timestamp under `ros2 bag record`, a capture time from a momentedge writer
+— which clipper never interprets and which may arrive out of order, so its
+coverage is a liveness signal only. Retention always ages a recording out on its
+`log_time`, independent of the window's source, so a producer cannot drive file
+deletion through `publish_time`. On ROS 2 Humble `publish_time = log_time`
+verbatim, so `publish` is a no-op there; it differs on Jazzy and newer.
 
 ## Deployment
 
