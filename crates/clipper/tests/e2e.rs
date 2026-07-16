@@ -316,7 +316,16 @@ fn time_source_selects_the_window_clock_domain(
     let src: Vec<(u64, u64)> = (-4..=3).map(|k| (at(k), at(k) + 3 * SEC)).collect();
     let staged = env.record_dir().join(".synthetic.tmp");
     let recording = env.record_dir().join("synthetic_0.mcap");
-    write_time_source_recording(&staged, SRC_TOPIC, &src, "ts", at(0), at(0), 2 * SEC, 2 * SEC);
+    write_time_source_recording(
+        &staged,
+        SRC_TOPIC,
+        &src,
+        "ts",
+        at(0),
+        at(0),
+        2 * SEC,
+        2 * SEC,
+    );
     // Rename so the tail only ever sees a complete file (its `.tmp` extension
     // also keeps discovery from picking it up mid-write).
     std::fs::rename(&staged, &recording).expect("publishing the synthetic recording");
@@ -380,7 +389,8 @@ fn live_writer_capture_time_windowing(#[case] time_source: &str) {
     // No Recorded on the mcap interface — wait for the clip itself. Its name
     // carries the resolved anchor (the trigger record's log_time or publish_time
     // per --time-source); the writer names its trigger "custom-mcap-writer-example".
-    let clip = env.wait_for_clip_matching("_custom-mcap-writer-example.mcap", Duration::from_secs(60));
+    let clip =
+        env.wait_for_clip_matching("_custom-mcap-writer-example.mcap", Duration::from_secs(60));
     let anchor = anchor_from_clip(&clip);
     let (ws, we) = (anchor - half_window_ns, anchor + half_window_ns);
 
@@ -388,9 +398,14 @@ fn live_writer_capture_time_windowing(#[case] time_source: &str) {
     // was applied to. The clip must be a complete MCAP holding captured data.
     let msgs = read_clip_stamps(&clip);
     assert!(!msgs.is_empty(), "the clip must hold the windowed data");
-    let data: Vec<&(String, u64, u64)> =
-        msgs.iter().filter(|(topic, _, _)| topic != TRIGGER_TOPIC).collect();
-    assert!(!data.is_empty(), "the clip must hold captured data messages");
+    let data: Vec<&(String, u64, u64)> = msgs
+        .iter()
+        .filter(|(topic, _, _)| topic != TRIGGER_TOPIC)
+        .collect();
+    assert!(
+        !data.is_empty(),
+        "the clip must hold captured data messages"
+    );
 
     // `selected` is the stamp --time-source windowed on; `other` is the
     // contrasting stamp, offset 3 s away and so out of the same numeric window
@@ -419,7 +434,9 @@ fn live_writer_capture_time_windowing(#[case] time_source: &str) {
         "--time-source {time_source}: no data message's contrasting stamp fell \
          outside the window [{ws}, {we}] — the log/publish domains must differ by \
          the 3 s offset, stamps {:?}",
-        data.iter().map(|m| (other(m), selected(m))).collect::<Vec<_>>(),
+        data.iter()
+            .map(|m| (other(m), selected(m)))
+            .collect::<Vec<_>>(),
     );
 
     assert!(

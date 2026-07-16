@@ -215,14 +215,15 @@ pub fn stage_clip(
         .with_context(|| format!("creating capturing dir {}", capturing.display()))?;
 
     let (file, staged_path) = create_new_file(&capturing.join(&desired_name))?;
-    let stats = copy_window(plan, file, start_ns, end_ns, compression, time_source).inspect_err(|_| {
-        // A failed copy must not leave a half-written, footer-less file even in
-        // the capturing dir; the error itself is what the caller reports. No
-        // `StagedClip` is constructed on this path, so its `Drop` cannot do it.
-        if let Err(e) = std::fs::remove_file(&staged_path) {
-            warn!("removing partial clip {}: {e}", staged_path.display());
-        }
-    })?;
+    let stats =
+        copy_window(plan, file, start_ns, end_ns, compression, time_source).inspect_err(|_| {
+            // A failed copy must not leave a half-written, footer-less file even in
+            // the capturing dir; the error itself is what the caller reports. No
+            // `StagedClip` is constructed on this path, so its `Drop` cannot do it.
+            if let Err(e) = std::fs::remove_file(&staged_path) {
+                warn!("removing partial clip {}: {e}", staged_path.display());
+            }
+        })?;
     Ok(StagedClip {
         staged_path,
         out_dir,
@@ -581,12 +582,7 @@ pub(crate) mod tests {
     }
 
     /// [`plan_one`] on an explicit windowing `source`.
-    fn plan_one_src(
-        tailer: &Tailer,
-        start_ns: u64,
-        end_ns: u64,
-        source: TimeSource,
-    ) -> WindowPlan {
+    fn plan_one_src(tailer: &Tailer, start_ns: u64, end_ns: u64, source: TimeSource) -> WindowPlan {
         tailer
             .plan_window(start_ns, end_ns, source)
             .into_iter()
@@ -1011,8 +1007,14 @@ pub(crate) mod tests {
                 offset: 0,
                 len: 64,
                 time: Some(Stamps {
-                    log: Span { min: 0, max: u64::MAX },
-                    publish: Span { min: 0, max: u64::MAX },
+                    log: Span {
+                        min: 0,
+                        max: u64::MAX,
+                    },
+                    publish: Span {
+                        min: 0,
+                        max: u64::MAX,
+                    },
                 }),
             }],
             channels: HashMap::new(),

@@ -129,7 +129,10 @@ pub fn writer_bin() -> PathBuf {
     let status = build
         .status()
         .expect("running cargo build for custom-mcap-writer");
-    assert!(status.success(), "building custom-mcap-writer failed: {status}");
+    assert!(
+        status.success(),
+        "building custom-mcap-writer failed: {status}"
+    );
     assert!(
         writer.is_file(),
         "custom-mcap-writer not at {} after building it",
