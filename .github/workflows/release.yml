@@ -60,6 +60,25 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # The arm64 runner image fetches base Ubuntu packages from ports.ubuntu.com,
+      # which is intermittently unroutable from the runner network — IPv6 has no
+      # route (Network is unreachable) and IPv4 times out — so the setup-ros apt
+      # install below dies with "Unable to fetch some archives". Repoint apt at the
+      # Azure ports mirror the runners reach over the Azure backbone, and force IPv4
+      # since the archive has no working IPv6 route. Only the ports.ubuntu.com host
+      # is rewritten (the rewrite is idempotent and leaves packages.ros.org alone);
+      # the apt.conf drop-in also adds retries the whole job inherits.
+      - name: Repoint apt at the Azure ports mirror
+        run: |
+          set -euo pipefail
+          files=$(grep -rl '//ports.ubuntu.com/' /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null || true)
+          if [ -n "$files" ]; then
+            sudo sed -i 's|//ports.ubuntu.com/|//azure.ports.ubuntu.com/|g' $files
+          fi
+          printf 'Acquire::ForceIPv4 "true";\nAcquire::Retries "5";\nAcquire::http::Timeout "30";\n' \
+            | sudo tee /etc/apt/apt.conf.d/99momentedge-arm64-mirror >/dev/null
+          sudo apt-get update
+
       # ros-tooling/setup-ros registers the packages.ros.org apt repository, installs
       # the ROS dev tools (colcon, build-essential, cmake, git) and rosdep, and
       # installs the matrix distro's desktop variant — ros-base, rosbag2 + the MCAP

@@ -53,6 +53,15 @@ Result: every distro runs the whole binary minus the one flaky-skipped test.
 binaries ABI-compatible with the deployment targets by construction — same
 rationale as `build-on-target.sh`.
 
+**apt is repointed at the Azure ports mirror before `setup-ros`.** The arm64
+runner image fetches base Ubuntu packages from `ports.ubuntu.com`, which is
+intermittently unroutable from the runner network (IPv6 has no route, IPv4 times
+out) and fails the `setup-ros` apt install with `Unable to fetch some archives`.
+A step rewrites the `ports.ubuntu.com` host to `azure.ports.ubuntu.com` (the
+mirror the Azure-hosted runners reach over the backbone) in the apt sources and
+drops an `apt.conf.d` file forcing IPv4 plus retries. The rewrite is idempotent
+and leaves `packages.ros.org` alone; only release.yml needs it (ci.yml is Nix).
+
 **Two packages, two tools.** The `deb` job builds `ros-<distro>-momentedge-msgs`
 with bloom and `momentedge-clipper` with cargo-deb (bloom has no cargo build
 type). `ros-tooling/setup-ros@v0.7` (desktop) covers `ros-base`,
