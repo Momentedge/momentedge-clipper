@@ -640,7 +640,14 @@ fn drive<I: Interface>(
                 .spawn(move || {
                     let _permit = permit;
                     if let Err(e) = handler::handle_trigger(
-                        trig, anchor_ns, &out_dir, grace, tailer, coverage, extract_tx, announcer,
+                        trig,
+                        anchor_ns,
+                        &out_dir,
+                        grace,
+                        tailer,
+                        coverage,
+                        extract_tx,
+                        announcer,
                         time_source,
                     ) {
                         error!("trigger handling failed: {e:#}");
@@ -1273,9 +1280,6 @@ mod tests {
             with_name("../escape").is_err(),
             "path traversal is rejected"
         );
-        assert!(
-            with_name("a..b").is_err(),
-            "an embedded '..' is rejected"
-        );
+        assert!(with_name("a..b").is_err(), "an embedded '..' is rejected");
     }
 }
