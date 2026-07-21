@@ -122,7 +122,7 @@ satisfies the requirement on every profile (the unchunked `fastwrite` profile
 has no chunks to back-patch; its chunked profiles write each chunk record
 atomically, never seeking back mid-chunk).
 
-Two examples show compliant producers.
+Three examples show compliant producers.
 [`examples/custom-mcap-writer`](examples/custom-mcap-writer/README.md) writes
 unchunked (`use_chunks(false)`) — every message its own complete top-level
 record, for the lowest visibility latency.
@@ -130,6 +130,10 @@ record, for the lowest visibility latency.
 buffered chunks (`use_chunks(true)` + `disable_seeking(true)`) — each chunk is
 assembled in memory and appended as one complete record, so the output is
 zstd-compressed yet still tailable.
+[`examples/cu-mcap-record`](examples/cu-mcap-record/README.md) appends routed
+task outputs unchunked (`use_chunks(false)`) from inside a copper (cu29)
+`CuSinkTask` — a compliant recording produced by a copper application rather
+than a standalone writer, with the Trigger carried in-band and no ROS.
 
 Each pass maintains three artefacts per recording, plus one collection-wide
 watch:

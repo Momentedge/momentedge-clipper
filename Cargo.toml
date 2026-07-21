@@ -17,6 +17,11 @@ members = [
     # `disable_seeking(true)`): the second compliant producer path.
     "examples/chunked-mcap-writer",
 ]
+# Excluded from the workspace: this copper (cu29) example pulls the published
+# cu29 1.0 dependency tree, which must never load into the ROS dev shells or the
+# per-distro CI matrix. It carries its own committed Cargo.lock and is built and
+# tested by a dedicated ROS-free CI job. See examples/cu-mcap-record/README.md.
+exclude = ["examples/cu-mcap-record"]
 
 [workspace.package]
 version = "0.1.0"

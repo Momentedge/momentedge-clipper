@@ -20,6 +20,14 @@ behind non-obvious choices, the skip rules, and local testing.
 that only nightly rustfmt honours. Running it per-distro would be three
 identical copies behind a heavy nix realization.
 
+**`cu-mcap-record` is a standalone ROS-free job, outside the distro matrix.**
+The copper example crate is workspace-excluded (root `Cargo.toml` `exclude`)
+with its own committed `Cargo.lock`, so the matrix never sees its cu29
+dependency tree. Its job runs plain-toolchain `cargo fmt` (nightly, same
+rustfmt.toml reason as above) plus `clippy`/`test` on stable with `--locked`,
+inside `examples/cu-mcap-record` — no nix, no ROS. Do not add the crate to the
+matrix build line; the exclusion exists to keep cu29 out of the ROS shells.
+
 **One matrix leg per distro; three steps share one nix shell.**
 Build → unit → e2e reuse the same realized nix closure and compiled artifacts.
 Only `humble`, `jazzy`, and `lyrical` are in the matrix — rolling can't build

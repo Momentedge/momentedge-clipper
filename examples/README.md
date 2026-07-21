@@ -29,3 +29,8 @@ root is the minimal continuous setup; the guides expand on it.
   append each chunk as one complete record, so clipper tails the output live.
   The compressed counterpart to `custom-mcap-writer`'s unchunked, lowest-latency
   output.
+- [`cu-mcap-record/`](cu-mcap-record/README.md) — a copper (cu29) `CuSinkTask`
+  that appends routed task outputs to a **tailable** MCAP Recording (no ROS),
+  with the clip Trigger delivered in-band through the recording itself. The
+  copper-side producer path; workspace-excluded with its own committed
+  `Cargo.lock` so its cu29 dependency tree stays out of the ROS dev shells.

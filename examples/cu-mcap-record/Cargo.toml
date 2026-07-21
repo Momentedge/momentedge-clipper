@@ -1,0 +1,25 @@
+[package]
+name = "cu-mcap-record"
+# Literal package fields: this crate is excluded from the repo workspace (see the
+# root Cargo.toml), so it cannot inherit `[workspace.package]` via `.workspace`.
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[dependencies]
+# The single umbrella crate: runtime, `copper_runtime` macro, `input_msg!` /
+# `output_msg!`, clock types, config, `NoopLogger`, and the `Reflect` /
+# `Serialize` / `Deserialize` derives via `cu29::prelude`.
+cu29 = "1.0"
+# MUST be the `cu-bincode` fork imported under the key `bincode`: cu29's
+# `CuMsgPayload` bound requires the fork's `Encode` / `Decode` traits, not
+# plain crates.io bincode's.
+bincode = { package = "cu-bincode", version = "2.0", features = ["derive"] }
+# Matches the workspace pin so the tailability semantics (`use_chunks(false)`)
+# stay identical to the sibling writer examples.
+mcap = "0.24"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+signal-hook = "0.3"

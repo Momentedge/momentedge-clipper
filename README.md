@@ -280,6 +280,8 @@ Setup guides for the recording + clipper stack live under
 | [`launch/`](examples/launch/README.md) | recorder + clipper brought up together with `ros2 launch` |
 | [`trigger-pub/`](examples/trigger-pub/README.md) | an example trigger source for development |
 | [`custom-mcap-writer/`](examples/custom-mcap-writer/README.md) | a ROS-free MCAP writer that owns `publish_time` as a capture timestamp |
+| [`chunked-mcap-writer/`](examples/chunked-mcap-writer/README.md) | a ROS-free MCAP writer producing tailable zstd-compressed chunks |
+| [`cu-mcap-record/`](examples/cu-mcap-record/README.md) | a copper (cu29) `CuSinkTask` appending routed outputs to a tailable Recording — ROS-free, workspace-excluded |
 
 ## Documentation
 
