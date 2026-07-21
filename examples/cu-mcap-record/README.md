@@ -87,13 +87,10 @@ rejects a non-zero payload `trigger_time`.
 
 ## Run
 
-The crate is excluded from the repo's Cargo workspace (its cu29 dependency tree
-stays out of the ROS dev shells and the per-distro CI matrix), so it is built and
-run from its own directory rather than with `cargo run -p`:
+Run it from the repo root with `-p` — it is a workspace member:
 
 ```bash
-cd examples/cu-mcap-record
-cargo run -- --out out          # writes out/recording-<unix-seconds>.mcap until Ctrl+C
+cargo run -p cu-mcap-record -- --out out   # writes out/recording-<unix-seconds>.mcap until Ctrl+C
 ```
 
 `--out` is the only flag (default `out`); it names the directory the Recording is
@@ -124,8 +121,8 @@ writes one continuous Recording and leaves pruning to clipper.
 Clipper's live e2e suite drives this binary as its copper Producer fixture: the
 `copper_sink_recording_produces_clip` test runs this app and unmodified clipper
 together on `--interface mcap` and asserts a Clip appears and parses. The suite
-provisions the binary from this crate's own lockfile (`CU_MCAP_RECORD_BIN`, or
-an on-demand build), so its cu29 tree stays out of the ROS build lanes.
+provisions the binary beside the clipper binary under test (`CU_MCAP_RECORD_BIN`,
+or an on-demand `-p cu-mcap-record` build).
 
 ## Production notes
 

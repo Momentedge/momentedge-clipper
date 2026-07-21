@@ -63,32 +63,24 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
-  # Lean ROS-free lane for the workspace-EXCLUDED copper example. Its cu29 1.0
-  # dependency tree never touches the ROS dev shells or the per-distro matrix,
-  # so it builds with the plain system toolchain on ubuntu-latest — no nix, no
-  # ROS — exactly like the `fmt` job. It carries its own committed Cargo.lock;
-  # clippy and test run `--locked` so that lockfile is enforced. fmt needs a
-  # nightly rustfmt (the repo rustfmt.toml, found by walking up from the crate,
-  # uses the unstable group_imports/imports_granularity keys); clippy and test
-  # run on stable, installed last so it is the default toolchain.
+  # Lean ROS-free lane for the copper example: a fast signal that the
+  # cu-mcap-record member builds, clippies, and tests without the ROS toolchain.
+  # It is a workspace member, but its cu29 deps are crate-local (not in
+  # [workspace.dependencies]), so nothing in the ROS lanes compiles cu29 unless
+  # it asks for `-p cu-mcap-record` — which the recorder matrix does, once, to
+  # prebuild the live-e2e Producer fixture. This job runs from the repo root with
+  # `-p cu-mcap-record` on the plain system toolchain — no nix, no ROS — so `-p`
+  # pulls only the example and its cu29 tree, never clipper's r2r closure.
+  # `--locked` enforces the shared root lockfile. Formatting is covered by the
+  # `fmt` job's `cargo fmt --all --check`, which now includes this member.
   cu-mcap-record:
     name: cu-mcap-record
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: examples/cu-mcap-record
     steps:
       - uses: actions/checkout@v6
 
-      # nightly, rustfmt only — the crate's `cargo fmt` picks up the root
-      # rustfmt.toml's unstable keys, which stable rustfmt rejects.
-      - name: Install nightly rustfmt
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rustfmt
-
-      # stable (installed last, so the default) for the edition-2024
-      # build/clippy/test. Latest stable is well past 1.85.
+      # stable for the edition-2024 build/clippy/test. Latest stable is well
+      # past 1.85.
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -97,17 +89,13 @@ jobs:
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: examples/cu-mcap-record
           shared-key: cu-mcap-record
 
-      - name: Format check
-        run: cargo +nightly fmt --check
-
       - name: Clippy
-        run: cargo clippy --locked --all-targets
+        run: cargo clippy --locked --all-targets -p cu-mcap-record
 
       - name: Test
-        run: cargo test --locked
+        run: cargo test --locked -p cu-mcap-record
 
   recorder:
     name: ${{ matrix.distro }}
@@ -191,16 +179,13 @@ jobs:
           tool: cargo-nextest
 
       # Caches cargo registry + this distro's target/ (the r2r build links the
-      # distro's rcl/rmw, so the key is per distro). The excluded copper example
-      # has its own target/ (built as the live copper e2e's Producer fixture), so
-      # list it as a second workspace to cache its cu29 tree per leg too.
+      # distro's rcl/rmw, so the key is per distro). The copper example is a
+      # workspace member now, so its cu29 tree builds into the same root target/
+      # and caches with everything else — no separate workspace entry needed.
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: ${{ matrix.distro }}
-          workspaces: |
-            .
-            examples/cu-mcap-record
 
       # Realise the distro's dev shell on its own, so the ROS2 closure is
       # substituted (from momentedge / ros.cachix.org) as a distinct step. A full
@@ -209,19 +194,15 @@ jobs:
       - name: Realise the ROS2 dev shell
         run: nix develop ".#${{ matrix.distro }}" --command true
 
-      # Build the clipper binary and the workspace example producer
-      # custom-mcap-writer, plus the workspace-excluded copper example (its own
-      # committed lockfile). The
-      # copper binary is the live copper e2e's Producer fixture
-      # (`copper_sink_recording_produces_clip`); prebuilding it here keeps the
-      # cu29 tree out of the test's own timeout — the e2e's on-demand build then
-      # finds it up to date. It builds ROS-free, but runs inside the same dev
-      # shell so it shares the toolchain and target the e2e step's on-demand
-      # `cargo build` checks against.
+      # Build the clipper binary, the custom-mcap-writer example producer, and
+      # the cu-mcap-record copper example. The copper binary is the live copper
+      # e2e's Producer fixture (`copper_sink_recording_produces_clip`);
+      # prebuilding it here (its own `-p` target now that it is a member) keeps
+      # the cu29 compile out of the test's own timeout — the e2e's on-demand
+      # build then finds it up to date. Its cu29 deps are crate-local, so `-p`
+      # pulls the cu29 tree only for this one target, not the whole matrix.
       - name: Build
-        run: |
-          nix develop ".#${{ matrix.distro }}" --command cargo build --locked -p clipper -p custom-mcap-writer
-          nix develop ".#${{ matrix.distro }}" --command cargo build --locked --manifest-path examples/cu-mcap-record/Cargo.toml
+        run: nix develop ".#${{ matrix.distro }}" --command cargo build --locked -p clipper -p custom-mcap-writer -p cu-mcap-record
 
       - name: Unit tests
         run: nix develop ".#${{ matrix.distro }}" --command cargo nextest run --locked -p clipper -E 'not binary(e2e)'

@@ -1,25 +1,31 @@
 [package]
 name = "cu-mcap-record"
-# Literal package fields: this crate is excluded from the repo workspace (see the
-# root Cargo.toml), so it cannot inherit `[workspace.package]` via `.workspace`.
-version = "0.1.0"
-edition = "2024"
-license = "Apache-2.0"
+# A copper (cu29) example, not a published crate.
+publish = false
+# A workspace member (see the root Cargo.toml): it inherits the shared
+# version / edition / license and the `[workspace.dependencies]` versions via
+# `.workspace = true`, like the sibling examples. Its copper dependencies (cu29
+# and the cu-bincode fork) stay declared here by decision — they are NOT hoisted
+# into `[workspace.dependencies]`, so the cu29 tree stays scoped to this crate.
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [dependencies]
-# The single umbrella crate: runtime, `copper_runtime` macro, `input_msg!` /
-# `output_msg!`, clock types, config, `NoopLogger`, and the `Reflect` /
-# `Serialize` / `Deserialize` derives via `cu29::prelude`.
+# The copper runtime umbrella crate: runtime, `copper_runtime` macro,
+# `input_msg!` / `output_msg!`, clock types, config, `NoopLogger`, and the
+# `Reflect` / `Serialize` / `Deserialize` derives via `cu29::prelude`. Kept
+# crate-local (not a workspace dependency) so its cu29 tree does not enter
+# `[workspace.dependencies]`.
 cu29 = "1.0"
 # MUST be the `cu-bincode` fork imported under the key `bincode`: cu29's
-# `CuMsgPayload` bound requires the fork's `Encode` / `Decode` traits, not
-# plain crates.io bincode's.
+# `CuMsgPayload` bound requires the fork's `Encode` / `Decode` traits, not plain
+# crates.io bincode's. Crate-local for the same reason as cu29.
 bincode = { package = "cu-bincode", version = "2.0", features = ["derive"] }
-# Matches the workspace pin so the tailability semantics (`use_chunks(false)`)
-# stay identical to the sibling writer examples.
-mcap = "0.24"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-anyhow = "1"
-clap = { version = "4", features = ["derive"] }
-signal-hook = "0.3"
+# The remaining dependencies are shared with the rest of the workspace.
+mcap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+signal-hook.workspace = true

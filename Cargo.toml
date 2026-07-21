@@ -16,12 +16,13 @@ members = [
     # via the `mcap` crate's buffered chunk mode (`use_chunks(true)` +
     # `disable_seeking(true)`): the second compliant producer path.
     "examples/chunked-mcap-writer",
+    # Copper (cu29) CuSinkTask producer example — appends a tailable MCAP
+    # Recording clipper cuts clips from, ROS-free. Its copper deps (cu29 and the
+    # cu-bincode fork) stay declared in the crate's own Cargo.toml by decision —
+    # do NOT hoist them into [workspace.dependencies]; keeping them crate-local
+    # keeps the cu29 tree scoped to this one member.
+    "examples/cu-mcap-record",
 ]
-# Excluded from the workspace: this copper (cu29) example pulls the published
-# cu29 1.0 dependency tree, which must never load into the ROS dev shells or the
-# per-distro CI matrix. It carries its own committed Cargo.lock and is built and
-# tested by a dedicated ROS-free CI job. See examples/cu-mcap-record/README.md.
-exclude = ["examples/cu-mcap-record"]
 
 [workspace.package]
 version = "0.1.0"

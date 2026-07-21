@@ -609,14 +609,15 @@ rationale.
   absent), so the case needs no extra build step.
 - **A copper (cu29) Producer reaches clipper end to end**
   (`copper_sink_recording_produces_clip`, ROS-free at runtime): the
-  workspace-excluded `examples/cu-mcap-record` binary — a copper `CuSinkTask` —
-  appends an unchunked, epoch-stamped Recording while clipper tails it
-  `--interface mcap`, writing its own in-Recording `json` `Trigger`; clipper
-  lifts that trigger back out and cuts the clip, proving a copper-rs robot with
-  no ROS surface reaches clipper through the Recording alone. The Producer is
-  resolved by `cu_mcap_record_bin` — `CU_MCAP_RECORD_BIN`, else built on demand
-  from the excluded crate's own lockfile/target; CI's matrix `Build` step
-  prebuilds it so the on-demand build stays inside the test timeout.
+  `examples/cu-mcap-record` binary — a copper `CuSinkTask` — appends an
+  unchunked, epoch-stamped Recording while clipper tails it `--interface mcap`,
+  writing its own in-Recording `json` `Trigger`; clipper lifts that trigger back
+  out and cuts the clip, proving a copper-rs robot with no ROS surface reaches
+  clipper through the Recording alone. The Producer (a workspace member whose
+  cu29 deps stay crate-local) is resolved by `cu_mcap_record_bin` beside the
+  clipper binary — `CU_MCAP_RECORD_BIN`, else built on demand with `-p
+  cu-mcap-record`; CI's matrix `Build` step prebuilds it so the on-demand build
+  stays inside the test timeout.
 
 ## Retention
 

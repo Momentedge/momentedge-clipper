@@ -50,23 +50,22 @@ A virtual workspace (no root package), so `resolver = "3"` (the edition-2024
 resolver) is set explicitly — a virtual workspace does not infer the resolver
 from member editions and otherwise falls back to `"1"` with a warning. Members
 are the recorder crate (`crates/clipper`), the example trigger source
-(`examples/trigger-pub`), and the two mcap-writer examples
-(`examples/custom-mcap-writer`, `examples/chunked-mcap-writer`) — the examples
-stay members so they inherit `[workspace.package]` and the shared
-`[workspace.dependencies]` versions, rather than for shipping. `momentedge_msgs/` (ROS2 interface package) and `sim/` (the
-sim camera's launch/config tree) are not Cargo members. `examples/cu-mcap-record`
-is instead explicitly **excluded** from the workspace (via `[workspace].exclude`)
-with its own committed `Cargo.lock`: the exclusion keeps its copper (cu29)
-dependency graph out of the workspace and the ROS dev shells, so a dedicated
-ROS-free CI job builds and tests it. The per-distro matrix builds the example
-*binary* separately (by `--manifest-path`, its own lockfile) as the Producer
-fixture the live copper e2e drives — the binary is a test-time artifact; its
-cu29 tree still never enters the workspace dependency graph.
+(`examples/trigger-pub`), the two mcap-writer examples
+(`examples/custom-mcap-writer`, `examples/chunked-mcap-writer`), and the copper
+producer example (`examples/cu-mcap-record`) — the examples stay members so they
+inherit `[workspace.package]` and the shared `[workspace.dependencies]`
+versions, rather than for shipping. `examples/cu-mcap-record` keeps its copper
+dependencies (`cu29` and the `cu-bincode` fork) declared in its own `Cargo.toml`
+rather than in `[workspace.dependencies]`, so the heavy cu29 tree stays scoped
+to that one member; it still lives in the shared root lockfile, and a lean
+ROS-free CI job builds and tests it with `-p cu-mcap-record`. `momentedge_msgs/`
+(ROS2 interface package) and `sim/` (the sim camera's launch/config tree) are
+not Cargo members.
 
 ```
 crates/clipper/         # triggered clip recorder tailing the continuous mcap
 momentedge_msgs/        # local ROS2 interface package (Trigger, Recorded)
-examples/               # setup guides + trigger-pub + mcap-writer examples (cu-mcap-record: workspace-excluded)
+examples/               # setup guides + trigger-pub + mcap-writer examples + cu-mcap-record (copper)
 sim/                    # synthetic gscam camera (sim/cam_sim.sh) — see sim/README.md
 nix/                    # flake package defs: momentedge-msgs, ros-env, binaries
 scripts/                # record.sh, run.sh, build-on-target.sh, packaging scripts

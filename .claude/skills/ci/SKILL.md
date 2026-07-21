@@ -20,20 +20,20 @@ behind non-obvious choices, the skip rules, and local testing.
 that only nightly rustfmt honours. Running it per-distro would be three
 identical copies behind a heavy nix realization.
 
-**`cu-mcap-record` has its own standalone ROS-free job, plus a fixture build in
-the matrix.** The copper example crate is workspace-excluded (root `Cargo.toml`
-`exclude`) with its own committed `Cargo.lock`, so the exclusion keeps its cu29
-dependency tree out of the workspace dependency graph and the ROS dev shells —
-`cargo build -p clipper` and the unit lanes never resolve cu29. Its dedicated
-job runs plain-toolchain `cargo fmt` (nightly, same rustfmt.toml reason as
-above) plus `clippy`/`test` on stable with `--locked`, inside
-`examples/cu-mcap-record` — no nix, no ROS. Separately, the per-distro
-`recorder` matrix `Build` step builds the example **binary** by
-`--manifest-path` (its own lockfile, never `-p`) as the Producer fixture the
-live copper e2e (`copper_sink_recording_produces_clip`) drives; its `target/`
-is a second `Swatinem/rust-cache` workspace so the cu29 tree caches per leg.
-Prebuilding it there keeps the cu29 compile out of the e2e test's own timeout —
-the test's on-demand `cargo build --locked` then finds it up to date.
+**`cu-mcap-record` has a lean ROS-free job, plus a fixture build in the matrix.**
+The copper example is a workspace member, but its cu29 deps are declared
+crate-local (not in `[workspace.dependencies]`), so the cu29 tree stays scoped
+to that one member: `cargo build -p clipper` and the `-p clipper` unit lane
+never resolve or compile it. Its dedicated job runs from the repo root on the
+plain system toolchain — `cargo clippy --locked --all-targets -p cu-mcap-record`
+and `cargo test --locked -p cu-mcap-record`, no nix, no ROS — where `-p` pulls
+only the example and its cu29 tree, never clipper's r2r closure. Formatting is
+covered by the `fmt` job's `cargo fmt --all --check`, which includes the member.
+Separately, the per-distro `recorder` matrix `Build` step adds `-p
+cu-mcap-record` to its build line to prebuild the Producer fixture the live
+copper e2e (`copper_sink_recording_produces_clip`) drives; prebuilding it keeps
+the cu29 compile out of the e2e test's own timeout — the test's on-demand `-p
+cu-mcap-record` build then finds it up to date.
 
 **One matrix leg per distro; three steps share one nix shell.**
 Build → unit → e2e reuse the same realized nix closure and compiled artifacts.
