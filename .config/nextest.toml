@@ -37,13 +37,13 @@ test-group = "ros-e2e"
 filter = "test(corrupt_tail_health_live)"
 retries = 2
 
-# The copper live e2e builds its Producer fixture — the workspace-excluded
-# cu-mcap-record crate — on demand when no prebuilt binary is present. A cold
-# cu29 compile takes minutes, far past the default two 60 s periods, so raise
-# the ceiling to ten (~10 min) for this one test; the 60 s slow-warning period
-# still flags a genuinely stuck run. CI's matrix Build step (and a local
-# prebuild) make the in-test build an up-to-date no-op, so this ceiling is only
-# ever approached on a cold checkout.
+# The copper live e2e builds its Producer fixture (the cu-mcap-record member)
+# on demand with `-p cu-mcap-record` when no prebuilt binary is present. That
+# compiles the cu29 tree — minutes on a cold cache, far past the default two
+# 60 s periods — so raise the ceiling to ten (~10 min) for this one test; the
+# 60 s slow-warning period still flags a genuinely stuck run. CI's matrix Build
+# step (and a local prebuild) make the in-test build an up-to-date no-op, so
+# this ceiling is only ever approached on a cold checkout.
 [[profile.e2e.overrides]]
 filter = "test(copper_sink_recording_produces_clip)"
 slow-timeout = { period = "60s", terminate-after = 10, grace-period = "10s" }

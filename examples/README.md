@@ -32,5 +32,6 @@ root is the minimal continuous setup; the guides expand on it.
 - [`cu-mcap-record/`](cu-mcap-record/README.md) — a copper (cu29) `CuSinkTask`
   that appends routed task outputs to a **tailable** MCAP Recording (no ROS),
   with the clip Trigger delivered in-band through the recording itself. The
-  copper-side producer path; workspace-excluded with its own committed
-  `Cargo.lock` so its cu29 dependency tree stays out of the ROS dev shells.
+  copper-side producer path; a workspace member whose cu29 dependencies stay
+  declared crate-local so the copper tree does not enter the shared dependency
+  set.
