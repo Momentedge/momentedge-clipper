@@ -56,9 +56,12 @@ stay members so they inherit `[workspace.package]` and the shared
 `[workspace.dependencies]` versions, rather than for shipping. `momentedge_msgs/` (ROS2 interface package) and `sim/` (the
 sim camera's launch/config tree) are not Cargo members. `examples/cu-mcap-record`
 is instead explicitly **excluded** from the workspace (via `[workspace].exclude`)
-with its own committed `Cargo.lock`: its copper (cu29) dependency tree must stay
-out of the ROS dev shells and the per-distro CI matrix, so a dedicated ROS-free
-CI job builds and tests it.
+with its own committed `Cargo.lock`: the exclusion keeps its copper (cu29)
+dependency graph out of the workspace and the ROS dev shells, so a dedicated
+ROS-free CI job builds and tests it. The per-distro matrix builds the example
+*binary* separately (by `--manifest-path`, its own lockfile) as the Producer
+fixture the live copper e2e drives — the binary is a test-time artifact; its
+cu29 tree still never enters the workspace dependency graph.
 
 ```
 crates/clipper/         # triggered clip recorder tailing the continuous mcap
