@@ -63,6 +63,52 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
+  # Lean ROS-free lane for the workspace-EXCLUDED copper example. Its cu29 1.0
+  # dependency tree never touches the ROS dev shells or the per-distro matrix,
+  # so it builds with the plain system toolchain on ubuntu-latest — no nix, no
+  # ROS — exactly like the `fmt` job. It carries its own committed Cargo.lock;
+  # clippy and test run `--locked` so that lockfile is enforced. fmt needs a
+  # nightly rustfmt (the repo rustfmt.toml, found by walking up from the crate,
+  # uses the unstable group_imports/imports_granularity keys); clippy and test
+  # run on stable, installed last so it is the default toolchain.
+  cu-mcap-record:
+    name: cu-mcap-record
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: examples/cu-mcap-record
+    steps:
+      - uses: actions/checkout@v6
+
+      # nightly, rustfmt only — the crate's `cargo fmt` picks up the root
+      # rustfmt.toml's unstable keys, which stable rustfmt rejects.
+      - name: Install nightly rustfmt
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+
+      # stable (installed last, so the default) for the edition-2024
+      # build/clippy/test. Latest stable is well past 1.85.
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: examples/cu-mcap-record
+          shared-key: cu-mcap-record
+
+      - name: Format check
+        run: cargo +nightly fmt --check
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets
+
+      - name: Test
+        run: cargo test --locked
+
   recorder:
     name: ${{ matrix.distro }}
     runs-on: ubuntu-latest

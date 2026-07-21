@@ -49,16 +49,21 @@ matrix detail: [`sim/CLAUDE.md`](sim/CLAUDE.md).
 A virtual workspace (no root package), so `resolver = "3"` (the edition-2024
 resolver) is set explicitly — a virtual workspace does not infer the resolver
 from member editions and otherwise falls back to `"1"` with a warning. Members
-are the recorder crate (`crates/clipper`) and the example trigger source
-(`examples/trigger-pub`) — the example stays a member so it inherits
-`[workspace.package]` and the shared `[workspace.dependencies]` versions, rather
-than for shipping. `momentedge_msgs/` (ROS2 interface package) and `sim/` (the
-sim camera's launch/config tree) are not Cargo members.
+are the recorder crate (`crates/clipper`), the example trigger source
+(`examples/trigger-pub`), and the two mcap-writer examples
+(`examples/custom-mcap-writer`, `examples/chunked-mcap-writer`) — the examples
+stay members so they inherit `[workspace.package]` and the shared
+`[workspace.dependencies]` versions, rather than for shipping. `momentedge_msgs/` (ROS2 interface package) and `sim/` (the
+sim camera's launch/config tree) are not Cargo members. `examples/cu-mcap-record`
+is instead explicitly **excluded** from the workspace (via `[workspace].exclude`)
+with its own committed `Cargo.lock`: its copper (cu29) dependency tree must stay
+out of the ROS dev shells and the per-distro CI matrix, so a dedicated ROS-free
+CI job builds and tests it.
 
 ```
 crates/clipper/         # triggered clip recorder tailing the continuous mcap
 momentedge_msgs/        # local ROS2 interface package (Trigger, Recorded)
-examples/               # setup guides (continuous, split-bags, launch) + trigger-pub
+examples/               # setup guides + trigger-pub + mcap-writer examples (cu-mcap-record: workspace-excluded)
 sim/                    # synthetic gscam camera (sim/cam_sim.sh) — see sim/README.md
 nix/                    # flake package defs: momentedge-msgs, ros-env, binaries
 scripts/                # record.sh, run.sh, build-on-target.sh, packaging scripts

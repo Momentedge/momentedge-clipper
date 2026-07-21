@@ -1,0 +1,30 @@
+(
+    // Global loop-rate limiter: the whole CopperList graph is pulled at this
+    // rate. There is no per-task Hz in cu29 1.0 — the ~10 s trigger decimates
+    // internally (it clears its payload on every non-fire iteration).
+    runtime: (rate_target_hz: 50),
+    tasks: [
+        (
+            id: "sensor",
+            type: "tasks::SensorSource",
+        ),
+        (
+            id: "trigger",
+            type: "tasks::TriggerSource",
+        ),
+        (
+            id: "sink",
+            type: "tasks::RecordSink",
+            // Reaches the sink's `new()` as `Option<&ComponentConfig>`; `main`
+            // overrides it from the `--out` flag before the app is built.
+            config: { "out_dir": "out" },
+        ),
+    ],
+    cnx: [
+        // Connection order into the sink defines the tuple order of its `Input`
+        // type: sensor is slot 0, trigger is slot 1. Reordering these silently
+        // mis-binds the payload types to the wrong slots.
+        ( src: "sensor",  dst: "sink", msg: "tasks::SensorSample" ),
+        ( src: "trigger", dst: "sink", msg: "tasks::TriggerCmd" ),
+    ],
+)
