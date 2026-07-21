@@ -20,13 +20,20 @@ behind non-obvious choices, the skip rules, and local testing.
 that only nightly rustfmt honours. Running it per-distro would be three
 identical copies behind a heavy nix realization.
 
-**`cu-mcap-record` is a standalone ROS-free job, outside the distro matrix.**
-The copper example crate is workspace-excluded (root `Cargo.toml` `exclude`)
-with its own committed `Cargo.lock`, so the matrix never sees its cu29
-dependency tree. Its job runs plain-toolchain `cargo fmt` (nightly, same
-rustfmt.toml reason as above) plus `clippy`/`test` on stable with `--locked`,
-inside `examples/cu-mcap-record` — no nix, no ROS. Do not add the crate to the
-matrix build line; the exclusion exists to keep cu29 out of the ROS shells.
+**`cu-mcap-record` has its own standalone ROS-free job, plus a fixture build in
+the matrix.** The copper example crate is workspace-excluded (root `Cargo.toml`
+`exclude`) with its own committed `Cargo.lock`, so the exclusion keeps its cu29
+dependency tree out of the workspace dependency graph and the ROS dev shells —
+`cargo build -p clipper` and the unit lanes never resolve cu29. Its dedicated
+job runs plain-toolchain `cargo fmt` (nightly, same rustfmt.toml reason as
+above) plus `clippy`/`test` on stable with `--locked`, inside
+`examples/cu-mcap-record` — no nix, no ROS. Separately, the per-distro
+`recorder` matrix `Build` step builds the example **binary** by
+`--manifest-path` (its own lockfile, never `-p`) as the Producer fixture the
+live copper e2e (`copper_sink_recording_produces_clip`) drives; its `target/`
+is a second `Swatinem/rust-cache` workspace so the cu29 tree caches per leg.
+Prebuilding it there keeps the cu29 compile out of the e2e test's own timeout —
+the test's on-demand `cargo build --locked` then finds it up to date.
 
 **One matrix leg per distro; three steps share one nix shell.**
 Build → unit → e2e reuse the same realized nix closure and compiled artifacts.

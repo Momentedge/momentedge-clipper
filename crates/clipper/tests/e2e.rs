@@ -445,6 +445,74 @@ fn live_writer_capture_time_windowing(#[case] time_source: &str) {
     );
 }
 
+/// A copper (cu29) app produces the Recording, clipper cuts the clip (clipper-a6q).
+/// The `examples/cu-mcap-record` binary — a copper `CuSinkTask` — appends a
+/// growing, unchunked, epoch-stamped Recording while clipper tails it
+/// `--interface mcap`, entirely ROS-free at runtime: no ros2 stack, no
+/// `ros2 bag record`. The copper app writes its own in-Recording `json`
+/// `Trigger` (`periodic-1`) on its first iteration with a fixed ±3 s window, and
+/// clipper lifts that Trigger back out of the file it tails and cuts the clip;
+/// the clip's appearance in `out_dir` is the only completion signal. This is the
+/// live copper-Producer sibling of `live_writer_capture_time_windowing` (which
+/// drives the plain-Rust `custom-mcap-writer`): it proves a copper-rs robot with
+/// no ROS surface reaches clipper through the Recording alone.
+///
+/// The binary is provisioned by [`cu_mcap_record_bin`] (its own excluded
+/// lockfile/target, prebuilt in CI). Anchored on the Trigger record's own
+/// `log_time` (default `--time-source`), the window closes ~3 s after the app
+/// starts, which the app's continuous ~50 Hz `/sensor` stream covers naturally,
+/// well inside the wait; grace is only a backstop. Assertions stay robust to
+/// scheduling — a parseable clip, in-window stamps, `/sensor` present, non-empty
+/// — with no exact counts or tight latency bounds.
+#[rstest]
+fn copper_sink_recording_produces_clip() {
+    if !require_e2e() {
+        return;
+    }
+    let env = TestEnv::new();
+    // Empty record dir at startup so the tail discovers the copper app's growing
+    // file as a live new Recording — the trigger tap fires only for Recordings
+    // indexed live — then lifts the json Trigger out of it. Bring clipper up
+    // first (it waits for its "clipper up" line) so it is already tailing the
+    // dir when the app creates the file and writes the near-immediate Trigger.
+    std::fs::create_dir_all(env.record_dir()).expect("creating the record dir");
+    let mut extractor = env.start_extractor_mcap(10);
+
+    let _producer = env.start_cu_recorder();
+
+    // No Recorded on the mcap interface — wait for the clip itself. The copper
+    // app names its first Trigger "periodic-1"; the clip name carries the
+    // resolved anchor (the Trigger record's own log_time under the default
+    // --time-source log). Locate it by name suffix.
+    let clip = env.wait_for_clip_matching("_periodic-1.mcap", Duration::from_secs(60));
+    let anchor = anchor_from_clip(&clip);
+    // The window bounds live in the producer's trigger JSON, and clipper anchors
+    // on the trigger record's own stamp so that record is inside its own window
+    // and copied into the clip — recover the bounds from it rather than
+    // re-hardcoding, so a producer-side window change cannot silently desync this
+    // assertion. Fall back to the producer's constants only if the trigger record
+    // is somehow absent (examples/cu-mcap-record's TRIGGER_PREROLL_NS /
+    // TRIGGER_POSTROLL_NS are the source of truth: 3 s each).
+    let (preroll, postroll) = clip_trigger_window(&clip).unwrap_or((3 * SEC, 3 * SEC));
+
+    // read_clip requires a complete summary/footer/magic, so it is also the MCAP
+    // completeness check on the cut clip.
+    let msgs = read_clip(&clip);
+    assert!(!msgs.is_empty(), "the clip must hold the recorded window");
+    assert_clip_within_window(&msgs, anchor - preroll, anchor + postroll);
+    assert!(
+        msgs.iter().any(|(topic, _)| topic == "/sensor"),
+        "the copper /sensor topic must be in the clip, got topics: {:?}",
+        msgs.iter()
+            .map(|(t, _)| t)
+            .collect::<std::collections::HashSet<_>>(),
+    );
+    assert!(
+        extractor.is_running(),
+        "the ROS-free extractor must outlive the cut"
+    );
+}
+
 /// Restart during operation: the recorder is stopped and relaunched (the
 /// record script wipes the bag dir), the extractor must re-discover the new
 /// recording and keep cutting clips for later triggers.

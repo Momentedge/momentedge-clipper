@@ -121,6 +121,12 @@ ROS, no extra IPC. To window Clips on capture time instead of log time, add
 README](../../README.md)) bound how much of the Recording is kept; this example
 writes one continuous Recording and leaves pruning to clipper.
 
+Clipper's live e2e suite drives this binary as its copper Producer fixture: the
+`copper_sink_recording_produces_clip` test runs this app and unmodified clipper
+together on `--interface mcap` and asserts a Clip appears and parses. The suite
+provisions the binary from this crate's own lockfile (`CU_MCAP_RECORD_BIN`, or
+an on-demand build), so its cu29 tree stays out of the ROS build lanes.
+
 ## Production notes
 
 - **Epoch stamping is a requirement, not a demo convenience.** On a real robot

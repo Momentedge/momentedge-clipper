@@ -191,11 +191,16 @@ jobs:
           tool: cargo-nextest
 
       # Caches cargo registry + this distro's target/ (the r2r build links the
-      # distro's rcl/rmw, so the key is per distro).
+      # distro's rcl/rmw, so the key is per distro). The excluded copper example
+      # has its own target/ (built as the live copper e2e's Producer fixture), so
+      # list it as a second workspace to cache its cu29 tree per leg too.
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: ${{ matrix.distro }}
+          workspaces: |
+            .
+            examples/cu-mcap-record
 
       # Realise the distro's dev shell on its own, so the ROS2 closure is
       # substituted (from momentedge / ros.cachix.org) as a distinct step. A full
@@ -204,8 +209,19 @@ jobs:
       - name: Realise the ROS2 dev shell
         run: nix develop ".#${{ matrix.distro }}" --command true
 
+      # Build the clipper binary and the workspace example producer
+      # custom-mcap-writer, plus the workspace-excluded copper example (its own
+      # committed lockfile). The
+      # copper binary is the live copper e2e's Producer fixture
+      # (`copper_sink_recording_produces_clip`); prebuilding it here keeps the
+      # cu29 tree out of the test's own timeout — the e2e's on-demand build then
+      # finds it up to date. It builds ROS-free, but runs inside the same dev
+      # shell so it shares the toolchain and target the e2e step's on-demand
+      # `cargo build` checks against.
       - name: Build
-        run: nix develop ".#${{ matrix.distro }}" --command cargo build --locked -p clipper -p custom-mcap-writer
+        run: |
+          nix develop ".#${{ matrix.distro }}" --command cargo build --locked -p clipper -p custom-mcap-writer
+          nix develop ".#${{ matrix.distro }}" --command cargo build --locked --manifest-path examples/cu-mcap-record/Cargo.toml
 
       - name: Unit tests
         run: nix develop ".#${{ matrix.distro }}" --command cargo nextest run --locked -p clipper -E 'not binary(e2e)'

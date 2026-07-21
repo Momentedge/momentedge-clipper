@@ -141,6 +141,54 @@ pub fn writer_bin() -> PathBuf {
     writer
 }
 
+/// Absolute path to the built `cu-mcap-record` example binary — the copper
+/// (cu29) Producer the live copper e2e drives. Unlike `custom-mcap-writer`,
+/// this crate is excluded from the workspace (its cu29 dependency tree stays
+/// out of the ROS dev shells and the per-distro matrix), so it builds into its
+/// own `target/` from its own committed lockfile, never beside
+/// `CARGO_BIN_EXE_clipper`. `CU_MCAP_RECORD_BIN` names a prebuilt binary
+/// directly; otherwise it is built on demand with `--locked` against the
+/// crate's own manifest. CI prebuilds it in the matrix `Build` step, so the
+/// on-demand build here is an up-to-date no-op; a cold build (many minutes for
+/// the cu29 tree) runs under the raised terminate-after this test gets in the
+/// `e2e` profile (`.config/nextest.toml`).
+pub fn cu_mcap_record_bin() -> PathBuf {
+    if let Some(path) = std::env::var_os("CU_MCAP_RECORD_BIN") {
+        let path = PathBuf::from(path);
+        assert!(
+            path.is_file(),
+            "CU_MCAP_RECORD_BIN={} is not a file",
+            path.display(),
+        );
+        return path;
+    }
+    // The excluded crate lives two levels above this crate's manifest and owns
+    // its own target dir (it is not a workspace member, so `-p` cannot reach it).
+    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/cu-mcap-record");
+    let manifest = crate_dir.join("Cargo.toml");
+    // Pin the output to the crate's own target/ with an explicit --target-dir:
+    // the flag overrides any inherited CARGO_TARGET_DIR (e.g. the build skill's
+    // per-distro target/e2e-$d), so the built path and the checked `bin` always
+    // agree — and match the dir CI's rust-cache covers and .gitignore expects.
+    let target_dir = crate_dir.join("target");
+    let bin = target_dir.join("debug/cu-mcap-record");
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let status = Command::new(cargo)
+        .args(["build", "--locked", "--manifest-path"])
+        .arg(&manifest)
+        .arg("--target-dir")
+        .arg(&target_dir)
+        .status()
+        .expect("running cargo build for cu-mcap-record");
+    assert!(status.success(), "building cu-mcap-record failed: {status}");
+    assert!(
+        bin.is_file(),
+        "cu-mcap-record not at {} after building it",
+        bin.display(),
+    );
+    bin
+}
+
 /// A `ROS_DOMAIN_ID` unique to this test: nextest runs each test in its own
 /// process, so a plain counter would restart identically everywhere — the PID
 /// disambiguates across test processes, the counter within one. Band 80–101
@@ -447,6 +495,21 @@ impl TestEnv {
             .args(["--trigger-after-ms", &trigger_after_ms.to_string()])
             .args(["--publish-offset-ms", &publish_offset_ms.to_string()]);
         self.spawn("writer", cmd)
+    }
+
+    /// Spawn the copper `cu-mcap-record` example appending a growing, unchunked,
+    /// epoch-stamped Recording into `record/` (it creates
+    /// `recording-<unix-seconds>.mcap` there). The app emits ~50 Hz `/sensor`
+    /// data and fires its first in-Recording `json` `Trigger` (`periodic-1`) on
+    /// its first iteration, with a fixed ±3 s window on the Trigger record's own
+    /// epoch stamp; clipper tails the growing file the whole time. It runs until
+    /// torn down — SIGINT-finalised by an explicit [`Proc::stop`], or SIGTERM'd
+    /// by the [`Proc`] guard on drop (clipper has already cut the clip from the
+    /// growing file by then, so finalisation is not needed for the cut).
+    pub fn start_cu_recorder(&self) -> Proc {
+        let mut cmd = Command::new(cu_mcap_record_bin());
+        cmd.arg("--out").arg(self.record_dir());
+        self.spawn("cu-recorder", cmd)
     }
 
     /// A `ros2 topic echo --once` capturing the next `Recorded` announcement
@@ -1023,6 +1086,28 @@ pub fn read_clip_stamps(path: &Path) -> Vec<(String, u64, u64)> {
             (msg.channel.topic.clone(), msg.log_time, msg.publish_time)
         })
         .collect()
+}
+
+/// The `(preroll, postroll)` nanoseconds carried by the trigger record inside a
+/// clip, decoded from its `json` payload on the trigger topic — the window
+/// bounds the Producer actually asked for. Under `--interface mcap` the window
+/// is anchored on the trigger record's own stamp, so that record normally lies
+/// inside its own window and is copied into the clip; `None` if it is not there
+/// (or the payload lacks the fields). Lets a window assertion tether to the
+/// Producer's real bounds instead of a hardcoded copy.
+pub fn clip_trigger_window(path: &Path) -> Option<(u64, u64)> {
+    let buf =
+        std::fs::read(path).unwrap_or_else(|e| panic!("reading clip {}: {e}", path.display()));
+    for msg in mcap::MessageStream::new(&buf).expect("clip is a complete MCAP") {
+        let msg = msg.expect("clip message parses");
+        if msg.channel.topic == TRIGGER_TOPIC {
+            let payload: serde_json::Value = serde_json::from_slice(&msg.data).ok()?;
+            let preroll = payload.get("preroll")?.as_u64()?;
+            let postroll = payload.get("postroll")?.as_u64()?;
+            return Some((preroll, postroll));
+        }
+    }
+    None
 }
 
 /// Every message in the clip lies inside the inclusive trigger window.

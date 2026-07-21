@@ -111,6 +111,17 @@ nix develop --command bash -c \
   'CLIPPER_E2E=1 cargo nextest run -p clipper --profile e2e -E "binary(e2e)"'
 ```
 
+The copper live e2e (`copper_sink_recording_produces_clip`) drives the
+workspace-excluded `cu-mcap-record` binary as its Producer fixture, building it
+on demand into `examples/cu-mcap-record/target/`. The first cold run compiles
+the cu29 tree and takes minutes — the `e2e` profile grants that one test a
+longer terminate-after so it does not trip the per-test timeout. Prebuild it
+with `cargo build --locked --manifest-path examples/cu-mcap-record/Cargo.toml`,
+or set `CU_MCAP_RECORD_BIN` to a prebuilt binary, to skip the wait. The fixture
+is ROS-free and distro-independent, so it builds into its own `target/` once and
+is reused across the per-distro loop below — that loop's `CARGO_TARGET_DIR` does
+not redirect it (the fixture build pins its own `--target-dir`).
+
 Each test runs in its own `ROS_DOMAIN_ID` (band 80–101) with its own temp dirs,
 so a recorder already on domain 0 is unaffected. Expect a few minutes of wall
 clock (the tests sleep out real trigger windows). Run across the working distros
