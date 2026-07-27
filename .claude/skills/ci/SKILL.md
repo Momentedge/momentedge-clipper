@@ -48,6 +48,31 @@ Same-repo PRs would run the heavy matrix twice (push + PR events). Add
 No external cache service needed. `ros.cachix.org` is a read-only substituter
 (named in `nixConfig`); nothing is pushed to it and no token is required.
 
+**Every job using `rust-cache` first runs `mkdir -p target/tests/target`.**
+Any `target/` that has compiled cu29 carries a `tests` entry, because
+cu29-derive's build script copies its trybuild fixtures into
+`<target>/tests/trybuild`. rust-cache special-cases a `tests` entry and recurses
+into both `<target>/tests/target` and `<target>/tests/trybuild`, but the first
+call is not awaited (`src/cleanup.ts`), so the ENOENT for the directory that is
+never created escapes its `try`/`catch` as an unhandled rejection and kills the
+action mid-clean. What is left is a `target/` whose `.fingerprint` entries
+outlive the build-script binaries already deleted beside them, and the next
+cargo build fails on a build script it believes is current:
+
+```
+error: failed to run custom build command for `bindgen v0.71.1`
+  could not execute process .../build-script-build (never executed)
+  No such file or directory (os error 2)
+```
+
+The clean fires on a partial cache-key match, so the symptom is intermittent and
+lands on whichever crate cargo reaches first, unrelated to any source change.
+Pre-creating the directory turns that recursion into a no-op; it precedes the
+rust-cache step so the guard covers the restore-time clean, and the directory is
+cached in turn, so an already-poisoned cache heals without a key bump. The
+`release.yml` deb legs need no guard — `build-on-target.sh` builds only
+`BUILD_PACKAGES` (`clipper`), so cu29 never compiles there.
+
 ## e2e skip rules
 
 `CLIPPER_E2E_SKIP_FLAKY=1` is set on every CI leg. The `skip_flaky()` gate in
