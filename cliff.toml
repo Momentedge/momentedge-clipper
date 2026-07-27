@@ -100,9 +100,19 @@ trim = true
 # The group loop leaves blank lines at both ends of the assembled document.
 # Invisible once GitHub renders it, but the body is also read raw (`git cliff
 # --latest`, the workflow's step summary), so trim both ends.
+#
+# The tail pattern is `\s*\z`, not `\s+\z`: it must match even when the body ends
+# flush against its last character, so the replacement always lands and the
+# document always ends in exactly one newline. The template's `{%- endif %}` eats
+# the newline after the "Full Changelog" line, so that flush ending is the normal
+# case, not an edge one — and a body without it is a live hazard. The release job
+# feeds this file to git-cliff-action, whose run.sh appends it to `$GITHUB_OUTPUT`
+# between `content<<EOF` and a closing `EOF` line; with no trailing newline the
+# delimiter is glued onto the last content line, no line equals `EOF`, and the
+# runner rejects the whole step with "Matching delimiter not found 'EOF'".
 postprocessors = [
   { pattern = '\A\s+', replace = "" },
-  { pattern = '\s+\z', replace = "\n" },
+  { pattern = '\s*\z', replace = "\n" },
 ]
 
 [git]
