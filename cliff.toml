@@ -1,0 +1,143 @@
+# git-cliff configuration — turns the conventional-commit history between two
+# `v*` tags into the body of the GitHub release for the newer tag. The `release`
+# job in .github/workflows/release.yml runs `git-cliff --latest` against this
+# file and hands the result to the release as `body_path`.
+#
+# The release body is the only consumer: there is no CHANGELOG.md in the tree, so
+# neither `header` nor `footer` is set and each release renders as a standalone
+# document.
+#
+# A generated commit list answers "what landed" but never "why this release
+# matters", so the two are written by different authors. **Tag annotatedly** —
+#
+#   git tag -a v0.2.0        # not `git tag v0.2.0`
+#
+# — and git-cliff picks the annotation up as `message`: its first line becomes the
+# release headline, the rest the prose beneath it. That human overview leads the
+# page; the generated groups follow, with everything mechanical folded into a
+# <details> so the detail is available without dominating. A lightweight tag has no
+# annotation to read and simply renders the changelog alone — degraded, not broken.
+#
+# Preview what a release would say, without installing anything:
+#
+#   nix run nixpkgs#git-cliff -- --latest        # the newest tag's notes
+#   nix run nixpkgs#git-cliff -- --unreleased    # commits since the newest tag
+#
+# `--unreleased` has no tag yet, so it shows no headline. To draft one against the
+# text you are about to tag with:
+#
+#   nix run nixpkgs#git-cliff -- --unreleased --with-tag-message "$(cat draft.txt)"
+#
+# Links are built from a literal repository URL rather than from `[remote.github]`,
+# so rendering stays a pure local git operation — no GitHub API call, no token,
+# and identical output from a CI checkout (HTTPS origin) and a local clone (SSH).
+#
+# Group ordering is the `<!-- NN -->` prefix trick: `group_by` sorts groups
+# alphabetically, so the HTML comment carries the sort key and the template's
+# `striptags` filter strips it before rendering. The keys are zero-padded to two
+# digits because the sort is lexicographic — an unpadded `10` would land between
+# `0` and `5`.
+
+[changelog]
+body = """
+{%- macro remote_url() -%}
+https://github.com/Momentedge/momentedge-clipper
+{%- endmacro -%}
+
+{%- macro section(heading, commits) %}
+### {{ heading | striptags | trim }}
+{% for commit in commits %}
+- {% if commit.scope %}**{{ commit.scope }}**: {% endif %}\
+{% if commit.breaking %}[**breaking**] {% endif %}\
+{{ commit.message }} \
+([{{ commit.id | truncate(length=7, end="") }}]({{ self::remote_url() }}/commit/{{ commit.id }}))
+{%- endfor %}
+{% endmacro %}
+
+{#- The annotated tag's message is the release's human-written overview: first
+    line as the headline, the rest as prose. Absent on a lightweight tag, in which
+    case the release is just the changelog. -#}
+{%- if message %}
+{%- set msg = message | trim %}
+{%- set headline = msg | split(pat="\\n") | first | trim %}
+## {{ headline }}
+{% set prose = msg | trim_start_matches(pat=headline) | trim %}
+{%- if prose %}
+{{ prose }}
+{% endif %}
+{%- endif %}
+
+{#- Highlights (`<!-- 1x -->`) stay open; everything mechanical (`<!-- 2x -->`)
+    collapses, so the page opens on what a reader actually came for. With no
+    highlights to lead with, the rest renders open rather than behind an empty
+    page. -#}
+{%- set_global has_highlights = false %}
+{%- for group, cs in commits | group_by(attribute="group") %}
+{%- if group is starting_with("<!-- 1") %}{% set_global has_highlights = true %}{% endif %}
+{%- endfor %}
+
+{%- for group, cs in commits | group_by(attribute="group") %}
+{%- if group is starting_with("<!-- 1") %}{{ self::section(heading=group, commits=cs) }}{% endif %}
+{%- endfor %}
+
+{%- if has_highlights %}
+<details>
+<summary>Other changes</summary>
+{% endif %}
+{%- for group, cs in commits | group_by(attribute="group") %}
+{%- if not group is starting_with("<!-- 1") %}{{ self::section(heading=group, commits=cs) }}{% endif %}
+{%- endfor %}
+{%- if has_highlights %}
+</details>
+{% endif %}
+{%- if version and previous.version %}
+**Full Changelog**: {{ self::remote_url() }}/compare/{{ previous.version }}...{{ version }}
+{%- endif %}
+"""
+
+trim = true
+
+# The group loop leaves blank lines at both ends of the assembled document.
+# Invisible once GitHub renders it, but the body is also read raw (`git cliff
+# --latest`, the workflow's step summary), so trim both ends.
+postprocessors = [
+  { pattern = '\A\s+', replace = "" },
+  { pattern = '\s+\z', replace = "\n" },
+]
+
+[git]
+conventional_commits = true
+
+# Unconventional subjects are kept, not dropped: a commit that skipped the
+# convention still shipped in the release, and the catch-all parser below files
+# it under "Other" where it is visible rather than silently missing.
+filter_unconventional = false
+filter_commits = false
+
+split_commits = false
+protect_breaking_commits = true
+topo_order = false
+sort_commits = "newest"
+
+# Only the release tags — `v0.1.1`, not any future non-version tag.
+tag_pattern = "v[0-9]*"
+
+# The `1x` / `2x` split is load-bearing, not just ordering: the template renders
+# every `1x` group open and hides the `2x` groups behind a <details>. Moving a type
+# across that boundary changes what a reader sees without clicking.
+commit_parsers = [
+  { message = "^chore\\(release\\)", skip = true },
+  # Highlights — always visible.
+  { message = "^feat", group = "<!-- 10 -->🚀 Features" },
+  { message = "^fix", group = "<!-- 11 -->🐛 Bug fixes" },
+  { message = "^perf", group = "<!-- 12 -->⚡ Performance" },
+  # Mechanical — collapsed.
+  { message = "^refactor", group = "<!-- 20 -->♻️ Refactoring" },
+  { message = "^docs", group = "<!-- 21 -->📚 Documentation" },
+  { message = "^test", group = "<!-- 22 -->🧪 Tests" },
+  { message = "^build", group = "<!-- 23 -->📦 Build & packaging" },
+  { message = "^ci", group = "<!-- 24 -->⚙️ CI" },
+  { message = "^style", group = "<!-- 25 -->🎨 Style" },
+  { message = "^chore", group = "<!-- 26 -->🧹 Chores" },
+  { message = ".*", group = "<!-- 27 -->Other" },
+]

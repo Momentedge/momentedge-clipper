@@ -87,10 +87,47 @@ The job ends with a smoke-test that installs both `.deb` files and runs `clipper
 confirming the `Depends` chain resolves. The packaging steps themselves live in the
 `packaging` skill (`.claude/skills/packaging/SKILL.md`).
 
-**Tag-gated publish.** A `v*` tag publishes; `workflow_dispatch` has a `publish`
-boolean (default `false`) so packaging can be exercised without touching a
-release. Both `artifact upload` and the release-attach step are gated on
-`!env.ACT` so `act` runs never publish.
+**Tag-gated publish, in a single `release` job.** A `v*` tag publishes;
+`workflow_dispatch` has a `publish` boolean (default `false`) so packaging can be
+exercised without touching a release. The `deb` matrix legs only upload artifacts;
+the `release` job (`needs: deb`, plain `ubuntu-latest` — it renders Markdown and
+moves files, so it needs no ROS and no arm64) downloads them with
+`merge-multiple: true` and writes the release once. One writer is a requirement,
+not a preference: a release has a single body, so generating notes from a 2-leg
+matrix would have the legs race to overwrite each other. `needs: deb` also means a
+failed distro blocks the release rather than publishing half of it. The artifact
+upload, the download, and the publish step are gated on `!env.ACT` so `act` runs
+never publish.
+
+**Release notes come from the commit history, not from PRs.** Work lands directly
+on `main` as conventional commits, so GitHub's native `generate_release_notes`
+(which enumerates merged PRs) would yield an empty list — and being a flat list
+itself, it would not summarise anything either. `git-cliff` reads the commits
+between the previous tag and this one instead, grouping them by conventional-commit
+type; [`cliff.toml`](cliff.toml) in the repo root holds the template and carries its
+own rationale. `orhun/git-cliff-action@v4` is a composite action that downloads a
+prebuilt binary, so it also runs under `act`.
+
+**Cut releases with an annotated tag — `git tag -a v0.2.0`, never `git tag v0.2.0`.**
+GitHub does not copy a tag's annotation into the release body (no setting changes
+that), but git-cliff exposes it to the template as `message`, and `cliff.toml`
+renders its first line as the release headline and the remainder as the overview
+paragraph. That is the only place a human explains what the release is *for*: the
+generated groups below it say what landed, never why it matters. Highlights
+(`feat`/`fix`/`perf`) stay open beneath it and the mechanical types fold into a
+`<details>`. A lightweight tag degrades cleanly to the changelog with no overview —
+which is what every tag through `v0.1.1` is, so the first annotated tag is also the
+first release with a headline.
+
+Two details the config depends on: the `release` job checks out with
+`fetch-depth: 0` (a shallow checkout has none of the commits to walk), and the
+git-cliff invocation switches on the trigger — `--latest` on a tag renders that
+tag's section, `--unreleased` otherwise previews commits since the last tag. The
+notes are written to the job summary on *every* run, publishing or not, so an
+unpublished `workflow_dispatch` is how you preview what a tag would say before
+cutting it. Locally the same preview is `nix run nixpkgs#git-cliff -- --unreleased`,
+plus `--with-tag-message "$(cat draft.txt)"` to try out the headline and overview
+before committing to the annotation.
 
 ## Local testing with `act`
 

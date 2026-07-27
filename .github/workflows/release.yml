@@ -17,10 +17,21 @@
 # ABI-compatible with the target's ROS graph — the same reason deployment is native
 # rather than nix or cross.
 #
-# A version tag (v*) publishes: the .deb files are attached to the GitHub release
-# for that tag. workflow_dispatch only builds and uploads artifacts (publish is off
-# by default), so the packaging can be exercised — and run locally under `act` —
-# without creating a release. See .claude/skills/ci/SKILL.md for the act recipe.
+# A version tag (v*) publishes: the `release` job writes the release for that tag
+# with notes generated from the conventional-commit history (git-cliff, cliff.toml)
+# and both distros' .deb files attached. workflow_dispatch only builds and uploads
+# artifacts (publish is off by default) but still renders the notes into the job
+# summary, so the packaging and the notes can be exercised — and run locally under
+# `act` — without creating a release. See .claude/skills/ci/SKILL.md for the act
+# recipe.
+#
+# Tag annotatedly (`git tag -a v0.2.0`): the annotation's first line becomes the
+# release headline and the rest the overview paragraph above the generated
+# changelog. A lightweight tag publishes the changelog with no overview.
+#
+# Publishing is one job, not a matrix step: a release has a single body, so exactly
+# one writer may own it. The `deb` legs only upload artifacts; `release` collects
+# them and writes the release once, after every leg has passed.
 
 name: release
 
@@ -168,9 +179,9 @@ jobs:
             /opt/momentedge-clipper/bin/clipper || code=$?
           echo "clipper live-run exit code: $code (124 = ran the full window, then SIGINT)"
 
-      # Skipped under act (its artifact backend is absent): the act run's verification
-      # is the successful build plus the smoke-test and the package scripts' dpkg-deb
-      # output in the log.
+      # The only handoff to the `release` job below. Skipped under act (its artifact
+      # backend is absent): the act run's verification is the successful build plus
+      # the smoke-test and the package scripts' dpkg-deb output in the log.
       - name: Upload build artifacts
         if: ${{ !env.ACT }}
         uses: actions/upload-artifact@v4
@@ -179,11 +190,67 @@ jobs:
           path: dist/*.deb
           if-no-files-found: error
 
+  # Writes the GitHub release: notes from the commit history, both distros' .deb
+  # files attached. Runs after every `deb` leg has passed, so a release is never
+  # published with one distro's packages missing.
+  #
+  # It runs on every trigger, not only publishing ones — an unpublished dispatch
+  # still renders the notes into the job summary, which is how you preview what a
+  # tag would say before cutting it.
+  release:
+    name: release
+    needs: deb
+    # Plain amd64: this job only renders Markdown and moves .deb files around — it
+    # neither builds nor runs them, so the arm64 runners are not needed here.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # fetch-depth: 0 is required — git-cliff walks the commits between the previous
+      # tag and this one, which a shallow checkout does not contain. It also brings
+      # the tag objects, and with them the annotation the notes lead with.
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      # cliff.toml groups the conventional-commit subjects (feat/fix/docs/...) into
+      # the release body; it carries the full rationale. On a tag, `--latest` renders
+      # that tag's section; otherwise `--unreleased` previews the commits accumulated
+      # since the last tag. The action is composite (downloads a prebuilt git-cliff),
+      # so it runs under act too.
+      - name: Generate release notes
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: cliff.toml
+          args: ${{ github.ref_type == 'tag' && '--latest' || '--unreleased' }}
+        env:
+          OUTPUT: RELEASE_NOTES.md
+
+      - name: Show the notes in the job summary
+        run: |
+          {
+            echo "## Release notes (${{ github.ref_type == 'tag' && github.ref_name || 'unreleased' }})"
+            echo
+            cat RELEASE_NOTES.md
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # merge-multiple flattens both legs' artifacts into one dist/, matching the
+      # layout the packaging scripts produce — the distro is already in each
+      # filename (<pkg>_<VERSION>_ubuntu<YY.MM>-<distro>_<arch>.deb), so the two
+      # legs' files never collide.
+      - name: Download the built .deb files
+        if: ${{ (github.ref_type == 'tag' || inputs.publish) && !env.ACT }}
+        uses: actions/download-artifact@v4
+        with:
+          pattern: momentedge-debs-*
+          merge-multiple: true
+          path: dist
+
       # Publish only for a real tag push, or a dispatch that opted in. Never under
-      # act, so local runs never touch releases. The glob attaches both .deb files.
-      - name: Attach .deb files to the GitHub release
+      # act, so local runs never touch releases.
+      - name: Publish the GitHub release
         if: ${{ (github.ref_type == 'tag' || inputs.publish) && !env.ACT }}
         uses: softprops/action-gh-release@v2
         with:
+          body_path: RELEASE_NOTES.md
           files: dist/*.deb
           fail_on_unmatched_files: true
