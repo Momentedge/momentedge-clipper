@@ -77,6 +77,37 @@ flake.nix               # per-distro ROS2 dev shells + nix-built binaries
 - `../ros2_sources` — the bag replay that feeds the recorder (its README has the
   workflow).
 
+## Cutting a release
+
+Tag releases **annotated**, never lightweight:
+
+```bash
+git tag -a v0.2.0        # opens an editor; then: git push origin v0.2.0
+```
+
+Pushing a `v*` tag runs [`release.yml`](.github/workflows/release.yml): it builds
+the two `.deb` packages per distro and writes the GitHub release. The body is
+generated from the conventional-commit subjects since the previous tag by git-cliff
+([`cliff.toml`](cliff.toml)) — which is also why commit subjects are worth writing
+carefully, since they are published verbatim.
+
+**The tag annotation is the only human-written part of a release.** Its first line
+becomes the release headline and the rest the overview paragraph above the
+generated changelog, answering the one question a commit list cannot: what this
+release is *for*. GitHub never copies a tag annotation into a release body on its
+own; git-cliff is what carries it across, and it can only do so for an annotated
+tag. A lightweight tag degrades cleanly to the changelog alone — missing its
+"why", not broken.
+
+Draft the annotation against the real commit list before committing to it:
+
+```bash
+nix run nixpkgs#git-cliff -- --unreleased --with-tag-message "$(cat draft.txt)"
+```
+
+Job layout, the `act` recipe, and the notes template's grouping rules live in the
+**`ci`** skill and in `cliff.toml`'s own header.
+
 ## Keeping docs in sync
 
 The docs describe the same system from different angles. **After a change to
