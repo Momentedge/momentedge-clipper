@@ -154,6 +154,24 @@ cutting it. Locally the same preview is `nix run nixpkgs#git-cliff -- --unreleas
 plus `--with-tag-message "$(cat draft.txt)"` to try out the headline and overview
 before committing to the annotation.
 
+**The rendered notes must end in a newline**, which `cliff.toml`'s `\s*\z` tail
+postprocessor guarantees. `git-cliff-action`'s `run.sh` appends the file to
+`$GITHUB_OUTPUT` between a `content<<EOF` line and a closing `EOF` line using
+`cat`, which adds nothing of its own; a body ending flush against its last
+character therefore absorbs the delimiter into that line, no line equals `EOF`,
+and the runner kills the step before any release is written:
+
+```
+##[error]Unable to process file command 'output' successfully.
+##[error]Invalid value. Matching delimiter not found 'EOF'
+```
+
+The workflow itself never reads that `content` output — it passes
+`RELEASE_NOTES.md` as `body_path` — but the failed output write fails the step
+regardless, skipping publish entirely. Keep the tail postprocessor as `\s*\z`
+(matches the empty string at end of input, so the replacement always lands) and
+not `\s+\z`, which cannot match a body with no trailing whitespace to consume.
+
 ## Local testing with `act`
 
 ```bash
