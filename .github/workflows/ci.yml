@@ -86,6 +86,28 @@ jobs:
         with:
           components: clippy
 
+      # Guards rust-cache against its own `target/tests` handling, which would
+      # otherwise corrupt the restored target/ and break the build after it.
+      #
+      # cu29-derive's build script copies its trybuild fixtures into
+      # <target>/tests/trybuild, so any target/ that has compiled cu29 carries a
+      # `tests` entry. rust-cache special-cases that entry and recurses into both
+      # <target>/tests/target and <target>/tests/trybuild — but the first call is
+      # not awaited, so when that directory is absent (only trybuild is ever
+      # created) the ENOENT rejection escapes its try/catch as an unhandled
+      # rejection and kills the action mid-clean. The half-cleaned target/ keeps
+      # .fingerprint entries whose build-script binaries were already deleted, and
+      # the next cargo build dies on a build script it thinks is up to date:
+      # "could not execute process .../build-script-build (never executed)".
+      #
+      # Creating the directory makes that recursion open an empty dir and return.
+      # It runs before rust-cache so the guard is in place for the restore-time
+      # clean (which fires on a partial key match), and the directory is then
+      # cached too — so a cache already poisoned with a bare tests/trybuild heals
+      # on its next run rather than needing a cache-key bump.
+      - name: Pre-create target/tests/target for rust-cache
+        run: mkdir -p target/tests/target
+
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
         with:
@@ -178,10 +200,15 @@ jobs:
         with:
           tool: cargo-nextest
 
+      # The copper example is a workspace member, so its cu29 tree builds into the
+      # same root target/ as everything else — which is also why this leg needs
+      # the same rust-cache guard the cu-mcap-record job documents above.
+      - name: Pre-create target/tests/target for rust-cache
+        run: mkdir -p target/tests/target
+
       # Caches cargo registry + this distro's target/ (the r2r build links the
-      # distro's rcl/rmw, so the key is per distro). The copper example is a
-      # workspace member now, so its cu29 tree builds into the same root target/
-      # and caches with everything else — no separate workspace entry needed.
+      # distro's rcl/rmw, so the key is per distro). The copper example's cu29
+      # tree caches with everything else — no separate workspace entry needed.
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
         with:
