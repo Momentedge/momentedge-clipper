@@ -73,6 +73,28 @@ cached in turn, so an already-poisoned cache heals without a key bump. The
 `release.yml` deb legs need no guard — `build-on-target.sh` builds only
 `BUILD_PACKAGES` (`clipper`), so cu29 never compiles there.
 
+**A cargo cache older than a week produces the same `(never executed)` error,
+and the fix is to delete the cache.** On a partial key match rust-cache also
+prunes by age, deleting entries whose mtime is over `ONE_WEEK` from `build/`,
+`.fingerprint/`, and `deps/` — separately, and via an `rmExcept` whose timestamp
+branch ends in `return` rather than `continue`, so each directory has only its
+first entry examined. `build/<pkg>` and `.fingerprint/<pkg>` are therefore pruned
+independently, and when a `build/` entry goes while its fingerprint twin stays,
+cargo again executes a build script that is no longer on disk.
+
+Caches are written only by runs that pass (`cache-on-failure` is false), so this
+arrives after roughly a week of red CI: nothing refreshes the mtimes, the whole
+cache ages past the threshold at once, and the next run starts deleting from it.
+Green runs keep it far from the threshold, so it is not a recurring cost.
+
+Diagnose by age, not by content — `gh api
+"repos/Momentedge/momentedge-clipper/actions/caches?per_page=100" --jq
+'.actions_caches[] | "\(.created_at)  \(.key)"'` — and delete every entry older
+than a week with `gh cache delete <key>`. The next run finds no cache, builds
+cold, and saves a fresh one. Only the affected keys need deleting: a job whose
+cache is recent is unaffected, which is why `cu-mcap-record` passed through the
+outage that failed all three distro legs.
+
 ## e2e skip rules
 
 `CLIPPER_E2E_SKIP_FLAKY=1` is set on every CI leg. The `skip_flaky()` gate in
