@@ -12,7 +12,7 @@ own their angle, and this file does not repeat them:
 - **[examples/trigger-pub/CLAUDE.md](examples/trigger-pub/CLAUDE.md)** and
   **[sim/CLAUDE.md](sim/CLAUDE.md)** — the example trigger source and sim camera.
 
-Build, CI, and packaging mechanics live in **skills** (loaded on demand):
+Build, CI, packaging, and release mechanics live in **skills** (loaded on demand):
 
 - **`build`** ([`.claude/skills/build/SKILL.md`](.claude/skills/build/SKILL.md))
   — the Nix dev shell, per-distro builds, the r2r/IDL model, tests and coverage,
@@ -21,6 +21,8 @@ Build, CI, and packaging mechanics live in **skills** (loaded on demand):
   GitHub Actions workflows, skip rules, and local `act` testing.
 - **`packaging`** ([`.claude/skills/packaging/SKILL.md`](.claude/skills/packaging/SKILL.md))
   — the two-deb (bloom + cargo-deb) release pipeline and its gotchas.
+- **`release`** ([`.claude/skills/release/SKILL.md`](.claude/skills/release/SKILL.md))
+  — writing the tag annotation that becomes the release headline and overview.
 
 ## The recorder in one line
 
@@ -99,14 +101,10 @@ own; git-cliff is what carries it across, and it can only do so for an annotated
 tag. A lightweight tag degrades cleanly to the changelog alone — missing its
 "why", not broken.
 
-Draft the annotation against the real commit list before committing to it:
-
-```bash
-nix run nixpkgs#git-cliff -- --unreleased --with-tag-message "$(cat draft.txt)"
-```
-
-Job layout, the `act` recipe, and the notes template's grouping rules live in the
-**`ci`** skill and in `cliff.toml`'s own header.
+How to write that annotation — the rules, the sizing, how to preview it against
+the real commit list, and how to reword a release that is already published — is
+the **`release`** skill. Job layout, the `act` recipe, and the notes template's
+grouping rules live in the **`ci`** skill and in `cliff.toml`'s own header.
 
 ## Keeping docs in sync
 
