@@ -59,6 +59,39 @@ clipper is a standalone application that sits beside a continuous
 Because the recording is already on disk, the preroll — the data from *before*
 the trigger — is there to copy.
 
+## What it costs
+
+Keeping the preroll on disk instead of in memory is what makes clipper cheap.
+Measured on Jetson Orin Nano and Orin NX against a `ros2 bag record` writing
+about 20 MB/s, clipper's standing cost is a rounding error next to the recorder
+it tails — and the recorder does not notice it is there:
+
+| | Orin Nano | Orin NX |
+|---|---|---|
+| **clipper, tailing** | **0.5 % of one core**, 22 MiB | **0.4 % of one core**, 21 MiB |
+| the recorder alone | 5.6 % | 6.0 % |
+| the recorder, with clipper attached | 5.8 % | 6.1 % |
+
+- **No disk reads.** clipper's scan of the growing file is served entirely from
+  page cache — measured read traffic to the physical disk is zero, so it adds
+  no read IO to the device the recorder is writing to.
+- **Pending clips are free.** Ten overlapping windows waiting for their postroll
+  to elapse cost 0.3 % of one core and no more memory than sitting idle: about
+  30 KB and a parked thread each.
+- **It stays small under load.** Ten overlapping windows all copying at once,
+  at 20 MB/s, cost 15 % of *one* core on a six-core Nano.
+- **Memory does not grow with the window.** clipper holds about 22 MiB whether
+  the preroll is five seconds or ten minutes, because the preroll was never in
+  memory to begin with. rosbag2's `--snapshot-mode` keeps that window in RAM
+  instead: 390 MB against clipper's 112 MB for a 15-second window, growing
+  linearly with window × bitrate, so a ten-minute preroll would need roughly
+  12 GB.
+
+Clip compression is opt-in and is the one thing that costs real CPU; the figures
+above are with it off. Full methodology, per-configuration figures, and the
+conditions each number depends on live in
+[Momentedge/clipper-benchmarks](https://github.com/Momentedge/clipper-benchmarks).
+
 ## Quickstart
 
 You need three things, each in its own shell sharing one ROS 2 environment
@@ -291,6 +324,9 @@ Setup guides for the recording + clipper stack live under
 - **[CLAUDE.md](CLAUDE.md)** and **[crates/clipper/CLAUDE.md](crates/clipper/CLAUDE.md)**
   — contributor and agent notes: workspace layout, build mechanics, and the
   recorder's internal design.
+- **[Momentedge/clipper-benchmarks](https://github.com/Momentedge/clipper-benchmarks)**
+  — the overhead benchmarks behind [What it costs](#what-it-costs): the harness,
+  the full report, and the methodology each figure depends on.
 
 ## License
 
