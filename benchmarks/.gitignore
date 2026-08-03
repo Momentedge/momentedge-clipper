@@ -1,0 +1,9 @@
+# Collected run data lives on the benchmark hosts and is pulled here for
+# analysis; only the report and its charts are committed.
+results/
+*.csv
+tegrastats.log
+triggers.jsonl
+fixtures/
+__pycache__/
+*.pyc
