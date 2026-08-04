@@ -59,7 +59,7 @@ clipper is a standalone application that sits beside a continuous
 Because the recording is already on disk, the preroll — the data from *before*
 the trigger — is there to copy.
 
-## What it costs
+## Resource overhead
 
 Keeping the preroll on disk instead of in memory is what makes clipper cheap.
 Measured on Jetson Orin Nano and Orin NX against a `ros2 bag record` writing
