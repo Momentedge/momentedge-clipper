@@ -59,6 +59,60 @@ clipper is a standalone application that sits beside a continuous
 Because the recording is already on disk, the preroll — the data from *before*
 the trigger — is there to copy.
 
+## What it costs
+
+Keeping the preroll on disk instead of in memory is what makes clipper cheap.
+Measured on Jetson Orin Nano and Orin NX against a `ros2 bag record` writing
+about 20 MB/s, clipper's standing cost is a rounding error next to the recorder
+it tails — and the recorder does not notice it is there:
+
+| | Orin Nano | Orin NX |
+|---|---|---|
+| **clipper, tailing** | **0.45 % of one core**, 22.0 MiB | **0.39 % of one core**, 21.4 MiB |
+| the recorder alone | 5.60 % | 5.98 % |
+| the recorder, with clipper attached | 5.68 % | 6.13 % |
+
+Attaching clipper moves the recorder by 0.08 and 0.15 percentage points, which
+is the size of the spread between repetitions — so the measurement says the
+recorder does not notice, rather than by exactly how much.
+
+- **No disk reads while tailing.** clipper's scan of the growing file is served
+  entirely from page cache: its own read traffic to the device is 0.0 MB over a
+  two-minute measurement. Copying a clip does read the disk — about 450 MB to
+  cut ten seventy-second windows. (Measured on the Nano; the NX kernel carries
+  no per-process IO accounting, so it cannot answer either way.)
+- **Pending clips are close to free.** Ten overlapping windows waiting for their
+  postroll to elapse cost two hundredths of a percentage point of one core, and
+  about 60 KB and one and a half threads each.
+- **Copying ten windows costs about one core.** Ten overlapping windows all
+  copying at once, at 20 MB/s, cost 103 % of one core on a six-core Nano and
+  finish in under three minutes. `--extract-parallelism` trades that against
+  wall clock rather than reducing it: at one worker per core the same work takes
+  432 % of one core and a third of the time.
+- **Memory does not grow with pending windows.** clipper holds 22.0 MiB tailing
+  and 22.6 MiB with ten windows queued, because a window's preroll is on disk
+  rather than in memory. It grows only while actually copying — 55 MiB at the
+  default parallelism — and returns afterwards.
+
+Clip compression is opt-in and is the one thing that costs real CPU. On a 410 MB
+window it turns roughly 0.7 s of copying into just over 5 s, for a clip about
+14 % smaller; the tailing figures above are unaffected by it, because a run that
+cuts nothing never compresses anything.
+
+On a six-core board, leaving `--extract-parallelism` at its default is what
+keeps the recorder lossless: copying ten windows across every core costs the
+recorder a handful of dropped messages on the Nano, and dozens when the board is
+also busy, while one worker at a time drops none. The eight-core NX drops none
+in any configuration.
+
+Figures are per board and are not comparable across the two: the Nano and the NX
+differ in SoC, core count, RAM, kernel and ROS distro, so the ratios above hold
+within a column and the absolutes do not travel between them.
+
+Full methodology, per-configuration figures, and the conditions each number
+depends on live in
+[Momentedge/clipper-benchmarks](https://github.com/Momentedge/clipper-benchmarks).
+
 ## Quickstart
 
 You need three things, each in its own shell sharing one ROS 2 environment
@@ -291,6 +345,9 @@ Setup guides for the recording + clipper stack live under
 - **[CLAUDE.md](CLAUDE.md)** and **[crates/clipper/CLAUDE.md](crates/clipper/CLAUDE.md)**
   — contributor and agent notes: workspace layout, build mechanics, and the
   recorder's internal design.
+- **[Momentedge/clipper-benchmarks](https://github.com/Momentedge/clipper-benchmarks)**
+  — the overhead benchmarks behind [What it costs](#what-it-costs): the harness,
+  the full report, and the methodology each figure depends on.
 
 ## License
 
