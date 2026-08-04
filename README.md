@@ -105,11 +105,9 @@ recorder a handful of dropped messages on the Nano, and dozens when the board is
 also busy, while one worker at a time drops none. The eight-core NX drops none
 in any configuration.
 
-rosbag2's `--snapshot-mode` is the alternative worth weighing first: it holds
-the preroll in RAM rather than on disk, so it writes nothing until you ask, at
-the cost of memory that scales with window × bitrate. Where each design wins is
-set out in
-[SNAPSHOT-COMPARISON.md](https://github.com/Momentedge/clipper-benchmarks/blob/main/SNAPSHOT-COMPARISON.md).
+Figures are per board and are not comparable across the two: the Nano and the NX
+differ in SoC, core count, RAM, kernel and ROS distro, so the ratios above hold
+within a column and the absolutes do not travel between them.
 
 Full methodology, per-configuration figures, and the conditions each number
 depends on live in
