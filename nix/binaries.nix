@@ -4,7 +4,7 @@
 # its own apt ROS2 (see README "Native build on the target"), since a nix-built
 # binary bakes /nix/store RPATHs and would drag the nix closure along instead of
 # using the host's ROS. Both are built: clipper-tailing (the deployable recorder,
-# whose cargo package is still `clipper`) and trigger-pub (the example trigger
+# built from the `clipper` cargo package) and trigger-pub (the example trigger
 # publisher, examples/trigger-pub). r2r's build
 # script (bindgen + rcl codegen) needs the same environment the dev shell's
 # shellHook sets: rosEnv's setup hook exports AMENT_PREFIX_PATH, and the explicit

@@ -741,8 +741,10 @@ this section is the rationale.
   resolves `momentedge_msgs` types from `AMENT_PREFIX_PATH`, so the test
   binary needs no r2r dependency and carries no process-global DDS state.
   The binary under test is located via `CARGO_BIN_EXE_clipper-tailing` (cargo
-  derives that name from the binary's, with `-` mapped to `_`), and every spawn
-  blocks until its `clipper-tailing up` startup line appears.
+  builds that variable from the bin target's name verbatim, hyphen included — it
+  does not translate `-` to `_` the way it does for package names in `cfg`
+  paths), and every spawn blocks until its `clipper-tailing up` startup line
+  appears.
 - **nextest is the required runner, not launch_testing**: process-per-test
   isolation, per-test slow-timeouts, leak detection for orphaned children,
   and the `ros-e2e` test group (`.config/nextest.toml`) serializing the suite

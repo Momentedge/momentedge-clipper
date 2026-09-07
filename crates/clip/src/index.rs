@@ -41,7 +41,7 @@
 //! Only the 22-byte fixed header of each top-level `Message` record is read
 //! during a scan (channel id, sequence, `log_time`, `publish_time`); message
 //! bodies are first touched by the cut ([`crate::cut`]). The one exception is an
-//! opt-in trigger tap ([`ScanSeed::trigger_tx`]): when set, the scan also lifts
+//! opt-in trigger tap ([`ScanSeed::tap`]): when set, the scan also lifts
 //! the full body of messages on the trigger topic out as
 //! [`TriggerRecord`]s for the caller to decode by `message_encoding`. With the
 //! tap unset — the default — no message body is read during the scan at all.
@@ -303,7 +303,7 @@ pub struct RecordingIndex {
     pub channels: HashMap<u16, ChannelDef>,
     /// Channels on the trigger topic (`id -> message_encoding`), the subset of
     /// `channels` a tapping caller watches. Empty unless the scan is seeded with
-    /// a trigger tap ([`ScanSeed::trigger_tx`]); seeds each scan pass so a
+    /// a trigger tap ([`ScanSeed::tap`]); seeds each scan pass so a
     /// trigger message references its channel defined in an earlier pass.
     pub trigger_channels: HashMap<u16, String>,
     pub bounds: TimeBounds,
@@ -351,8 +351,11 @@ impl RecordingIndex {
     /// registry as this pass updates it), then channels, then extents, then
     /// bounds.
     ///
-    /// Leaves the scan cursor alone; [`Self::advance`] is the paired step that
-    /// moves it, and is what a scan loop wants.
+    /// Leaves the scan cursor alone, which is almost never what a caller wants:
+    /// [`Self::advance`] pairs it with the cursor move and is what a scan loop
+    /// should call. This half stays reachable for a caller that folds a delta it
+    /// did not get from [`scan_available`] — replaying one, or merging an index
+    /// built elsewhere — where there is no [`ScanProgress`] to advance to.
     pub fn apply_delta(&mut self, delta: ScanDelta) {
         for (id, schema) in delta.schemas {
             self.schemas.insert(id, schema);
@@ -476,11 +479,6 @@ pub struct ScanDelta {
     pending_time: Option<Stamps>,
     schemas: Vec<(u16, SchemaDef)>,
     channels: Vec<RawChannel>,
-    /// The highest `log_time` this pass saw. Folded into the recording's
-    /// [`TimeBounds`] by way of the extents this pass closes, so nothing outside
-    /// reads it directly — a fault can leave it ahead of any extent, and a
-    /// caller pinning coverage to it would claim data no window can plan.
-    high_water_ns: u64,
     /// min/max of `log_time − publish_time` over the messages this pass folded.
     /// `None` until the first message; logged once per pass at debug.
     skew: Option<Skew>,
@@ -510,7 +508,6 @@ struct RawChannel {
 
 impl ScanDelta {
     fn absorb_time(&mut self, log_time: u64, publish_time: u64) {
-        self.high_water_ns = self.high_water_ns.max(log_time);
         self.pending_time = Some(match self.pending_time {
             Some(mut s) => {
                 s.extend(log_time, publish_time);
@@ -647,7 +644,6 @@ impl ScanDelta {
         }
         self.schemas.extend(sub.schemas);
         self.channels.extend(sub.channels);
-        self.high_water_ns = self.high_water_ns.max(sub.high_water_ns);
         // Trigger channels discovered in the chunk persist for later records;
         // triggers lifted from it emit only here, after the chunk iterated
         // cleanly. The sub-delta staged them (TriggerSink::Staged) rather than
@@ -887,11 +883,11 @@ pub fn scan_available(
             op::DATA_END | op::FOOTER => {
                 ended = true;
             }
-            // `Record` is the mcap crate's enum, not ours: it carries a dozen
-            // record kinds this scan has no opinion about, and upstream may add
-            // more. A catch-all is the right shape for a foreign enum — the
-            // lint guards our own.
-            _ => {} // Header, message/chunk indexes, attachments, …
+            // Every other opcode: the header, the message and chunk indexes,
+            // attachments, statistics, metadata and the summary offsets. None
+            // carries a stamp or a channel, and all are framed like the rest, so
+            // the walk consumes each by its length and moves on.
+            _ => {}
         }
         if ended {
             break;

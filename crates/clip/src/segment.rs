@@ -640,13 +640,15 @@ mod tests {
     /// A stage that **panics** is caught, reported to the caller as an error,
     /// and leaves the pool serving.
     ///
-    /// This is the arm [`spawn_stage_workers`]' `catch_unwind` exists for, and
-    /// it is the one that matters most: a worker thread that unwinds out of its
-    /// receive loop is gone for good, and every later job on that channel blocks
-    /// forever on a reply nobody will send — a recorder that stops cutting clips
-    /// with no error anywhere, because the callers are all parked. The sibling
-    /// test above covers the ordinary `Err` return; this one kills the worker
-    /// mid-copy and asserts the same two properties hold.
+    /// This is the arm [`spawn_stage_workers`]' `catch_unwind` exists for. A
+    /// worker that unwinds out of its receive loop is gone for good: it drops
+    /// the reply channel on the way out, so the caller that queued the job reads
+    /// a disconnect and reports "the staging worker dropped the job" — an error
+    /// naming the plumbing rather than the fault, and one that says nothing
+    /// about the pool now being one worker short. With `parallelism` at its
+    /// default of one, that is every later cut. The sibling test above covers
+    /// the ordinary `Err` return; this one kills the worker mid-copy and asserts
+    /// the same two properties survive it.
     #[test]
     fn a_panicking_stage_is_reported_and_the_pool_serves_the_next_job() -> anyhow::Result<()> {
         let root = test_dir("stage-panics")?;
