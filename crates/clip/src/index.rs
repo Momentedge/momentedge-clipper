@@ -31,9 +31,12 @@
 //!   the scan; an unchunked recording (the fastwrite storage profile) pays no
 //!   such cost.
 //!
-//! A pass also reports the highest `log_time` it saw
-//! ([`ScanDelta::high_water_ns`]), from which the caller raises whatever
-//! coverage its consumers wait on.
+//! Coverage — how far a caller can prove the recording reaches — is read off
+//! [`RecordingIndex::bounds`] once a pass has been applied, never off the pass
+//! itself. The two disagree exactly when a pass faults partway: a message whose
+//! stamps were folded but whose extent was never closed counts toward neither
+//! the index nor anything a window can plan from, so a caller that trusted the
+//! pass would claim coverage over data the cut would leave out.
 //!
 //! Only the 22-byte fixed header of each top-level `Message` record is read
 //! during a scan (channel id, sequence, `log_time`, `publish_time`); message
@@ -206,6 +209,7 @@ impl Extent {
 /// A snapshot for one clip: the open recording, the extents overlapping the
 /// window (in file order), and the channel registry to map IDs with. `file` is
 /// `None` while no recording has been discovered yet.
+#[derive(Debug)]
 pub struct WindowPlan {
     pub file: Option<Arc<File>>,
     pub extents: Vec<Extent>,
@@ -231,8 +235,9 @@ impl WindowPlan {
 ///
 /// The live tailer implements it over its time-ordered collection of
 /// recordings, so a window straddling a rollover yields one single-file plan per
-/// source recording; a whole-file index over one already-complete recording
-/// implements it too, yielding at most one. The cut path never learns which of
+/// source recording. An index built in one pass over an already-complete
+/// recording fits the same shape, yielding at most one plan, which is what this
+/// trait exists to leave room for. The cut path never learns which of
 /// the two it is talking to.
 pub trait WindowPlanner {
     /// One single-file [`WindowPlan`] per recording overlapping
@@ -272,6 +277,7 @@ impl TimeBounds {
 /// a live tailer holds a time-ordered collection of them, one per recording it
 /// follows — feeding each scan pass's [`ScanDelta`] back in through
 /// [`Self::apply_delta`] and serving windows out of it through [`Self::plan`].
+#[derive(Debug)]
 pub struct RecordingIndex {
     pub path: PathBuf,
     pub file: Arc<File>,
@@ -281,7 +287,7 @@ pub struct RecordingIndex {
     /// **Resume invariant:** a pass that faulted returns the offset of the
     /// faulted record with its partial delta already applied here, so a caller
     /// retrying MUST resume at that offset, never earlier. Re-scanning an
-    /// already-applied region makes [`ScanDelta::extend_extent`] compute
+    /// already-applied region makes the open extent's extension compute
     /// `record_end - open.offset` across bytes the open extent already spans and
     /// underflow.
     pub offset: u64,
@@ -321,10 +327,32 @@ impl RecordingIndex {
         }
     }
 
+    /// Fold one scan pass's result into this recording and move the cursor to
+    /// where the pass stopped — the whole of what a caller does between passes.
+    ///
+    /// The two steps belong together. Applying the delta without advancing
+    /// `offset` leaves the next pass re-reading records this one already folded,
+    /// and the open extent it re-extends then computes `record_end -
+    /// open.offset` across bytes it already spans, underflowing. Advancing
+    /// without applying loses a pass's registry and extents outright. Take
+    /// [`Self::apply_delta`] alone only when there is no [`ScanProgress`] to
+    /// advance to.
+    ///
+    /// The pass may have stopped on a fault; `progress.offset` is then the
+    /// faulted record rather than the file end, and resuming there — never
+    /// earlier — is what makes a retry safe.
+    pub fn advance(&mut self, delta: ScanDelta, progress: &ScanProgress) {
+        self.apply_delta(delta);
+        self.offset = progress.offset;
+    }
+
     /// Fold one scan pass's delta into this recording's registry, extents, and
-    /// time bounds. Mirrors the single-index `apply`: schemas first (so a
-    /// channel resolves its schema against the registry as this pass updates
-    /// it), then channels, then extents, then bounds.
+    /// time bounds: schemas first (so a channel resolves its schema against the
+    /// registry as this pass updates it), then channels, then extents, then
+    /// bounds.
+    ///
+    /// Leaves the scan cursor alone; [`Self::advance`] is the paired step that
+    /// moves it, and is what a scan loop wants.
     pub fn apply_delta(&mut self, delta: ScanDelta) {
         for (id, schema) in delta.schemas {
             self.schemas.insert(id, schema);
@@ -393,20 +421,22 @@ pub struct ScanProgress {
 /// its `trigger_channels`; the two tap fields are the caller's own choice and
 /// are `None` for a scan that only indexes timestamps — the default, under which
 /// no message body is read at all.
+#[derive(Debug)]
 pub struct ScanSeed {
     /// The extent still accumulating at the resume offset, from
     /// [`RecordingIndex::open`]. The pass keeps extending it, so records either
     /// side of a pass boundary land in one extent.
     pub open: Option<Extent>,
-    /// The topic whose messages the scan lifts out as triggers, or `None` to
-    /// disable the tap entirely (a caller reading triggers from a live
-    /// subscription instead). When `None`, the scan is byte-for-byte the
-    /// timestamp-only pass; no message body is ever read during it.
-    pub trigger_topic: Option<String>,
-    /// Where lifted [`TriggerRecord`]s go (the caller drains the far end).
-    /// `Some` exactly when `trigger_topic` is. Best-effort: a full or closed tap
-    /// never stalls the scan.
-    pub trigger_tx: Option<Sender<TriggerRecord>>,
+    /// The trigger tap: the topic whose messages the scan lifts out, and where
+    /// the lifted [`TriggerRecord`]s go (the caller drains the far end).
+    ///
+    /// The two travel together because neither means anything alone — a topic
+    /// with nowhere to send lifts bodies and drops them, a sender with no topic
+    /// never fires — and a seed able to carry one without the other would fail
+    /// silently either way. `None` disables the tap, and the scan is then
+    /// byte-for-byte the timestamp-only pass: no message body is read at all.
+    /// Sending is best-effort; a full or closed tap never stalls the scan.
+    pub tap: Option<(String, Sender<TriggerRecord>)>,
     /// Channels on the trigger topic already known (`id -> message_encoding`),
     /// from [`RecordingIndex::trigger_channels`], so a trigger message resolves
     /// against its channel defined in an earlier pass.
@@ -418,7 +448,7 @@ pub struct ScanSeed {
 /// chunk-interior record only after the chunk's CRC verifies. So the top-level
 /// delta carries the live tap and sends straight down it, while a chunk sub-delta
 /// stages until [`ScanDelta::absorb_chunk`] re-emits each through the parent.
-#[derive(Default)]
+#[derive(Debug, Default)]
 enum TriggerSink {
     /// The live tap the MCAP interface drains — the top-level scan delta. A
     /// lifted trigger sends now.
@@ -437,7 +467,7 @@ enum TriggerSink {
 /// its file IO and folded into the caller's [`RecordingIndex`] afterwards
 /// ([`RecordingIndex::apply_delta`]) — so the IO runs with no lock held and the
 /// publication is one short step at the end.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct ScanDelta {
     closed: Vec<Extent>,
     open: Option<Extent>,
@@ -446,9 +476,10 @@ pub struct ScanDelta {
     pending_time: Option<Stamps>,
     schemas: Vec<(u16, SchemaDef)>,
     channels: Vec<RawChannel>,
-    /// The highest `log_time` this pass saw — the log half of the coverage
-    /// watch. The publish half derives from the recording bounds
-    /// ([`TimeBounds::publish`]), not from a delta field.
+    /// The highest `log_time` this pass saw. Folded into the recording's
+    /// [`TimeBounds`] by way of the extents this pass closes, so nothing outside
+    /// reads it directly — a fault can leave it ahead of any extent, and a
+    /// caller pinning coverage to it would claim data no window can plan.
     high_water_ns: u64,
     /// min/max of `log_time − publish_time` over the messages this pass folded.
     /// `None` until the first message; logged once per pass at debug.
@@ -468,6 +499,7 @@ pub struct ScanDelta {
 }
 
 /// A `Channel` record before its schema is resolved against the registry.
+#[derive(Debug)]
 struct RawChannel {
     id: u16,
     schema_id: u16,
@@ -477,14 +509,6 @@ struct RawChannel {
 }
 
 impl ScanDelta {
-    /// The highest `log_time` this pass saw, or 0 when it folded no message —
-    /// the log half of the coverage the caller raises once it has applied the
-    /// delta. The publish half is not carried here: it derives from the
-    /// recording's [`TimeBounds`] after [`RecordingIndex::apply_delta`].
-    pub fn high_water_ns(&self) -> u64 {
-        self.high_water_ns
-    }
-
     fn absorb_time(&mut self, log_time: u64, publish_time: u64) {
         self.high_water_ns = self.high_water_ns.max(log_time);
         self.pending_time = Some(match self.pending_time {
@@ -537,6 +561,14 @@ impl ScanDelta {
     /// Fold one parsed record into the delta: schema/channel definitions into
     /// the registry, message times into the pending extent bounds.
     fn absorb_parsed(&mut self, rec: Record<'_>) {
+        // `Record` is the mcap crate's enum, not ours: a dozen record kinds this
+        // scan has no opinion about, and upstream may add more. A catch-all is
+        // the right shape for a foreign enum — the lint exists to guard the
+        // enums this workspace owns, where every arm is a decision.
+        #[expect(
+            clippy::wildcard_enum_match_arm,
+            reason = "foreign enum whose variant set this crate does not control"
+        )]
         match rec {
             Record::Schema { header, data } => self.schemas.push((
                 header.id,
@@ -577,6 +609,8 @@ impl ScanDelta {
                     });
                 }
             }
+            // Header, the message/chunk indexes, attachments, statistics and
+            // metadata: nothing a scan for stamps and channels reads.
             _ => {}
         }
     }
@@ -680,8 +714,9 @@ impl ScanDelta {
 /// The pass does file IO and owns no state: `seed` carries the caller's snapshot
 /// of the recording being resumed, and the caller folds the returned
 /// [`ScanDelta`] back into its [`RecordingIndex`]
-/// ([`RecordingIndex::apply_delta`]), records the returned offset, and raises
-/// its own coverage from [`ScanDelta::high_water_ns`].
+/// ([`RecordingIndex::apply_delta`]) and records the returned offset. Coverage,
+/// if the caller keeps any, comes from the index's [`TimeBounds`] afterwards —
+/// not from the pass, which counts messages whose extent a fault left unclosed.
 ///
 /// The delta comes with a plain [`ScanProgress`] rather than a `Result`:
 /// localized damage is skipped (a damaged chunk, an unparseable schema/channel,
@@ -694,7 +729,7 @@ impl ScanDelta {
 /// **Resume invariant:** that partial delta is applied like any other, so a
 /// caller retrying after a fault MUST resume at the returned `offset` (the
 /// faulted record), never earlier. Re-scanning an already-applied region makes
-/// [`ScanDelta::extend_extent`] compute `record_end - open.offset` across bytes
+/// the open extent's extension compute `record_end - open.offset` across bytes
 /// the open extent already spans and underflow.
 pub fn scan_available(
     file: &File,
@@ -706,10 +741,14 @@ pub fn scan_available(
     // offset, and the tap context (both stay empty/idle when the tap is
     // disabled). The top-level delta carries the live sink, so triggers it lifts
     // send straight down the tap as the scan finds them.
+    let (trigger_topic, trigger_sink) = match seed.tap {
+        Some((topic, tx)) => (Some(topic), TriggerSink::Live(tx)),
+        None => (None, TriggerSink::Off),
+    };
     let mut delta = ScanDelta {
         open: seed.open,
-        trigger_topic: seed.trigger_topic,
-        trigger_sink: seed.trigger_tx.map_or(TriggerSink::Off, TriggerSink::Live),
+        trigger_topic,
+        trigger_sink,
         trigger_channels: seed.trigger_channels,
         ..ScanDelta::default()
     };
@@ -848,6 +887,10 @@ pub fn scan_available(
             op::DATA_END | op::FOOTER => {
                 ended = true;
             }
+            // `Record` is the mcap crate's enum, not ours: it carries a dozen
+            // record kinds this scan has no opinion about, and upstream may add
+            // more. A catch-all is the right shape for a foreign enum — the
+            // lint guards our own.
             _ => {} // Header, message/chunk indexes, attachments, …
         }
         if ended {
@@ -1339,14 +1382,19 @@ mod tests {
         bytes.extend_from_slice(&[0x05, 0x01, 0x02, 0x03, 0x04]); // 5 of 9 header bytes
         std::fs::write(&path, bytes)?;
 
-        let (index, file) = index_file(&path)?;
+        let (mut index, file) = index_file(&path)?;
         let start = MAGIC.len() as u64;
 
         // Only the magic on disk: nothing to scan, nothing to fault on.
         let (delta, p) = scan_available(&file, start, start, seed_with(&index, None));
         assert_eq!(p.offset, start);
         assert!(!p.ended && p.fault.is_none());
-        assert_eq!(delta.high_water_ns(), 0);
+        index.apply_delta(delta);
+        assert!(
+            !index.bounds.has_messages,
+            "a pass over bare magic folds no message, so the index still has no \
+             time bounds and a caller reading coverage off it claims nothing"
+        );
 
         // A record header still being appended: same outcome.
         let (delta, p) = scan_available(
@@ -1357,7 +1405,9 @@ mod tests {
         );
         assert_eq!(p.offset, start);
         assert!(!p.ended && p.fault.is_none());
-        assert_eq!(delta.high_water_ns(), 0);
+        index.apply_delta(delta);
+        assert!(!index.bounds.has_messages);
+        assert!(index.extents.is_empty() && index.open.is_none());
 
         std::fs::remove_dir_all(root)?;
         Ok(())

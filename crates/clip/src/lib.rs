@@ -92,9 +92,11 @@ impl std::fmt::Display for TimeSource {
 /// [`std::panic::catch_unwind`]) as text: panics carry a `&str` or `String`
 /// message in practice; anything else gets a placeholder.
 ///
-/// Lives here because both sides of a split recorder need it — the staging
-/// worker pool ([`segment`]) catches a panicking stage per job, and a
-/// thread supervisor lifts a joined payload into an error chain.
+/// Lives here because the staging worker pool ([`segment`]) needs it: a worker
+/// catches a panicking stage per job and has to render the payload as the error
+/// it replies. Anything else supervising threads around a recording — a
+/// `JoinHandle::join` that came back `Err` — wants the same three lines, so it
+/// is public rather than private to that module.
 pub fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
     payload
         .downcast_ref::<&str>()

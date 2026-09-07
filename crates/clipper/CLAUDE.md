@@ -740,7 +740,7 @@ this section is the rationale.
 - **Everything is a child process; the test owns no ROS node.** The ros2 CLI
   resolves `momentedge_msgs` types from `AMENT_PREFIX_PATH`, so the test
   binary needs no r2r dependency and carries no process-global DDS state.
-  The binary under test is located via `CARGO_BIN_EXE_clipper_tailing` (cargo
+  The binary under test is located via `CARGO_BIN_EXE_clipper-tailing` (cargo
   derives that name from the binary's, with `-` mapped to `_`), and every spawn
   blocks until its `clipper-tailing up` startup line appears.
 - **nextest is the required runner, not launch_testing**: process-per-test
@@ -786,7 +786,7 @@ this section is the rationale.
   the clip's every message is in-window on the *selected* stamp while at least
   one message is out-of-window on the *contrasting* stamp — jointly impossible
   unless the two clock domains genuinely select different message sets. The
-  writer binary is resolved beside `CARGO_BIN_EXE_clipper_tailing` (built on
+  writer binary is resolved beside `CARGO_BIN_EXE_clipper-tailing` (built on
   demand if absent), so the case needs no extra build step.
 - **A copper (cu29) Producer reaches clipper end to end**
   (`copper_sink_recording_produces_clip`, ROS-free at runtime): the

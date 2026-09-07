@@ -9,15 +9,15 @@
 #
 # Splitting bounds each file; disk is bounded only once old splits are pruned,
 # which is a separate job — this script only records. See examples/split-bags
-# for a delete-by-age timer and examples/systemd for the recorder + clipper +
-# pruner as services.
+# for a delete-by-age timer and examples/launch for the recorder and clipper
+# under `ros2 launch`.
 #
 # This is a minimal example invocation, not a deployment entry point. The full
-# setups — low-latency tuning, split bags with retention, and a systemd unit
-# layout — live under examples/:
+# setups — low-latency tuning, split bags with retention, and a supervised
+# launch — live under examples/:
 #   examples/continuous/   one growing file (no splits) + latency trade-offs
 #   examples/split-bags/   --max-bag-size / --max-bag-duration + pruning
-#   examples/systemd/      rosbag + clipper + pruning as services
+#   examples/launch/       rosbag + clipper under `ros2 launch`, with respawn
 #
 # rosbag2 refuses to record into an existing bag directory, so ./record is
 # wiped on start. ./record is gitignored.

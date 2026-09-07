@@ -1,5 +1,5 @@
 //! A copper (cu29) `CuSinkTask` that appends routed task outputs to an MCAP
-//! Recording `clipper --interface mcap` can tail live — the copper producer
+//! Recording `clipper-tailing --interface mcap` can tail live — the copper producer
 //! path beside the two plain-`mcap`-crate writer examples
 //! (`examples/custom-mcap-writer`, `examples/chunked-mcap-writer`). No ROS
 //! stack is involved anywhere: the Trigger travels in-band, written into the
@@ -160,7 +160,7 @@ struct MetaEnvelope<'a> {
 }
 
 /// `builtin_interfaces/Time` flattened to its two fields — the shape
-/// `crates/clipper/src/trigger.rs::Stamp` decodes.
+/// `crates/clip/src/trigger.rs::Stamp` decodes.
 #[derive(Serialize)]
 struct TriggerStampWire {
     sec: i32,
@@ -894,7 +894,7 @@ mod tests {
         (records, pos)
     }
 
-    /// Mirrors `crates/clipper/src/trigger.rs::Stamp`'s `Deserialize` shape — a
+    /// Mirrors `crates/clip/src/trigger.rs::Stamp`'s `Deserialize` shape — a
     /// local copy so this crate stays free of any dependency on
     /// `crates/clipper` (which pulls in `r2r`/ROS), while still proving the JSON
     /// this program writes decodes into that exact field shape.
@@ -904,10 +904,10 @@ mod tests {
         nanosec: u32,
     }
 
-    /// Mirrors `crates/clipper/src/trigger.rs::Trigger`'s `Deserialize` shape
+    /// Mirrors `crates/clip/src/trigger.rs::Trigger`'s `Deserialize` shape
     /// (`description` optional, defaulting empty; the rest required; unknown
     /// fields ignored) — see that module's doc comment and
-    /// `crates/clipper/src/decode.rs`'s `json_decodes_the_msg_shape` test.
+    /// `crates/clip/src/decode.rs`'s `json_decodes_the_msg_shape` test.
     #[derive(serde::Deserialize, Debug, PartialEq)]
     struct TestTrigger {
         name: String,

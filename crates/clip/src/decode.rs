@@ -42,13 +42,14 @@ use crate::trigger::Trigger;
 /// - Anything else — `cbor`, schema-bound `protobuf`/`flatbuffer`, or an
 ///   unknown encoding — is an error, as is a body that does not parse.
 ///
-/// The sole caller is the recorder's MCAP interface (`McapInterface`, in the
-/// `clipper` crate): the ROS interface reads typed triggers off its subscription
-/// and never decodes the file, and its tail runs with the trigger tap unwired,
-/// so this path — and this error — is reachable only when clipper is reading
-/// triggers out of the tailed recording. There the caller logs the error and
-/// skips that one trigger rather than failing: an undecodable message on
-/// clipper's own trigger topic must not stop the recorder.
+/// This is reached only by a caller taking its triggers *out of a recording*.
+/// The device recorder's MCAP interface is one; a consumer replaying a finished
+/// recording is another. A caller reading typed triggers off a live ROS
+/// subscription decodes nothing here, and scans with the trigger tap unwired.
+///
+/// An error is the caller's to survive, not to fail on: an undecodable message
+/// on the trigger topic means one trigger lost, and both known callers log it
+/// and move to the next record rather than stopping.
 pub fn decode_trigger(encoding: &str, body: &[u8]) -> Result<Trigger> {
     match encoding {
         #[cfg(feature = "ros")]

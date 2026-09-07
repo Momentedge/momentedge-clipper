@@ -122,8 +122,7 @@ pub fn index_file(path: &Path) -> Result<(RecordingIndex, Arc<File>)> {
 pub fn seed_with(index: &RecordingIndex, tap: Option<(&str, &Sender<TriggerRecord>)>) -> ScanSeed {
     ScanSeed {
         open: index.open,
-        trigger_topic: tap.map(|(topic, _)| topic.to_string()),
-        trigger_tx: tap.map(|(_, tx)| tx.clone()),
+        tap: tap.map(|(topic, tx)| (topic.to_string(), tx.clone())),
         trigger_channels: index.trigger_channels.clone(),
     }
 }
@@ -146,8 +145,7 @@ pub fn scan_passes(
         let file_len = file.metadata().context("stat of the scanned file")?.len();
         let offset = index.offset;
         let (delta, progress) = scan_available(file, offset, file_len, seed_with(index, tap));
-        index.apply_delta(delta);
-        index.offset = progress.offset;
+        index.advance(delta, &progress);
         if progress.ended || progress.fault.is_some() || progress.offset == offset {
             return Ok(progress);
         }

@@ -2,9 +2,10 @@
 
 An example node that publishes `momentedge_msgs/Trigger` on
 `/events/momentedge/trigger` at a fixed interval, so the triggered recorder
-(`clipper`) has something to react to without a real trigger source. A real
-deployment supplies its own trigger publisher; `clipper` never depends on this
-one. Built on [r2r](https://github.com/sequenceplanner/r2r); no async runtime.
+(`clipper-tailing`) has something to react to without a real trigger source. A
+real deployment supplies its own trigger publisher; the recorder never depends
+on this one. Built on [r2r](https://github.com/sequenceplanner/r2r); no async
+runtime.
 
 ## Behaviour
 
@@ -28,7 +29,7 @@ controls verbosity (default `info`).
 
 ## Run
 
-From the dev shell, paired with a running `clipper` and `scripts/record.sh`:
+From the dev shell, paired with a running `clipper-tailing` and `scripts/record.sh`:
 
 ```bash
 nix develop --command cargo run -p trigger-pub -- --period 5 --preroll 2000000000 --postroll 2000000000

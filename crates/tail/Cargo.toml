@@ -35,3 +35,25 @@ log.workspace = true
 clip = { path = "../clip", features = ["test-support"] }
 # The clip compression codec the handler tests drive the staging pool through.
 mcap.workspace = true
+
+[lints.rust]
+# A public type a downstream crate holds in a struct or logs on an error path
+# needs `Debug`, and the omission only shows up in the consumer's build.
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[lints.clippy]
+# Every arm of a match over one of *our* enums is a decision; a catch-all hides
+# the site a new variant has to be handled at. Matches over foreign enums —
+# `mcap::records::Record` above all — keep a catch-all under `#[expect]`, since
+# upstream may add variants this crate has no opinion about.
+wildcard_enum_match_arm = "warn"
+
+# Deliberately not enabled here, having been measured rather than assumed:
+#   missing_docs — 57 of the 60 hits are struct fields on types whose own docs
+#     already say what they carry (`SchemaDef { name, encoding, data }`), so the
+#     lint buys restated field names, not contracts.
+#   clippy::arithmetic_side_effects — 25 hits, all offset and length arithmetic
+#     in the scan and the cut, every one already bounded by an explicit
+#     `MAX_RECORD_LEN` or file-length check before it runs. Suppressing 25 sites
+#     would bury the two that matter.

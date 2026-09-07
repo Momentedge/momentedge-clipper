@@ -138,9 +138,10 @@ jobs:
   # lockfile; formatting is covered by the `fmt` job's `cargo fmt --all --check`.
   #
   # There is deliberately no `--features ros` build here: that arm needs the ROS
-  # toolchain this job is defined by not having, and the per-distro `recorder`
-  # matrix below already builds clipper — and therefore `clip` with `ros` on —
-  # under every distro.
+  # toolchain this job is defined by not having. The per-distro `recorder` matrix
+  # below covers it — its unit step selects `clip` and `tail` alongside the
+  # recorder, so the resolver unifies `ros` and `clap` onto clip's test target and
+  # the feature-gated tests run there.
   libraries:
     name: clip + tail (ROS-free)
     runs-on: ubuntu-latest
@@ -301,8 +302,14 @@ jobs:
       - name: Build
         run: nix develop ".#${{ matrix.distro }}" --command cargo build --locked -p clipper -p custom-mcap-writer -p cu-mcap-record
 
+      # The libraries are selected alongside the recorder so their feature-gated
+      # tests actually run somewhere. `clip`'s `cdr_round_trips_through_r2r` needs
+      # the `ros` feature and `display_matches_the_clap_value_names` needs `clap`;
+      # the ROS-free `libraries` job builds neither feature by design, so this is
+      # the only lane that can. Selecting all three lets the resolver unify the
+      # recorder's `clip` features onto clip's own test target.
       - name: Unit tests
-        run: nix develop ".#${{ matrix.distro }}" --command cargo nextest run --locked -p clipper -E 'not binary(e2e)'
+        run: nix develop ".#${{ matrix.distro }}" --command cargo nextest run --locked -p clip -p tail -p clipper -E 'not binary(e2e)'
 
       # Live ROS2 e2e: real `ros2 bag record`, CLI-published triggers, real
       # Recorded announcements. Gated on CLIPPER_E2E; serialized and

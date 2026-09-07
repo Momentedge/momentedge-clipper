@@ -1,13 +1,13 @@
-//! The neutral trigger/completion contract shared by the interfaces and the
-//! handler.
+//! The neutral trigger and completion contract every trigger source targets.
 //!
-//! This module is the dependency-light boundary both sides of the recorder
-//! depend on while staying independent of each other: the recorder's interface
-//! layer (which knows ROS vs MCAP and the wire encodings) produces a [`Trigger`]
-//! and consumes the handler's [`Completion`] through [`Announce`]; the handler
-//! layer cuts clips from a [`Trigger`] and announces a [`Completion`], knowing
-//! nothing of ROS or any encoding. Keeping these types free of `r2r` and `mcap`
-//! is what lets either side change without dragging the other along. [`Trigger`]
+//! This is the dependency-light boundary between the two halves of cutting a
+//! clip, and it exists so neither half has to know the other. Above it sits
+//! whatever knows the outside world — a ROS subscription, records lifted out of
+//! a recording, a JSON list — and it produces a [`Trigger`] and consumes a
+//! [`Completion`] through [`Announce`]. Below it sits the cut, which acts on a
+//! [`Trigger`] and reports a [`Completion`] knowing nothing of ROS or any wire
+//! encoding. Keeping these types free of `r2r` and `mcap` is what lets either
+//! side change without dragging the other along. [`Trigger`]
 //! and [`Stamp`] do derive `serde::Deserialize` — their fields mirror the
 //! `momentedge_msgs/Trigger` JSON shape, so the JSON decoder reads a payload
 //! straight into them with no parallel wire type; the CDR path maps r2r's own

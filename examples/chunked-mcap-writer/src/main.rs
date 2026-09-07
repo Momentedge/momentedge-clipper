@@ -103,7 +103,7 @@ const POSE_SCHEMA: &[u8] = br#"{
 }"#;
 
 /// `builtin_interfaces/Time` flattened to its two fields — the JSON shape
-/// `crates/clipper/src/trigger.rs::Stamp` derives `Deserialize` for.
+/// `crates/clip/src/trigger.rs::Stamp` derives `Deserialize` for.
 #[derive(Serialize)]
 struct StampMsg {
     sec: i32,
@@ -111,7 +111,7 @@ struct StampMsg {
 }
 
 /// The JSON payload for `/events/momentedge/trigger` — field-for-field the
-/// shape `crates/clipper/src/trigger.rs::Trigger` decodes. `trigger_time`
+/// shape `crates/clip/src/trigger.rs::Trigger` decodes. `trigger_time`
 /// stays `{sec: 0, nanosec: 0}`: inert under the mcap interface, where the
 /// anchor is the trigger record's own MCAP stamp (see the module docs).
 #[derive(Serialize)]
@@ -144,7 +144,7 @@ fn register<W: Write + Seek>(writer: &mut mcap::Writer<W>) -> Result<(u16, u16)>
     let schema_id = writer.add_schema("Pose", "jsonschema", POSE_SCHEMA)?;
     let pose_id = writer.add_channel(schema_id, "/pose", "json", &BTreeMap::new())?;
     // Schemaless, schema id 0 — clipper's MCAP interface decodes triggers by
-    // `message_encoding` alone, not a schema (see crates/clipper/src/decode.rs).
+    // `message_encoding` alone, not a schema (see crates/clip/src/decode.rs).
     let trigger_id = writer.add_channel(0, TRIGGER_TOPIC, "json", &BTreeMap::new())?;
     Ok((pose_id, trigger_id))
 }
@@ -379,7 +379,7 @@ mod tests {
         (records, pos)
     }
 
-    /// Mirrors `crates/clipper/src/trigger.rs::Stamp`'s `Deserialize` shape —
+    /// Mirrors `crates/clip/src/trigger.rs::Stamp`'s `Deserialize` shape —
     /// a local copy so this crate stays free of any dependency on
     /// `crates/clipper` (which pulls in `r2r`/ROS), while still proving the
     /// JSON this program writes decodes into that exact field shape.
@@ -389,10 +389,10 @@ mod tests {
         nanosec: u32,
     }
 
-    /// Mirrors `crates/clipper/src/trigger.rs::Trigger`'s `Deserialize` shape
+    /// Mirrors `crates/clip/src/trigger.rs::Trigger`'s `Deserialize` shape
     /// (`description` optional, defaulting empty; the rest required; unknown
     /// fields ignored) — see that module's doc comment and
-    /// `crates/clipper/src/decode.rs`'s `json_decodes_the_msg_shape` test.
+    /// `crates/clip/src/decode.rs`'s `json_decodes_the_msg_shape` test.
     #[derive(serde::Deserialize, Debug, PartialEq)]
     struct TestTrigger {
         name: String,

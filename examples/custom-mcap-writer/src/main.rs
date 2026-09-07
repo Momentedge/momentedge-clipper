@@ -154,7 +154,7 @@ const POSE_SCHEMA: &[u8] = br#"{
 }"#;
 
 /// `builtin_interfaces/Time` flattened to its two fields — the JSON shape
-/// `crates/clipper/src/trigger.rs::Stamp` derives `Deserialize` for.
+/// `crates/clip/src/trigger.rs::Stamp` derives `Deserialize` for.
 #[derive(Serialize)]
 struct StampMsg {
     sec: i32,
@@ -174,8 +174,8 @@ impl StampMsg {
 }
 
 /// The JSON payload for `/events/momentedge/trigger`. Field-for-field the
-/// shape `crates/clipper/src/trigger.rs::Trigger` derives `Deserialize` for
-/// (verified against its doc comments and `crates/clipper/src/decode.rs`'s
+/// shape `crates/clip/src/trigger.rs::Trigger` derives `Deserialize` for
+/// (verified against its doc comments and `crates/clip/src/decode.rs`'s
 /// `json_decodes_the_msg_shape` test): `description` is optional there but
 /// always emitted here, `trigger_time` mirrors `builtin_interfaces/Time`, and
 /// `preroll`/`postroll` are nanoseconds either side of `trigger_time`.
@@ -350,7 +350,7 @@ fn main() -> Result<()> {
     let mut channels = channels();
     let ids = register(&mut writer, &channels)?;
     // Schemaless, like `/size` — clipper's MCAP interface decodes triggers by
-    // `message_encoding` alone, not a schema (see crates/clipper/src/decode.rs).
+    // `message_encoding` alone, not a schema (see crates/clip/src/decode.rs).
     let trigger_channel_id = writer.add_channel(0, TRIGGER_TOPIC, "json", &BTreeMap::new())?;
 
     let publish_offset_ns = cfg.publish_offset_ms * 1_000_000;
@@ -421,7 +421,7 @@ mod tests {
 
     use super::*;
 
-    /// Mirrors `crates/clipper/src/trigger.rs::Stamp`'s `Deserialize` shape —
+    /// Mirrors `crates/clip/src/trigger.rs::Stamp`'s `Deserialize` shape —
     /// a local copy so this crate stays free of any dependency on
     /// `crates/clipper` (which pulls in `r2r`/ROS), while still proving the
     /// JSON this program writes decodes into that exact field shape.
@@ -431,10 +431,10 @@ mod tests {
         nanosec: u32,
     }
 
-    /// Mirrors `crates/clipper/src/trigger.rs::Trigger`'s `Deserialize` shape
+    /// Mirrors `crates/clip/src/trigger.rs::Trigger`'s `Deserialize` shape
     /// (`description` optional, defaulting empty; the rest required; unknown
     /// fields ignored) — see that module's doc comment and
-    /// `crates/clipper/src/decode.rs`'s `json_decodes_the_msg_shape` test,
+    /// `crates/clip/src/decode.rs`'s `json_decodes_the_msg_shape` test,
     /// which this mirrors field-for-field.
     #[derive(serde::Deserialize, Debug, PartialEq)]
     struct TestTrigger {

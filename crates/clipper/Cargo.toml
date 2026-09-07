@@ -58,17 +58,12 @@ libc = "0.2"
 # Test structuring: expands the storage-profile matrix into per-case tests
 # that nextest runs as isolated processes.
 rstest = "0.26"
-# `Watch`'s test-only setter, which the admission-gate test drives waiters with.
+# `Watch`'s test-only setter, which the admission-gate test parks and releases
+# sixteen handlers with. Cargo's v2+ resolver does not enable a dev-dependency's
+# features for a normal build, so a release binary compiles none of it.
 tail = { path = "../tail", features = ["test-support"] }
 # Reading back the JSON trigger payloads the e2e harness writes into a recording.
 serde_json = "1"
-# `clip::testing`, behind clip's `test-support` feature: the MCAP fixture writers
-# the tail's unit tests build recordings out of (raw records, chunks, finished
-# and still-being-written files), shared with clip's own index tests rather than
-# duplicated here. Cargo's v2+ resolver does not enable a dev-dependency's
-# features for a normal build, so a release build of the recorder still compiles
-# no fixture code.
-clip = { path = "../clip", features = ["test-support"] }
 
 # Debian packaging via cargo-deb: `cargo deb -p clipper --no-build --variant <distro>`
 # (scripts/package-clipper-deb.sh). bloom has no cargo build type, so cargo-deb is

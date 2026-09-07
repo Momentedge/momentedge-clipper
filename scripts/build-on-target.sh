@@ -45,6 +45,15 @@ for _p in "${_build_pkgs[@]}"; do _pkg_flags+=(-p "$_p"); done
 
 echo
 echo "built:"
-for _p in "${_build_pkgs[@]}"; do echo "  $REPO_ROOT/target/release/$_p"; done
+# A cargo package's binary need not share its name: the `clipper` package builds
+# `clipper-tailing`. Map the ones that differ so the listing names files that
+# exist — a wrong path here is the first thing a deployer copies.
+for _p in "${_build_pkgs[@]}"; do
+  case "$_p" in
+    clipper) _bin=clipper-tailing ;;
+    *) _bin="$_p" ;;
+  esac
+  echo "  $REPO_ROOT/target/release/$_bin"
+done
 echo "run the recorder: scripts/record.sh + target/release/clipper-tailing"
 echo "run the demo trigger: examples/trigger-pub/start_demo_trigger_pub.sh (needs trigger-pub built)"

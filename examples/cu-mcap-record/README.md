@@ -2,7 +2,7 @@
 
 A standalone [copper (cu29)](https://github.com/copper-project/copper-rs)
 application whose sink task appends routed task outputs to an MCAP **Recording**
-that `clipper --interface mcap` tails live — the copper **Producer** path beside
+that `clipper-tailing --interface mcap` tails live — the copper **Producer** path beside
 the two plain-`mcap`-crate writer examples,
 [`custom-mcap-writer`](../custom-mcap-writer/README.md) (unchunked) and
 [`chunked-mcap-writer`](../chunked-mcap-writer/README.md) (buffered chunks +
@@ -108,7 +108,7 @@ Point unmodified clipper at the same directory with `--record-dir` (the tailed
 Recording directory) and `--out-dir` (where finished Clips land):
 
 ```bash
-clipper --interface mcap --record-dir examples/cu-mcap-record/out --out-dir clips
+clipper-tailing --interface mcap --record-dir examples/cu-mcap-record/out --out-dir clips
 ```
 
 Clipper tails the growing Recording, lifts each Trigger out of it, cuts a Clip

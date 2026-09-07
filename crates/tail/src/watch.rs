@@ -13,6 +13,7 @@
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
+#[derive(Debug)]
 pub struct Watch<T> {
     value: Mutex<T>,
     changed: Condvar,

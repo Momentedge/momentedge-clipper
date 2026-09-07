@@ -28,6 +28,7 @@ use std::path::{Path, PathBuf};
 /// each inode exactly once.
 ///
 /// See the module docs for the identity/ordering contract.
+#[derive(Debug)]
 pub struct NewFileWatchIterator {
     dir: PathBuf,
     /// `(dev, ino)` of files already yielded (and, for [`Self::seeded`], the

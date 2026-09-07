@@ -37,6 +37,7 @@ use crate::{cut, panic_text};
 /// tested on, and a job that carried only the bounds would let those two be
 /// answered from different clocks — a clip silently holding the wrong messages
 /// rather than an error.
+#[derive(Debug)]
 pub struct StageJob {
     plan: WindowPlan,
     start_ns: u64,
@@ -600,15 +601,115 @@ mod tests {
         Ok(())
     }
 
+    /// A plan whose extent declares more bytes than any allocation can hold, so
+    /// the copy panics rather than returning an error. Its `time` span covers
+    /// everything, so any window selects it.
+    struct Unallocatable(Arc<File>);
+
+    impl WindowPlanner for Unallocatable {
+        fn plan_window(
+            &self,
+            _start_ns: u64,
+            _end_ns: u64,
+            _source: TimeSource,
+        ) -> Vec<WindowPlan> {
+            vec![WindowPlan {
+                file: Some(self.0.clone()),
+                // `copy_window` sizes its read buffer from `len`; a length past
+                // `isize::MAX` cannot be a `Vec` capacity, so the allocation
+                // panics with "capacity overflow" instead of returning an error.
+                extents: vec![Extent {
+                    offset: 0,
+                    len: u64::MAX,
+                    time: Some(Stamps {
+                        log: Span {
+                            min: 0,
+                            max: u64::MAX,
+                        },
+                        publish: Span {
+                            min: 0,
+                            max: u64::MAX,
+                        },
+                    }),
+                }],
+                channels: HashMap::new(),
+            }]
+        }
+    }
+
+    /// A stage that **panics** is caught, reported to the caller as an error,
+    /// and leaves the pool serving.
+    ///
+    /// This is the arm [`spawn_stage_workers`]' `catch_unwind` exists for, and
+    /// it is the one that matters most: a worker thread that unwinds out of its
+    /// receive loop is gone for good, and every later job on that channel blocks
+    /// forever on a reply nobody will send — a recorder that stops cutting clips
+    /// with no error anywhere, because the callers are all parked. The sibling
+    /// test above covers the ordinary `Err` return; this one kills the worker
+    /// mid-copy and asserts the same two properties hold.
+    #[test]
+    fn a_panicking_stage_is_reported_and_the_pool_serves_the_next_job() -> anyhow::Result<()> {
+        let root = test_dir("stage-panics")?;
+        let src = root.join("src.mcap");
+        write_recording(&src, false, &[("/t", 100)])?;
+        let rec = root.join("rec.mcap");
+        write_recording(&rec, false, &[("/t", 100), ("/t", 200)])?;
+
+        let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION);
+
+        let doomed = Unallocatable(Arc::new(File::open(&src)?));
+        let err = cut_window(
+            &doomed,
+            0,
+            u64::MAX,
+            &root.join("boom.mcap"),
+            &stage_tx,
+            TimeSource::Log,
+        )
+        .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("staging panicked"),
+            "the panic is reported as an error, not lost with the thread: {text}"
+        );
+        assert!(!root.join("boom.mcap").exists(), "no clip is published");
+
+        // The same pool, after a worker caught a panic: a well-formed window
+        // still cuts. Without the catch this call never returns.
+        let planner = indexed(&[&rec])?;
+        let stats = cut_window(
+            &planner,
+            0,
+            1_000,
+            &root.join("good.mcap"),
+            &stage_tx,
+            TimeSource::Log,
+        )?;
+        assert_eq!(
+            read_clip(&stats[0].out_path)?,
+            vec![("/t".to_string(), 100), ("/t".to_string(), 200)],
+            "the worker that caught a panic is still serving jobs"
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
     /// `time_source` reaches both halves of the cut: the planner chooses extents
     /// on it, and the copy tests each message's membership on it.
     ///
     /// The two are separately capable of being wired to the wrong clock, and a
     /// window whose extents were selected on one domain and whose messages were
     /// filtered on the other would quietly produce a short clip rather than an
-    /// error — so this drives one recording through `cut_window` twice, on the
-    /// same bounds, and asserts the two domains disagree exactly as the stamps
-    /// say they should.
+    /// error. Pinning both halves needs a window where the extent itself falls
+    /// outside one domain — otherwise the planner returns the same extent either
+    /// way and only the copy is under test. So the stamps here are far apart:
+    /// log times 100/200 against publish times 1_000/2_000, and a window of
+    /// [900, 1_500] that the extent's log span misses entirely. A planner stuck
+    /// on `log` returns no plan and the cut comes out empty; a copy stuck on
+    /// `log` finds no message inside and the cut comes out empty; only both on
+    /// `publish` yields the one message. The narrower [180, 320] case below then
+    /// exercises the copy's membership test on its own.
     #[test]
     fn cut_window_selects_extents_and_messages_on_the_time_source() -> anyhow::Result<()> {
         let root = test_dir("segment-domain")?;
@@ -626,9 +727,66 @@ mod tests {
         let planner = indexed(&[&rec])?;
         let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION);
 
+        // A second recording whose log span [100, 200] and publish span
+        // [1_000, 2_000] do not overlap: the window [900, 1_500] falls inside
+        // the publish span and entirely outside the log one, so the extent is
+        // planned on `publish` and not on `log`.
+        let apart = root.join("apart.mcap");
+        write_raw(
+            &apart,
+            &[
+                raw_record(op::CHANNEL, &channel_body(1, 0, "/t", "cdr")),
+                raw_record(op::MESSAGE, &message_body_pub(1, 0, 100, 1_000, b"a")),
+                raw_record(op::MESSAGE, &message_body_pub(1, 1, 200, 2_000, b"b")),
+            ],
+        )?;
+        let apart_planner = indexed(&[&apart])?;
+
+        let on_publish_apart = cut_window(
+            &apart_planner,
+            900,
+            1_500,
+            &root.join("apart-publish.mcap"),
+            &stage_tx,
+            TimeSource::Publish,
+        )?;
+        assert_eq!(
+            read_clip(&on_publish_apart[0].out_path)?
+                .into_iter()
+                .map(|(_, t)| t)
+                .collect::<Vec<u64>>(),
+            vec![100],
+            "both halves on publish: the extent is planned and the message at \
+             publish 1_000 is inside"
+        );
+
+        // The same window on `log`: the extent's log span [100, 200] is nowhere
+        // near it, so the planner returns nothing and the cut is a valid empty
+        // clip. This is the assertion a planner hard-wired to one domain fails.
+        let on_log_apart = cut_window(
+            &apart_planner,
+            900,
+            1_500,
+            &root.join("apart-log.mcap"),
+            &stage_tx,
+            TimeSource::Log,
+        )?;
+        assert_eq!(
+            on_log_apart.len(),
+            1,
+            "an uncovered window still yields one segment"
+        );
+        assert_eq!(
+            on_log_apart[0].extents_read, 0,
+            "the planner selects extents on the window's own domain, so a log \
+             window past the log span reads none"
+        );
+        assert!(read_clip(&on_log_apart[0].out_path)?.is_empty());
+
         // The window [180, 320] holds log_times 200 and 300 on `log`; on
         // `publish` only the message published at 250 is inside, and its
-        // log_time — what a reader of the clip sees — is 100.
+        // log_time — what a reader of the clip sees — is 100. Both domains plan
+        // the same extent here, so this pins the copy's membership test alone.
         let on_log = cut_window(
             &planner,
             180,

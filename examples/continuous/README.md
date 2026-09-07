@@ -95,7 +95,7 @@ ros2 bag record --all \
   --max-cache-size 0 \
   --output ./record
 
-clipper --record-dir ./record --grace-secs 2
+clipper-tailing --record-dir ./record --grace-secs 2
 ```
 
 ## Retention

@@ -44,7 +44,7 @@
 //! framing intact. A **framing** fault has no resync point, so the scan stops at
 //! it, having applied everything before it. The tail then retries from exactly
 //! that offset — never re-attaching, never rescanning from scratch — under a
-//! bounded, backing-off [`MAX_SCAN_FAULTS`] budget, treating a recorder restart
+//! bounded, backing-off `MAX_SCAN_FAULTS` budget, treating a recorder restart
 //! during the backoff as recovery. Only when the same byte faults through the
 //! whole budget does [`Tailer::run`] return an error and the process exit for a
 //! supervisor to restart: a tailer wedged on a stuck file would otherwise
@@ -174,6 +174,7 @@ enum RecordingState {
 /// split falls exactly here: the index is `clip`'s, shared with every such
 /// consumer, and the two lifecycle fields stay behind with the tail that is
 /// the only thing to have a lifecycle.
+#[derive(Debug)]
 struct Recording {
     id: RecordingId,
     state: RecordingState,
@@ -184,7 +185,7 @@ struct Recording {
 /// (oldest .. newest), plus which one is being incrementally scanned. The tail
 /// thread is the sole writer; trigger handlers only read it (under the mutex)
 /// via [`WindowPlanner::plan_window`].
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct TailState {
     recordings: std::collections::VecDeque<Recording>,
     /// The recording being incrementally tailed (`Tailing`). `None` before the
@@ -307,20 +308,18 @@ impl TailState {
 
 /// Shared tail state: the scanning thread feeds it, trigger handlers snapshot
 /// it via [`WindowPlanner::plan_window`] and wait on the coverage watch.
+#[derive(Debug)]
 pub struct Tailer {
     state: Mutex<TailState>,
     coverage: Arc<Watch<Coverage>>,
-    /// The topic whose messages the scan lifts out as triggers, or `None` to
-    /// disable the tap entirely (the ROS interface, which reads triggers from a
-    /// live subscription instead). When `None`, the scan is byte-for-byte the
-    /// timestamp-only tail; no message body is ever read during the scan.
-    trigger_topic: Option<String>,
-    /// Where lifted [`TriggerRecord`]s go (the MCAP interface drains the far
-    /// end). `Some` exactly when `trigger_topic` is. Best-effort: a full or
-    /// closed tap never stalls the scan. Cloned into each pass's [`ScanSeed`],
-    /// which the scan turns into the sink it sends triggers straight down the
-    /// moment it lifts them.
-    trigger_tx: Option<Sender<TriggerRecord>>,
+    /// The trigger tap: the topic whose messages the scan lifts out, and the
+    /// channel the MCAP interface drains them from. `None` disables it — the ROS
+    /// interface reads triggers from a live subscription instead — and the scan
+    /// is then byte-for-byte the timestamp-only tail, reading no message body at
+    /// all. Cloned into each pass's [`ScanSeed`], which the scan turns into the
+    /// sink it sends triggers down the moment it lifts them; best-effort, so a
+    /// full or closed tap never stalls the scan.
+    tap: Option<(String, Sender<TriggerRecord>)>,
 }
 
 impl Tailer {
@@ -328,7 +327,7 @@ impl Tailer {
     /// wait on. The scan reads only message timestamps; triggers arrive through
     /// the ROS interface, not the file.
     pub fn new() -> (Arc<Self>, Arc<Watch<Coverage>>) {
-        Self::build(None, None)
+        Self::build(None)
     }
 
     /// A tailer whose scan also lifts messages on `trigger_topic` out of the
@@ -340,20 +339,16 @@ impl Tailer {
         trigger_topic: impl Into<String>,
         trigger_tx: Sender<TriggerRecord>,
     ) -> (Arc<Self>, Arc<Watch<Coverage>>) {
-        Self::build(Some(trigger_topic.into()), Some(trigger_tx))
+        Self::build(Some((trigger_topic.into(), trigger_tx)))
     }
 
-    fn build(
-        trigger_topic: Option<String>,
-        trigger_tx: Option<Sender<TriggerRecord>>,
-    ) -> (Arc<Self>, Arc<Watch<Coverage>>) {
+    fn build(tap: Option<(String, Sender<TriggerRecord>)>) -> (Arc<Self>, Arc<Watch<Coverage>>) {
         let coverage = Arc::new(Watch::new(Coverage::default()));
         (
             Arc::new(Tailer {
                 state: Mutex::new(TailState::default()),
                 coverage: coverage.clone(),
-                trigger_topic,
-                trigger_tx,
+                tap,
             }),
             coverage,
         )
@@ -381,7 +376,7 @@ impl Tailer {
     /// their fds and — when `delete_old_files` is set — unlinking them from disk.
     ///
     /// Returns only on an unrecoverable scan fault (the same byte faulting
-    /// through the whole [`MAX_SCAN_FAULTS`] budget) or a magic mismatch; the
+    /// through the whole `MAX_SCAN_FAULTS` budget) or a magic mismatch; the
     /// supervisor then exits the process for a restart, since limping on would
     /// degrade every clip to a grace-timeout cut silently. A missing or empty
     /// record directory is not a fault — discovery idles until the recorder
@@ -585,7 +580,7 @@ impl Tailer {
     /// monotonic in the watch; never lowered). The brief state lock is the only
     /// one a handler's `plan_window` can contend on; the file IO above ran with
     /// no lock held.
-    fn apply_to_current(&self, delta: ScanDelta, offset: u64) {
+    fn apply_to_current(&self, delta: ScanDelta, progress: &ScanProgress) {
         // Triggers were already sent straight down the tap as the scan lifted
         // them ([`ScanDelta::emit_trigger`]); apply only publishes the index and
         // advances coverage. A handler that received a trigger before this runs
@@ -597,8 +592,7 @@ impl Tailer {
             if let Some(id) = st.current
                 && let Some(r) = st.recording_mut(id)
             {
-                r.index.apply_delta(delta);
-                r.index.offset = offset;
+                r.index.advance(delta, progress);
             }
             (st.high_water_ns(), st.publish_high_water_ns())
         };
@@ -659,15 +653,14 @@ impl Tailer {
                 // trigger channels it has already seen, so a trigger message
                 // resolves against a channel defined in an earlier pass. Both
                 // stay empty/idle when the tap is disabled.
-                trigger_topic: self.trigger_topic.clone(),
-                trigger_tx: self.trigger_tx.clone(),
+                tap: self.tap.clone(),
                 trigger_channels: current
                     .map(|r| r.index.trigger_channels.clone())
                     .unwrap_or_default(),
             }
         };
         let (delta, progress) = index::scan_available(file, offset, file_len, seed);
-        self.apply_to_current(delta, progress.offset);
+        self.apply_to_current(delta, &progress);
         progress
     }
 }
@@ -830,6 +823,90 @@ pub(crate) mod tests {
             guard += 1;
             assert!(guard < 1000, "drain did not converge");
         }
+        Ok(())
+    }
+
+    /// The tailer seeds the shared scan with its own trigger tap, so a
+    /// trigger-topic message in the recording arrives on the tap channel.
+    ///
+    /// The scan itself is [`clip::index`]'s and is tested there against a fixture
+    /// seed. What is only testable here is the *production* seed: that
+    /// [`Tailer::with_trigger_tap`]'s topic and sender reach
+    /// [`clip::index::ScanSeed`] at all. A tailer that built the seed with
+    /// `trigger_tx: None` would tail correctly, index correctly, cover
+    /// correctly — and silently never lift a trigger, which under the `mcap`
+    /// interface is a recorder that ignores every trigger it is given.
+    #[test]
+    fn the_tap_seeded_by_the_tailer_lifts_a_trigger() -> Result<()> {
+        let root = test_dir("tail-tap")?;
+        let rec = root.join("rec.mcap");
+        write_raw(
+            &rec,
+            &[
+                raw_record(op::CHANNEL, &channel_body(1, 0, "/trig", "json")),
+                raw_record(op::MESSAGE, &message_body(1, 0, 100, b"{}")),
+            ],
+        )?;
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let (tailer, _coverage) = Tailer::with_trigger_tap("/trig", tx);
+        let file = attached(&tailer, &rec)?;
+        scan_to_end(&tailer, &file, 8)?;
+
+        let lifted = rx.try_recv().expect("the seeded tap lifts the trigger");
+        assert_eq!(lifted.message_encoding, "json");
+        assert_eq!(lifted.body, b"{}");
+        assert_eq!(lifted.log_time, 100);
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// The tap's channel registry survives across scan passes, because the
+    /// tailer seeds each pass from the recording's accumulated
+    /// `trigger_channels`.
+    ///
+    /// A trigger message references a `Channel` record written earlier, possibly
+    /// in a pass that has already completed. A seed that started each pass with
+    /// an empty registry would lift triggers only when the channel definition
+    /// happened to land in the same pass — the common case in a test that writes
+    /// a whole file at once, and the rare case against a live recorder. So the
+    /// channel and the message are written in two passes here.
+    #[test]
+    fn the_seeded_tap_remembers_channels_from_an_earlier_pass() -> Result<()> {
+        let root = test_dir("tail-tap-passes")?;
+        let rec = root.join("rec.mcap");
+        // Pass one sees only the channel definition.
+        write_raw(
+            &rec,
+            &[raw_record(
+                op::CHANNEL,
+                &channel_body(7, 0, "/trig", "json"),
+            )],
+        )?;
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let (tailer, _coverage) = Tailer::with_trigger_tap("/trig", tx);
+        let file = attached(&tailer, &rec)?;
+        let first = scan_to_end(&tailer, &file, 8)?;
+        assert!(rx.try_recv().is_err(), "no trigger has been written yet");
+
+        // Pass two appends the trigger message alone; its channel is known only
+        // from the recording's registry.
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&rec)?;
+            f.write_all(&raw_record(op::MESSAGE, &message_body(7, 0, 250, b"{}")))?;
+        }
+        scan_to_end(&tailer, &file, first.offset)?;
+
+        let lifted = rx
+            .try_recv()
+            .expect("a trigger resolves against a channel from an earlier pass");
+        assert_eq!(lifted.log_time, 250);
+        assert_eq!(lifted.message_encoding, "json");
+
+        std::fs::remove_dir_all(root)?;
         Ok(())
     }
 

@@ -16,7 +16,7 @@ on [Foxglove's quickstart writer](https://docs.foxglove.dev/docs/sdk/example).
 
 ## Tailability: unchunked output
 
-This writer's output is meant to be tailed **live** by `clipper --interface
+This writer's output is meant to be tailed **live** by `clipper-tailing --interface
 mcap`, not just read after the fact — that is the deployment story capture-time
 windowing is built for. A producer clipper can tail live appends complete
 top-level records only and never seeks back to rewrite one. MCAP's chunked
@@ -106,7 +106,7 @@ cargo run -p custom-mcap-writer -- --out demo.mcap --duration 5 --trigger-after-
 No ROS environment is needed — the crate carries no r2r dependency and builds
 with the system toolchain. Open the result in [Foxglove](https://foxglove.dev)
 or inspect it with the [`mcap` CLI](https://github.com/foxglove/mcap); feed it
-to `clipper --interface mcap` to exercise capture-time clip windows end to end.
+to `clipper-tailing --interface mcap` to exercise capture-time clip windows end to end.
 
 ## How it works
 

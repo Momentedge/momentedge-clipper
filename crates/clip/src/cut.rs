@@ -1,17 +1,18 @@
-//! Window extraction from the tailed continuous recording.
+//! Window extraction from a recording, whether or not anyone is still writing it.
 //!
-//! Given a [`WindowPlan`] snapshot from the tail — the open recording, the
-//! byte extents overlapping the window, and the channel registry — this
-//! assembles one output MCAP holding every message whose `log_time` falls in
+//! Given a [`WindowPlan`] — the open recording, the byte extents overlapping the
+//! window, and the channel registry — this assembles one output MCAP holding
+//! every message whose stamp on the window's [`TimeSource`] falls in
 //! `[start_ns, end_ns]`. It is a **direct copy** of message payload bytes:
 //! registry schemas/channels are registered in the output writer by content,
-//! then each message is emitted with its raw serialized body. The CDR message
-//! bodies are never decoded — the only thing inspected is each record's
-//! `log_time`.
+//! then each message is emitted with its raw serialized body. Message bodies are
+//! never decoded — the only thing inspected is the one stamp the window lives
+//! on.
 //!
-//! Each extent is read with `read_at` (no shared seek state with the tail)
-//! and its records are walked with our own opcode + length framing — the same
-//! walk the tail performed to build the extent, so the boundaries are known
+//! Each extent is read with `read_at`, so a copy shares no seek state with
+//! whatever else holds the file open, and its records are walked with our own
+//! opcode + length framing — the same walk the scan performed to build the
+//! extent, so the boundaries are known
 //! to tile. That ownership of the framing is what makes extraction
 //! **damage-tolerant**, the way the MCAP format is designed to be (length
 //! prefixes delimit every record; chunk CRCs exist to detect and discard a
@@ -100,6 +101,7 @@ pub fn reset_capturing_dir(out_dir: &Path) -> Result<()> {
 /// that never reached the final directory never lingers in the capturing area
 /// either.
 #[must_use = "a staged clip must be published or it is cleaned up unpublished"]
+#[derive(Debug)]
 pub struct StagedClip {
     /// Where the completed, fsynced file currently lives in the capturing dir.
     staged_path: PathBuf,
