@@ -2,9 +2,9 @@
 //! handler.
 //!
 //! This module is the dependency-light boundary both sides of the recorder
-//! depend on while staying independent of each other: the [`interface`] layer
-//! (which knows ROS vs MCAP and the wire encodings) produces a [`Trigger`] and
-//! consumes the handler's [`Completion`] through [`Announce`]; the [`handler`]
+//! depend on while staying independent of each other: the recorder's interface
+//! layer (which knows ROS vs MCAP and the wire encodings) produces a [`Trigger`]
+//! and consumes the handler's [`Completion`] through [`Announce`]; the handler
 //! layer cuts clips from a [`Trigger`] and announces a [`Completion`], knowing
 //! nothing of ROS or any encoding. Keeping these types free of `r2r` and `mcap`
 //! is what lets either side change without dragging the other along. [`Trigger`]
@@ -13,8 +13,16 @@
 //! straight into them with no parallel wire type; the CDR path maps r2r's own
 //! generated `Trigger` onto these through a `From` impl.
 //!
-//! [`interface`]: crate::interface
-//! [`handler`]: crate::handler
+//! That `r2r`-freedom is deliberate and structural, not incidental: the domain
+//! types below never name `r2r` in a default build. Two conversions bridge them
+//! to the ROS messages, both behind the `ros` feature and both in this crate
+//! because the orphan rule leaves nowhere else — a downstream crate may not
+//! implement `From` between two types it does not own. The inbound one, filling
+//! a [`Trigger`] from a `momentedge_msgs/Trigger`, sits with the decoder that
+//! shares it ([`crate::decode`]); the outbound one, rendering a [`Completion`]
+//! as a `momentedge_msgs/Recorded`, sits at the bottom of this module. A
+//! consumer that never enables the feature links no ROS at all and still speaks
+//! the whole contract.
 
 use serde::Deserialize;
 
@@ -22,8 +30,8 @@ use serde::Deserialize;
 /// the publisher's own publish-domain timestamp (`trigger_time`), one possible
 /// source of a window's anchor: read only by the ros interface under the
 /// `publish` time source. Every other interface × time-source cell resolves the
-/// anchor from a transport stamp and rejects a non-zero `trigger_time` (see
-/// [`crate::interface`]).
+/// anchor from a transport stamp and rejects a non-zero `trigger_time` (see the
+/// recorder's interface layer).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 pub struct Stamp {
     pub sec: i32,
@@ -99,14 +107,34 @@ pub struct Completion {
     pub preroll: u64,
 }
 
-/// The output half of an [`crate::interface::Interface`]: announce a finished
-/// clip. The ROS interface publishes a `Recorded`; the MCAP interface is a
-/// no-op (the file move is the announcement). `Clone + Send` so each trigger
-/// handler thread carries its own announcer moved in — not `Sync`, since an
-/// announcer is never shared across threads by reference (the r2r `Publisher`
-/// behind [`crate::interface::RosAnnouncer`] is `Send` but not `Sync`).
+/// The output half of the recorder's interface: announce a finished clip. The
+/// ROS interface publishes a `Recorded`; the MCAP interface is a no-op (the
+/// file move is the announcement). `Clone + Send` so each trigger handler
+/// thread carries its own announcer moved in — not `Sync`, since an announcer
+/// is never shared across threads by reference (the r2r `Publisher` behind the
+/// recorder's ROS announcer is `Send` but not `Sync`).
 pub trait Announce: Clone + Send + 'static {
     fn announce(&self, completion: &Completion);
+}
+
+/// A finished clip's [`Completion`] maps field-for-field onto the r2r-generated
+/// `momentedge_msgs/Recorded` a ROS interface publishes (its [`Stamp`] onto the
+/// nested `builtin_interfaces/Time`). By reference — an announcer keeps the
+/// `Completion` to log from after the publish.
+#[cfg(feature = "ros")]
+impl From<&Completion> for r2r::momentedge_msgs::msg::Recorded {
+    fn from(completion: &Completion) -> Self {
+        r2r::momentedge_msgs::msg::Recorded {
+            name: completion.name.clone(),
+            filenames: completion.filenames.clone(),
+            description: completion.description.clone(),
+            trigger_time: r2r::builtin_interfaces::msg::Time {
+                sec: completion.trigger_time.sec,
+                nanosec: completion.trigger_time.nanosec,
+            },
+            preroll: completion.preroll,
+        }
+    }
 }
 
 #[cfg(test)]

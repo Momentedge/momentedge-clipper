@@ -11,7 +11,9 @@
 # instead of realising it from source. Cargo artifacts are cached per distro
 # via Swatinem/rust-cache, which is orthogonal and remains.
 #
-# Scope: only clipper is built and tested (trigger-pub is not in CI).
+# Scope: the recorder (clipper) on every distro, plus two lean ROS-free lanes on
+# a plain toolchain — the shared `clip` library and the `cu-mcap-record` copper
+# example (trigger-pub is not in CI).
 # Distros: humble, jazzy, lyrical — the three the Rust crates build under
 # (rolling cannot build r2r 0.9.6; see README "Integration tests"). The e2e step
 # below runs the full suite on every leg under the `e2e` nextest profile,
@@ -118,6 +120,71 @@ jobs:
 
       - name: Test
         run: cargo test --locked -p cu-mcap-record
+
+  # ROS-free lane for the shared `clip` library. The whole reason the MCAP format
+  # layer, the recording index and the cut path live in their own crate is that a
+  # consumer of a recording can link them with no ROS installation anywhere — so
+  # something has to hold that property down. This job builds, lints and tests
+  # `clip` on a plain stable toolchain (no nix, no ROS2 closure, nothing on PATH
+  # but cargo) and asserts up front that its default dependency tree contains no
+  # r2r. An r2r dependency that is not gated behind the `ros` feature then turns
+  # this job red in seconds, instead of surfacing much later as a missing rmw at
+  # link time in the downstream cloud build, which has no ROS toolchain at all.
+  #
+  # It is cheap for the same reasons: one small crate on a stock toolchain, with
+  # neither a nix realization nor a ROS2 closure to substitute, so it reports long
+  # before the recorder matrix finishes. `--locked` enforces the shared root
+  # lockfile; formatting is covered by the `fmt` job's `cargo fmt --all --check`.
+  #
+  # There is deliberately no `--features ros` build here: that arm needs the ROS
+  # toolchain this job is defined by not having, and the per-distro `recorder`
+  # matrix below already builds clipper — and therefore `clip` with `ros` on —
+  # under every distro.
+  clip:
+    name: clip (ROS-free)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # stable for the edition-2024 build/clippy/test, as in the job above.
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      # The same rust-cache guard the cu-mcap-record job documents at length
+      # above: cargo builds into the shared root target/, which carries a `tests`
+      # entry once cu29 has been compiled into it.
+      - name: Pre-create target/tests/target for rust-cache
+        run: mkdir -p target/tests/target
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: clip
+
+      # The property this lane exists for, checked before anything is compiled:
+      # `cargo tree` resolves from the lockfile without building, so a leak fails
+      # here rather than deep in a clippy run. The tree is captured first and
+      # tested afterwards on purpose — piping cargo into grep would let the good
+      # case (grep matches nothing, exits 1) decide the step's status under
+      # pipefail, inverting the check.
+      - name: Assert clip's default build pulls no r2r
+        run: |
+          set -euo pipefail
+          tree=$(cargo tree --locked -p clip -e normal --prefix none)
+          echo "$tree"
+          if grep -q '^r2r' <<<"$tree"; then
+            echo "::error::clip's default dependency tree contains r2r: the crate no longer builds without a ROS installation."
+            echo "Every r2r dependency in clip must sit behind its optional 'ros' feature, which is off by default."
+            exit 1
+          fi
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -p clip -- -D warnings
+
+      - name: Test
+        run: cargo test --locked -p clip
 
   recorder:
     name: ${{ matrix.distro }}

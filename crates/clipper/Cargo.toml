@@ -22,11 +22,13 @@ futures.workspace = true
 crossbeam-channel.workspace = true
 # SIGINT/SIGTERM delivered as a message on a channel `supervise` selects on.
 signal-hook.workspace = true
-# MCAP record parsing (`parse_record`, `read::ChunkReader`) for the tail scan
-# and extraction — the scan and the copy own their own opcode + length framing,
-# so the halt-on-first-error `LinearReader` is deliberately unused (see
-# src/clip.rs) — and `Writer` for the clip output (schemas/channels by content,
-# summary + footer on `finish`).
+# The shared library: the MCAP format layer and recording index, the cut path,
+# the neutral trigger contract and segment publication. `ros` adds the CDR
+# trigger decoder and the two r2r message conversions; `clap` makes `TimeSource`
+# a `ValueEnum` for the `--time-source` flag.
+clip = { path = "../clip", features = ["ros", "clap"] }
+# MCAP write options for the clip compression flag; the record parsing itself
+# lives in `clip`.
 mcap.workspace = true
 # Error plumbing for the tail and extraction paths.
 anyhow.workspace = true
@@ -37,13 +39,6 @@ clap.workspace = true
 # Logging via the `log` facade; pretty_env_logger is the backend (honours RUST_LOG).
 log.workspace = true
 pretty_env_logger.workspace = true
-# Trigger payload decoders for the MCAP interface (src/decode.rs), dispatched on
-# a channel's message_encoding. Both are already in the dependency closure
-# transitively, so declaring them direct adds no crates to the build: serde +
-# serde_json decode `json` triggers. (`cdr` needs no new dependency — r2r's rmw
-# deserialization.)
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 
 # Dev-dependencies serve the live e2e suite (tests/e2e.rs + tests/harness/);
 # the inline unit tests use only the crate's own dependencies.
@@ -56,6 +51,15 @@ libc = "0.2"
 # Test structuring: expands the storage-profile matrix into per-case tests
 # that nextest runs as isolated processes.
 rstest = "0.26"
+# Reading back the JSON trigger payloads the e2e harness writes into a recording.
+serde_json = "1"
+# `clip::testing`, behind clip's `test-support` feature: the MCAP fixture writers
+# the tail's unit tests build recordings out of (raw records, chunks, finished
+# and still-being-written files), shared with clip's own index tests rather than
+# duplicated here. Cargo's v2+ resolver does not enable a dev-dependency's
+# features for a normal build, so a release build of the recorder still compiles
+# no fixture code.
+clip = { path = "../clip", features = ["test-support"] }
 
 # Debian packaging via cargo-deb: `cargo deb -p clipper --no-build --variant <distro>`
 # (scripts/package-clipper-deb.sh). bloom has no cargo build type, so cargo-deb is

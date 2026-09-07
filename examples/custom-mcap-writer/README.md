@@ -2,7 +2,7 @@
 
 A standalone program that writes an MCAP file directly with the
 [`mcap`](https://crates.io/crates/mcap) crate — no ROS, no CDR. It exists to
-make **capture-time windowing** real: `crates/clipper` can cut a clip on either
+make **capture-time windowing** real: clipper can cut a clip on either
 `log_time` or `publish_time`, but no ROS publisher, on any distro, can set
 `publish_time` on the wire — rosbag2 fills it from the DDS source timestamp.
 Writing MCAP records directly is the only way to put a genuine capture instant
@@ -120,8 +120,8 @@ format and writes bytes:
 - **`/size`** — a raw JSON string built with `format!`, on a schemaless channel.
   The most basic payload there is: no schema, no serializer, just bytes.
 - **`/events/momentedge/trigger`** — a JSON object matching the shape
-  `crates/clipper` decodes for a `json`-encoded trigger
-  (`crates/clipper/src/trigger.rs::Trigger` / `crates/clipper/src/decode.rs`):
+  `crates/clip` decodes for a `json`-encoded trigger
+  (`crates/clip/src/trigger.rs::Trigger` / `crates/clip/src/decode.rs`):
   `{"name", "description", "trigger_time": {"sec", "nanosec"}, "preroll",
   "postroll"}`, `preroll`/`postroll` in nanoseconds either side of the anchor.
   `trigger_time` is `{"sec": 0, "nanosec": 0}` unless
@@ -129,7 +129,10 @@ format and writes bytes:
   above) — the record's own `publish_time` carries the anchor regardless.
   Written once, `--trigger-after-ms` milliseconds after startup, on a
   schemaless channel — clipper's MCAP interface decodes triggers by
-  `message_encoding` alone, never a schema.
+  `message_encoding` alone, never a schema. `json` is the arm of that decoder
+  every build of `crates/clip` carries; `cdr` is deserialized through r2r's rmw
+  typesupport behind the crate's `ros` feature, so a JSON trigger is the one a
+  consumer with no ROS toolchain can always read.
 
 Each data channel is an `Iterator<Item = Vec<u8>>` that generates its next
 payload on `.next()`. The program registers every channel once, then every

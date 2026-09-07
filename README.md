@@ -163,8 +163,8 @@ like every ROS executable — no bundled overlay, no baked rpath.
 
 ### From source
 
-clipper is a standard Rust workspace, but the build needs a ROS 2 environment
-(for `rcl`/`rmw` and the message typesupport):
+clipper is a standard Rust workspace, but building the binary needs a ROS 2
+environment (for `rcl`/`rmw` and the message typesupport):
 
 - **Development:** a [Nix](https://nixos.org/) dev shell provides ROS 2 —
   `nix develop --command cargo build`. See [CLAUDE.md](CLAUDE.md) for the
@@ -342,12 +342,16 @@ Setup guides for the recording + clipper stack live under
 - **[ARCHITECTURE.md](ARCHITECTURE.md)** — the technical overview: thread model,
   tailing mechanics, atomic clip publication, restart/rollover recovery, damage
   tolerance, and the deployment build model.
+- **[`crates/clip`](crates/clip)** — the library half of clipper: the MCAP
+  format layer, the recording index, the cut path and the trigger contract,
+  buildable with no ROS toolchain anywhere. It is what a program of your own
+  links to cut clips out of a recording without running the recorder.
 - **[CLAUDE.md](CLAUDE.md)** and **[crates/clipper/CLAUDE.md](crates/clipper/CLAUDE.md)**
   — contributor and agent notes: workspace layout, build mechanics, and the
-  recorder's internal design.
+  internal design of both crates.
 - **[Momentedge/clipper-benchmarks](https://github.com/Momentedge/clipper-benchmarks)**
-  — the overhead benchmarks behind [What it costs](#what-it-costs): the harness,
-  the full report, and the methodology each figure depends on.
+  — the overhead benchmarks behind [Resource overhead](#resource-overhead): the
+  harness, the full report, and the methodology each figure depends on.
 
 ## License
 

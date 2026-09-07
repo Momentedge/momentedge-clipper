@@ -29,19 +29,36 @@ recording, and a clip is a complete, standard MCAP file on both sides.
 
 ## Module map
 
-clipper is one crate, [`crates/clipper`](crates/clipper); `momentedge_msgs` is
-the local ROS 2 interface package defining `Trigger`/`Recorded`.
+Two crates. [`crates/clip`](crates/clip) is the library every consumer of a
+recording shares; [`crates/clipper`](crates/clipper) is the device recorder built
+on it. `momentedge_msgs` is the local ROS 2 interface package defining
+`Trigger`/`Recorded`.
 
-| Source file | Role |
+**`clip` builds without ROS.** Nothing in it links r2r, opens a node, or needs a
+ROS installation, so a consumer cutting clips out of a finished recording on a
+plain Linux host runs the same format layer and the same copy the device runs.
+The one ROS-shaped piece — the `cdr` trigger decoder and the two r2r message
+conversions — sits behind the `ros` cargo feature, off by default; the recorder
+turns it on. A CI lane builds, lints and tests `clip` on a bare toolchain so an
+r2r dependency that escapes the feature fails there rather than downstream.
+
+| `clip` module | Role |
+|---|---|
+| `src/index.rs` | The format layer: schema/channel definitions, extents carrying both time spans, the per-recording index, the incremental scan and its delta, the window plan and the `WindowPlanner` that serves one |
+| `src/cut.rs` | Window extraction: read planned extents, assemble and atomically publish a standalone MCAP clip |
+| `src/segment.rs` | One window to durable clips: plan, stage a segment per source recording over a worker pool, drop the empties, publish |
+| `src/trigger.rs` | The neutral contract: `Trigger`, `Stamp`, `TriggerRecord`, `Completion`, the `Announce` trait, `now_ns` — plus the `Completion` → `Recorded` conversion under `ros` |
+| `src/decode.rs` | `decode_trigger`: decode a trigger payload by its MCAP `message_encoding` (`json` always, `cdr` under `ros`) |
+| `src/lib.rs` | `TimeSource` (the clock domain a window lives in) and `panic_text` |
+| `src/testing.rs` | MCAP fixture writers, under the `test-support` feature, so a consumer's tests build recordings the way `clip`'s own do |
+
+| `clipper` source file | Role |
 |---|---|
 | `src/main.rs` | Entry point, configuration (clap), admission gate, thread supervision |
-| `src/tail.rs` | Recording collection: per-recording extent index + schema/channel registry, collection-wide coverage watch, retention pruning, the trigger tap |
+| `src/tail.rs` | Recording collection: the live tail over `clip::index`, collection-wide coverage watch, retention pruning, the trigger tap |
 | `src/discover.rs` | `NewFileWatchIterator`: lazy directory iterator yielding each new `*.mcap` once, by `(dev,ino)` identity, mtime-ordered |
-| `src/handler.rs` | The ROS- and encoding-agnostic per-trigger flow and the staging worker pool |
-| `src/clip.rs` | Window extraction: read planned extents, assemble and atomically publish a standalone MCAP clip |
+| `src/handler.rs` | The per-trigger flow: wait out the postroll and coverage, then hand the window to `clip::segment` and announce the result |
 | `src/interface.rs` | `trait Interface` + the `ros` and `mcap` implementations and their announcers |
-| `src/decode.rs` | `decode_trigger`: decode a trigger payload by its MCAP `message_encoding` (`cdr`, `json`) |
-| `src/trigger.rs` | The neutral contract: `Trigger`, `Stamp`, `TriggerRecord`, `Completion`, the `Announce` trait, `now_ns` |
 | `src/supervision.rs` | `spawn_supervised`/`harvest_panic`: pair each long-lived thread with a channel carrying its verdict |
 | `src/watch.rs` | `Watch<T>`: a `Mutex` + `Condvar` primitive for coverage notification |
 

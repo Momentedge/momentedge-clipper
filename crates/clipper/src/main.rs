@@ -55,14 +55,11 @@
 //! Logging uses the `log` facade with a pretty_env_logger backend; `RUST_LOG`
 //! controls verbosity.
 
-mod clip;
-mod decode;
 mod discover;
 mod handler;
 mod interface;
 mod supervision;
 mod tail;
-mod trigger;
 mod watch;
 
 use std::path::PathBuf;
@@ -73,13 +70,14 @@ use std::time::Duration;
 
 use anyhow::Context;
 use clap::{CommandFactory, FromArgMatches, Parser, ValueEnum};
+use clip::trigger::{Trigger, now_ns};
+use clip::{TimeSource, segment};
 use crossbeam_channel::{Receiver, Sender, bounded, select, unbounded};
 use interface::{Anchor, Interface, McapInterface, RosInterface};
 use log::{error, info, warn};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use supervision::{Supervised, harvest_panic, spawn_supervised};
 use tail::{Coverage, Tailer};
-use trigger::Trigger;
 use watch::Watch;
 
 const TRIGGER_TOPIC: &str = "/events/momentedge/trigger";
@@ -160,38 +158,6 @@ impl std::fmt::Display for InterfaceKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.to_possible_value()
             .expect("no InterfaceKind variant is skipped")
-            .get_name()
-            .fmt(f)
-    }
-}
-
-/// The clock domain a clip's whole window lives in, chosen by `--time-source`.
-/// It governs the anchor, which messages fall inside the window, which extents
-/// are read, and the coverage a handler waits on — and nothing else (retention
-/// ages files on `log_time`, the postroll floor is the wall clock). clipper
-/// never interprets what a producer wrote into `publish_time`; it windows on
-/// whatever is there.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
-pub(crate) enum TimeSource {
-    /// Window on each message's `log_time` — when the producer received it.
-    /// Approximately non-decreasing in file order, so coverage on it is a
-    /// completeness proof. The default.
-    #[default]
-    Log,
-    /// Window on each message's `publish_time` — whatever the producer put
-    /// there (a DDS source timestamp, a capture time). Publish times may arrive
-    /// out of order, so coverage on it is a liveness signal, not a completeness
-    /// proof: a message can land after the cut with an in-window `publish_time`
-    /// and be lost. `--grace-secs` bounds the wait.
-    Publish,
-}
-
-impl std::fmt::Display for TimeSource {
-    /// Render as the clap value name (`log`/`publish`) so the `--help` default
-    /// and the accepted flag values share the `ValueEnum` possible-value names.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.to_possible_value()
-            .expect("no TimeSource variant is skipped")
             .get_name()
             .fmt(f)
     }
@@ -418,16 +384,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // to a single run. This also creates out_dir, so the first clip can be
     // published without further setup. Fatal if it fails — a recorder that
     // cannot prepare its output directory must not start.
-    clip::reset_capturing_dir(&cfg.out_dir)?;
+    clip::cut::reset_capturing_dir(&cfg.out_dir)?;
 
     // One staging worker per allowed concurrent clip copy; see
     // Config::extract_parallelism. The clip compression codec is process-global,
-    // captured in the workers.
-    let extract_tx = handler::spawn_stage_workers(
-        cfg.extract_parallelism,
-        cfg.clip_compression.to_mcap(),
-        cfg.time_source,
-    );
+    // captured in the workers; each window's clock domain travels with its job.
+    let extract_tx =
+        segment::spawn_stage_workers(cfg.extract_parallelism, cfg.clip_compression.to_mcap());
 
     // Admission gate for trigger handlers; see [`Admission`].
     let admission = Admission::new(MAX_ACTIVE_TRIGGERS);
@@ -544,7 +507,7 @@ fn validate_trigger(trig: &Trigger, anchor: Anchor, now_ns: u64) -> Result<(), S
 }
 
 /// Reject a trigger `name` that cannot be safely embedded in the clip pathname
-/// `<anchor_ns>_<name>.mcap`. [`handler::sanitize`] maps stray characters to `_`
+/// `<anchor_ns>_<name>.mcap`. [`clip::segment::sanitize`] maps stray characters to `_`
 /// at clip creation, but structural hazards — an empty name, a path separator or
 /// NUL, a leading dot (a hidden file), or an embedded `..` (a parent-directory
 /// escape) — are refused whole here rather than silently rewritten, so a
@@ -588,7 +551,7 @@ fn drive<I: Interface>(
     cfg: Arc<Config>,
     tailer: Arc<Tailer>,
     coverage: Arc<Watch<Coverage>>,
-    extract_tx: Sender<handler::StageJob>,
+    extract_tx: Sender<segment::StageJob>,
     admission: Arc<Admission>,
 ) -> anyhow::Result<()> {
     let iface_name = iface.name();
@@ -614,7 +577,7 @@ fn drive<I: Interface>(
             // The single validation gate every resolved trigger passes before a
             // handler is spawned. A rejected trigger cuts no clip and announces
             // nothing — the `error!` log is its only trace.
-            if let Err(reason) = validate_trigger(&trig, anchor, trigger::now_ns()) {
+            if let Err(reason) = validate_trigger(&trig, anchor, now_ns()) {
                 error!("trigger rejected: {reason}");
                 return;
             }
@@ -1143,7 +1106,7 @@ mod tests {
         Trigger {
             name: "evt".to_string(),
             description: String::new(),
-            trigger_time: trigger::Stamp { sec: 0, nanosec: 0 },
+            trigger_time: clip::trigger::Stamp { sec: 0, nanosec: 0 },
             preroll: 0,
             postroll: 0,
         }
@@ -1152,7 +1115,7 @@ mod tests {
     /// [`valid_trigger`] with a chosen `trigger_time`, for the matrix cell tests.
     fn trigger_with_time(trigger_time_ns: u64) -> Trigger {
         Trigger {
-            trigger_time: trigger::Stamp {
+            trigger_time: clip::trigger::Stamp {
                 sec: (trigger_time_ns / 1_000_000_000) as i32,
                 nanosec: (trigger_time_ns % 1_000_000_000) as u32,
             },

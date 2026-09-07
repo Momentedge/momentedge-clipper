@@ -36,7 +36,7 @@ use log::{error, warn};
 use mcap::records::Record;
 
 use crate::TimeSource;
-use crate::tail::{ChannelDef, MAX_RECORD_LEN, WindowPlan, op};
+use crate::index::{ChannelDef, MAX_RECORD_LEN, WindowPlan, op};
 
 /// The stamp a message's window membership is tested on, per the window's
 /// [`TimeSource`]: its `log_time` or its `publish_time`.
@@ -561,32 +561,35 @@ impl ClipWriter<'_> {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
     use super::*;
-    use crate::tail::tests::{
-        channel_body, message_body, message_body_pub, raw_record, scan_to_end, test_dir, write_raw,
-        write_recording, write_recording_opts,
+    use crate::index::{Extent, RecordingIndex, Span, Stamps, WindowPlan, op};
+    use crate::testing::{
+        channel_body, index_file, message_body, message_body_pub, raw_record, read_clip,
+        scan_to_end, test_dir, write_raw, write_recording, write_recording_opts,
     };
-    use crate::tail::{Extent, Span, Stamps, Tailer, WindowPlan, op};
 
     /// Plan the single source recording a clip test cuts from on the `log`
     /// domain — the domain almost every clip test windows on; [`plan_one_src`]
     /// takes an explicit source. These tests each index one recording, so
-    /// [`Tailer::plan_window`]'s `Vec` holds at most one plan; an empty `Vec` (no
-    /// recording yet) becomes an empty plan.
-    fn plan_one(tailer: &Tailer, start_ns: u64, end_ns: u64) -> WindowPlan {
-        plan_one_src(tailer, start_ns, end_ns, TimeSource::Log)
+    /// [`RecordingIndex::plan`] offers at most one plan; no overlapping extent
+    /// (no recording data in the window) becomes an empty plan.
+    fn plan_one(index: &RecordingIndex, start_ns: u64, end_ns: u64) -> WindowPlan {
+        plan_one_src(index, start_ns, end_ns, TimeSource::Log)
     }
 
     /// [`plan_one`] on an explicit windowing `source`.
-    fn plan_one_src(tailer: &Tailer, start_ns: u64, end_ns: u64, source: TimeSource) -> WindowPlan {
-        tailer
-            .plan_window(start_ns, end_ns, source)
-            .into_iter()
-            .next()
+    fn plan_one_src(
+        index: &RecordingIndex,
+        start_ns: u64,
+        end_ns: u64,
+        source: TimeSource,
+    ) -> WindowPlan {
+        index
+            .plan(start_ns, end_ns, source)
             .unwrap_or_else(WindowPlan::empty)
     }
 
@@ -594,24 +597,12 @@ pub(crate) mod tests {
     /// cut clips through the same codec the recorder uses by default.
     const TEST_COMPRESSION: Option<mcap::Compression> = Some(mcap::Compression::Zstd);
 
-    /// Read a finished clip back; `MessageStream` insists on a complete
-    /// summary/footer/magic, so this doubles as a validity check.
-    pub(crate) fn read_clip(path: &Path) -> Result<Vec<(String, u64)>> {
-        let buf = std::fs::read(path)?;
-        mcap::MessageStream::new(&buf)?
-            .map(|msg| {
-                let msg = msg?;
-                Ok((msg.channel.topic.clone(), msg.log_time))
-            })
-            .collect()
-    }
-
-    fn tail_whole(path: &Path) -> Result<Arc<Tailer>> {
-        let (tailer, _coverage) = Tailer::new();
-        let file = Arc::new(File::open(path)?);
-        tailer.attach(file.clone());
-        scan_to_end(&tailer, &file, 8)?;
-        Ok(tailer)
+    /// Index one finished recording whole: open it, scan every record, and hand
+    /// back the index the window plans are cut from.
+    fn index_whole(path: &Path) -> Result<RecordingIndex> {
+        let (mut index, file) = index_file(path)?;
+        scan_to_end(&mut index, &file)?;
+        Ok(index)
     }
 
     #[test]
@@ -619,10 +610,10 @@ pub(crate) mod tests {
         let root = test_dir("clip-staged")?;
         let rec = root.join("rec.mcap");
         write_recording(&rec, false, &[("/t", 10), ("/t", 20), ("/t", 30)])?;
-        let tailer = tail_whole(&rec)?;
+        let index = index_whole(&rec)?;
 
         let out = root.join("clip.mcap");
-        let plan = plan_one(&tailer, 0, 100);
+        let plan = plan_one(&index, 0, 100);
         let stats = extract_clip(&plan, &out, 0, 100, TEST_COMPRESSION)?;
 
         // The final path is the published location, holding a complete clip.
@@ -654,10 +645,10 @@ pub(crate) mod tests {
         let root = test_dir("clip-invisible")?;
         let rec = root.join("rec.mcap");
         write_recording(&rec, false, &[("/t", 10), ("/t", 20)])?;
-        let tailer = tail_whole(&rec)?;
+        let index = index_whole(&rec)?;
 
         let out = root.join("clip.mcap");
-        let plan = plan_one(&tailer, 0, 100);
+        let plan = plan_one(&index, 0, 100);
 
         // After stage 1 only: the final dir holds no clip, but the staged file
         // in the capturing dir is already complete and read_clip-valid.
@@ -689,10 +680,10 @@ pub(crate) mod tests {
         let root = test_dir("clip-dropped")?;
         let rec = root.join("rec.mcap");
         write_recording(&rec, false, &[("/t", 10)])?;
-        let tailer = tail_whole(&rec)?;
+        let index = index_whole(&rec)?;
 
         let out = root.join("clip.mcap");
-        let plan = plan_one(&tailer, 0, 100);
+        let plan = plan_one(&index, 0, 100);
 
         // A staged clip abandoned without publishing — an early return or a
         // panic between the stages — must not strand the file in the capturing
@@ -759,13 +750,13 @@ pub(crate) mod tests {
         let root = test_dir("clip-reset-then-cut")?;
         let rec = root.join("rec.mcap");
         write_recording(&rec, false, &[("/t", 10), ("/t", 20)])?;
-        let tailer = tail_whole(&rec)?;
+        let index = index_whole(&rec)?;
 
         let out_dir = root.join("clips");
         reset_capturing_dir(&out_dir)?;
 
         let out = out_dir.join("clip.mcap");
-        let plan = plan_one(&tailer, 0, 100);
+        let plan = plan_one(&index, 0, 100);
         let stats = extract_clip(&plan, &out, 0, 100, TEST_COMPRESSION)?;
 
         assert_eq!(stats.out_path, out);
@@ -798,10 +789,10 @@ pub(crate) mod tests {
                 ("/t", 250),
             ],
         )?;
-        let tailer = tail_whole(&rec)?;
+        let index = index_whole(&rec)?;
 
         let out = root.join("clip.mcap");
-        let plan = plan_one(&tailer, 100, 200);
+        let plan = plan_one(&index, 100, 200);
         let stats = extract_clip(&plan, &out, 100, 200, TEST_COMPRESSION)?;
 
         assert_eq!(stats.messages_copied, 3);
@@ -827,10 +818,10 @@ pub(crate) mod tests {
             true,
             &[("/a", 10), ("/b", 20), ("/a", 30), ("/b", 40), ("/a", 50)],
         )?;
-        let tailer = tail_whole(&rec)?;
+        let index = index_whole(&rec)?;
 
         let out = root.join("clip.mcap");
-        let plan = plan_one(&tailer, 20, 40);
+        let plan = plan_one(&index, 20, 40);
         let stats = extract_clip(&plan, &out, 20, 40, TEST_COMPRESSION)?;
 
         assert_eq!(stats.messages_copied, 3);
@@ -850,10 +841,11 @@ pub(crate) mod tests {
     #[test]
     fn clip_before_any_recording_is_a_valid_empty_mcap() -> Result<()> {
         let root = test_dir("clip-empty")?;
-        let (tailer, _coverage) = Tailer::new();
 
         let out = root.join("clip.mcap");
-        let plan = plan_one(&tailer, 0, 100);
+        // Nothing is indexed, so no recording offers a plan: the empty plan a
+        // trigger arriving before any data still cuts a valid clip from.
+        let plan = WindowPlan::empty();
         let stats = extract_clip(&plan, &out, 0, 100, TEST_COMPRESSION)?;
 
         assert_eq!(stats.messages_copied, 0);
@@ -868,8 +860,8 @@ pub(crate) mod tests {
         let root = test_dir("clip-dup")?;
         let rec = root.join("rec.mcap");
         write_recording(&rec, false, &[("/t", 10), ("/t", 20)])?;
-        let tailer = tail_whole(&rec)?;
-        let plan = plan_one(&tailer, 0, 100);
+        let index = index_whole(&rec)?;
+        let plan = plan_one(&index, 0, 100);
 
         // Two publications of the same desired name: the collision is resolved
         // at the publish stage against the final dir, so the second lands as a
@@ -896,10 +888,10 @@ pub(crate) mod tests {
         let root = test_dir("clip-remap")?;
         let rec = root.join("rec.mcap");
         write_recording(&rec, false, &[("/a", 10), ("/b", 20), ("/a", 30)])?;
-        let tailer = tail_whole(&rec)?;
+        let index = index_whole(&rec)?;
 
         let out = root.join("clip.mcap");
-        let plan = plan_one(&tailer, 0, 100);
+        let plan = plan_one(&index, 0, 100);
         extract_clip(&plan, &out, 0, 100, TEST_COMPRESSION)?;
 
         let buf = std::fs::read(&out)?;
@@ -915,8 +907,8 @@ pub(crate) mod tests {
         let root = test_dir("clip-deleted")?;
         let rec = root.join("rec.mcap");
         write_recording(&rec, false, &[("/t", 10), ("/t", 20)])?;
-        let tailer = tail_whole(&rec)?;
-        let plan = plan_one(&tailer, 0, 100);
+        let index = index_whole(&rec)?;
+        let plan = plan_one(&index, 0, 100);
 
         // The recorder-restart scenario: the bag directory is wiped while a
         // window is still being cut. The plan's `Arc<File>` keeps the inode
@@ -940,8 +932,8 @@ pub(crate) mod tests {
         let root = test_dir("clip-truncated")?;
         let rec = root.join("rec.mcap");
         write_recording(&rec, false, &[("/t", 10), ("/t", 20), ("/t", 30)])?;
-        let tailer = tail_whole(&rec)?;
-        let plan = plan_one(&tailer, 0, 100);
+        let index = index_whole(&rec)?;
+        let plan = plan_one(&index, 0, 100);
 
         // Shrink the recording under the plan (append-only violated — e.g. a
         // damaged filesystem). The extent read must fail, and the failure must
@@ -974,8 +966,8 @@ pub(crate) mod tests {
         let root = test_dir("clip-nochannel")?;
         let rec = root.join("rec.mcap");
         write_recording(&rec, false, &[("/t", 10)])?;
-        let tailer = tail_whole(&rec)?;
-        let mut plan = plan_one(&tailer, 0, 100);
+        let index = index_whole(&rec)?;
+        let mut plan = plan_one(&index, 0, 100);
         // No Channel record for the message's ID: nothing to emit a
         // Schema/Channel from, so the message is skipped — the clip stays
         // valid rather than failing.
@@ -1042,12 +1034,12 @@ pub(crate) mod tests {
         let root = test_dir("clip-gap")?;
         let rec = root.join("rec.mcap");
         write_recording(&rec, false, &[("/t", 100), ("/t", 200)])?;
-        let tailer = tail_whole(&rec)?;
+        let index = index_whole(&rec)?;
 
         // The extent (time bounds 100..200) overlaps the window, so it is
         // planned and read — but no individual message falls inside it.
         let out = root.join("clip.mcap");
-        let plan = plan_one(&tailer, 120, 180);
+        let plan = plan_one(&index, 120, 180);
         let stats = extract_clip(&plan, &out, 120, 180, TEST_COMPRESSION)?;
 
         assert!(stats.extents_read > 0, "the covering extent is read");
@@ -1074,10 +1066,10 @@ pub(crate) mod tests {
             b"payload",
             &[("/t", 10), ("/t", 20), ("/t", 30), ("/t", 40), ("/t", 50)],
         )?;
-        let tailer = tail_whole(&rec)?;
+        let index = index_whole(&rec)?;
 
         let out = root.join("clip.mcap");
-        let plan = plan_one(&tailer, 20, 40);
+        let plan = plan_one(&index, 20, 40);
         let stats = extract_clip(&plan, &out, 20, 40, TEST_COMPRESSION)?;
 
         assert_eq!(stats.messages_copied, 3);
@@ -1116,8 +1108,8 @@ pub(crate) mod tests {
         )?;
         writer.finish()?;
 
-        let tailer = tail_whole(&rec)?;
-        let plan = plan_one(&tailer, 0, 100);
+        let index = index_whole(&rec)?;
+        let plan = plan_one(&index, 0, 100);
         assert!(
             plan.channels.values().all(|c| c.schema.is_none()),
             "schema_id 0 must resolve to no schema"
@@ -1141,8 +1133,9 @@ pub(crate) mod tests {
             std::fs::write(root.join(format!("clip_{n}.mcap")), b"existing")?;
         }
 
-        let (tailer, _coverage) = Tailer::new();
-        let plan = plan_one(&tailer, 0, 100);
+        // Nothing is indexed, so the window plans empty; the clip's content is
+        // beside the point here — the naming collision is what is under test.
+        let plan = WindowPlan::empty();
         // Staging succeeds — the capturing dir is empty, so the clip assembles
         // there — and the collision only surfaces at publish, where 1000
         // suffixes against the pre-filled final dir are exhausted.
@@ -1180,14 +1173,14 @@ pub(crate) mod tests {
             &payload,
             &stamps,
         )?;
-        let tailer = tail_whole(&rec)?;
+        let index = index_whole(&rec)?;
         assert!(
-            plan_one(&tailer, 0, u64::MAX).extents.len() >= 2,
+            plan_one(&index, 0, u64::MAX).extents.len() >= 2,
             "precondition: the recording spans several extents"
         );
 
         let out = root.join("clip.mcap");
-        let plan = plan_one(&tailer, 30, 70);
+        let plan = plan_one(&index, 30, 70);
         let stats = extract_clip(&plan, &out, 30, 70, TEST_COMPRESSION)?;
 
         assert!(
@@ -1223,16 +1216,16 @@ pub(crate) mod tests {
             &payload,
             &[("/big", 10), ("/big", 20), ("/big", 30)],
         )?;
-        let tailer = tail_whole(&rec)?;
+        let index = index_whole(&rec)?;
 
-        let all = plan_one(&tailer, 0, u64::MAX);
+        let all = plan_one(&index, 0, u64::MAX);
         assert_eq!(all.extents.len(), 3, "one oversized extent per message");
         for pair in all.extents.windows(2) {
             assert_eq!(pair[1].offset, pair[0].offset + pair[0].len);
         }
 
         let out = root.join("clip.mcap");
-        let plan = plan_one(&tailer, 15, 25);
+        let plan = plan_one(&index, 15, 25);
         let stats = extract_clip(&plan, &out, 15, 25, TEST_COMPRESSION)?;
 
         assert_eq!(stats.extents_read, 1);
@@ -1269,8 +1262,8 @@ pub(crate) mod tests {
                 b"payload",
                 &stamps,
             )?;
-            let tailer = tail_whole(&rec)?;
-            let plan = plan_one(&tailer, 20, 30);
+            let index = index_whole(&rec)?;
+            let plan = plan_one(&index, 20, 30);
             assert_eq!(plan.channels.len(), 2, "{name}: registry from chunks");
 
             let out = root.join(format!("clip-{name}.mcap"));
@@ -1293,8 +1286,8 @@ pub(crate) mod tests {
         let root = test_dir("clip-outcomp")?;
         let rec = root.join("rec.mcap");
         write_recording(&rec, false, &[("/t", 10), ("/t", 20), ("/t", 30)])?;
-        let tailer = tail_whole(&rec)?;
-        let plan = plan_one(&tailer, 0, 100);
+        let index = index_whole(&rec)?;
+        let plan = plan_one(&index, 0, 100);
         let expected = vec![
             ("/t".to_string(), 10),
             ("/t".to_string(), 20),
@@ -1350,8 +1343,8 @@ pub(crate) mod tests {
             &payload,
             &[("/big", 10)],
         )?;
-        let tailer = tail_whole(&rec)?;
-        let plan = plan_one(&tailer, 0, 100);
+        let index = index_whole(&rec)?;
+        let plan = plan_one(&index, 0, 100);
         assert!(
             plan.extents.iter().map(|e| e.len).sum::<u64>() < (1 << 20),
             "precondition: the chunk compressed far below the payload size"
@@ -1384,8 +1377,8 @@ pub(crate) mod tests {
             &payload,
             &[("/t", 10), ("/t", 20), ("/t", 30), ("/t", 40)],
         )?;
-        let tailer = tail_whole(&rec)?;
-        let plan = plan_one(&tailer, 0, 100);
+        let index = index_whole(&rec)?;
+        let plan = plan_one(&index, 0, 100);
 
         // Corrupt a payload byte *after* the tail scanned (and CRC-checked)
         // the chunk: post-scan disk damage. Payload bytes exist only inside
@@ -1435,18 +1428,12 @@ pub(crate) mod tests {
                 raw_record(op::MESSAGE, &message_body(1, 2, 30, b"x")),
             ],
         )?;
-        let (tailer, coverage) = Tailer::new();
-        let file = Arc::new(File::open(&rec)?);
-        tailer.attach(file.clone());
-        scan_to_end(&tailer, &file, 8)?;
-        assert_eq!(
-            coverage.get().high_water_ns,
-            30,
-            "the tail scans past the runt"
-        );
+        let index = index_whole(&rec)?;
 
         let out = root.join("clip.mcap");
-        let plan = plan_one(&tailer, 0, 100);
+        // The scan indexes past the runt, so the message behind it is planned
+        // and copied through below.
+        let plan = plan_one(&index, 0, 100);
         let stats = extract_clip(&plan, &out, 0, 100, TEST_COMPRESSION)?;
         assert_eq!(stats.records_skipped, 1);
         assert_eq!(stats.messages_copied, 2);
@@ -1493,10 +1480,10 @@ pub(crate) mod tests {
         let root = test_dir("clip-drop-missing")?;
         let rec = root.join("rec.mcap");
         write_recording(&rec, false, &[("/t", 10)])?;
-        let tailer = tail_whole(&rec)?;
+        let index = index_whole(&rec)?;
 
         let out = root.join("clip.mcap");
-        let plan = plan_one(&tailer, 0, 100);
+        let plan = plan_one(&index, 0, 100);
         let staged = stage_clip(&plan, &out, 0, 100, TEST_COMPRESSION, TimeSource::Log)?;
 
         // Simulate the staged file disappearing (e.g. an admin removed it or
@@ -1521,10 +1508,10 @@ pub(crate) mod tests {
         let root = test_dir("clip-stage-collision")?;
         let rec = root.join("rec.mcap");
         write_recording(&rec, false, &[("/t", 10), ("/t", 20)])?;
-        let tailer = tail_whole(&rec)?;
+        let index = index_whole(&rec)?;
 
         let out = root.join("clip.mcap");
-        let plan = plan_one(&tailer, 0, 100);
+        let plan = plan_one(&index, 0, 100);
 
         // Stage the same desired name twice without publishing between them;
         // both clips land in the capturing dir, each under a distinct path.
@@ -1567,14 +1554,14 @@ pub(crate) mod tests {
                 raw_record(op::MESSAGE, &message_body_pub(1, 2, 300, 350, b"c")),
             ],
         )?;
-        let tailer = tail_whole(&rec)?;
+        let index = index_whole(&rec)?;
         let out = root.join("clip.mcap");
 
         // The window [180, 320] selects different messages per domain: on `log`
         // it holds log_times 200 and 300; on `publish` only the message
         // published at 250 lands inside, and that message's log_time is 100.
         let log_clip = publish_clip(stage_clip(
-            &plan_one_src(&tailer, 180, 320, TimeSource::Log),
+            &plan_one_src(&index, 180, 320, TimeSource::Log),
             &out,
             180,
             320,
@@ -1589,7 +1576,7 @@ pub(crate) mod tests {
         assert_eq!(log_times, vec![200, 300], "log windows on log_time");
 
         let pub_clip = publish_clip(stage_clip(
-            &plan_one_src(&tailer, 180, 320, TimeSource::Publish),
+            &plan_one_src(&index, 180, 320, TimeSource::Publish),
             &out,
             180,
             320,

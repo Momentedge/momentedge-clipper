@@ -4,6 +4,10 @@
 # resolver "1" and warns.
 resolver = "3"
 members = [
+    # The shared library: the MCAP format layer, the recording index, the cut
+    # path, the neutral trigger contract, and segment publication. ROS-free by
+    # default — the `ros` feature adds only the CDR trigger decoder.
+    "crates/clip",
     "crates/clipper",
     # Example trigger source — a workspace member so it inherits the shared
     # package metadata and dependency versions below, not a deployable crate.

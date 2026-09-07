@@ -23,16 +23,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
+use clip::TimeSource;
+use clip::decode::decode_trigger;
+use clip::trigger::{Announce, Completion, Trigger, TriggerRecord, now_ns};
 use crossbeam_channel::{Receiver, select};
 use futures::executor::block_on;
 use futures::stream::{Stream, StreamExt};
 use log::{error, info, warn};
 use r2r::{Publisher, QosProfile};
 
-use crate::TimeSource;
-use crate::decode::decode_trigger;
 use crate::supervision::{harvest_panic, spawn_supervised};
-use crate::trigger::{Announce, Completion, Trigger, TriggerRecord, now_ns};
 
 /// The window anchor an interface resolved for one trigger, plus whether it came
 /// from the trigger's own `trigger_time` field. Exactly one cell of the
@@ -188,7 +188,7 @@ impl Interface for RosInterface {
         let drain = spawn_supervised("trigger-drain", move || -> anyhow::Result<()> {
             while let Some(t) = block_on(sub.next()) {
                 // `t.into()` is the shared r2r-Trigger -> domain-Trigger conversion
-                // (the `From` impl in `crate::decode`). The anchor is resolved on
+                // (the `From` impl in `clip::decode`). The anchor is resolved on
                 // the active `--time-source`: `now` at this subscription instant
                 // under `log`, the trigger's `trigger_time` under `publish`.
                 let trigger: Trigger = t.into();
@@ -211,28 +211,6 @@ impl Interface for RosInterface {
                 Err(_) => Err(harvest_panic(drain_handle)
                     .context("trigger drain thread exited unexpectedly")),
             },
-        }
-    }
-}
-
-/// A finished clip's [`Completion`] maps field-for-field onto the r2r-generated
-/// `momentedge_msgs/Recorded` the ROS interface publishes (its [`Stamp`] onto
-/// the nested `builtin_interfaces/Time`). By reference — the announcer keeps the
-/// `Completion` to log from after the publish. The orphan rule permits this
-/// foreign-target impl because [`Completion`] is local.
-///
-/// [`Stamp`]: crate::trigger::Stamp
-impl From<&Completion> for r2r::momentedge_msgs::msg::Recorded {
-    fn from(completion: &Completion) -> Self {
-        r2r::momentedge_msgs::msg::Recorded {
-            name: completion.name.clone(),
-            filenames: completion.filenames.clone(),
-            description: completion.description.clone(),
-            trigger_time: r2r::builtin_interfaces::msg::Time {
-                sec: completion.trigger_time.sec,
-                nanosec: completion.trigger_time.nanosec,
-            },
-            preroll: completion.preroll,
         }
     }
 }
@@ -275,7 +253,7 @@ pub(crate) struct McapInterface {
     trigger_topic: Arc<str>,
     /// The clock domain the anchor is read from: each trigger record's own
     /// `log_time` or `publish_time`.
-    time_source: crate::TimeSource,
+    time_source: TimeSource,
 }
 
 impl McapInterface {
@@ -285,7 +263,7 @@ impl McapInterface {
     pub(crate) fn new(
         trigger_topic: &str,
         triggers: Receiver<TriggerRecord>,
-        time_source: crate::TimeSource,
+        time_source: TimeSource,
     ) -> Self {
         McapInterface {
             triggers,
@@ -358,10 +336,10 @@ impl Announce for NullAnnouncer {
 mod tests {
     use std::sync::{Arc, Mutex};
 
+    use clip::trigger::Stamp;
     use crossbeam_channel::unbounded;
 
     use super::*;
-    use crate::trigger::Stamp;
 
     /// CDR-serialize a `momentedge_msgs/Trigger` the way rosbag2 writes it, so a
     /// [`TriggerRecord`] with `message_encoding = "cdr"` decodes back to it.

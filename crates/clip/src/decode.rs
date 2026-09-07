@@ -6,14 +6,22 @@
 //! to serialize as CDR: `json` is a first-class peer of `cdr`. Only the payload
 //! bytes the tail captured are read — no schema, no node, no ROS runtime.
 //!
-//! The two covered encodings are decodable with dependencies already in the
-//! closure: `cdr` through `r2r`'s rmw deserialization (the rmw library only,
-//! never a node), `json` through `serde_json`. `cbor`/`protobuf`/`flatbuffer`
-//! and any unknown encoding return an error the caller logs and skips.
+//! The two covered encodings split along the crate's one ROS seam. `json` is
+//! always decodable, through `serde_json`. `cdr` sits behind the `ros` feature,
+//! decoded through `r2r`'s rmw typesupport — the linked rmw library only, never
+//! a `Context`, `Node`, or executor. That feature is off by default, so a
+//! ROS-free consumer of a recording never pulls `r2r` into its build; there a
+//! `cdr` payload is an error naming the absent feature rather than a decode
+//! failure. `cbor`/`protobuf`/`flatbuffer` and any unknown encoding return an
+//! error the caller logs and skips.
 
 use anyhow::{Context, Result, bail};
 
-use crate::trigger::{Stamp, Trigger};
+// `Stamp` is named only by the r2r conversion below, which the `ros` feature
+// gates, so a default build must not import it; the tests name it themselves.
+#[cfg(feature = "ros")]
+use crate::trigger::Stamp;
+use crate::trigger::Trigger;
 
 /// Decode one trigger payload — `body`, the bytes after an MCAP Message
 /// record's fixed fields — according to its channel's `encoding`.
@@ -24,7 +32,9 @@ use crate::trigger::{Stamp, Trigger};
 ///   serialized form rosbag2 writes (CDR with its encapsulation header), which
 ///   is exactly what `from_serialized_bytes` expects. It yields r2r's generated
 ///   type, which the [`From`] impl below maps onto the neutral domain
-///   [`Trigger`].
+///   [`Trigger`]. That arm is compiled in only under the `ros` feature; a build
+///   without it answers a `cdr` payload with an error naming the missing
+///   feature, so no consumer silently loses triggers it cannot read.
 /// - **`json`** is parsed by `serde_json` straight into the domain [`Trigger`],
 ///   which derives `Deserialize`; its docs give the accepted shape
 ///   (`description` optional, unknown fields ignored, the rest required, the
@@ -32,15 +42,16 @@ use crate::trigger::{Stamp, Trigger};
 /// - Anything else — `cbor`, schema-bound `protobuf`/`flatbuffer`, or an
 ///   unknown encoding — is an error, as is a body that does not parse.
 ///
-/// The sole caller is the MCAP interface ([`crate::interface::McapInterface`]):
-/// the ROS interface reads typed triggers off its subscription and never decodes
-/// the file, and its tail runs with the trigger tap unwired, so this path — and
-/// this error — is reachable only when clipper is reading triggers out of the
-/// tailed recording. There the caller logs the error and skips that one trigger
-/// rather than failing: an undecodable message on clipper's own trigger topic
-/// must not stop the recorder.
+/// The sole caller is the recorder's MCAP interface (`McapInterface`, in the
+/// `clipper` crate): the ROS interface reads typed triggers off its subscription
+/// and never decodes the file, and its tail runs with the trigger tap unwired,
+/// so this path — and this error — is reachable only when clipper is reading
+/// triggers out of the tailed recording. There the caller logs the error and
+/// skips that one trigger rather than failing: an undecodable message on
+/// clipper's own trigger topic must not stop the recorder.
 pub fn decode_trigger(encoding: &str, body: &[u8]) -> Result<Trigger> {
     match encoding {
+        #[cfg(feature = "ros")]
         "cdr" => {
             use r2r::WrappedTypesupport;
             Ok(
@@ -49,6 +60,13 @@ pub fn decode_trigger(encoding: &str, body: &[u8]) -> Result<Trigger> {
                     .into(),
             )
         }
+        #[cfg(not(feature = "ros"))]
+        "cdr" => bail!(
+            "no CDR trigger decoder in this build: `cdr` needs r2r's rmw typesupport, which only \
+             the `ros` feature links, and this build was made without it. The payload was never \
+             read, so this says nothing about the recording — encode the trigger as `json`, which \
+             needs no decoder here, or rebuild this consumer with the `ros` feature"
+        ),
         "json" => serde_json::from_slice(body).context("parsing a JSON momentedge_msgs/Trigger"),
         other => bail!("no trigger decoder for message_encoding {other:?}"),
     }
@@ -58,6 +76,14 @@ pub fn decode_trigger(encoding: &str, body: &[u8]) -> Result<Trigger> {
 /// neutral domain [`Trigger`] (its nested `builtin_interfaces/Time` onto
 /// [`Stamp`]). The CDR decoder and the live ROS interface share this one
 /// conversion, so the domain type itself stays free of `r2r`.
+///
+/// It sits in this crate rather than in the recorder that also uses it because
+/// the orphan rule leaves nowhere else: to a downstream crate both r2r's
+/// generated type and the domain [`Trigger`] are foreign, and a crate may not
+/// implement `From` between two foreign types. The conversion has to live with
+/// the domain type — which is what the `ros` feature buys, at the cost of `r2r`
+/// only for the builds that ask for it.
+#[cfg(feature = "ros")]
 impl From<r2r::momentedge_msgs::msg::Trigger> for Trigger {
     fn from(t: r2r::momentedge_msgs::msg::Trigger) -> Self {
         Trigger {
@@ -76,6 +102,7 @@ impl From<r2r::momentedge_msgs::msg::Trigger> for Trigger {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::trigger::Stamp;
 
     /// The canonical decoded trigger the encoding-specific test bytes all map to.
     fn expected() -> Trigger {
@@ -125,11 +152,32 @@ mod tests {
         assert!(decode_trigger("json", body).is_err());
     }
 
+    /// The ROS-free half of the feature split, and the property it exists for: a
+    /// `cdr` payload has no decoder here, and the error says why — this build
+    /// lacks the `ros` feature, and `json` needs no decoder — so a reader of the
+    /// log knows whether to re-encode the trigger or rebuild the consumer,
+    /// rather than suspecting the recording.
+    #[cfg(not(feature = "ros"))]
+    #[test]
+    fn cdr_without_the_ros_feature_names_the_missing_feature() {
+        let err = decode_trigger("cdr", b"").expect_err("a build without `ros` has no CDR decoder");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("`ros` feature"),
+            "the error must name the missing feature: {msg}"
+        );
+        assert!(
+            msg.contains("`json`"),
+            "the error must name the encoding that needs no decoder: {msg}"
+        );
+    }
+
     /// CDR round-trip through r2r's rmw typesupport, node-free: serialize a real
     /// `momentedge_msgs/Trigger` with `to_serialized_bytes` (the rmw form
     /// rosbag2 writes) and decode it back. Exercises the path the MCAP interface
     /// takes for a `cdr` channel. Runs inside the dev shell, where the rmw
     /// library and the momentedge_msgs typesupport are on the load path.
+    #[cfg(feature = "ros")]
     #[test]
     fn cdr_round_trips_through_r2r() {
         use r2r::WrappedTypesupport;

@@ -1,0 +1,48 @@
+[package]
+name = "clip"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MCAP recording index, cut path and trigger contract shared by every consumer of a recording"
+
+[features]
+default = []
+# The CDR arm of the trigger decoder, and the `From<r2r …Trigger>` conversion the
+# live ROS interface shares with it. Both need r2r's rmw deserialization (the
+# linked rmw library only — never a node), so they sit behind this feature and a
+# default build pulls no r2r: a ROS-free consumer of a recording never links the
+# ROS toolchain. `json` triggers decode either way.
+ros = ["dep:r2r"]
+# `TimeSource` as a clap `ValueEnum`, for a binary that takes the clock domain on
+# its command line. Off by default so a library consumer never links clap.
+clap = ["dep:clap"]
+# Publishes the MCAP fixture writers in `clip::testing` — the same recordings
+# this crate's own tests are built from — so a downstream crate's tests write
+# their fixtures through them instead of keeping a copy that drifts from what the
+# scan expects. A dev-only opt-in: a consumer enables it under
+# `[dev-dependencies]`, where the v2+ resolver keeps it out of a normal build, so
+# a release binary compiles no fixture code.
+test-support = []
+
+[dependencies]
+# MCAP record parsing (`parse_record`, `read::ChunkReader`) for the incremental
+# scan and the cut — both own their opcode + length framing, so the halt-on-first-
+# error `LinearReader` is deliberately unused — and `Writer` for the clip output.
+mcap.workspace = true
+# Error plumbing for the scan and the cut.
+anyhow.workspace = true
+# Logging via the `log` facade; the binary picks the backend.
+log.workspace = true
+# The scan's trigger tap and the staging worker pool are both channel-shaped: the
+# tap sends lifted `TriggerRecord`s at the far end, and each stage job carries its
+# own reply channel.
+crossbeam-channel.workspace = true
+# `json` trigger payloads: `Trigger` derives `Deserialize`, `serde_json` parses.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# ROS2 client bindings, `ros` only: the rmw typesupport the `cdr` trigger decoder
+# deserializes through, and the generated `momentedge_msgs/Trigger` the `From`
+# impl maps onto the neutral domain type.
+r2r = { workspace = true, optional = true }
+# CLI value parsing, `clap` only: derives `ValueEnum` for `TimeSource`.
+clap = { workspace = true, optional = true }

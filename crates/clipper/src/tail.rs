@@ -1,42 +1,30 @@
 //! Tail of the growing MCAP file behind a continuous `ros2 bag record`.
 //!
-//! rosbag2's MCAP writer is append-only while recording: bytes below the
-//! current end of file never change, and every record is length-prefixed (a
-//! 1-byte opcode + u64le length). The tail exploits both properties: it keeps
-//! the recording open, repeatedly consumes the complete records that appeared
-//! since the previous pass — a record whose declared extent runs past the
-//! current file length is still being written and is left for the next pass —
-//! and never re-reads a byte it has already consumed.
+//! Reading a recording while it is still being written is sound because of the
+//! MCAP format itself — bytes below the current end of file never change, and
+//! every record is length-prefixed — and the incremental scan that exploits
+//! that, together with the extent index and schema/channel registry it fills,
+//! is [`clip::index`]. This module is the live half around it: discovering
+//! recordings, keeping each open, driving that scan pass by pass, and owning
+//! everything a scan of an already-complete file has no use for — where each
+//! recording sits in the collection's lifecycle, how far the collection
+//! provably reaches, and what to do when a pass faults.
 //!
-//! Three artefacts come out of the scan, all served to the per-trigger
-//! extraction ([`crate::clip`]):
-//!
-//! * **Extent index** — contiguous byte ranges of the file (closed at
-//!   [`EXTENT_CAP_BYTES`]) carrying the min/max `log_time` and `publish_time`
-//!   of the messages they hold. A clip reads only the extents whose span on the
-//!   active time source overlaps its window, so cutting a clip never rescans
-//!   the file.
-//! * **Schema/channel registry** — every `Schema`/`Channel` record seen, keyed
-//!   by the file's channel ID (unique within one continuous file). Chunked
-//!   recordings carry these *inside* chunks, so chunks are decompressed during
-//!   the tail; an unchunked recording (the fastwrite storage profile) pays no
-//!   such cost.
-//! * **Coverage watch** — the collection-wide highest `log_time` and
-//!   `publish_time` seen ([`Coverage`]); a trigger handler waits on the active
-//!   time source's mark until the recording reaches its window end (a
-//!   completeness proof on `log`, a liveness signal on `publish`).
+//! What the tail adds on top of the index is the **coverage watch**: the
+//! collection-wide highest `log_time` and `publish_time` seen ([`Coverage`]). A
+//! trigger handler waits on the active time source's mark until the recording
+//! reaches its window end — a completeness proof on `log`, a liveness signal on
+//! `publish`. The window's clock domain is selectable (`--time-source`):
+//! `log_time` is the default base, `publish_time` the alternative, and the gap
+//! between the two — the recorder's queue backlog plus the producer's clock
+//! skew — is observable either way.
 //!
 //! Only the 22-byte fixed header of each top-level `Message` record is read
 //! during the tail (channel id, sequence, `log_time`, `publish_time`); message
-//! bodies are first touched by the extraction. The window's clock domain is
-//! selectable (`--time-source`): `log_time` is the default base, `publish_time`
-//! the alternative, and the gap between the two — the recorder's queue backlog
-//! plus the producer's clock skew — is observable either way. The
-//! same "decode only the timestamps" discipline
-//! as the rest of the workspace, applied to file tailing. The one exception is
-//! an opt-in trigger tap ([`Tailer::with_trigger_tap`], wired only by the MCAP
-//! interface): when set, the scan also lifts the full body of messages on the
-//! trigger topic out as [`TriggerRecord`]s for the interface to decode by
+//! bodies are first touched by the extraction ([`clip::cut`]). The one exception
+//! is an opt-in trigger tap ([`Tailer::with_trigger_tap`], wired only by the
+//! MCAP interface): when set, the scan also lifts the full body of messages on
+//! the trigger topic out as [`TriggerRecord`]s for the interface to decode by
 //! `message_encoding`. With the tap unset — the default — no message body is
 //! read during the scan at all.
 //!
@@ -49,20 +37,18 @@
 //! it (beads clipper-gl2), then pruned. Extractions hold their own file handle,
 //! so a recording pruned or deleted while a clip reads it stays readable.
 //!
-//! Damage in the recording is tolerated the way [`crate::clip`] tolerates it
-//! at extraction: a damaged chunk, an unparseable schema/channel, or a runt
-//! message is warned and skipped, the framing intact. A **framing** fault has
-//! no resync point (a record length past [`MAX_RECORD_LEN`], or an IO error
-//! reading a record), so the scan stops at it, having applied everything
-//! before it. The tail then retries from exactly that offset — never
-//! re-attaching, never rescanning from scratch — under a bounded,
-//! backing-off [`MAX_SCAN_FAULTS`] budget, treating a recorder restart during
-//! the backoff as recovery. Only when the same byte faults through the whole
-//! budget does [`Tailer::run`] return an error and the process exit for a
+//! Damage in the recording is tolerated the way [`clip::cut`] tolerates it at
+//! extraction, and the scan itself draws the line: a damaged chunk, an
+//! unparseable schema/channel, or a runt message is warned and skipped, the
+//! framing intact. A **framing** fault has no resync point, so the scan stops at
+//! it, having applied everything before it. The tail then retries from exactly
+//! that offset — never re-attaching, never rescanning from scratch — under a
+//! bounded, backing-off [`MAX_SCAN_FAULTS`] budget, treating a recorder restart
+//! during the backoff as recovery. Only when the same byte faults through the
+//! whole budget does [`Tailer::run`] return an error and the process exit for a
 //! supervisor to restart: a tailer wedged on a stuck file would otherwise
 //! degrade every clip to a grace-timeout cut with no other signal.
 
-use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
@@ -70,26 +56,15 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use clip::TimeSource;
+use clip::index::{
+    self, MAGIC, RecordingIndex, ScanDelta, ScanProgress, ScanSeed, WindowPlan, WindowPlanner,
+};
+use clip::trigger::{TriggerRecord, now_ns};
 use crossbeam_channel::Sender;
-use log::{debug, info, warn};
-use mcap::records::Record;
+use log::{info, warn};
 
-use crate::TimeSource;
-use crate::trigger::{TriggerRecord, now_ns};
 use crate::watch::Watch;
-
-/// The 8 magic bytes opening (and, after `finish`, closing) every MCAP file.
-const MAGIC: [u8; 8] = *b"\x89MCAP0\r\n";
-
-/// Extents close once they cover this many bytes, bounding both the bytes one
-/// index entry stands for and the index's growth (one entry per cap per file).
-const EXTENT_CAP_BYTES: u64 = 4 * 1024 * 1024;
-
-/// Upper bound on a plausible single record. A length beyond this means the
-/// scan is desynchronised from the record framing (or the file is corrupt).
-/// [`crate::clip`] applies the same bound to the records it reads back out
-/// of extents, including chunk-interior records after decompression.
-pub(crate) const MAX_RECORD_LEN: u64 = 1 << 31;
 
 /// Sleep between scan passes when the file has not grown.
 const TAIL_POLL: Duration = Duration::from_millis(50);
@@ -116,131 +91,6 @@ pub(crate) const MAX_SCAN_FAULTS: u32 = 5;
 /// increments so a recorder restart (the file replaced) is noticed within one
 /// increment and treated as recovery.
 pub(crate) const SCAN_BACKOFF_CAP: Duration = Duration::from_millis(3200);
-
-/// MCAP record opcodes the tail dispatches on.
-pub(crate) mod op {
-    pub const FOOTER: u8 = 0x02;
-    pub const SCHEMA: u8 = 0x03;
-    pub const CHANNEL: u8 = 0x04;
-    pub const MESSAGE: u8 = 0x05;
-    pub const CHUNK: u8 = 0x06;
-    pub const DATA_END: u8 = 0x0F;
-}
-
-/// An owned copy of a `Schema` record.
-#[derive(Clone, Debug)]
-pub struct SchemaDef {
-    pub name: String,
-    pub encoding: String,
-    pub data: Vec<u8>,
-}
-
-/// An owned copy of a `Channel` record, with its schema resolved.
-#[derive(Clone, Debug)]
-pub struct ChannelDef {
-    pub topic: String,
-    pub message_encoding: String,
-    pub metadata: BTreeMap<String, String>,
-    pub schema: Option<SchemaDef>,
-}
-
-/// The inclusive minimum and maximum of one timestamp source over a set of
-/// messages.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Span {
-    pub min: u64,
-    pub max: u64,
-}
-
-impl Span {
-    fn point(t: u64) -> Self {
-        Span { min: t, max: t }
-    }
-
-    fn extend(&mut self, t: u64) {
-        self.min = self.min.min(t);
-        self.max = self.max.max(t);
-    }
-
-    fn merge(&mut self, other: Span) {
-        self.min = self.min.min(other.min);
-        self.max = self.max.max(other.max);
-    }
-}
-
-/// The `log_time` and `publish_time` spans of a set of messages, carried
-/// together because both come from the same message header. Both spans are
-/// exact: either may drive extent overlap and coverage, selected by the active
-/// [`TimeSource`]. Retention reads only `log` — a producer must not be able to
-/// drive file deletion through `publish_time`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Stamps {
-    pub log: Span,
-    pub publish: Span,
-}
-
-impl Stamps {
-    fn point(log: u64, publish: u64) -> Self {
-        Stamps {
-            log: Span::point(log),
-            publish: Span::point(publish),
-        }
-    }
-
-    fn extend(&mut self, log: u64, publish: u64) {
-        self.log.extend(log);
-        self.publish.extend(publish);
-    }
-
-    fn merge(&mut self, other: Stamps) {
-        self.log.merge(other.log);
-        self.publish.merge(other.publish);
-    }
-}
-
-/// The span of `log_time − publish_time` over a set of messages — the
-/// recorder's queue backlog plus the producer's clock skew, in nanoseconds
-/// (signed: a `publish_time` past its `log_time` reads negative). Accumulated
-/// per scan pass and logged at debug; no windowing reads it.
-#[derive(Clone, Copy, Debug)]
-struct Skew {
-    min: i128,
-    max: i128,
-}
-
-impl Skew {
-    fn observe(&mut self, gap: i128) {
-        self.min = self.min.min(gap);
-        self.max = self.max.max(gap);
-    }
-}
-
-/// A contiguous byte range of the recording, aligned to top-level record
-/// boundaries, with the time bounds of the messages it holds. `time` is `None`
-/// while the range carries no timed record (e.g. only schema/channel records).
-#[derive(Clone, Copy, Debug)]
-pub struct Extent {
-    pub offset: u64,
-    pub len: u64,
-    pub time: Option<Stamps>,
-}
-
-impl Extent {
-    /// Whether any message in the extent can fall inside `[start_ns, end_ns]` on
-    /// the windowing `source`. Exact, not heuristic: the bounds are the actual
-    /// min/max of the extent's messages on that source, so a message in the
-    /// window implies its extent overlaps it. `source` picks which of the two
-    /// carried spans to test — `log` or `publish`.
-    fn overlaps(&self, start_ns: u64, end_ns: u64, source: TimeSource) -> bool {
-        self.time.is_some_and(|s| {
-            let span = match source {
-                TimeSource::Log => s.log,
-                TimeSource::Publish => s.publish,
-            };
-            span.max >= start_ns && span.min <= end_ns
-        })
-    }
-}
 
 /// How far the recordings provably reach on each time source: the highest
 /// message stamp the tail has seen on disk, across the whole collection of
@@ -285,28 +135,6 @@ impl Coverage {
     }
 }
 
-/// A snapshot for one clip: the open recording, the extents overlapping the
-/// window (in file order), and the channel registry to map IDs with. `file` is
-/// `None` while no recording has been discovered yet.
-pub struct WindowPlan {
-    pub file: Option<Arc<File>>,
-    pub extents: Vec<Extent>,
-    pub channels: HashMap<u16, ChannelDef>,
-}
-
-impl WindowPlan {
-    /// A plan with no source file — stages a channelless empty clip (magic +
-    /// summary + footer) for a window no recording covers. The empty path needs
-    /// no `Arc<File>`, so it serves the "no recording exists yet" case too.
-    pub fn empty() -> Self {
-        WindowPlan {
-            file: None,
-            extents: Vec::new(),
-            channels: HashMap::new(),
-        }
-    }
-}
-
 /// A monotonic recording sequence number, assigned at insertion. Insertion
 /// order is mtime order is time order (rosbag2 opens each split/restart file
 /// after closing the previous one), so a larger id is always a later recording.
@@ -328,120 +156,36 @@ enum RecordingState {
     Ended,
 }
 
-/// The `log_time` and `publish_time` spans of the messages indexed in one
-/// recording. `has_messages` is false until the first timed record lands,
-/// distinguishing "no data" from "data at time 0". Either span drives window
-/// overlap and coverage, selected by the active time source; retention ages on
-/// `log.max` alone (against the watch floor), whatever the window's source.
-#[derive(Clone, Copy, Debug, Default)]
-struct TimeBounds {
-    log: Span,
-    publish: Span,
-    has_messages: bool,
-}
-
-impl TimeBounds {
-    fn absorb(&mut self, stamps: Stamps) {
-        if self.has_messages {
-            self.log.merge(stamps.log);
-            self.publish.merge(stamps.publish);
-        } else {
-            self.log = stamps.log;
-            self.publish = stamps.publish;
-            self.has_messages = true;
-        }
-    }
-}
-
-/// One indexed recording: its open file handle, scan progress, extent index,
-/// schema/channel registry, and time bounds. The tail owns a time-ordered
-/// collection of these (see [`TailState`]); trigger handlers read them through
-/// [`Tailer::plan_window`].
-struct RecordingIndex {
+/// One recording as the tail holds it: what it contains, plus where it sits in
+/// the collection.
+///
+/// The [`RecordingIndex`] knows the recording's *content* — its open file
+/// handle, how far it has been scanned, its extents and their time spans, its
+/// schema/channel registry, its time bounds — and nothing about any other
+/// recording. Tailing adds exactly what a *collection* of recordings needs: an
+/// `id` fixing this one's place in time order, and a [`RecordingState`] saying
+/// whether it is waiting behind the current file, being scanned, or finished
+/// and eligible for retention pruning.
+///
+/// A consumer cutting a clip out of one already-complete file needs only the
+/// former — it opens the file, indexes it once, and plans windows against it;
+/// there is no successor, no rollover, no retention horizon. That is why the
+/// split falls exactly here: the index is `clip`'s, shared with every such
+/// consumer, and the two lifecycle fields stay behind with the tail that is
+/// the only thing to have a lifecycle.
+struct Recording {
     id: RecordingId,
-    path: PathBuf,
-    file: Arc<File>,
     state: RecordingState,
-    /// The scan resume point: bytes below it are consumed, the next pass starts
-    /// here. Begins at 0 (magic unverified); set past the magic once verified.
-    offset: u64,
-    /// Whether the 8 magic bytes have been verified — gates the `New → Tailing`
-    /// transition, since a freshly created file may not hold them yet.
-    magic_ok: bool,
-    extents: Vec<Extent>,
-    /// The extent still accumulating records at the end of the scanned region.
-    /// Included in window plans — a window may end inside it.
-    open: Option<Extent>,
-    schemas: HashMap<u16, SchemaDef>,
-    channels: HashMap<u16, ChannelDef>,
-    /// Channels on the trigger topic (`id -> message_encoding`), the subset of
-    /// `channels` the MCAP-interface tap watches. Empty unless the tail was built
-    /// with a trigger tap (`Tailer::with_trigger_tap`); seeds each scan pass so a
-    /// trigger message references its channel defined in an earlier pass.
-    trigger_channels: HashMap<u16, String>,
-    bounds: TimeBounds,
+    index: RecordingIndex,
 }
 
-impl RecordingIndex {
-    /// Fold one scan pass's delta into this recording's registry, extents, and
-    /// time bounds. Mirrors the single-index `apply`: schemas first (so a
-    /// channel resolves its schema against the registry as this pass updates
-    /// it), then channels, then extents, then bounds.
-    fn apply_delta(&mut self, delta: ScanDelta) {
-        for (id, schema) in delta.schemas {
-            self.schemas.insert(id, schema);
-        }
-        for raw in delta.channels {
-            let schema = (raw.schema_id != 0)
-                .then(|| self.schemas.get(&raw.schema_id).cloned())
-                .flatten();
-            self.channels.insert(
-                raw.id,
-                ChannelDef {
-                    topic: raw.topic,
-                    message_encoding: raw.message_encoding,
-                    metadata: raw.metadata,
-                    schema,
-                },
-            );
-        }
-        for (id, encoding) in delta.trigger_channels {
-            self.trigger_channels.insert(id, encoding);
-        }
-        self.extents.extend(delta.closed);
-        self.open = delta.open;
-        for extent in self.extents.iter().chain(self.open.iter()) {
-            if let Some(stamps) = extent.time {
-                self.bounds.absorb(stamps);
-            }
-        }
-    }
-
-    /// A single-file [`WindowPlan`] over this recording's extents overlapping
-    /// `[start_ns, end_ns]` on `source`, or `None` if none do.
-    fn plan(&self, start_ns: u64, end_ns: u64, source: TimeSource) -> Option<WindowPlan> {
-        let extents: Vec<Extent> = self
-            .extents
-            .iter()
-            .chain(self.open.iter())
-            .filter(|e| e.overlaps(start_ns, end_ns, source))
-            .copied()
-            .collect();
-        (!extents.is_empty()).then(|| WindowPlan {
-            file: Some(self.file.clone()),
-            extents,
-            channels: self.channels.clone(),
-        })
-    }
-}
-
-/// The tail-owned collection of recording indexes, in time order
+/// The tail-owned collection of [`Recording`]s, in time order
 /// (oldest .. newest), plus which one is being incrementally scanned. The tail
 /// thread is the sole writer; trigger handlers only read it (under the mutex)
-/// via [`Tailer::plan_window`].
+/// via [`WindowPlanner::plan_window`].
 #[derive(Default)]
 struct TailState {
-    recordings: std::collections::VecDeque<RecordingIndex>,
+    recordings: std::collections::VecDeque<Recording>,
     /// The recording being incrementally tailed (`Tailing`). `None` before the
     /// first file is discovered or after the last one ends with no successor.
     current: Option<RecordingId>,
@@ -450,11 +194,11 @@ struct TailState {
 }
 
 impl TailState {
-    fn recording(&self, id: RecordingId) -> Option<&RecordingIndex> {
+    fn recording(&self, id: RecordingId) -> Option<&Recording> {
         self.recordings.iter().find(|r| r.id == id)
     }
 
-    fn recording_mut(&mut self, id: RecordingId) -> Option<&mut RecordingIndex> {
+    fn recording_mut(&mut self, id: RecordingId) -> Option<&mut Recording> {
         self.recordings.iter_mut().find(|r| r.id == id)
     }
 
@@ -465,19 +209,10 @@ impl TailState {
     fn insert_new_recording(&mut self, path: PathBuf, file: Arc<File>) -> RecordingId {
         let id = RecordingId(self.next_id);
         self.next_id += 1;
-        self.recordings.push_back(RecordingIndex {
+        self.recordings.push_back(Recording {
             id,
-            path,
-            file,
             state: RecordingState::New,
-            offset: 0,
-            magic_ok: false,
-            extents: Vec::new(),
-            open: None,
-            schemas: HashMap::new(),
-            channels: HashMap::new(),
-            trigger_channels: HashMap::new(),
-            bounds: TimeBounds::default(),
+            index: RecordingIndex::new(path, file),
         });
         if self.current.is_none() {
             self.current = Some(id);
@@ -519,14 +254,14 @@ impl TailState {
     fn plan_window(&self, start_ns: u64, end_ns: u64, source: TimeSource) -> Vec<WindowPlan> {
         self.recordings
             .iter()
-            .filter_map(|r| r.plan(start_ns, end_ns, source))
+            .filter_map(|r| r.index.plan(start_ns, end_ns, source))
             .collect()
     }
 
     /// Drop every `Ended` recording whose newest data is older than
     /// `floor_ns` — never the `current` file, never a `New` or `Tailing` one,
     /// never mid-file. Returns the dropped recordings' paths (for optional
-    /// on-disk deletion). Dropping a [`RecordingIndex`] releases its
+    /// on-disk deletion). Dropping a [`Recording`] releases its
     /// `Arc<File>`, closing the descriptor once no in-flight plan still holds a
     /// clone, so the prune bounds both memory and open fds.
     fn prune(&mut self, floor_ns: u64) -> Vec<PathBuf> {
@@ -534,10 +269,10 @@ impl TailState {
         self.recordings.retain(|r| {
             let expired = r.state == RecordingState::Ended
                 && Some(r.id) != self.current
-                && r.bounds.has_messages
-                && r.bounds.log.max < floor_ns;
+                && r.index.bounds.has_messages
+                && r.index.bounds.log.max < floor_ns;
             if expired {
-                pruned.push(r.path.clone());
+                pruned.push(r.index.path.clone());
             }
             !expired
         });
@@ -549,8 +284,8 @@ impl TailState {
     fn high_water_ns(&self) -> u64 {
         self.recordings
             .iter()
-            .filter(|r| r.bounds.has_messages)
-            .map(|r| r.bounds.log.max)
+            .filter(|r| r.index.bounds.has_messages)
+            .map(|r| r.index.bounds.log.max)
             .max()
             .unwrap_or(0)
     }
@@ -562,15 +297,15 @@ impl TailState {
     fn publish_high_water_ns(&self) -> u64 {
         self.recordings
             .iter()
-            .filter(|r| r.bounds.has_messages)
-            .map(|r| r.bounds.publish.max)
+            .filter(|r| r.index.bounds.has_messages)
+            .map(|r| r.index.bounds.publish.max)
             .max()
             .unwrap_or(0)
     }
 }
 
 /// Shared tail state: the scanning thread feeds it, trigger handlers snapshot
-/// it via [`Tailer::plan_window`] and wait on the coverage watch.
+/// it via [`WindowPlanner::plan_window`] and wait on the coverage watch.
 pub struct Tailer {
     state: Mutex<TailState>,
     coverage: Arc<Watch<Coverage>>,
@@ -581,270 +316,10 @@ pub struct Tailer {
     trigger_topic: Option<String>,
     /// Where lifted [`TriggerRecord`]s go (the MCAP interface drains the far
     /// end). `Some` exactly when `trigger_topic` is. Best-effort: a full or
-    /// closed tap never stalls the scan. Cloned into each scan's [`ScanDelta`],
-    /// which sends triggers straight down it the moment it lifts them.
+    /// closed tap never stalls the scan. Cloned into each pass's [`ScanSeed`],
+    /// which the scan turns into the sink it sends triggers straight down the
+    /// moment it lifts them.
     trigger_tx: Option<Sender<TriggerRecord>>,
-}
-
-/// Where one scan pass stopped, whether the recording ended, and whether a
-/// fault stopped it short. A fault carries the framing error; `offset` is then
-/// the byte offset of the faulted record (where a retry resumes), not the file
-/// end. `ended` and `fault` are mutually exclusive — a pass that hits the
-/// footer cannot also fault.
-#[derive(Debug)]
-pub(crate) struct ScanProgress {
-    pub(crate) offset: u64,
-    pub(crate) ended: bool,
-    pub(crate) fault: Option<anyhow::Error>,
-}
-
-/// Where a [`ScanDelta`] routes a trigger it lifts. A trigger emits only once it
-/// is durable: a top-level record the moment its framing is read, a
-/// chunk-interior record only after the chunk's CRC verifies. So the top-level
-/// delta carries the live tap and sends straight down it, while a chunk sub-delta
-/// stages until [`ScanDelta::absorb_chunk`] re-emits each through the parent.
-#[derive(Default)]
-enum TriggerSink {
-    /// The live tap the MCAP interface drains — the top-level scan delta. A
-    /// lifted trigger sends now.
-    Live(Sender<TriggerRecord>),
-    /// A chunk sub-delta's staging buffer: triggers wait here until the chunk
-    /// iterates cleanly, then `absorb_chunk` re-emits them through the parent's
-    /// `Live` sink. A damaged chunk is discarded whole, so its staged triggers
-    /// never emit.
-    Staged(Vec<TriggerRecord>),
-    /// The tap is disabled (no `--interface mcap`): no trigger is ever lifted.
-    #[default]
-    Off,
-}
-
-/// Registry and extent updates of one scan pass, collected without the state
-/// lock (the pass does file IO) and applied under one short lock at the end.
-#[derive(Default)]
-struct ScanDelta {
-    closed: Vec<Extent>,
-    open: Option<Extent>,
-    /// min/max of both stamps for the records absorbed since the last extent
-    /// extension, folded into the open extent by [`Self::extend_extent`].
-    pending_time: Option<Stamps>,
-    schemas: Vec<(u16, SchemaDef)>,
-    channels: Vec<RawChannel>,
-    /// The highest `log_time` this pass saw — the log half of the coverage
-    /// watch. The publish half derives from the recording bounds
-    /// (`TailState::publish_high_water_ns`), not from a delta field.
-    high_water_ns: u64,
-    /// min/max of `log_time − publish_time` over the messages this pass folded.
-    /// `None` until the first message; logged once per pass at debug.
-    skew: Option<Skew>,
-    /// The trigger topic to lift, seeded from the tailer. `None` disables the
-    /// tap, so the fields below stay empty/idle and the scan never reads a body.
-    trigger_topic: Option<String>,
-    /// Channels on the trigger topic seen so far — seeded from the recording's
-    /// registry and grown as this pass parses `Channel` records — as
-    /// `id -> message_encoding`. Consulted when a message references one of them.
-    trigger_channels: HashMap<u16, String>,
-    /// Where a lifted trigger goes: the top-level delta sends it straight down the
-    /// live tap ([`TriggerSink::Live`]) the instant its framing is read; a chunk
-    /// sub-delta stages it ([`TriggerSink::Staged`]) until the chunk's CRC clears.
-    trigger_sink: TriggerSink,
-}
-
-/// A `Channel` record before its schema is resolved against the registry.
-struct RawChannel {
-    id: u16,
-    schema_id: u16,
-    topic: String,
-    message_encoding: String,
-    metadata: BTreeMap<String, String>,
-}
-
-impl ScanDelta {
-    fn absorb_time(&mut self, log_time: u64, publish_time: u64) {
-        self.high_water_ns = self.high_water_ns.max(log_time);
-        self.pending_time = Some(match self.pending_time {
-            Some(mut s) => {
-                s.extend(log_time, publish_time);
-                s
-            }
-            None => Stamps::point(log_time, publish_time),
-        });
-        let gap = log_time as i128 - publish_time as i128;
-        self.skew = Some(match self.skew {
-            Some(mut sk) => {
-                sk.observe(gap);
-                sk
-            }
-            None => Skew { min: gap, max: gap },
-        });
-    }
-
-    /// Route one lifted trigger by the delta's [`TriggerSink`]: the top-level
-    /// delta's [`TriggerSink::Live`] sends it straight down the tap now; a chunk
-    /// sub-delta's [`TriggerSink::Staged`] holds it until [`Self::absorb_chunk`]
-    /// re-emits it through the parent once the chunk's CRC verifies — a damaged
-    /// chunk emits nothing. The send is best-effort: a full or closed tap never
-    /// stalls the scan.
-    ///
-    /// The two scan sites that find a trigger — a chunk-interior message
-    /// ([`Self::absorb_parsed`]) and a top-level message
-    /// ([`Tailer::scan_available`]) — both arrive here; they differ only in how
-    /// each obtains the body (a decoded chunk `Cow` vs. a direct file read).
-    fn emit_trigger(&mut self, rec: TriggerRecord) {
-        match &mut self.trigger_sink {
-            // The live tap. `send` fails only when the receiver — the MCAP
-            // interface draining the tap — is gone, which happens only once its
-            // thread has died and `supervise` is already tearing the process
-            // down. There is nothing useful left to do with the trigger then, and
-            // the supervisor surfaces the real fault (a panicked interface
-            // thread), so the drop is deliberate, not a swallowed error.
-            TriggerSink::Live(tx) => {
-                let _ = tx.send(rec);
-            }
-            // A chunk sub-delta: hold the trigger until its chunk's CRC clears.
-            TriggerSink::Staged(staged) => staged.push(rec),
-            // Unreachable: a trigger is lifted only when `trigger_channels` is
-            // non-empty, which the disabled tap never fills.
-            TriggerSink::Off => {}
-        }
-    }
-
-    /// Fold one parsed record into the delta: schema/channel definitions into
-    /// the registry, message times into the pending extent bounds.
-    fn absorb_parsed(&mut self, rec: Record<'_>) {
-        match rec {
-            Record::Schema { header, data } => self.schemas.push((
-                header.id,
-                SchemaDef {
-                    name: header.name,
-                    encoding: header.encoding,
-                    data: data.into_owned(),
-                },
-            )),
-            Record::Channel(ch) => {
-                // Register a trigger channel before `ch` is moved, so messages
-                // later in this pass (or in later passes, via the recording's
-                // registry) resolve their encoding.
-                if self.trigger_topic.as_deref() == Some(ch.topic.as_str()) {
-                    self.trigger_channels
-                        .insert(ch.id, ch.message_encoding.clone());
-                }
-                self.channels.push(RawChannel {
-                    id: ch.id,
-                    schema_id: ch.schema_id,
-                    topic: ch.topic,
-                    message_encoding: ch.message_encoding,
-                    metadata: ch.metadata,
-                });
-            }
-            Record::Message { header, data } => {
-                self.absorb_time(header.log_time, header.publish_time);
-                // A message on a trigger channel is lifted whole (its body is the
-                // serialized Trigger payload); any other message contributes only
-                // its timestamp, its body untouched. Inside a chunk sub-delta this
-                // stages the trigger (TriggerSink::Staged) until the CRC clears.
-                if let Some(encoding) = self.trigger_channels.get(&header.channel_id).cloned() {
-                    self.emit_trigger(TriggerRecord {
-                        message_encoding: encoding,
-                        body: data.into_owned(),
-                        log_time: header.log_time,
-                        publish_time: header.publish_time,
-                    });
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// Decompress one chunk record body and absorb its interior records. The
-    /// only reason chunk bodies are read during the tail: chunked writers put
-    /// Schema/Channel records inside chunks.
-    ///
-    /// All-or-nothing: the interior is absorbed into a fresh sub-delta and
-    /// merged into `self` only once the chunk iterates cleanly
-    /// ([`mcap::read::ChunkReader`] verifies the CRC at the end of iteration).
-    /// A chunk that fails to decompress, fails its CRC, or holds an
-    /// unparseable interior record therefore contributes nothing — matching
-    /// clip.rs, which drops the whole chunk at extraction, so coverage never
-    /// claims data the cut would silently leave out. Only the registry and
-    /// time bounds move; the extent fields (`closed`/`open`) belong to
-    /// [`Self::extend_extent`] and the chunk's own record offset, untouched here.
-    fn absorb_chunk(&mut self, body: &[u8]) -> Result<()> {
-        let Record::Chunk { header, data } = mcap::parse_record(op::CHUNK, body)? else {
-            bail!("chunk opcode did not parse as a chunk record");
-        };
-        // Seed the sub-delta with the tap context so a Channel and a Message on
-        // the trigger topic inside this chunk (or in an earlier pass) resolve.
-        let mut sub = ScanDelta {
-            trigger_topic: self.trigger_topic.clone(),
-            trigger_channels: self.trigger_channels.clone(),
-            // Stage triggers lifted from the chunk; they emit only after the
-            // chunk iterates cleanly, so a damaged chunk lifts nothing.
-            trigger_sink: TriggerSink::Staged(Vec::new()),
-            ..ScanDelta::default()
-        };
-        for rec in mcap::read::ChunkReader::new(header, &data).context("opening chunk")? {
-            sub.absorb_parsed(rec.context("reading record inside chunk")?);
-        }
-        self.schemas.extend(sub.schemas);
-        self.channels.extend(sub.channels);
-        self.high_water_ns = self.high_water_ns.max(sub.high_water_ns);
-        // Trigger channels discovered in the chunk persist for later records;
-        // triggers lifted from it emit only here, after the chunk iterated
-        // cleanly. The sub-delta staged them (TriggerSink::Staged) rather than
-        // sending; re-emitting through the parent's live sink sends each now (a
-        // damaged chunk never reaches this point, so it emits nothing).
-        self.trigger_channels.extend(sub.trigger_channels);
-        if let TriggerSink::Staged(staged) = sub.trigger_sink {
-            for rec in staged {
-                self.emit_trigger(rec);
-            }
-        }
-        if let Some(sub_stamps) = sub.pending_time {
-            self.pending_time = Some(match self.pending_time {
-                Some(mut s) => {
-                    s.merge(sub_stamps);
-                    s
-                }
-                None => sub_stamps,
-            });
-        }
-        if let Some(sub_skew) = sub.skew {
-            self.skew = Some(match self.skew {
-                Some(mut sk) => {
-                    sk.observe(sub_skew.min);
-                    sk.observe(sub_skew.max);
-                    sk
-                }
-                None => sub_skew,
-            });
-        }
-        Ok(())
-    }
-
-    /// Append one consumed record (`[record_offset, record_end)`) to the open
-    /// extent, folding in the pending time bounds, and close the extent once it
-    /// reaches [`EXTENT_CAP_BYTES`]. Records are consumed in offset order.
-    fn extend_extent(&mut self, record_offset: u64, record_end: u64) {
-        let open = self.open.get_or_insert(Extent {
-            offset: record_offset,
-            len: 0,
-            time: None,
-        });
-        open.len = record_end - open.offset;
-        if let Some(stamps) = self.pending_time.take() {
-            open.time = Some(match open.time {
-                Some(mut existing) => {
-                    existing.merge(stamps);
-                    existing
-                }
-                None => stamps,
-            });
-        }
-        if open.len >= EXTENT_CAP_BYTES {
-            self.closed.push(*open);
-            self.open = None;
-        }
-    }
 }
 
 impl Tailer {
@@ -881,17 +356,6 @@ impl Tailer {
             }),
             coverage,
         )
-    }
-
-    /// Snapshot one single-file plan per recording overlapping
-    /// `[start_ns, end_ns]` on `source`, oldest first. A window inside one
-    /// recording yields one plan; one straddling a rollover yields one per source
-    /// file. Empty when no indexed recording covers the window.
-    pub fn plan_window(&self, start_ns: u64, end_ns: u64, source: TimeSource) -> Vec<WindowPlan> {
-        self.state
-            .lock()
-            .unwrap()
-            .plan_window(start_ns, end_ns, source)
     }
 
     /// Tail forever: follow the directory's recordings as a time-ordered
@@ -1022,7 +486,12 @@ impl Tailer {
         let (path, file, mut offset, magic_ok) = {
             let st = self.state.lock().unwrap();
             let r = st.recording(id).expect("current id is in the collection");
-            (r.path.clone(), r.file.clone(), r.offset, r.magic_ok)
+            (
+                r.index.path.clone(),
+                r.index.file.clone(),
+                r.index.offset,
+                r.index.magic_ok,
+            )
         };
 
         // First contact: the writer may not have flushed the 8 magic bytes yet.
@@ -1044,8 +513,8 @@ impl Tailer {
             offset = MAGIC.len() as u64;
             let mut st = self.state.lock().unwrap();
             if let Some(r) = st.recording_mut(id) {
-                r.offset = offset;
-                r.magic_ok = true;
+                r.index.offset = offset;
+                r.index.magic_ok = true;
             }
             st.mark_tailing(id);
             info!("tailing {}", path.display());
@@ -1103,8 +572,8 @@ impl Tailer {
         let mut st = self.state.lock().unwrap();
         let id = st.insert_new_recording(PathBuf::new(), file);
         if let Some(r) = st.recording_mut(id) {
-            r.magic_ok = true;
-            r.offset = MAGIC.len() as u64;
+            r.index.magic_ok = true;
+            r.index.offset = MAGIC.len() as u64;
         }
         st.mark_tailing(id);
     }
@@ -1127,8 +596,8 @@ impl Tailer {
             if let Some(id) = st.current
                 && let Some(r) = st.recording_mut(id)
             {
-                r.apply_delta(delta);
-                r.offset = offset;
+                r.index.apply_delta(delta);
+                r.index.offset = offset;
             }
             (st.high_water_ns(), st.publish_high_water_ns())
         };
@@ -1151,205 +620,70 @@ impl Tailer {
         });
     }
 
-    /// One incremental pass: consume every record completely on disk in
-    /// `[offset, file_len)`, then publish the index/registry/coverage updates.
-    /// Stops without error at the first record still being appended.
+    /// One incremental pass over the `current` recording: seed the scan from
+    /// what this tailer already knows, run it through
+    /// [`clip::index::scan_available`], then publish the delta it produced —
+    /// registry, extents, scan offset, and the coverage high-waters
+    /// ([`Self::apply_to_current`]). Stops without error at the first record
+    /// still being appended.
     ///
-    /// Returns a plain [`ScanProgress`] rather than a `Result`: localized
-    /// damage is skipped (a damaged chunk, an unparseable schema/channel, a
-    /// runt message — warned and consumed), and only **framing** faults stop
-    /// the pass. A framing fault — a record length past [`MAX_RECORD_LEN`], or
-    /// an IO error reading a record's header or body — leaves no resync point,
-    /// so the pass applies the delta it accumulated up to the faulted record
-    /// and reports `fault = Some(_)` with `offset` at that record.
+    /// The seed is read under the state lock and the lock is dropped before the
+    /// scan runs, so the file IO — the whole cost of a pass — never holds the
+    /// lock a handler's `plan_window` contends on. Publication afterwards is one
+    /// short step under the same lock.
     ///
-    /// **Resume invariant:** the partial delta is already applied, so a caller
+    /// Returns a plain [`ScanProgress`] rather than a `Result`: localized damage
+    /// is skipped by the scan itself (a damaged chunk, an unparseable
+    /// schema/channel, a runt message — warned and consumed), and only
+    /// **framing** faults stop the pass. A framing fault — a record length past
+    /// [`clip::index::MAX_RECORD_LEN`], or an IO error reading a record's header
+    /// or body — leaves no resync point, so the pass returns the delta it
+    /// accumulated up to the faulted record (applied here like any other) and
+    /// reports `fault = Some(_)` with `offset` at that record.
+    ///
+    /// **Resume invariant:** that partial delta is already applied, so a caller
     /// retrying after a fault MUST resume at the returned `offset` (the faulted
-    /// record), never earlier. Re-scanning an already-applied region makes
-    /// [`ScanDelta::extend_extent`] compute `record_end - open.offset` across
-    /// bytes the open extent already spans and underflow.
-    pub(crate) fn scan_available(
-        &self,
-        file: &File,
-        mut offset: u64,
-        file_len: u64,
-    ) -> ScanProgress {
-        let mut delta = {
+    /// record), never earlier. Re-scanning an already-applied region makes the
+    /// scan compute `record_end - open.offset` across bytes the open extent
+    /// already spans and underflow.
+    pub(crate) fn scan_available(&self, file: &File, offset: u64, file_len: u64) -> ScanProgress {
+        // Take the seed under the lock, then release it: the scan's file IO must
+        // not run with the state lock held.
+        let seed = {
             let st = self.state.lock().unwrap();
             let current = st.current.and_then(|id| st.recording(id));
-            ScanDelta {
-                open: current.and_then(|r| r.open),
-                // Seed the tap from the tailer and the current recording's known
-                // trigger channels; both stay empty/idle when the tap is disabled.
-                // The top-level delta carries the live sink, so triggers it lifts
-                // send straight down the tap as the scan finds them.
+            ScanSeed {
+                open: current.and_then(|r| r.index.open),
+                // The tap itself is the tailer's; the recording contributes the
+                // trigger channels it has already seen, so a trigger message
+                // resolves against a channel defined in an earlier pass. Both
+                // stay empty/idle when the tap is disabled.
                 trigger_topic: self.trigger_topic.clone(),
-                trigger_sink: self
-                    .trigger_tx
-                    .clone()
-                    .map_or(TriggerSink::Off, TriggerSink::Live),
+                trigger_tx: self.trigger_tx.clone(),
                 trigger_channels: current
-                    .map(|r| r.trigger_channels.clone())
+                    .map(|r| r.index.trigger_channels.clone())
                     .unwrap_or_default(),
-                ..ScanDelta::default()
             }
         };
-        let mut ended = false;
-        // The offset of the faulted record is `offset` (left unadvanced) when
-        // a fault breaks the loop; the partial delta is applied regardless.
-        let mut fault: Option<anyhow::Error> = None;
+        let (delta, progress) = index::scan_available(file, offset, file_len, seed);
+        self.apply_to_current(delta, progress.offset);
+        progress
+    }
+}
 
-        while offset + 9 <= file_len {
-            let mut hdr = [0u8; 9];
-            if let Err(e) = file.read_exact_at(&mut hdr, offset) {
-                fault = Some(anyhow::Error::new(e).context(format!(
-                    "reading record header at {offset}; framing desynchronised?"
-                )));
-                break;
-            }
-            let opcode = hdr[0];
-            let len = u64::from_le_bytes(hdr[1..9].try_into().unwrap());
-            if len > MAX_RECORD_LEN {
-                // u64::MAX is the placeholder a seek-back (chunked) writer leaves
-                // in a Chunk header until it back-patches the real length at chunk
-                // close — a recording written that way is unreadable mid-write, so
-                // name the cause rather than implying corruption.
-                fault = Some(if len == u64::MAX {
-                    anyhow::anyhow!(
-                        "record at offset {offset} declares u64::MAX bytes — an \
-                         unpatched length from a seek-back (chunked) writer? such \
-                         a recording cannot be tailed until it is finalised"
-                    )
-                } else {
-                    anyhow::anyhow!(
-                        "record at offset {offset} declares {len} bytes; framing desynchronised?"
-                    )
-                });
-                break;
-            }
-            let end = offset + 9 + len;
-            if end > file_len {
-                break; // still being appended; complete on a later pass
-            }
-            match opcode {
-                op::SCHEMA | op::CHANNEL => {
-                    let body = match read_body(file, offset + 9, len) {
-                        Ok(body) => body,
-                        Err(e) => {
-                            fault = Some(e.context(format!(
-                                "reading record body at {offset}; framing desynchronised?"
-                            )));
-                            break;
-                        }
-                    };
-                    // An unparseable Schema/Channel (e.g. an invalid-UTF-8
-                    // name or topic — spec-legal bytes the parser rejects) is
-                    // warned and consumed, not propagated: the framing is
-                    // intact, so the scan skips the record and keeps indexing
-                    // the rest, as the CHUNK arm does for a damaged chunk.
-                    match mcap::parse_record(opcode, &body) {
-                        Ok(rec) => delta.absorb_parsed(rec),
-                        Err(e) => warn!("parsing record at {offset}: {e:#}; skipping it"),
-                    }
-                }
-                op::MESSAGE => {
-                    // Decode the 22-byte fixed header in one read: channel_id
-                    // u16, sequence u32, log_time u64, publish_time u64 (all
-                    // LE). A message on a trigger channel also has its payload
-                    // (past those 22 fixed fields) lifted out; every other body
-                    // stays untouched until extraction.
-                    if len >= 22 {
-                        let mut header = [0u8; 22];
-                        if let Err(e) = file.read_exact_at(&mut header, offset + 9) {
-                            fault = Some(anyhow::Error::new(e).context(format!(
-                                "reading message header at {offset}; framing desynchronised?"
-                            )));
-                            break;
-                        }
-                        let channel_id = u16::from_le_bytes(header[0..2].try_into().unwrap());
-                        let log_time = u64::from_le_bytes(header[6..14].try_into().unwrap());
-                        let publish_time = u64::from_le_bytes(header[14..22].try_into().unwrap());
-                        delta.absorb_time(log_time, publish_time);
-
-                        if let Some(encoding) = delta.trigger_channels.get(&channel_id).cloned() {
-                            // The payload follows the 22-byte fixed fields; an
-                            // exactly-22-byte trigger message lifts an empty
-                            // body.
-                            let mut payload = vec![0u8; (len - 22) as usize];
-                            if let Err(e) = file.read_exact_at(&mut payload, offset + 9 + 22) {
-                                fault = Some(anyhow::Error::new(e).context(format!(
-                                    "reading trigger payload at {offset}; framing desynchronised?"
-                                )));
-                                break;
-                            }
-                            // A top-level record is durable the instant its
-                            // framing is read, so this goes straight down the
-                            // tap (no chunk CRC to clear).
-                            delta.emit_trigger(TriggerRecord {
-                                message_encoding: encoding,
-                                body: payload,
-                                log_time,
-                                publish_time,
-                            });
-                        }
-                    } else {
-                        // A conformant Message body is >= 22 bytes — its fixed
-                        // header alone. A shorter one cannot yield both stamps,
-                        // so it is skipped like other localized damage: the
-                        // record is still consumed (the framing is
-                        // self-consistent), but its time counts toward neither
-                        // extent bounds nor coverage.
-                        warn!(
-                            "message record at {offset} is only {len} B; \
-                             the 22-byte fixed header is incomplete, skipping it"
-                        );
-                    }
-                }
-                op::CHUNK => {
-                    let body = match read_body(file, offset + 9, len) {
-                        Ok(body) => body,
-                        Err(e) => {
-                            fault = Some(e.context(format!(
-                                "reading record body at {offset}; framing desynchronised?"
-                            )));
-                            break;
-                        }
-                    };
-                    if let Err(e) = delta.absorb_chunk(&body) {
-                        // A chunk that fails to decompress, fails its CRC, or
-                        // holds an unparseable interior record cannot say which
-                        // of its bytes are lying, so its whole contribution is
-                        // dropped — clip.rs drops the same chunk at extraction.
-                        // The record's framing is intact (its length prefix is
-                        // self-consistent), so it is still consumed: the scan
-                        // skips it and keeps indexing the records behind it.
-                        warn!("absorbing chunk at {offset}: {e:#}; skipping it");
-                    }
-                }
-                op::DATA_END | op::FOOTER => {
-                    ended = true;
-                }
-                _ => {} // Header, message/chunk indexes, attachments, …
-            }
-            if ended {
-                break;
-            }
-            delta.extend_extent(offset, end);
-            offset = end;
-        }
-
-        if let Some(skew) = delta.skew {
-            debug!(
-                "scan pass to offset {offset}: log-vs-publish skew spans [{} ns, {} ns]",
-                skew.min, skew.max
-            );
-        }
-        self.apply_to_current(delta, offset);
-        ScanProgress {
-            offset,
-            ended,
-            fault,
-        }
+/// The tail as a [`WindowPlanner`]: the shared cut path asks its planner which
+/// bytes of which file cover a window and never learns whether the answer came
+/// from a live tail or from a whole-file index over one finished recording.
+impl WindowPlanner for Tailer {
+    /// Snapshot one single-file plan per recording overlapping
+    /// `[start_ns, end_ns]` on `source`, oldest first. A window inside one
+    /// recording yields one plan; one straddling a rollover yields one per source
+    /// file. Empty when no indexed recording covers the window.
+    fn plan_window(&self, start_ns: u64, end_ns: u64, source: TimeSource) -> Vec<WindowPlan> {
+        self.state
+            .lock()
+            .unwrap()
+            .plan_window(start_ns, end_ns, source)
     }
 }
 
@@ -1417,83 +751,20 @@ fn file_len(file: &File) -> Result<u64> {
     Ok(file.metadata().context("stat of tailed file")?.len())
 }
 
-fn read_body(file: &File, offset: u64, len: u64) -> Result<Vec<u8>> {
-    let mut body = vec![0u8; len as usize];
-    file.read_exact_at(&mut body, offset)
-        .with_context(|| format!("reading {len} B record body at {offset}"))?;
-    Ok(body)
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::io::BufWriter;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::SystemTime;
+
+    use clip::index::{MAX_RECORD_LEN, op};
+    // The MCAP fixture writers, shared with `clip`'s own index tests through its
+    // `test-support` feature (a dev-dependency of this crate, so a release build
+    // compiles none of it).
+    use clip::testing::{
+        channel_body, message_body, message_body_pub, raw_record, test_dir, write_raw,
+        write_recording, write_unfinished_recording,
+    };
 
     use super::*;
-
-    /// Write a finished recording with one message per `(topic, log_time)`.
-    pub(crate) fn write_recording(
-        path: &Path,
-        chunked: bool,
-        stamps: &[(&str, u64)],
-    ) -> Result<()> {
-        let opts = if chunked {
-            // A tiny chunk size forces a chunk per message or two, so a test
-            // window spans several chunks.
-            mcap::WriteOptions::new()
-                .use_chunks(true)
-                .compression(Some(mcap::Compression::Zstd))
-                .chunk_size(Some(128))
-        } else {
-            mcap::WriteOptions::new()
-                .use_chunks(false)
-                .compression(None)
-        };
-        write_recording_opts(path, opts, b"payload", stamps)
-    }
-
-    /// [`write_recording`] with explicit writer options and payload, for tests
-    /// that need a specific chunk layout or extent-cap-sized messages.
-    pub(crate) fn write_recording_opts(
-        path: &Path,
-        opts: mcap::WriteOptions,
-        payload: &[u8],
-        stamps: &[(&str, u64)],
-    ) -> Result<()> {
-        let mut writer = opts.create(BufWriter::new(File::create(path)?))?;
-        let mut ids: HashMap<&str, u16> = HashMap::new();
-        for (seq, (topic, log_time)) in stamps.iter().enumerate() {
-            let id = match ids.get(topic) {
-                Some(id) => *id,
-                None => {
-                    let schema =
-                        writer.add_schema("std_msgs/msg/String", "ros2msg", b"string data")?;
-                    let id = writer.add_channel(schema, topic, "cdr", &BTreeMap::new())?;
-                    ids.insert(topic, id);
-                    id
-                }
-            };
-            writer.write_to_known_channel(
-                &mcap::records::MessageHeader {
-                    channel_id: id,
-                    sequence: seq as u32,
-                    log_time: *log_time,
-                    publish_time: *log_time,
-                },
-                payload,
-            )?;
-        }
-        writer.finish()?;
-        Ok(())
-    }
-
-    pub(crate) fn test_dir(name: &str) -> Result<PathBuf> {
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        let path =
-            std::env::temp_dir().join(format!("clipper-{name}-{}-{nanos}", std::process::id()));
-        std::fs::create_dir_all(&path)?;
-        Ok(path)
-    }
 
     /// Drive scan passes the way `tail_file` does until the recording ends, a
     /// pass faults, or a pass makes no progress (the file stopped growing).
@@ -1525,7 +796,7 @@ pub(crate) mod tests {
 
     /// The single plan a one-recording test cuts from on the `log` domain: most
     /// tests window on `log_time`, so this defaults there; [`plan_one_src`] takes
-    /// an explicit source. [`Tailer::plan_window`] returns one plan per
+    /// an explicit source. [`WindowPlanner::plan_window`] returns one plan per
     /// overlapping recording, and these tests index one, so its `Vec` holds at
     /// most one; no overlap becomes an empty plan.
     pub(crate) fn plan_one(tailer: &Tailer, start_ns: u64, end_ns: u64) -> WindowPlan {
@@ -1558,264 +829,6 @@ pub(crate) mod tests {
             guard += 1;
             assert!(guard < 1000, "drain did not converge");
         }
-        Ok(())
-    }
-
-    #[test]
-    fn scan_consumes_only_complete_records_and_resumes() -> Result<()> {
-        let root = test_dir("grow")?;
-        let finished = root.join("finished.mcap");
-        write_recording(
-            &finished,
-            false,
-            &[("/a", 100), ("/a", 200), ("/b", 300), ("/a", 400)],
-        )?;
-        let full = std::fs::read(&finished)?;
-
-        // Expose only a prefix that ends inside some record, as a writer
-        // mid-append would.
-        let growing = root.join("growing.mcap");
-        let cut = full.len() / 2;
-        std::fs::write(&growing, &full[..cut])?;
-
-        let (tailer, coverage) = Tailer::new();
-        let file = Arc::new(File::open(&growing)?);
-        tailer.attach(file.clone());
-
-        let p1 = scan_to_end(&tailer, &file, MAGIC.len() as u64)?;
-        assert!(!p1.ended, "prefix must not look finished");
-        assert!(
-            p1.offset <= cut as u64,
-            "scan must stop at or before the cut ({} > {cut})",
-            p1.offset
-        );
-
-        // The file "grows" to its full content; the scan resumes where it
-        // stopped and runs into DataEnd.
-        std::fs::write(&growing, &full)?;
-        let p2 = scan_to_end(&tailer, &file, p1.offset)?;
-        assert!(p2.ended, "full file ends with DataEnd/Footer");
-
-        let cov = coverage.get();
-        assert_eq!(cov.high_water_ns, 400);
-
-        let plan = plan_one(&tailer, 150, 350);
-        assert!(!plan.extents.is_empty());
-        let topics: Vec<_> = plan.channels.values().map(|c| c.topic.clone()).collect();
-        assert!(topics.contains(&"/a".to_string()) && topics.contains(&"/b".to_string()));
-
-        std::fs::remove_dir_all(root)?;
-        Ok(())
-    }
-
-    #[test]
-    fn scan_harvests_registry_and_times_from_inside_chunks() -> Result<()> {
-        let root = test_dir("chunked")?;
-        let path = root.join("rec.mcap");
-        write_recording(&path, true, &[("/a", 10), ("/b", 20), ("/a", 30)])?;
-
-        let (tailer, coverage) = Tailer::new();
-        let file = Arc::new(File::open(&path)?);
-        tailer.attach(file.clone());
-        let progress = scan_to_end(&tailer, &file, MAGIC.len() as u64)?;
-
-        assert!(progress.ended);
-        assert_eq!(coverage.get().high_water_ns, 30);
-        let plan = plan_one(&tailer, 0, 100);
-        assert_eq!(plan.channels.len(), 2, "channels live inside the chunks");
-        assert!(
-            plan.channels.values().all(|c| c.schema.is_some()),
-            "schemas must be resolved"
-        );
-        assert!(!plan.extents.is_empty());
-
-        std::fs::remove_dir_all(root)?;
-        Ok(())
-    }
-
-    #[test]
-    fn extents_outside_the_window_are_not_planned() -> Result<()> {
-        let root = test_dir("window")?;
-        let path = root.join("rec.mcap");
-        write_recording(&path, false, &[("/a", 100), ("/a", 200)])?;
-
-        let (tailer, _coverage) = Tailer::new();
-        let file = Arc::new(File::open(&path)?);
-        tailer.attach(file.clone());
-        scan_to_end(&tailer, &file, MAGIC.len() as u64)?;
-
-        assert!(plan_one(&tailer, 300, 500).extents.is_empty());
-        assert!(!plan_one(&tailer, 150, 500).extents.is_empty());
-
-        // Inclusive boundaries, exactly at the extent's min/max (100, 200):
-        // a window touching a bound by one nanosecond still plans the extent.
-        assert!(!plan_one(&tailer, 200, 500).extents.is_empty());
-        assert!(plan_one(&tailer, 201, 500).extents.is_empty());
-        assert!(!plan_one(&tailer, 0, 100).extents.is_empty());
-        assert!(plan_one(&tailer, 0, 99).extents.is_empty());
-
-        std::fs::remove_dir_all(root)?;
-        Ok(())
-    }
-
-    /// A length-prefixed top-level record as the writer lays it down.
-    pub(crate) fn raw_record(opcode: u8, body: &[u8]) -> Vec<u8> {
-        let mut rec = vec![opcode];
-        rec.extend_from_slice(&(body.len() as u64).to_le_bytes());
-        rec.extend_from_slice(body);
-        rec
-    }
-
-    /// A conformant `Message` record body (22 fixed bytes + payload) whose
-    /// `publish_time` equals its `log_time` — the common case for tests that do
-    /// not exercise the log/publish split.
-    pub(crate) fn message_body(
-        channel_id: u16,
-        sequence: u32,
-        log_time: u64,
-        payload: &[u8],
-    ) -> Vec<u8> {
-        message_body_pub(channel_id, sequence, log_time, log_time, payload)
-    }
-
-    /// A conformant `Message` record body with an independent `publish_time`,
-    /// for tests asserting the tail carries both stamps.
-    pub(crate) fn message_body_pub(
-        channel_id: u16,
-        sequence: u32,
-        log_time: u64,
-        publish_time: u64,
-        payload: &[u8],
-    ) -> Vec<u8> {
-        let mut body = Vec::new();
-        body.extend_from_slice(&channel_id.to_le_bytes());
-        body.extend_from_slice(&sequence.to_le_bytes());
-        body.extend_from_slice(&log_time.to_le_bytes());
-        body.extend_from_slice(&publish_time.to_le_bytes());
-        body.extend_from_slice(payload);
-        body
-    }
-
-    /// A [`Stamps`] with equal `log` and `publish` spans — the shape every
-    /// helper that stamps `publish_time = log_time` produces.
-    fn same_stamps(min: u64, max: u64) -> Stamps {
-        Stamps {
-            log: Span { min, max },
-            publish: Span { min, max },
-        }
-    }
-
-    /// A `Channel` record body (id, schema_id, topic, encoding, empty metadata).
-    pub(crate) fn channel_body(id: u16, schema_id: u16, topic: &str, encoding: &str) -> Vec<u8> {
-        let mut body = Vec::new();
-        body.extend_from_slice(&id.to_le_bytes());
-        body.extend_from_slice(&schema_id.to_le_bytes());
-        body.extend_from_slice(&(topic.len() as u32).to_le_bytes());
-        body.extend_from_slice(topic.as_bytes());
-        body.extend_from_slice(&(encoding.len() as u32).to_le_bytes());
-        body.extend_from_slice(encoding.as_bytes());
-        body.extend_from_slice(&0u32.to_le_bytes());
-        body
-    }
-
-    /// An uncompressed `Chunk` record body wrapping `records` (each a raw
-    /// length-prefixed interior record), with a caller-supplied
-    /// `uncompressed_crc`. `mcap::read::ChunkReader` yields the interior
-    /// records as it walks and verifies the CRC only at the end of iteration,
-    /// so a deliberately wrong CRC lets a test absorb the messages and then
-    /// fail. `compression` is the chunk's algorithm string (empty for none);
-    /// an unknown string fails `ChunkReader` construction outright.
-    pub(crate) fn chunk_body(
-        compression: &str,
-        uncompressed_crc: u32,
-        records: &[Vec<u8>],
-    ) -> Vec<u8> {
-        let interior: Vec<u8> = records.concat();
-        let mut body = Vec::new();
-        body.extend_from_slice(&0u64.to_le_bytes()); // message_start_time
-        body.extend_from_slice(&0u64.to_le_bytes()); // message_end_time
-        body.extend_from_slice(&(interior.len() as u64).to_le_bytes()); // uncompressed_size
-        body.extend_from_slice(&uncompressed_crc.to_le_bytes());
-        body.extend_from_slice(&(compression.len() as u32).to_le_bytes());
-        body.extend_from_slice(compression.as_bytes());
-        body.extend_from_slice(&(interior.len() as u64).to_le_bytes()); // records length
-        body.extend_from_slice(&interior);
-        body
-    }
-
-    /// The magic followed by the given raw records, as one file.
-    pub(crate) fn write_raw(path: &Path, records: &[Vec<u8>]) -> Result<()> {
-        let mut bytes = MAGIC.to_vec();
-        for rec in records {
-            bytes.extend_from_slice(rec);
-        }
-        std::fs::write(path, bytes)?;
-        Ok(())
-    }
-
-    /// A recording that is still being written: one schemaless channel and its
-    /// messages, with no DataEnd/Footer — exactly the shape a live tail sees.
-    pub(crate) fn write_unfinished_recording(
-        path: &Path,
-        topic: &str,
-        stamps: &[u64],
-    ) -> Result<()> {
-        let mut records = vec![raw_record(op::CHANNEL, &channel_body(1, 0, topic, "cdr"))];
-        for (seq, t) in stamps.iter().enumerate() {
-            records.push(raw_record(
-                op::MESSAGE,
-                &message_body(1, seq as u32, *t, b"payload"),
-            ));
-        }
-        write_raw(path, &records)
-    }
-
-    /// A `Schema` record body (id, name, encoding, length-prefixed data).
-    fn schema_body(id: u16, name: &str, encoding: &str, data: &[u8]) -> Vec<u8> {
-        let mut body = Vec::new();
-        body.extend_from_slice(&id.to_le_bytes());
-        body.extend_from_slice(&(name.len() as u32).to_le_bytes());
-        body.extend_from_slice(name.as_bytes());
-        body.extend_from_slice(&(encoding.len() as u32).to_le_bytes());
-        body.extend_from_slice(encoding.as_bytes());
-        body.extend_from_slice(&(data.len() as u32).to_le_bytes());
-        body.extend_from_slice(data);
-        body
-    }
-
-    #[test]
-    fn schema_following_its_channel_in_one_pass_still_resolves() -> Result<()> {
-        let root = test_dir("schema-after")?;
-        let path = root.join("rec.mcap");
-        // The spec orders Schema before any Channel referencing it; this file
-        // violates that. `apply` inserts a pass's schemas before resolving its
-        // channels, so the inversion still resolves — leniency, not a promise:
-        // a schema arriving only in a *later* pass stays unresolved (see
-        // `dangling_schema_id_yields_a_channel_without_schema`).
-        write_raw(
-            &path,
-            &[
-                raw_record(op::CHANNEL, &channel_body(1, 5, "/x", "cdr")),
-                raw_record(
-                    op::SCHEMA,
-                    &schema_body(5, "std_msgs/msg/String", "ros2msg", b"string data"),
-                ),
-                // A message so the channel's extent carries a time and is
-                // plannable; the registry resolution is what this test checks.
-                raw_record(op::MESSAGE, &message_body(1, 0, 10, b"x")),
-            ],
-        )?;
-
-        let (tailer, _coverage) = Tailer::new();
-        let file = attached(&tailer, &path)?;
-        scan_to_end(&tailer, &file, MAGIC.len() as u64)?;
-
-        let plan = plan_one(&tailer, 0, u64::MAX);
-        let ch = plan.channels.get(&1).expect("channel registered");
-        let schema = ch.schema.as_ref().expect("same-pass schema resolves");
-        assert_eq!(schema.name, "std_msgs/msg/String");
-
-        std::fs::remove_dir_all(root)?;
         Ok(())
     }
 
@@ -1855,400 +868,6 @@ pub(crate) mod tests {
             tailer.current_id().is_none(),
             "a vanished file leaves nothing indexed"
         );
-
-        std::fs::remove_dir_all(root)?;
-        Ok(())
-    }
-
-    #[test]
-    fn oversized_record_length_faults_after_applying_the_good_prefix() -> Result<()> {
-        let root = test_dir("desync")?;
-        let path = root.join("rec.mcap");
-        // A clean prefix — channel + two messages — then a record header whose
-        // declared length is past MAX_RECORD_LEN. The scan applies the prefix,
-        // then faults at the oversized record: there is no resync point, but
-        // the index the prefix built must survive (this is what makes the
-        // bounded retry idempotent — it resumes exactly at the fault offset).
-        let good = [
-            raw_record(op::CHANNEL, &channel_body(1, 0, "/t", "cdr")),
-            raw_record(op::MESSAGE, &message_body(1, 0, 100, b"x")),
-            raw_record(op::MESSAGE, &message_body(1, 1, 200, b"y")),
-        ];
-        let bad_offset = MAGIC.len() as u64 + good.iter().map(|r| r.len() as u64).sum::<u64>();
-        let mut bytes = MAGIC.to_vec();
-        for rec in &good {
-            bytes.extend_from_slice(rec);
-        }
-        bytes.push(op::MESSAGE);
-        bytes.extend_from_slice(&(MAX_RECORD_LEN + 1).to_le_bytes());
-        std::fs::write(&path, bytes)?;
-
-        let (tailer, coverage) = Tailer::new();
-        let file = attached(&tailer, &path)?;
-        let progress = scan_to_end(&tailer, &file, MAGIC.len() as u64)?;
-
-        let fault = progress.fault.expect("the oversized record must fault");
-        let msg = format!("{fault:#}");
-        assert!(
-            msg.contains("framing desynchronised") && msg.contains(&bad_offset.to_string()),
-            "fault must name the framing desync and the offset: {msg}"
-        );
-        assert_eq!(
-            progress.offset, bad_offset,
-            "the fault offset is the oversized record, so a retry resumes there"
-        );
-
-        // The good prefix was applied before the fault.
-        assert_eq!(coverage.get().high_water_ns, 200);
-        assert!(
-            !plan_one(&tailer, 50, 250).extents.is_empty(),
-            "the prefix's extent stays plannable across the fault"
-        );
-
-        std::fs::remove_dir_all(root)?;
-        Ok(())
-    }
-
-    /// A declared length of exactly u64::MAX is the placeholder a seek-back
-    /// (chunked) writer leaves in a Chunk header until it back-patches the real
-    /// value, so the fault names that cause instead of implying corruption.
-    #[test]
-    fn unpatched_placeholder_length_fault_names_the_seek_back_writer() -> Result<()> {
-        let root = test_dir("placeholder")?;
-        let path = root.join("rec.mcap");
-        let mut bytes = MAGIC.to_vec();
-        bytes.push(op::CHUNK);
-        bytes.extend_from_slice(&u64::MAX.to_le_bytes());
-        std::fs::write(&path, bytes)?;
-
-        let (tailer, _coverage) = Tailer::new();
-        let file = attached(&tailer, &path)?;
-        let progress = scan_to_end(&tailer, &file, MAGIC.len() as u64)?;
-
-        let fault = progress.fault.expect("the placeholder length must fault");
-        let msg = format!("{fault:#}");
-        assert!(
-            msg.contains("u64::MAX") && msg.contains("seek-back"),
-            "fault must name the unpatched seek-back placeholder: {msg}"
-        );
-
-        std::fs::remove_dir_all(root)?;
-        Ok(())
-    }
-
-    #[test]
-    fn corrupt_chunk_is_skipped_without_poisoning_the_scan() -> Result<()> {
-        let root = test_dir("badchunk")?;
-        let path = root.join("rec.mcap");
-        // A chunk record whose body is garbage cannot absorb; the scan must
-        // warn, consume it (the framing is intact — the length prefix is
-        // self-consistent), and keep indexing the records behind it, exactly
-        // as clip.rs drops a damaged chunk during extraction.
-        write_raw(
-            &path,
-            &[
-                raw_record(op::CHUNK, &[0xFF; 16]),
-                raw_record(op::CHANNEL, &channel_body(1, 0, "/t", "cdr")),
-                raw_record(op::MESSAGE, &message_body(1, 0, 42, b"x")),
-            ],
-        )?;
-
-        let (tailer, coverage) = Tailer::new();
-        let file = attached(&tailer, &path)?;
-        let progress = scan_to_end(&tailer, &file, MAGIC.len() as u64)?;
-        assert_eq!(
-            progress.offset,
-            file.metadata()?.len(),
-            "the bad chunk and the good records after it are all consumed"
-        );
-        assert_eq!(coverage.get().high_water_ns, 42);
-
-        let plan = plan_one(&tailer, 0, 100);
-        assert!(!plan.extents.is_empty(), "the good message is indexed");
-        let ch = plan
-            .channels
-            .get(&1)
-            .expect("channel after the chunk registered");
-        assert_eq!(ch.topic, "/t");
-
-        std::fs::remove_dir_all(root)?;
-        Ok(())
-    }
-
-    #[test]
-    fn chunk_failing_its_crc_contributes_nothing() -> Result<()> {
-        let root = test_dir("chunk-rollback")?;
-        let path = root.join("rec.mcap");
-        // A chunk whose interior is a valid channel + message but whose
-        // uncompressed_crc is wrong: ChunkReader yields both records and only
-        // fails the CRC at the end of iteration. Because extraction would drop
-        // the whole chunk, the scan must claim none of it — no channel
-        // registered, no time folded into coverage or extent bounds — even
-        // though the records absorbed cleanly before the CRC check failed.
-        let chunk = chunk_body(
-            "",
-            0xDEAD_BEEF, // not the real CRC of the interior
-            &[
-                raw_record(op::CHANNEL, &channel_body(1, 0, "/inside", "cdr")),
-                raw_record(op::MESSAGE, &message_body(1, 0, 500, b"x")),
-            ],
-        );
-        // A good message after the chunk proves the scan keeps going.
-        write_raw(
-            &path,
-            &[
-                raw_record(op::CHUNK, &chunk),
-                raw_record(op::CHANNEL, &channel_body(2, 0, "/after", "cdr")),
-                raw_record(op::MESSAGE, &message_body(2, 0, 700, b"y")),
-            ],
-        )?;
-
-        let (tailer, coverage) = Tailer::new();
-        let file = attached(&tailer, &path)?;
-        let progress = scan_to_end(&tailer, &file, MAGIC.len() as u64)?;
-        assert_eq!(
-            progress.offset,
-            file.metadata()?.len(),
-            "the chunk and the records after it are all consumed"
-        );
-        assert_eq!(
-            coverage.get().high_water_ns,
-            700,
-            "the dropped chunk's message (500) never reaches coverage"
-        );
-
-        let plan = plan_one(&tailer, 0, u64::MAX);
-        assert!(
-            plan.channels.contains_key(&2),
-            "the post-chunk channel registers"
-        );
-        assert!(
-            !plan.channels.contains_key(&1),
-            "the failed chunk's channel must not register"
-        );
-        // No extent may claim the dropped message's log_time (500); only the
-        // good post-chunk message (700) is in the bounds.
-        for e in &plan.extents {
-            if let Some(s) = e.time {
-                assert!(
-                    !(s.log.min <= 500 && 500 <= s.log.max),
-                    "extent {e:?} must not cover the dropped message's time"
-                );
-            }
-        }
-
-        std::fs::remove_dir_all(root)?;
-        Ok(())
-    }
-
-    #[test]
-    fn unsupported_chunk_compression_is_skipped() -> Result<()> {
-        let root = test_dir("chunk-compression")?;
-        let path = root.join("rec.mcap");
-        // A spec-legal chunk whose compression algorithm this build does not
-        // support: ChunkReader construction fails, so the chunk is skipped
-        // whole rather than poisoning the scan — the records behind it index.
-        let chunk = chunk_body(
-            "custom-xyz",
-            0,
-            &[raw_record(op::MESSAGE, &message_body(1, 0, 100, b"x"))],
-        );
-        write_raw(
-            &path,
-            &[
-                raw_record(op::CHUNK, &chunk),
-                raw_record(op::CHANNEL, &channel_body(9, 0, "/after", "cdr")),
-                raw_record(op::MESSAGE, &message_body(9, 0, 300, b"y")),
-            ],
-        )?;
-
-        let (tailer, coverage) = Tailer::new();
-        let file = attached(&tailer, &path)?;
-        let progress = scan_to_end(&tailer, &file, MAGIC.len() as u64)?;
-        assert_eq!(
-            progress.offset,
-            file.metadata()?.len(),
-            "all records consumed"
-        );
-        assert_eq!(coverage.get().high_water_ns, 300);
-        assert!(
-            plan_one(&tailer, 0, u64::MAX).channels.contains_key(&9),
-            "data after the unsupported chunk still indexes"
-        );
-
-        std::fs::remove_dir_all(root)?;
-        Ok(())
-    }
-
-    #[test]
-    fn unparseable_top_level_channel_is_skipped() -> Result<()> {
-        let root = test_dir("bad-channel")?;
-        let path = root.join("rec.mcap");
-        // A Channel record whose topic field carries invalid UTF-8 bytes:
-        // mcap::parse_record fails on it. The scan must warn, consume the
-        // record (its framing is intact), and keep indexing — the same
-        // leniency the CHUNK arm already gives a damaged chunk.
-        let mut bad_channel = Vec::new();
-        bad_channel.extend_from_slice(&1u16.to_le_bytes()); // id
-        bad_channel.extend_from_slice(&0u16.to_le_bytes()); // schema_id
-        bad_channel.extend_from_slice(&2u32.to_le_bytes()); // topic length
-        bad_channel.extend_from_slice(&[0xFF, 0xFE]); // invalid UTF-8 topic
-        bad_channel.extend_from_slice(&(3u32).to_le_bytes()); // encoding length
-        bad_channel.extend_from_slice(b"cdr");
-        bad_channel.extend_from_slice(&0u32.to_le_bytes()); // empty metadata
-
-        write_raw(
-            &path,
-            &[
-                raw_record(op::CHANNEL, &bad_channel),
-                raw_record(op::CHANNEL, &channel_body(2, 0, "/good", "cdr")),
-                raw_record(op::MESSAGE, &message_body(2, 0, 55, b"x")),
-            ],
-        )?;
-
-        let (tailer, coverage) = Tailer::new();
-        let file = attached(&tailer, &path)?;
-        let progress = scan_to_end(&tailer, &file, MAGIC.len() as u64)?;
-        assert_eq!(
-            progress.offset,
-            file.metadata()?.len(),
-            "all records consumed"
-        );
-        assert_eq!(coverage.get().high_water_ns, 55);
-
-        let plan = plan_one(&tailer, 0, 100);
-        assert!(
-            !plan.channels.contains_key(&1),
-            "the unparseable channel must not register"
-        );
-        let ch = plan.channels.get(&2).expect("the good channel registers");
-        assert_eq!(ch.topic, "/good");
-
-        std::fs::remove_dir_all(root)?;
-        Ok(())
-    }
-
-    #[test]
-    fn runt_message_is_consumed_without_poisoning_the_index() -> Result<()> {
-        let root = test_dir("runt")?;
-        let path = root.join("rec.mcap");
-        // First record: a Message too short to even hold a log_time. The scan
-        // must warn, consume it (the framing is self-consistent) and keep
-        // indexing the records behind it.
-        write_raw(
-            &path,
-            &[
-                raw_record(op::MESSAGE, &[0xAA; 4]),
-                raw_record(op::MESSAGE, &message_body(1, 0, 42, b"x")),
-            ],
-        )?;
-
-        let (tailer, coverage) = Tailer::new();
-        let file = attached(&tailer, &path)?;
-        let progress = scan_to_end(&tailer, &file, MAGIC.len() as u64)?;
-        assert_eq!(
-            progress.offset,
-            file.metadata()?.len(),
-            "both records consumed"
-        );
-        assert_eq!(coverage.get().high_water_ns, 42);
-
-        let plan = plan_one(&tailer, 0, 100);
-        assert_eq!(plan.extents.len(), 1);
-        assert_eq!(
-            plan.extents[0].time,
-            Some(same_stamps(42, 42)),
-            "the runt contributes no time bound"
-        );
-
-        std::fs::remove_dir_all(root)?;
-        Ok(())
-    }
-
-    #[test]
-    fn bare_magic_or_partial_header_makes_no_progress() -> Result<()> {
-        let root = test_dir("stub")?;
-        let path = root.join("rec.mcap");
-        let mut bytes = MAGIC.to_vec();
-        bytes.extend_from_slice(&[0x05, 0x01, 0x02, 0x03, 0x04]); // 5 of 9 header bytes
-        std::fs::write(&path, bytes)?;
-
-        let (tailer, coverage) = Tailer::new();
-        let file = attached(&tailer, &path)?;
-        let start = MAGIC.len() as u64;
-
-        // Only the magic on disk: nothing to scan, nothing to fault on.
-        let p = tailer.scan_available(&file, start, start);
-        assert_eq!(p.offset, start);
-        assert!(!p.ended && p.fault.is_none());
-
-        // A record header still being appended: same outcome.
-        let p = tailer.scan_available(&file, start, file.metadata()?.len());
-        assert_eq!(p.offset, start);
-        assert!(!p.ended && p.fault.is_none());
-        assert_eq!(coverage.get().high_water_ns, 0);
-
-        std::fs::remove_dir_all(root)?;
-        Ok(())
-    }
-
-    #[test]
-    fn out_of_order_stamps_keep_high_water_and_widen_extent_bounds() -> Result<()> {
-        let root = test_dir("ooo")?;
-        let path = root.join("rec.mcap");
-        write_recording(&path, false, &[("/a", 100), ("/a", 50)])?;
-
-        let (tailer, coverage) = Tailer::new();
-        let file = Arc::new(File::open(&path)?);
-        tailer.attach(file.clone());
-        scan_to_end(&tailer, &file, MAGIC.len() as u64)?;
-
-        assert_eq!(
-            coverage.get().high_water_ns,
-            100,
-            "high water never moves backwards"
-        );
-        let plan = plan_one(&tailer, 40, 60);
-        assert_eq!(plan.extents.len(), 1, "the late stamp widens the bounds");
-        assert_eq!(plan.extents[0].time, Some(same_stamps(50, 100)));
-
-        std::fs::remove_dir_all(root)?;
-        Ok(())
-    }
-
-    #[test]
-    fn extents_close_at_the_cap_and_tile_contiguously() -> Result<()> {
-        let root = test_dir("cap")?;
-        let path = root.join("rec.mcap");
-        let payload = vec![0u8; 1 << 20]; // 1 MiB per message, ~9 MiB total
-        let stamps: Vec<(&str, u64)> = (1..=9).map(|i| ("/big", i)).collect();
-        write_recording_opts(
-            &path,
-            mcap::WriteOptions::new()
-                .use_chunks(false)
-                .compression(None),
-            &payload,
-            &stamps,
-        )?;
-
-        let (tailer, _coverage) = Tailer::new();
-        let file = Arc::new(File::open(&path)?);
-        tailer.attach(file.clone());
-        scan_to_end(&tailer, &file, MAGIC.len() as u64)?;
-
-        let plan = plan_one(&tailer, 0, u64::MAX);
-        assert!(plan.extents.len() >= 2, "the cap must have closed extents");
-        assert_eq!(plan.extents[0].offset, MAGIC.len() as u64);
-        for pair in plan.extents.windows(2) {
-            assert_eq!(
-                pair[1].offset,
-                pair[0].offset + pair[0].len,
-                "extents tile the data section with no gap or overlap"
-            );
-        }
-        for e in &plan.extents[..plan.extents.len() - 1] {
-            assert!(e.len >= EXTENT_CAP_BYTES, "closed extents reached the cap");
-        }
 
         std::fs::remove_dir_all(root)?;
         Ok(())
@@ -2417,34 +1036,6 @@ pub(crate) mod tests {
             .open(&old)?
             .set_modified(SystemTime::now())?;
         assert_eq!(newest_mcap(&root), Some(old));
-
-        std::fs::remove_dir_all(root)?;
-        Ok(())
-    }
-
-    #[test]
-    fn dangling_schema_id_yields_a_channel_without_schema() -> Result<()> {
-        let root = test_dir("dangling")?;
-        let path = root.join("rec.mcap");
-        // A Channel referencing schema 7, which never appears on disk —
-        // either corruption or a schema record still in flight. The channel
-        // must still register (messages on it are clippable, schemaless).
-        write_raw(
-            &path,
-            &[
-                raw_record(op::CHANNEL, &channel_body(1, 7, "/raw", "cdr")),
-                raw_record(op::MESSAGE, &message_body(1, 0, 10, b"x")),
-            ],
-        )?;
-
-        let (tailer, _coverage) = Tailer::new();
-        let file = attached(&tailer, &path)?;
-        scan_to_end(&tailer, &file, MAGIC.len() as u64)?;
-
-        let plan = plan_one(&tailer, 0, 100);
-        let ch = plan.channels.get(&1).expect("channel registered");
-        assert_eq!(ch.topic, "/raw");
-        assert!(ch.schema.is_none());
 
         std::fs::remove_dir_all(root)?;
         Ok(())
@@ -2633,263 +1224,6 @@ pub(crate) mod tests {
 
         // Detached: it loops forever against split 1 and dies with the process.
         drop(handle);
-        std::fs::remove_dir_all(root)?;
-        Ok(())
-    }
-
-    // ── trigger tap ─────────────────────────────────────────────────────────
-
-    /// A top-level message on the tapped topic is lifted whole as a
-    /// `TriggerRecord` and sent down the tap the instant its framing is read;
-    /// messages on other topics contribute only their timestamp.
-    #[test]
-    fn tap_lifts_a_top_level_trigger_message() -> Result<()> {
-        let root = test_dir("tap-toplevel")?;
-        let path = root.join("rec.mcap");
-        write_raw(
-            &path,
-            &[
-                raw_record(op::CHANNEL, &channel_body(1, 0, "/trig", "cdr")),
-                raw_record(op::MESSAGE, &message_body(1, 0, 500, b"PAYLOAD")),
-                raw_record(op::CHANNEL, &channel_body(2, 0, "/data", "cdr")),
-                raw_record(op::MESSAGE, &message_body(2, 0, 600, b"ignored")),
-            ],
-        )?;
-
-        let (tx, rx) = crossbeam_channel::unbounded();
-        let (tailer, _coverage) = Tailer::with_trigger_tap("/trig", tx);
-        let file = attached(&tailer, &path)?;
-        scan_to_end(&tailer, &file, MAGIC.len() as u64)?;
-
-        let lifted: Vec<_> = rx.try_iter().collect();
-        assert_eq!(lifted.len(), 1, "only the trigger-topic message is lifted");
-        assert_eq!(lifted[0].message_encoding, "cdr");
-        assert_eq!(lifted[0].body, b"PAYLOAD");
-        assert_eq!(lifted[0].log_time, 500);
-
-        std::fs::remove_dir_all(root)?;
-        Ok(())
-    }
-
-    /// A message on the tapped topic that lives inside a chunk is lifted too, but
-    /// only after the chunk iterates cleanly (real chunked writer, valid CRC).
-    #[test]
-    fn tap_lifts_a_chunk_interior_trigger_message() -> Result<()> {
-        let root = test_dir("tap-chunk")?;
-        let path = root.join("rec.mcap");
-        write_recording(&path, true, &[("/trig", 700), ("/data", 800)])?;
-
-        let (tx, rx) = crossbeam_channel::unbounded();
-        let (tailer, _coverage) = Tailer::with_trigger_tap("/trig", tx);
-        let file = Arc::new(File::open(&path)?);
-        tailer.attach(file.clone());
-        scan_to_end(&tailer, &file, MAGIC.len() as u64)?;
-
-        let lifted: Vec<_> = rx.try_iter().collect();
-        assert_eq!(lifted.len(), 1, "the chunk-interior trigger is lifted");
-        assert_eq!(lifted[0].message_encoding, "cdr");
-        assert_eq!(lifted[0].body, b"payload");
-        assert_eq!(lifted[0].log_time, 700);
-
-        std::fs::remove_dir_all(root)?;
-        Ok(())
-    }
-
-    /// The failure path for the chunk's all-or-nothing staging: a trigger lifted
-    /// from inside a chunk that then fails its CRC must never reach the tap. The
-    /// sub-delta is discarded whole, so the staged trigger is dropped with it; a
-    /// good trigger after the chunk still lifts.
-    #[test]
-    fn a_damaged_chunk_lifts_no_trigger() -> Result<()> {
-        let root = test_dir("tap-bad-chunk")?;
-        let path = root.join("rec.mcap");
-        let chunk = chunk_body(
-            "",
-            0xDEAD_BEEF, // not the real interior CRC — ChunkReader fails at the end
-            &[
-                raw_record(op::CHANNEL, &channel_body(1, 0, "/trig", "cdr")),
-                raw_record(op::MESSAGE, &message_body(1, 0, 500, b"DROPPED")),
-            ],
-        );
-        write_raw(
-            &path,
-            &[
-                raw_record(op::CHUNK, &chunk),
-                raw_record(op::CHANNEL, &channel_body(2, 0, "/trig", "cdr")),
-                raw_record(op::MESSAGE, &message_body(2, 0, 900, b"GOOD")),
-            ],
-        )?;
-
-        let (tx, rx) = crossbeam_channel::unbounded();
-        let (tailer, _coverage) = Tailer::with_trigger_tap("/trig", tx);
-        let file = attached(&tailer, &path)?;
-        scan_to_end(&tailer, &file, MAGIC.len() as u64)?;
-
-        let lifted: Vec<_> = rx.try_iter().collect();
-        assert_eq!(
-            lifted.len(),
-            1,
-            "the damaged chunk's trigger is dropped; only the post-chunk one lifts"
-        );
-        assert_eq!(lifted[0].body, b"GOOD");
-        assert_eq!(lifted[0].log_time, 900);
-
-        std::fs::remove_dir_all(root)?;
-        Ok(())
-    }
-
-    /// A trigger-topic message shorter than the 22-byte fixed header cannot
-    /// yield both stamps, so it is skipped like other localized damage: no
-    /// `TriggerRecord` is lifted and its time reaches neither coverage nor the
-    /// extent bounds (a warning, the framing intact).
-    #[test]
-    fn a_runt_trigger_message_lifts_nothing() -> Result<()> {
-        let root = test_dir("tap-runt")?;
-        let path = root.join("rec.mcap");
-        let mut runt = Vec::new();
-        runt.extend_from_slice(&1u16.to_le_bytes()); // channel_id
-        runt.extend_from_slice(&0u32.to_le_bytes()); // sequence
-        runt.extend_from_slice(&500u64.to_le_bytes()); // log_time — 14 bytes, < 22
-        write_raw(
-            &path,
-            &[
-                raw_record(op::CHANNEL, &channel_body(1, 0, "/trig", "cdr")),
-                raw_record(op::MESSAGE, &runt),
-            ],
-        )?;
-
-        let (tx, rx) = crossbeam_channel::unbounded();
-        let (tailer, coverage) = Tailer::with_trigger_tap("/trig", tx);
-        let file = attached(&tailer, &path)?;
-        scan_to_end(&tailer, &file, MAGIC.len() as u64)?;
-
-        assert!(
-            rx.try_iter().next().is_none(),
-            "a runt trigger message lifts no TriggerRecord"
-        );
-        assert_eq!(
-            coverage.get().high_water_ns,
-            0,
-            "a header too short for both stamps is skipped, advancing nothing"
-        );
-
-        std::fs::remove_dir_all(root)?;
-        Ok(())
-    }
-
-    /// The extent index and the recording's [`TimeBounds`] carry the min/max of
-    /// both `log_time` and `publish_time`, independently. `log_time` ascends
-    /// while `publish_time` is out of order, so the two spans differ and neither
-    /// contaminates the other. Coverage stays `log_time` only.
-    #[test]
-    fn extent_and_bounds_carry_both_stamps() -> Result<()> {
-        let root = test_dir("both-stamps")?;
-        let path = root.join("rec.mcap");
-        write_raw(
-            &path,
-            &[
-                raw_record(op::CHANNEL, &channel_body(1, 0, "/t", "cdr")),
-                raw_record(op::MESSAGE, &message_body_pub(1, 0, 100, 1_000, b"a")),
-                raw_record(op::MESSAGE, &message_body_pub(1, 1, 200, 900, b"b")),
-                raw_record(op::MESSAGE, &message_body_pub(1, 2, 300, 1_100, b"c")),
-            ],
-        )?;
-
-        let (tailer, coverage) = Tailer::new();
-        let file = attached(&tailer, &path)?;
-        scan_to_end(&tailer, &file, MAGIC.len() as u64)?;
-
-        // Coverage is the max log_time, never a publish_time.
-        assert_eq!(coverage.get().high_water_ns, 300);
-
-        let plan = plan_one(&tailer, 0, u64::MAX);
-        assert_eq!(plan.extents.len(), 1, "the three messages fit one extent");
-        assert_eq!(
-            plan.extents[0].time,
-            Some(Stamps {
-                log: Span { min: 100, max: 300 },
-                publish: Span {
-                    min: 900,
-                    max: 1_100,
-                },
-            }),
-            "the extent carries min/max of both stamps independently"
-        );
-
-        // The recording's TimeBounds carry both spans too.
-        let bounds = {
-            let st = tailer.state.lock().unwrap();
-            st.recordings.front().expect("one recording indexed").bounds
-        };
-        assert_eq!(bounds.log, Span { min: 100, max: 300 });
-        assert_eq!(
-            bounds.publish,
-            Span {
-                min: 900,
-                max: 1_100
-            }
-        );
-        assert!(bounds.has_messages);
-
-        std::fs::remove_dir_all(root)?;
-        Ok(())
-    }
-
-    /// A `Message` whose body holds `log_time` but stops short of the full
-    /// 22-byte fixed header (`len` in `[14, 21]`) cannot yield both stamps, so
-    /// it is skipped like other localized damage: consumed via its intact
-    /// framing, contributing to neither coverage nor the extent bounds. The
-    /// good message behind the two runts still indexes.
-    #[test]
-    fn a_message_missing_publish_time_is_skipped_cleanly() -> Result<()> {
-        let root = test_dir("short-header")?;
-        let path = root.join("rec.mcap");
-        // 21 bytes: the full log fields plus a publish_time one byte short.
-        let mut short21 = Vec::new();
-        short21.extend_from_slice(&1u16.to_le_bytes()); // channel_id
-        short21.extend_from_slice(&0u32.to_le_bytes()); // sequence
-        short21.extend_from_slice(&400u64.to_le_bytes()); // log_time
-        short21.extend_from_slice(&[0u8; 7]); // publish_time, one byte short
-        // 14 bytes: log_time present, publish_time entirely absent.
-        let mut short14 = Vec::new();
-        short14.extend_from_slice(&1u16.to_le_bytes()); // channel_id
-        short14.extend_from_slice(&0u32.to_le_bytes()); // sequence
-        short14.extend_from_slice(&500u64.to_le_bytes()); // log_time only
-        write_raw(
-            &path,
-            &[
-                raw_record(op::CHANNEL, &channel_body(1, 0, "/t", "cdr")),
-                raw_record(op::MESSAGE, &short21),
-                raw_record(op::MESSAGE, &short14),
-                raw_record(op::MESSAGE, &message_body_pub(1, 3, 700, 650, b"good")),
-            ],
-        )?;
-
-        let (tailer, coverage) = Tailer::new();
-        let file = attached(&tailer, &path)?;
-        let progress = scan_to_end(&tailer, &file, MAGIC.len() as u64)?;
-        assert_eq!(
-            progress.offset,
-            file.metadata()?.len(),
-            "both runts and the good message are all consumed"
-        );
-        assert_eq!(
-            coverage.get().high_water_ns,
-            700,
-            "neither short-header record advances coverage"
-        );
-
-        let plan = plan_one(&tailer, 0, u64::MAX);
-        assert_eq!(plan.extents.len(), 1);
-        assert_eq!(
-            plan.extents[0].time,
-            Some(Stamps {
-                log: Span { min: 700, max: 700 },
-                publish: Span { min: 650, max: 650 },
-            }),
-            "the short-header records fold no time into the bounds"
-        );
-
         std::fs::remove_dir_all(root)?;
         Ok(())
     }
