@@ -27,6 +27,10 @@ signal-hook.workspace = true
 # trigger decoder and the two r2r message conversions; `clap` makes `TimeSource`
 # a `ValueEnum` for the `--time-source` flag.
 clip = { path = "../clip", features = ["ros", "clap"] }
+# Live tailing over `clip`: recording discovery, the recording collection and its
+# lifecycle, coverage, retention, and the per-trigger waits a cut from a growing
+# file needs before the shared cut path runs.
+tail = { path = "../tail" }
 # MCAP write options for the clip compression flag; the record parsing itself
 # lives in `clip`.
 mcap.workspace = true
@@ -51,6 +55,8 @@ libc = "0.2"
 # Test structuring: expands the storage-profile matrix into per-case tests
 # that nextest runs as isolated processes.
 rstest = "0.26"
+# `Watch`'s test-only setter, which the admission-gate test drives waiters with.
+tail = { path = "../tail", features = ["test-support"] }
 # Reading back the JSON trigger payloads the e2e harness writes into a recording.
 serde_json = "1"
 # `clip::testing`, behind clip's `test-support` feature: the MCAP fixture writers

@@ -2,6 +2,13 @@
 
 A *triggered* clip recorder over a **continuous `ros2 bag record`** output. It keeps the growing recording(s) open and **tails them**, so a clip can be cut as soon as the data is physically on disk: clip latency is bounded by the recorder's write-through latency. Built on [r2r](https://github.com/sequenceplanner/r2r) over plain OS threads — there is no async runtime.
 
+The recorder is three crates — [`clip`](../clip), [`tail`](../tail), and this
+binary — and this document is the internals of all three. The workspace
+[CLAUDE.md](../../CLAUDE.md) points here for them, so the two libraries' seams
+and invariants are written down here, in the recorder's directory, rather than
+each in its own crate: they only make sense read together, and the recorder is
+the one thing that reads them together.
+
 ## The pipeline it sits in
 
 ```
@@ -32,31 +39,41 @@ interface that file path is also the *trigger* path: the continuous recording
 must capture the trigger topic (`ros2 bag record --all`) so clipper can lift the
 triggers back out of it.
 
-## Two crates, one design
+## Three crates, two lines
 
-The recorder is two crates split at one line: **what a live tail adds** is
-`clipper`, **what every consumer of a recording shares** is
-[`clip`](../clip). `clip` holds the MCAP format layer and its recording index
-(`clip::index`), the copy that cuts a window out of one (`clip::cut`), the
-neutral trigger and completion contract (`clip::trigger`, `clip::decode`), and
-the segment assembly that turns one window into published clips
-(`clip::segment`). `clipper` adds discovery, the recording collection and its
-lifecycle, coverage, retention, the scan-fault budget, the two interfaces,
-configuration and supervision. The per-module table is in
-[ARCHITECTURE.md](../../ARCHITECTURE.md#module-map); this document covers both
-halves, because the seams below only make sense read together.
+**What every consumer of a recording shares** is [`clip`](../clip): the MCAP
+format layer and its recording index (`clip::index`), the copy that cuts a
+window out of one (`clip::cut`), the neutral trigger and completion contract
+(`clip::trigger`, `clip::decode`), and the segment assembly that turns one
+window into published clips (`clip::segment`).
 
-**`clip` builds with no ROS toolchain.** Its default feature set pulls no r2r,
-so a consumer cutting clips out of a finished recording on a plain Linux host
-runs the same format layer and the same copy the device runs. The
-`clip (ROS-free)` CI job holds that property down: it asserts
-`cargo tree -p clip` names no r2r, then builds, clippies and tests the crate on
-a stock stable toolchain with no nix and no ROS on `PATH` — so a dependency
-that escapes the feature gate turns that job red in seconds instead of
-surfacing as a missing rmw at link time in a downstream build that has no ROS
-at all.
+**What following a recording still being written adds** is [`tail`](../tail):
+discovery, the recording collection and its lifecycle, coverage, retention, the
+scan-fault budget, and — in `tail::handler` — the two waits a cut from a growing
+file must clear before the shared cut path runs. A consumer cutting from a
+recording nobody is writing links `clip` alone: no successor to find, no
+lifecycle to run, nothing to wait for.
 
-Three cargo features, all off by default:
+**What is left is the binary**, three files in this crate: the two interfaces and
+their announcers (`src/interface.rs`), and the clap `Config`, the admission gate
+and the thread supervision (`src/main.rs`, `src/supervision.rs`). Telling ROS
+from MCAP, taking configuration, and deciding what to do when a thread dies is
+the whole of what a device recorder adds over the two libraries. The per-module
+table is in [ARCHITECTURE.md](../../ARCHITECTURE.md#module-map).
+
+**Both libraries build with no ROS toolchain.** Neither default feature set
+pulls r2r, so a consumer cutting clips out of a recording on a plain Linux host
+runs the same format layer, the same copy, and — while the recording is still
+being written — the same tail the device runs. The `libraries` CI job
+(`clip + tail (ROS-free)`) holds that property down for both: it asserts
+`cargo tree` names no r2r in either crate's default tree *before* anything is
+compiled, then clippies and tests both with `-D warnings` on a stock stable
+toolchain with no nix and no ROS on `PATH` — so a dependency that escapes the
+feature gate turns that job red in seconds instead of surfacing as a missing rmw
+at link time in a downstream build that has no ROS at all. Only this crate needs
+r2r, and so only this crate needs the dev shell.
+
+`clip` carries three cargo features, all off by default:
 
 - **`ros`** — the `cdr` arm of the trigger decoder and the two r2r message
   conversions (`momentedge_msgs/Trigger` → `Trigger`, `Completion` →
@@ -72,36 +89,45 @@ Three cargo features, all off by default:
   enables it under `[dev-dependencies]`, where the v2+ resolver keeps it out of
   a release build.
 
-The recorder enables `ros` + `clap` normally and `test-support` under
-`[dev-dependencies]`.
+`tail` carries one, the same shape:
 
-**The window-plan seam** is what leaves the cut path indifferent to which half
-it runs in. `clip::index::WindowPlanner` is one method — `plan_window(start_ns,
-end_ns, source) -> Vec<WindowPlan>` — and `clip::segment::cut_window` takes a
-`&dyn WindowPlanner` and never learns which it holds. `Tailer` implements it
-over its live collection, so a window straddling a rollover yields one plan per
-source recording; a whole-file index over one finished recording implements it
-too, yielding at most one.
+- **`test-support`** — publishes `Watch`'s unconditional `get` and
+  `send_replace`. Nothing in the tail itself calls either — coverage rises
+  through `send_if_modified` — so they exist only to drive a waiter from a
+  test: the recorder's admission-gate test parks a full 16 handlers on a
+  `Watch<bool>` and frees them all with one `send_replace`.
+
+The recorder enables clip's `ros` + `clap` normally, and both crates'
+`test-support` under `[dev-dependencies]`.
+
+**The window-plan seam** is what leaves the cut path indifferent to which side
+of the line it runs on. `clip::index::WindowPlanner` is one method —
+`plan_window(start_ns, end_ns, source) -> Vec<WindowPlan>` — and
+`clip::segment::cut_window` takes a `&dyn WindowPlanner` and never learns which
+it holds. `tail::Tailer` implements it over its live collection, so a window
+straddling a rollover yields one plan per source recording; a whole-file index
+over one finished recording implements it too, yielding at most one.
 
 **The line falls where lifecycle begins.** `clip::index::RecordingIndex` is the
 pure per-recording index — path, file, scan offset, magic check, extents,
 schema/channel registry, trigger channels, time bounds — and knows nothing of
-any other recording. The tail wraps it in its own `Recording { id, state, index }`:
-the id fixing this recording's place in time order and the `New`/`Tailing`/`Ended`
+any other recording. `tail` wraps it in `Recording { id, state, index }`: the id
+fixing this recording's place in time order and the `New`/`Tailing`/`Ended`
 state are exactly what *tailing* adds, and a consumer cutting from a finished
-file needs neither. Coverage and its watch, retention and discovery stay on the
-tail's side of the line for the same reason — they are about tailing a growing
-file, not about a recording.
+file needs neither. Coverage and its watch, retention and discovery stay on
+`tail`'s side of the line for the same reason — they are about following a
+growing file, not about a recording.
 
-## Why tailing a live MCAP is sound (`clip::index` + `tail.rs`)
+## Why tailing a live MCAP is sound (`clip::index` + `tail`)
 
 One design in two halves. The **format** reasoning — why bytes already on disk
 can be read while the writer is still appending, what a pass over them yields,
 and how much damage a pass survives — is `clip::index`, shared with every
 consumer of a recording. The **tailing** reasoning — discovery, the recording
 collection and its lifecycle, coverage, and what to do when a pass faults — is
-`crates/clipper/src/tail.rs`. Neither half stands alone, so both are below, each
-attributed to where its code lives.
+`tail`: `crates/tail/src/tailer.rs`, with discovery in
+`crates/tail/src/discover.rs`. Neither half stands alone, so both are below,
+each attributed to where its code lives.
 
 Two properties of the format carry the whole design (`clip::index`):
 
@@ -165,11 +191,11 @@ the third the tail's own:
   records *inside* chunks, so chunks are decompressed during the tail
   (zstd, lz4 and uncompressed chunks all work — mcap's default features);
   the default fastwrite profile is unchunked and skips that cost entirely.
-- **Coverage watch** — a `Watch<Coverage>` (`Mutex` + `Condvar`, `src/watch.rs`)
-  holding a collection-wide high-water per source: the highest `log_time`
-  (`high_water_ns`) and the highest `publish_time` (`publish_high_water_ns`),
-  recomputed from every indexed recording's bounds each time a delta is applied.
-  It is the tail's and not the index's precisely because it spans the whole
+- **Coverage watch** — a `tail::Watch<Coverage>` (`Mutex` + `Condvar`,
+  `crates/tail/src/watch.rs`) holding a collection-wide high-water per source:
+  the highest `log_time` (`high_water_ns`) and the highest `publish_time`
+  (`publish_high_water_ns`), recomputed from every indexed recording's bounds
+  each time a delta is applied. It is the tail's and not the index's precisely because it spans the whole
   collection — only something holding all the recordings can say how far they
   provably reach. A handler waits on the high-water of its window's
   [time source](#time-source).
@@ -244,14 +270,14 @@ budget exists to prevent.
 
 **Recorder restarts and bag splits** are the tail's alone — a consumer of one
 finished recording has no successor to find and no lifecycle to run. Recordings
-are discovered by `discover::NewFileWatchIterator` (`src/discover.rs`), a lazy
-iterator that yields new `*.mcap` files one per `next()`. Each poll drains it;
-each yielded path is opened and inserted as a `New` recording into the
-collection (`TailState`), pairing a fresh `RecordingIndex` with the id and state
-that place it among the others. Files are tracked by
-`(dev, ino)` **identity**, not a timestamp cursor: a file under tail grows and
-its mtime (and ctime) advances, so a cursor would re-yield it every poll and
-index the same recording as a phantom duplicate. The iterator records the inode
+are discovered by `tail::discover::NewFileWatchIterator`
+(`crates/tail/src/discover.rs`), a lazy iterator that yields new `*.mcap` files
+one per `next()`. Each poll drains it; each yielded path is opened and inserted
+as a `New` recording into the collection (`TailState`), pairing a fresh
+`RecordingIndex` with the id and state that place it among the others. Files are
+tracked by `(dev, ino)` **identity**, not a timestamp cursor: a file under tail
+grows and its mtime (and ctime) advances, so a cursor would re-yield it every
+poll and index the same recording as a phantom duplicate. The iterator records the inode
 of every file it yields and never yields it again, forgetting inodes no longer on
 disk (so the set stays bounded and a reused inode yields its new file). mtime
 orders the unseen files oldest-first, so several appearing between polls drain in
@@ -278,23 +304,23 @@ file whose first eight bytes are wrong can never become a valid MCAP. A `NotFoun
 when opening a discovered path (the file vanished between discovery and open) is
 silently skipped; the iterator has already advanced past it.
 
-## Per-trigger flow (`handler.rs` + `clip::segment`)
+## Per-trigger flow (`tail::handler` + `clip::segment`)
 
 Each admitted trigger is handled on its own thread, so overlapping windows are
-cut concurrently against the shared tail. The handler (`handler.rs`) is generic
-over the [`Announce`](#the-interface-abstraction) the active interface supplies
-and knows only the neutral `Trigger`/`Completion` contract plus the window's
-`anchor_ns` and [time source](#time-source) — nothing of ROS or any wire
-encoding. The interface resolves the `anchor_ns` (the window centre) and hands it
+cut concurrently against the shared tail. The handler (`tail::handler`) is
+generic over the [`Announce`](#the-interface-abstraction) the active interface
+supplies and knows only the neutral `Trigger`/`Completion` contract plus the
+window's `anchor_ns` and [time source](#time-source) — nothing of ROS or any
+wire encoding. The interface resolves the `anchor_ns` (the window centre) and hands it
 in; the handler never derives an anchor itself.
 
-**The flow crosses the crate seam at the waits.** `record_clip` is steps 1–2 and
-nothing else: they are the only part that needs a file still being written, and
-they are why the *live* path exists at all. Steps 3–5 are
-`clip::segment::cut_window` — the same code, unchanged, that a consumer cutting
-from a finished recording runs, which waits for nothing. Step 6 is back in
-`handle_trigger`, because who is told about a clip is the recorder's business
-and not the cut's.
+**The flow crosses the crate seam at the waits.** `tail::handler::record_clip`
+is steps 1–2 and nothing else: they are the only part that needs a file still
+being written, and they are why `tail` exists at all. Steps 3–5 are
+`clip::segment::cut_window` — the same code a consumer cutting from a finished
+recording runs, which waits for nothing. Step 6 is back in
+`tail::handler::handle_trigger`, because announcing a clip belongs with the
+trigger it answers and not with the cut.
 
 Admission is bounded: at most
 `MAX_ACTIVE_TRIGGERS` (16) handlers may be active at once, and a trigger that
@@ -317,7 +343,7 @@ ignored: no handler runs, no clip is extracted, and no completion is announced.
    recorder's flush latency: near zero for the fastwrite profile, roughly one
    chunk fill (chunk size / aggregate data rate) for chunked profiles.
 3. **Multi-file snapshot** (`cut_window`). Call `planner.plan_window(start_ns,
-   end_ns, time_source)` once — the `Tailer` is the planner here — producing a
+   end_ns, time_source)` once — `tail::Tailer` is the planner here — producing a
    `Vec<WindowPlan>`: one plan per recording whose extents overlap the window on
    the active time source, oldest first. Each plan carries its own `Arc<File>`
    clone, so a retention prune or rollover after this snapshot cannot pull the
@@ -446,7 +472,7 @@ the trigger arrived live over ROS or was decoded out of the tailed MCAP.
 whole window lives in: the anchor, which messages fall inside, which extents are
 read (`Extent::overlaps` / `plan_window` in `clip::index`, on the source's
 `Span`), and which coverage high-water the wait blocks on
-(`Coverage::for_source`, in `tail.rs`). It governs nothing else —
+(`Coverage::for_source`, in `tail::tailer`). It governs nothing else —
 retention ages files on `log_time` (`TimeBounds.log.max`) whatever the window's
 source, and the postroll floor is the wall clock. clipper never interprets
 `publish_time`; it windows on the raw value, so `publish` coverage is a liveness
@@ -536,8 +562,10 @@ The recorder is decoupled into four layers around one neutral boundary, so the
 clip-cutting half never learns of ROS or any wire encoding and the
 outside-facing half is the only place either appears. The first two layers — the
 contract and the decoder — are `clip`'s, so a trigger source that is neither ROS
-nor this recorder still speaks them; the last two are `clipper`'s, because
-knowing ROS from MCAP is exactly what a device recorder is for:
+nor this recorder still speaks them; the third is the binary's, because telling
+ROS from MCAP is exactly what a device recorder is for; the fourth is `tail`'s,
+because what a cut has to wait for before it can run is the tail's business and
+no interface's:
 
 - **`clip::trigger`** — the neutral contract: `Trigger`, `Stamp`, `TriggerRecord`
   (the MCAP message record carrying an undecoded trigger), `Completion`, and the
@@ -570,11 +598,12 @@ knowing ROS from MCAP is exactly what a device recorder is for:
   raw trigger), plus the two announcers: `RosAnnouncer` (publishes `Recorded`)
   and `NullAnnouncer` (no-op). An interface produces decoded `Trigger`s and owns
   the completion half through its `Announce`r.
-- **`src/handler.rs`** — `handle_trigger` (generic over `Announce`) and
-  `record_clip`: the ROS- and encoding-agnostic half, speaking only the
-  `Trigger`/`Completion` contract. It waits, calls `clip::segment::cut_window`,
-  and announces what comes back; the planning, staging and publication below it
-  are `clip`'s and know nothing of triggers at all.
+- **`tail::handler`** (`crates/tail/src/handler.rs`) — `handle_trigger`
+  (generic over `Announce`) and `record_clip`: the ROS- and encoding-agnostic
+  half, speaking only the `Trigger`/`Completion` contract. It waits, calls
+  `clip::segment::cut_window`, and announces what comes back; the planning,
+  staging and publication below it are `clip`'s and know nothing of triggers at
+  all.
 
 `main.rs` wires it together: it builds the selected interface, and a generic
 `drive<I: Interface>` runs the recorder and supervises the tail, the one
@@ -586,7 +615,7 @@ interface thread, and the signal forwarder.
 run for the process's lifetime, plus one short-lived thread per admitted
 trigger:
 
-- **`tail`** — runs `Tailer::run`; discovers recordings via
+- **`tail`** — runs `tail::Tailer::run`; discovers recordings via
   `NewFileWatchIterator`, performs all blocking file IO for the incremental
   scan (`clip::index::scan_available`, called with no lock held), and prunes
   the collection every poll. Under the `mcap` interface it
@@ -656,9 +685,10 @@ silently holding the wrong messages;
 recording through both domains and pins them together.
 
 **`supervise()`.** Each long-lived companion thread is started with
-`spawn_supervised`: the closure sends its return value over a `bounded(1)`
-channel before returning; a panic unwinds without sending, dropping the sender.
-`supervise` uses `crossbeam_channel::select!` on three arms:
+`spawn_supervised` (`src/supervision.rs`): the closure sends its return value
+over a `bounded(1)` channel before returning; a panic unwinds without sending,
+dropping the sender. `supervise` uses `crossbeam_channel::select!` on three
+arms:
 
 1. **tail channel** — receives `anyhow::Result<()>`. `Ok(())` is an unexpected
    exit (the loop never returns on its own); `Err(e)` wraps the scan-fault root
@@ -691,11 +721,14 @@ complete clips. There is no explicit runtime teardown step.
 
 ## Integration tests (`tests/e2e.rs`)
 
-The inline `#[cfg(test)]` suites in both crates cover the index, the cut, the
-tail and supervision against synthetic MCAP files — written by `clip::testing`,
-which the recorder pulls in through clip's `test-support` feature as a
-dev-dependency, so both crates' tests build their fixtures the same way and
-neither drifts from what the scan expects. `tests/e2e.rs` covers the contract
+The inline `#[cfg(test)]` suites span all three crates. `clip`'s cover the
+index, the cut and the segment assembly; `tail`'s cover the discovery iterator,
+the tail loop and its fault budget, the coverage watch and the two waits — both
+against synthetic MCAP files written by `clip::testing`, which `tail` pulls in
+through clip's `test-support` feature as a dev-dependency so no fixture drifts
+from what the scan expects. `clipper`'s need no recording at all: the config
+parser, the four anchor cells, the admission gate and `supervise`'s three arms
+are pure functions and thread choreography. `tests/e2e.rs` covers the contract
 against the real stack — a live `ros2 bag record` matching the production
 `scripts/record.sh` invocation (the harness builds the command directly),
 triggers published with the ros2 CLI, and

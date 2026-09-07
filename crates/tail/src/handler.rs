@@ -1,20 +1,20 @@
-//! The Handler: turn a decoded [`Trigger`] into durable clips, independent of
-//! how the trigger arrived or how completion is announced.
+//! Turning a decoded [`Trigger`] into durable clips, independent of how the
+//! trigger arrived or how completion is announced.
 //!
-//! This half of the recorder knows nothing of ROS or wire encodings. It takes a
-//! neutral [`Trigger`], waits out the postroll and the tail's coverage, and then
-//! hands the window to [`clip::segment::cut_window`], which stages one clip
-//! segment per source recording and publishes them. The result is reported
-//! through an [`Announce`] the interface supplies — a ROS `Recorded` publish or
-//! an MCAP no-op.
+//! [`handle_trigger`] knows nothing of ROS or wire encodings. It takes a neutral
+//! [`Trigger`], waits out the postroll and the tail's coverage, hands the window
+//! to [`clip::segment::cut_window`] — which stages one clip segment per source
+//! recording and publishes them — and reports the result through an [`Announce`]
+//! its caller supplies: a ROS `Recorded` publish, or nothing at all when the
+//! clip's arrival in the output directory is the signal.
 //!
-//! **The two waits are the whole of what stays here.** Everything downstream of
-//! them — planning the window, staging, dropping empty segments, publishing —
-//! is in `clip` and is the same code a consumer cutting from a finished
-//! recording runs. Waiting is what makes this the *live* path: a window may
-//! reach past the last byte on disk, so the handler blocks until the wall clock
-//! passes the window end and the tail's coverage catches up (bounded by
-//! `--grace-secs`) before there is anything worth cutting.
+//! **The two waits are the whole of what this module is.** Everything past them
+//! — planning the window, staging, dropping empty segments, publishing — is
+//! [`clip::segment`], the same code that cuts from a recording nobody is
+//! writing. Waiting is what makes this the *live* path: a window may reach past
+//! the last byte on disk, so a cut blocks until the wall clock passes the window
+//! end and the tail's coverage catches up (bounded by the caller's grace,
+//! `--grace-secs` in the recorder) before there is anything worth cutting.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -27,7 +27,7 @@ use clip::trigger::{Announce, Completion, Trigger, now_ns};
 use crossbeam_channel::Sender;
 use log::{info, warn};
 
-use crate::tail::{Coverage, Tailer};
+use crate::tailer::{Coverage, Tailer};
 use crate::watch::Watch;
 
 /// Run one trigger's wait-then-stage-then-announce flow. A window that stays in
@@ -55,7 +55,7 @@ use crate::watch::Watch;
 // purely to satisfy the argument-count heuristic would add indirection without
 // making the seam clearer.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn handle_trigger<A: Announce>(
+pub fn handle_trigger<A: Announce>(
     trig: Trigger,
     anchor_ns: u64,
     out_dir: &Path,
@@ -195,7 +195,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::tail::tests::{drain, scan_to_end};
+    use crate::tailer::tests::{drain, scan_to_end};
 
     /// The clip compression the recorder's default (zstd) maps to; the unit
     /// tests drive the extraction worker pool through the same codec the

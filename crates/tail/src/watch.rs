@@ -27,15 +27,16 @@ impl<T: Clone> Watch<T> {
     }
 
     /// The current value, by clone. Production readers wait on a predicate
-    /// via [`Self::wait_timeout_for`]; the tests observe state through this.
-    #[cfg(test)]
+    /// via [`Self::wait_timeout_for`]; a test observes state through this.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn get(&self) -> T {
         self.value.lock().unwrap().clone()
     }
 
     /// Replace the value and wake every waiter. Coverage updates go through
-    /// [`Self::send_if_modified`]; this unconditional setter serves the tests.
-    #[cfg(test)]
+    /// [`Self::send_if_modified`]; this unconditional setter serves a test that
+    /// drives waiters directly.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn send_replace(&self, value: T) {
         *self.value.lock().unwrap() = value;
         self.changed.notify_all();

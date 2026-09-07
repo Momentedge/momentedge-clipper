@@ -12,8 +12,8 @@
 # via Swatinem/rust-cache, which is orthogonal and remains.
 #
 # Scope: the recorder (clipper) on every distro, plus two lean ROS-free lanes on
-# a plain toolchain — the shared `clip` library and the `cu-mcap-record` copper
-# example (trigger-pub is not in CI).
+# a plain toolchain — the `clip` and `tail` libraries, and the `cu-mcap-record`
+# copper example (trigger-pub is not in CI).
 # Distros: humble, jazzy, lyrical — the three the Rust crates build under
 # (rolling cannot build r2r 0.9.6; see README "Integration tests"). The e2e step
 # below runs the full suite on every leg under the `e2e` nextest profile,
@@ -121,17 +121,18 @@ jobs:
       - name: Test
         run: cargo test --locked -p cu-mcap-record
 
-  # ROS-free lane for the shared `clip` library. The whole reason the MCAP format
-  # layer, the recording index and the cut path live in their own crate is that a
-  # consumer of a recording can link them with no ROS installation anywhere — so
-  # something has to hold that property down. This job builds, lints and tests
-  # `clip` on a plain stable toolchain (no nix, no ROS2 closure, nothing on PATH
-  # but cargo) and asserts up front that its default dependency tree contains no
-  # r2r. An r2r dependency that is not gated behind the `ros` feature then turns
-  # this job red in seconds, instead of surfacing much later as a missing rmw at
-  # link time in the downstream cloud build, which has no ROS toolchain at all.
+  # ROS-free lane for the two library crates. The whole reason the MCAP format
+  # layer, the recording index, the cut path and the tail live outside the
+  # recorder is that a consumer can link them with no ROS installation anywhere —
+  # so something has to hold that property down. This job builds, lints and tests
+  # `clip` and `tail` on a plain stable toolchain (no nix, no ROS2 closure,
+  # nothing on PATH but cargo) and asserts up front that neither default
+  # dependency tree contains r2r. An r2r dependency that is not gated behind
+  # `clip`'s `ros` feature then turns this job red in seconds, instead of
+  # surfacing much later as a missing rmw at link time in a downstream build that
+  # has no ROS toolchain at all.
   #
-  # It is cheap for the same reasons: one small crate on a stock toolchain, with
+  # It is cheap for the same reasons: two small crates on a stock toolchain, with
   # neither a nix realization nor a ROS2 closure to substitute, so it reports long
   # before the recorder matrix finishes. `--locked` enforces the shared root
   # lockfile; formatting is covered by the `fmt` job's `cargo fmt --all --check`.
@@ -140,8 +141,8 @@ jobs:
   # toolchain this job is defined by not having, and the per-distro `recorder`
   # matrix below already builds clipper — and therefore `clip` with `ros` on —
   # under every distro.
-  clip:
-    name: clip (ROS-free)
+  libraries:
+    name: clip + tail (ROS-free)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -161,7 +162,7 @@ jobs:
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: clip
+          shared-key: libraries
 
       # The property this lane exists for, checked before anything is compiled:
       # `cargo tree` resolves from the lockfile without building, so a leak fails
@@ -169,22 +170,24 @@ jobs:
       # tested afterwards on purpose — piping cargo into grep would let the good
       # case (grep matches nothing, exits 1) decide the step's status under
       # pipefail, inverting the check.
-      - name: Assert clip's default build pulls no r2r
+      - name: Assert the libraries' default builds pull no r2r
         run: |
           set -euo pipefail
-          tree=$(cargo tree --locked -p clip -e normal --prefix none)
-          echo "$tree"
-          if grep -q '^r2r' <<<"$tree"; then
-            echo "::error::clip's default dependency tree contains r2r: the crate no longer builds without a ROS installation."
-            echo "Every r2r dependency in clip must sit behind its optional 'ros' feature, which is off by default."
-            exit 1
-          fi
+          for crate in clip tail; do
+            tree=$(cargo tree --locked -p "$crate" -e normal --prefix none)
+            echo "$tree"
+            if grep -q '^r2r' <<<"$tree"; then
+              echo "::error::$crate's default dependency tree contains r2r: the crate no longer builds without a ROS installation."
+              echo "Every r2r dependency must sit behind clip's optional 'ros' feature, which is off by default."
+              exit 1
+            fi
+          done
 
       - name: Clippy
-        run: cargo clippy --locked --all-targets -p clip -- -D warnings
+        run: cargo clippy --locked --all-targets -p clip -p tail -- -D warnings
 
       - name: Test
-        run: cargo test --locked -p clip
+        run: cargo test --locked -p clip -p tail
 
   recorder:
     name: ${{ matrix.distro }}

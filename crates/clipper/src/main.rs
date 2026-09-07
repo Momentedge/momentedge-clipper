@@ -55,12 +55,8 @@
 //! Logging uses the `log` facade with a pretty_env_logger backend; `RUST_LOG`
 //! controls verbosity.
 
-mod discover;
-mod handler;
 mod interface;
 mod supervision;
-mod tail;
-mod watch;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -77,8 +73,7 @@ use interface::{Anchor, Interface, McapInterface, RosInterface};
 use log::{error, info, warn};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use supervision::{Supervised, harvest_panic, spawn_supervised};
-use tail::{Coverage, Tailer};
-use watch::Watch;
+use tail::{Coverage, Tailer, Watch, handler};
 
 const TRIGGER_TOPIC: &str = "/events/momentedge/trigger";
 const RECORDED_TOPIC: &str = "/events/momentedge/recorded";

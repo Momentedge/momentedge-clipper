@@ -342,13 +342,16 @@ Setup guides for the recording + clipper stack live under
 - **[ARCHITECTURE.md](ARCHITECTURE.md)** — the technical overview: thread model,
   tailing mechanics, atomic clip publication, restart/rollover recovery, damage
   tolerance, and the deployment build model.
-- **[`crates/clip`](crates/clip)** — the library half of clipper: the MCAP
-  format layer, the recording index, the cut path and the trigger contract,
-  buildable with no ROS toolchain anywhere. It is what a program of your own
-  links to cut clips out of a recording without running the recorder.
+- **[`crates/clip`](crates/clip)** and **[`crates/tail`](crates/tail)** — the
+  library halves of clipper, both buildable with no ROS toolchain anywhere.
+  `clip` is the MCAP format layer, the recording index, the cut path and the
+  trigger contract — what a program of your own links to cut clips out of a
+  recording without running the recorder. `tail` adds what a recording still
+  being written needs: discovery, the recording collection, coverage, retention,
+  and the waiting a cut does when its window reaches past the last byte on disk.
 - **[CLAUDE.md](CLAUDE.md)** and **[crates/clipper/CLAUDE.md](crates/clipper/CLAUDE.md)**
   — contributor and agent notes: workspace layout, build mechanics, and the
-  internal design of both crates.
+  internal design of all three crates.
 - **[Momentedge/clipper-benchmarks](https://github.com/Momentedge/clipper-benchmarks)**
   — the overhead benchmarks behind [Resource overhead](#resource-overhead): the
   harness, the full report, and the methodology each figure depends on.

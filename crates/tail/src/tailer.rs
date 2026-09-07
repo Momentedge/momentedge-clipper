@@ -30,8 +30,9 @@
 //!
 //! The tail owns a time-ordered collection of recordings. New `*.mcap` files
 //! under the record dir — a rosbag2 split rolling over to `<bag>_<n+1>.mcap`, or
-//! a restart recreating the bag directory — are discovered (a recorder running
-//! its files appear in mtime order, [`crate::discover`]) and indexed alongside
+//! a restart recreating the bag directory — are discovered by
+//! [`crate::discover`], which yields them in mtime order so several appearing
+//! between polls are indexed oldest first, and indexed alongside
 //! the ones already known. Each is scanned in turn; a finished recording is
 //! retained for a watch window so a clip straddling a rollover recovers across
 //! it (beads clipper-gl2), then pruned. Extractions hold their own file handle,

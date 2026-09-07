@@ -8,6 +8,10 @@ members = [
     # path, the neutral trigger contract, and segment publication. ROS-free by
     # default — the `ros` feature adds only the CDR trigger decoder.
     "crates/clip",
+    # Live tailing over `clip`: recording discovery, the recording collection and
+    # its lifecycle, coverage, retention, and the waits a cut from a growing file
+    # needs. ROS-free like `clip`.
+    "crates/tail",
     "crates/clipper",
     # Example trigger source — a workspace member so it inherits the shared
     # package metadata and dependency versions below, not a deployable crate.

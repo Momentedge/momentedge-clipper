@@ -1,0 +1,37 @@
+[package]
+name = "tail"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Follow a growing MCAP recording and cut clips out of it as the data lands"
+
+[features]
+default = []
+# Publishes the parts of this crate that exist only to be driven from a test —
+# `Watch`'s unconditional setter and reader, which nothing in the tail itself
+# calls (coverage rises through `send_if_modified`). A dev-only opt-in: a
+# consumer enables it under `[dev-dependencies]`, where the v2+ resolver keeps it
+# out of a normal build, so a release binary compiles neither.
+test-support = []
+
+[dependencies]
+# The format layer this crate follows a live file with: the recording index the
+# scan fills, the window plan it serves, the neutral trigger contract, and the
+# cut a window ends in. Default features — nothing here needs r2r, so a build of
+# this crate needs no ROS installation either.
+clip = { path = "../clip" }
+# Error plumbing for discovery, the scan loop and the retention prune.
+anyhow.workspace = true
+# The trigger tap the scan lifts records down, and each stage job's reply
+# channel on the way back.
+crossbeam-channel.workspace = true
+# Logging via the `log` facade; the binary picks the backend.
+log.workspace = true
+
+[dev-dependencies]
+# The MCAP fixture writers the tests build recordings with — the same ones
+# `clip`'s own tests use, so a fixture cannot drift from what the scan expects.
+# A dev-only feature: the v2+ resolver keeps it out of the normal build above.
+clip = { path = "../clip", features = ["test-support"] }
+# The clip compression codec the handler tests drive the staging pool through.
+mcap.workspace = true

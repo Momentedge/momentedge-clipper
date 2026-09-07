@@ -35,6 +35,24 @@ copper e2e (`copper_sink_recording_produces_clip`) drives; prebuilding it keeps
 the cu29 compile out of the e2e test's own timeout — the test's on-demand `-p
 cu-mcap-record` build then finds it up to date.
 
+**The two libraries have their own lean ROS-free job.** `clip` and `tail` exist
+so a consumer can link the format layer, the recording index, the cut path and
+the tail with no ROS installation anywhere, and the `libraries` job
+(`name: clip + tail (ROS-free)`) is what holds that property down. Before
+anything is compiled it asserts that `cargo tree --locked -p <crate> -e normal`
+names no r2r for either crate — the tree is captured into a variable and grepped
+afterwards rather than piped, because under `pipefail` a `cargo | grep` pipeline
+would let the good case (grep matches nothing, exits 1) decide the step's status
+and invert the check. Then `cargo clippy --locked --all-targets -p clip -p tail
+-- -D warnings` and `cargo test --locked -p clip -p tail`, on a plain stable
+toolchain with no nix and no ROS on `PATH`, cached under
+`shared-key: libraries`. An r2r dependency that escapes `clip`'s `ros` feature
+turns this job red in seconds instead of surfacing much later as a missing rmw
+at link time in a downstream build that has no ROS toolchain at all. There is
+deliberately no `--features ros` build here: that arm needs the very toolchain
+this job is defined by not having, and the `recorder` matrix below already
+builds clipper — and so `clip` with `ros` on — under every distro.
+
 **One matrix leg per distro; three steps share one nix shell.**
 Build → unit → e2e reuse the same realized nix closure and compiled artifacts.
 Only `humble`, `jazzy`, and `lyrical` are in the matrix — rolling can't build

@@ -8,10 +8,11 @@ own their angle, and this file does not repeat them:
 - **[ARCHITECTURE.md](ARCHITECTURE.md)** — the technical overview: thread model,
   tailing, atomic clip publication, recovery, the `ros`/`mcap` seam, deployment.
 - **[crates/clipper/CLAUDE.md](crates/clipper/CLAUDE.md)** — the recorder's deep
-  internals and concurrency invariants, for changing the crate. It covers the
-  shared library `crates/clip` too: the two crates are one design, split at the
-  line between what a live tail adds and what every consumer of a recording
-  shares.
+  internals and concurrency invariants, for changing any of it. It covers all
+  three crates: the binary and the two libraries under it are one design, cut
+  along two lines — what every consumer of a recording shares (`crates/clip`),
+  what following one still being written adds (`crates/tail`), and what only a
+  ROS node needs (`crates/clipper`).
 - **[examples/trigger-pub/CLAUDE.md](examples/trigger-pub/CLAUDE.md)** and
   **[sim/CLAUDE.md](sim/CLAUDE.md)** — the example trigger source and sim camera.
 
@@ -54,32 +55,39 @@ matrix detail: [`sim/CLAUDE.md`](sim/CLAUDE.md).
 A virtual workspace (no root package), so `resolver = "3"` (the edition-2024
 resolver) is set explicitly — a virtual workspace does not infer the resolver
 from member editions and otherwise falls back to `"1"` with a warning. Members
-are the shared library (`crates/clip`), the recorder crate (`crates/clipper`),
-the example trigger source (`examples/trigger-pub`), the two mcap-writer examples
-(`examples/custom-mcap-writer`, `examples/chunked-mcap-writer`), and the copper
-producer example (`examples/cu-mcap-record`) — the examples stay members so they
-inherit `[workspace.package]` and the shared `[workspace.dependencies]`
-versions, rather than for shipping. `examples/cu-mcap-record` keeps its copper
-dependencies (`cu29` and the `cu-bincode` fork) declared in its own `Cargo.toml`
-rather than in `[workspace.dependencies]`, so the heavy cu29 tree stays scoped
-to that one member; it still lives in the shared root lockfile, and a lean
-ROS-free CI job builds and tests it with `-p cu-mcap-record`. `momentedge_msgs/`
-(ROS2 interface package) and `sim/` (the sim camera's launch/config tree) are
-not Cargo members.
+are the two libraries (`crates/clip`, `crates/tail`), the recorder binary
+(`crates/clipper`), the example trigger source (`examples/trigger-pub`), the two
+mcap-writer examples (`examples/custom-mcap-writer`,
+`examples/chunked-mcap-writer`), and the copper producer example
+(`examples/cu-mcap-record`) — the examples stay members so they inherit
+`[workspace.package]` and the shared `[workspace.dependencies]` versions, rather
+than for shipping. `examples/cu-mcap-record` keeps its copper dependencies
+(`cu29` and the `cu-bincode` fork) declared in its own `Cargo.toml` rather than
+in `[workspace.dependencies]`, so the heavy cu29 tree stays scoped to that one
+member; it still lives in the shared root lockfile, and a lean ROS-free CI job
+builds and tests it with `-p cu-mcap-record`. `momentedge_msgs/` (ROS2 interface
+package) and `sim/` (the sim camera's launch/config tree) are not Cargo members.
 
-`crates/clip` is the library half of the recorder — the MCAP format layer, the
-recording index, the cut path, the neutral trigger contract and segment
-publication — and it builds with no ROS toolchain anywhere. Its `ros` feature,
-off by default, adds only the CDR trigger decoder and the two r2r message
-conversions; its `clap` feature makes `TimeSource` a `ValueEnum`; its
-`test-support` feature publishes the MCAP fixture writers a consumer's tests
-build recordings with. A second lean CI job builds, lints and tests it on the
-plain toolchain, so an r2r dependency that escapes the `ros` feature fails there
-rather than in a downstream ROS-free build.
+`crates/clip` and `crates/tail` are the libraries under the recorder, and
+neither needs a ROS toolchain anywhere. `clip` is what every consumer of a
+recording shares — the MCAP format layer, the recording index, the cut path, the
+neutral trigger contract and segment publication — so cutting a window out of a
+recording nobody is writing links `clip` alone. `tail` is what a recording with
+no end yet costs on top: discovery, the recording collection and its lifecycle,
+coverage, retention, the scan-fault budget, and the waits a cut from a growing
+file does before the shared cut path runs. `clip`'s `ros` feature, off by
+default, adds only the CDR trigger decoder and the two r2r message conversions;
+its `clap` feature makes `TimeSource` a `ValueEnum`; its `test-support` feature
+publishes the MCAP fixture writers a consumer's tests build recordings with, and
+`tail`'s publishes the watch setter a waiter test drives. The `libraries` CI job
+builds, lints and tests both on the plain toolchain, so an r2r dependency that
+escapes the `ros` feature fails there rather than in a downstream ROS-free
+build.
 
 ```
 crates/clip/            # ROS-free library: format layer, index, cut, trigger contract
-crates/clipper/         # triggered clip recorder tailing the continuous mcap
+crates/tail/            # ROS-free library: following a recording still being written
+crates/clipper/         # the recorder binary: interfaces, config, supervision
 momentedge_msgs/        # local ROS2 interface package (Trigger, Recorded)
 examples/               # setup guides + trigger-pub + mcap-writer examples + cu-mcap-record (copper)
 sim/                    # synthetic gscam camera (sim/cam_sim.sh) — see sim/README.md

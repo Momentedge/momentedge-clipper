@@ -2,11 +2,12 @@
 name: build
 description: >
   Dev-shell and build mechanics for the clipper workspace — the per-distro Nix
-  ROS 2 shells, the system Rust toolchain, the ROS-free `clip` library that needs
-  neither, the r2r/IDL codegen model, which distros the crates build on, and how
-  to run unit tests, coverage, and the live e2e suite. Use when building or
-  testing clipper, entering the dev shell, adding a ROS distro, editing
-  flake.nix / nix/, or running cargo-llvm-cov or the gated e2e tests.
+  ROS 2 shells, the system Rust toolchain, the ROS-free `clip` and `tail`
+  libraries that need neither, the r2r/IDL codegen model, which distros the
+  crates build on, and how to run unit tests, coverage, and the live e2e suite.
+  Use when building or testing clipper, entering the dev shell, adding a ROS
+  distro, editing flake.nix / nix/, or running cargo-llvm-cov or the gated e2e
+  tests.
 ---
 
 # Build & dev environment
@@ -24,7 +25,8 @@ flake deliberately provides no Rust):
 nix develop --command cargo build        # likewise clippy, test, run
 ```
 
-`crates/clip` is the exception: it needs no dev shell and no nix (below).
+`crates/clip` and `crates/tail` are the exception: they need no dev shell and no
+nix (below).
 
 - **Coverage** is `cargo-llvm-cov`, also from the system, not the flake. The
   system toolchain ships the `llvm-tools` component, so `cargo-llvm-cov` finds
@@ -34,41 +36,49 @@ nix develop --command cargo build        # likewise clippy, test, run
   the sysroot tools and force a hand-maintained LLVM-major constraint).
 - **nextest** (the e2e runner) is likewise a system prerequisite, not flaked.
 
-### `clip` builds without the dev shell
+### `clip` and `tail` build without the dev shell
 
 `crates/clip` — the MCAP format layer and recording index, the cut path, the
-neutral trigger contract — pulls no r2r in its default feature set, so it needs
-no ROS installation and no nix realization:
+neutral trigger contract — and `crates/tail` — discovery, the recording
+collection and its lifecycle, coverage, retention, and the waits before a cut —
+pull no r2r in their default feature sets, so they need no ROS installation and
+no nix realization:
 
 ```bash
-cargo clippy -p clip --all-targets
-cargo test -p clip
+cargo clippy -p clip -p tail --all-targets
+cargo test -p clip -p tail
 ```
 
 Straight from the repo root, on the system toolchain. That is the fast inner
-loop for anything in the index, the cut or the trigger types; `cargo test -p
-clipper`, the e2e suite, and `clip` with `ros` on all link r2r and go back
-through `nix develop`.
+loop for anything in the index, the cut, the trigger types or the tail; `cargo
+test -p clipper`, the e2e suite, and `clip` with `ros` on all link r2r and go
+back through `nix develop`.
 
-Three features, all off by default, so nothing a consumer has not asked for gets
-linked:
+`clip` carries three features and `tail` one, all off by default, so nothing a
+consumer has not asked for gets linked:
 
-- **`ros`** — the CDR arm of the trigger decoder and the two r2r message
+- **`clip/ros`** — the CDR arm of the trigger decoder and the two r2r message
   conversions. They live in `clip` rather than in the recorder because the
   orphan rule forbids a downstream crate from writing `From` between two foreign
   types.
-- **`clap`** — `TimeSource` as a `ValueEnum`, for a binary that takes the clock
-  domain on its command line.
-- **`test-support`** — publishes `clip::testing`, the MCAP fixture writers, so a
-  consumer's tests build recordings the way `clip`'s own do instead of keeping a
-  copy that drifts from what the scan expects. A dev-only opt-in: declared under
-  `[dev-dependencies]`, where the v2+ resolver keeps it out of a release build.
+- **`clip/clap`** — `TimeSource` as a `ValueEnum`, for a binary that takes the
+  clock domain on its command line.
+- **`clip/test-support`** — publishes `clip::testing`, the MCAP fixture writers,
+  so a consumer's tests build recordings the way `clip`'s own do instead of
+  keeping a copy that drifts from what the scan expects. A dev-only opt-in:
+  declared under `[dev-dependencies]`, where the v2+ resolver keeps it out of a
+  release build.
+- **`tail/test-support`** — publishes `Watch`'s test-only `get` and
+  `send_replace`, the unconditional reader and setter the tail itself never
+  calls (its own coverage updates go through `send_if_modified`); the recorder's
+  admission-gate test drives waiters with them. The same dev-only opt-in, under
+  `[dev-dependencies]`.
 
-The recorder takes `ros` + `clap` on its normal dependency on `clip`, and
-`test-support` under `[dev-dependencies]`. The featureless build is the one CI
-holds down: the `clip (ROS-free)` job asserts `cargo tree -p clip` names no r2r
-before compiling anything, then clippies and tests on a stock toolchain with no
-ROS on the machine at all — see the `ci` skill.
+The recorder takes `ros` + `clap` on its normal dependency on `clip`, and both
+crates' `test-support` under `[dev-dependencies]`. The featureless build is the
+one CI holds down: the `libraries` job asserts `cargo tree` names no r2r for
+either crate before compiling anything, then clippies and tests both on a stock
+toolchain with no ROS on the machine at all — see the `ci` skill.
 
 ## One ROS 2 distro per shell
 
@@ -106,8 +116,9 @@ jazzy have removed. The workspace pins r2r to its `0.9.6` git tag
 build on **humble, jazzy, lyrical** — but **not rolling**, which r2r `0.9.6`
 still references the variant for (beads `clipper-2xb`). The pin returns to
 crates.io once `0.9.6` ships there (beads `clipper-4rw`). `rolling` still gets a
-working ROS 2 shell for everything but the Rust build. None of this reaches
-`clip`'s default build, which links no r2r and so answers to no distro.
+working ROS 2 shell for everything but the Rust build. None of this reaches the
+two libraries' default builds: `clip` links r2r only with `ros` on and `tail`
+never links it at all, so neither answers to a distro.
 
 `momentedge_msgs/` is a **local `ament_cmake` interface package** built by the
 flake via `ros.buildRosPackage` and added to both the env and
@@ -124,19 +135,20 @@ consumes no split events.
 
 ## Tests and coverage
 
-Unit/integration tests run with plain `cargo test` in the dev shell; `clip`'s
-run outside it (above). The suite spans both crates, so coverage names both:
+Unit/integration tests run with plain `cargo test` in the dev shell; the two
+libraries' run outside it (above). The suite spans all three crates, so coverage
+names all three:
 
 ```bash
-cargo llvm-cov -p clip                                                   # clip alone, no shell
-nix develop --command cargo llvm-cov -p clip -p clipper                  # summary table
-nix develop --command cargo llvm-cov -p clip -p clipper --html           # target/llvm-cov/html/index.html
-nix develop --command cargo llvm-cov -p clip -p clipper --lcov --output-path lcov.info
+cargo llvm-cov -p clip -p tail                                                  # both libraries, no shell
+nix develop --command cargo llvm-cov -p clip -p tail -p clipper                 # summary table
+nix develop --command cargo llvm-cov -p clip -p tail -p clipper --html          # target/llvm-cov/html/index.html
+nix develop --command cargo llvm-cov -p clip -p tail -p clipper --lcov --output-path lcov.info
 ```
 
-`-p clipper` alone builds no test binary for `clip`, so the library's own tests
-never run and its lines — instrumented all the same, as a path dependency —
-report only what the recorder's tests happen to reach.
+`-p clipper` alone builds no test binary for `clip` or `tail`, so the libraries'
+own tests never run and their lines — instrumented all the same, as path
+dependencies — report only what the recorder's tests happen to reach.
 
 Coverage builds use their own target dir (`target/llvm-cov-target`), so the
 first run is a full rebuild. The report is assembled from every test binary
