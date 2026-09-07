@@ -162,22 +162,41 @@ jobs:
 
       # Validate the packages install and the dependency chain resolves: apt pulls
       # the msgs deb as a dependency of the clipper deb (installed first so it is
-      # available locally), then clipper starts against the apt-installed typesupport,
-      # sourcing only the distro setup — no build overlay. A missing/unresolved
-      # typesupport would crash it immediately instead of idling to the SIGINT.
+      # available locally), then the recorder starts against the apt-installed
+      # typesupport, sourcing only the distro setup — no build overlay. A
+      # missing/unresolved typesupport would crash it immediately instead of
+      # idling to the SIGINT.
+      #
+      # Both installed names are exercised. `clipper` is a compatibility symlink
+      # onto `clipper-tailing`, kept for one release so units written before the
+      # rename keep working; a symlink that does not resolve, or resolves to some
+      # other program, is exactly the failure this catches. `--version` must match
+      # exactly — clap renders it from the command's configured name, so the same
+      # program reports the same string however it was invoked. `--help` is
+      # compared with its `Usage:` line dropped, because clap builds that line
+      # from argv[0]: through the symlink it reads `Usage: clipper`, which is
+      # right — the help tells you how to invoke the name you actually used. The
+      # live run goes through the symlink, which is the path an un-migrated unit
+      # file still has.
       - name: Smoke-test the installed packages
         run: |
           sudo apt-get install -y ./dist/ros-${{ matrix.distro }}-momentedge-msgs_*.deb
           sudo apt-get install -y ./dist/momentedge-clipper_*.deb
           source /opt/ros/${{ matrix.distro }}/setup.bash
-          /opt/momentedge-clipper/bin/clipper --help
+          bin=/opt/momentedge-clipper/bin
+          dpkg -L momentedge-clipper
+          test -L "$bin/clipper" || { echo "::error::$bin/clipper is not a symlink"; exit 1; }
+          "$bin/clipper-tailing" --help
+          diff <("$bin/clipper-tailing" --version) <("$bin/clipper" --version)
+          diff <("$bin/clipper-tailing" --help | grep -v '^Usage:') \
+               <("$bin/clipper" --help | grep -v '^Usage:')
           rec="$(mktemp -d)"
           # `|| code=$?` so timeout's exit (124 when it fires the SIGINT after the
           # full window — the healthy case) doesn't fail the step.
           code=0
           RUST_LOG=info MOMENTEDGE_RECORD_DIR="$rec" timeout -s INT 6 \
-            /opt/momentedge-clipper/bin/clipper || code=$?
-          echo "clipper live-run exit code: $code (124 = ran the full window, then SIGINT)"
+            "$bin/clipper" || code=$?
+          echo "recorder live-run exit code: $code (124 = ran the full window, then SIGINT)"
 
       # The only handoff to the `release` job below. Skipped under act (its artifact
       # backend is absent): the act run's verification is the successful build plus

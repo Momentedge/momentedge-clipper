@@ -442,7 +442,11 @@ shared-memory transport and direct DDS interop work.
 clipper ships as **two Debian packages**: `ros-<distro>-momentedge-msgs` (the
 `ament_cmake` interface package, built with bloom into `/opt/ros/<distro>`) and
 `momentedge-clipper` (the Rust binary, built with cargo-deb), the latter
-declaring an apt `Depends` on the former. The binary carries no bundled overlay
+declaring an apt `Depends` on the former. `momentedge-clipper` installs the
+recorder as `/opt/momentedge-clipper/bin/clipper-tailing`, with a `clipper`
+compatibility symlink beside it — a transitional measure kept for one release
+so units and scripts invoking that path keep working until every device has
+been re-deployed, and dropped after that. The binary carries no bundled overlay
 and no baked rpath; it resolves its typesupport through the standard
 `/opt/ros/<distro>/setup.bash`, like every ROS executable.
 

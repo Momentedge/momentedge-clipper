@@ -97,15 +97,18 @@ pub fn now_ns() -> u64 {
 
 /// Absolute path to the built `custom-mcap-writer` example binary (the
 /// momentedge writer the live capture-time e2e drives). Every workspace binary
-/// lands in the same `target/<profile>/` directory as the clipper binary under
-/// test, so it is resolved beside `CARGO_BIN_EXE_clipper` rather than through a
-/// `CARGO_BIN_EXE_*` cargo sets only for the crate under test. If it is not
+/// lands in the same `target/<profile>/` directory as the recorder under test,
+/// so it is resolved beside `CARGO_BIN_EXE_clipper-tailing` rather than through
+/// a `CARGO_BIN_EXE_*` cargo sets only for the crate under test. (Cargo spells
+/// that variable with the bin target's name verbatim, hyphen included — it does
+/// not translate `-` to `_` the way it does for package names in `cfg` and
+/// feature paths.) If it is not
 /// there — the e2e run builds only `-p clipper`, not the example — it is built
 /// on demand into that same directory. The example carries no r2r/ROS
 /// dependency, so the build is a quick final link over the workspace's
 /// already-compiled crates.
 pub fn writer_bin() -> PathBuf {
-    let bin_dir = Path::new(env!("CARGO_BIN_EXE_clipper"))
+    let bin_dir = Path::new(env!("CARGO_BIN_EXE_clipper-tailing"))
         .parent()
         .expect("the clipper binary has a parent directory");
     let writer = bin_dir.join("custom-mcap-writer");
@@ -143,8 +146,8 @@ pub fn writer_bin() -> PathBuf {
 
 /// Absolute path to the built `cu-mcap-record` example binary — the copper
 /// (cu29) Producer the live copper e2e drives. As a workspace member its binary
-/// lands in the same `target/<profile>/` directory as the clipper binary under
-/// test, so it is resolved beside `CARGO_BIN_EXE_clipper`. If it is not there —
+/// lands in the same `target/<profile>/` directory as the recorder under test,
+/// so it is resolved beside `CARGO_BIN_EXE_clipper-tailing`. If it is not there —
 /// the e2e run builds only `-p clipper`, not the example — it is built on demand
 /// with `-p cu-mcap-record`. `CU_MCAP_RECORD_BIN` overrides the path. Unlike
 /// `custom-mcap-writer`, this build compiles the cu29 tree, so a cold on-demand
@@ -161,7 +164,7 @@ pub fn cu_mcap_record_bin() -> PathBuf {
         );
         return path;
     }
-    let bin_dir = Path::new(env!("CARGO_BIN_EXE_clipper"))
+    let bin_dir = Path::new(env!("CARGO_BIN_EXE_clipper-tailing"))
         .parent()
         .expect("the clipper binary has a parent directory");
     let bin = bin_dir.join("cu-mcap-record");
@@ -438,13 +441,13 @@ impl TestEnv {
     /// [`Self::start_extractor`] (the ROS interface, the default) on an explicit
     /// `--time-source` (`MOMENTEDGE_TIME_SOURCE`) — `log` or `publish`.
     pub fn start_extractor_src(&self, grace_secs: u64, time_source: &str) -> Proc {
-        let mut cmd = self.command(env!("CARGO_BIN_EXE_clipper"));
+        let mut cmd = self.command(env!("CARGO_BIN_EXE_clipper-tailing"));
         cmd.env("MOMENTEDGE_RECORD_DIR", self.record_dir())
             .env("MOMENTEDGE_OUT_DIR", self.out_dir())
             .env("MOMENTEDGE_GRACE_SECS", grace_secs.to_string())
             .env("MOMENTEDGE_TIME_SOURCE", time_source);
         let proc = self.spawn("extractor", cmd);
-        proc.expect_log("clipper up", Duration::from_secs(30));
+        proc.expect_log("clipper-tailing up", Duration::from_secs(30));
         proc
     }
 
@@ -460,14 +463,14 @@ impl TestEnv {
     /// (`MOMENTEDGE_TIME_SOURCE`) — `log` or `publish` — for the domain-selection
     /// e2e.
     pub fn start_extractor_mcap_src(&self, grace_secs: u64, time_source: &str) -> Proc {
-        let mut cmd = self.command(env!("CARGO_BIN_EXE_clipper"));
+        let mut cmd = self.command(env!("CARGO_BIN_EXE_clipper-tailing"));
         cmd.env("MOMENTEDGE_RECORD_DIR", self.record_dir())
             .env("MOMENTEDGE_OUT_DIR", self.out_dir())
             .env("MOMENTEDGE_GRACE_SECS", grace_secs.to_string())
             .env("MOMENTEDGE_INTERFACE", "mcap")
             .env("MOMENTEDGE_TIME_SOURCE", time_source);
         let proc = self.spawn("extractor", cmd);
-        proc.expect_log("clipper up", Duration::from_secs(30));
+        proc.expect_log("clipper-tailing up", Duration::from_secs(30));
         proc
     }
 

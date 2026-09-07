@@ -125,8 +125,9 @@ ros2 bag record --all --storage mcap --output ./record
 #    or ./scripts/record.sh for storage-tuned defaults
 
 # 2. clipper, tailing ./record, writing clips to ./clipped
-clipper --record-dir ./record --out-dir ./clipped --clip-compression zstd
-#    from a source checkout: cargo run -p clipper -- --record-dir ./record --out-dir ./clipped
+clipper-tailing --record-dir ./record --out-dir ./clipped --clip-compression zstd
+#    from a source checkout:
+#    cargo run -p clipper --bin clipper-tailing -- --record-dir ./record --out-dir ./clipped
 
 # 3. Fire a trigger: 5 s before and 5 s after the instant clipper receives it.
 #    Under the default --time-source log the window anchors on clipper's own
@@ -154,8 +155,13 @@ Humble host, Jazzy on Jazzy, …):
 ```bash
 sudo apt install ./ros-humble-momentedge-msgs_*.deb ./momentedge-clipper_*.deb
 source /opt/ros/humble/setup.bash
-/opt/momentedge-clipper/bin/clipper --help
+/opt/momentedge-clipper/bin/clipper-tailing --help
 ```
+
+The package installs the recorder as `/opt/momentedge-clipper/bin/clipper-tailing`
+and, beside it, a `clipper` symlink to the same binary — a compatibility symlink
+kept for one release so units and scripts naming that path keep running. Point
+them at `clipper-tailing`: the symlink is gone in the release after.
 
 `momentedge-clipper` resolves its message typesupport from the
 `ros-<distro>-momentedge-msgs` package through the distro's own `setup.bash`,
@@ -169,18 +175,19 @@ environment (for `rcl`/`rmw` and the message typesupport):
 - **Development:** a [Nix](https://nixos.org/) dev shell provides ROS 2 —
   `nix develop --command cargo build`. See [CLAUDE.md](CLAUDE.md) for the
   dev-shell and per-distro build details.
-- **On a deployment target:** `./scripts/build-on-target.sh` compiles `clipper`
-  and `momentedge_msgs` natively against the host's apt ROS 2 install (the
-  binaries are ABI-compatible with the rest of the host's ROS graph by
-  construction). See [ARCHITECTURE.md](ARCHITECTURE.md#deployment) for the
+- **On a deployment target:** `./scripts/build-on-target.sh` compiles
+  `clipper-tailing` and `momentedge_msgs` natively against the host's apt ROS 2
+  install (the binaries are ABI-compatible with the rest of the host's ROS graph
+  by construction). See [ARCHITECTURE.md](ARCHITECTURE.md#deployment) for the
   rationale.
 
 ## Configuration
 
-`clipper` is configured by CLI flags, each with a `MOMENTEDGE_*` environment
-fallback and a built-in default: a flag overrides the env var, which overrides
-the default. `clipper --help` lists them; `clipper --version` prints the
-version. Everything is optional — `clipper` runs with no arguments.
+`clipper-tailing` is configured by CLI flags, each with a `MOMENTEDGE_*`
+environment fallback and a built-in default: a flag overrides the env var, which
+overrides the default. `clipper-tailing --help` lists them;
+`clipper-tailing --version` prints the version. Everything is optional —
+`clipper-tailing` runs with no arguments.
 
 | Flag | Env var | Default | Meaning |
 |---|---|---|---|

@@ -6,8 +6,8 @@ This mirrors the `scripts/record.sh` + `scripts/run.sh` pair as two launch files
 
 - [`record.launch.py`](record.launch.py) — the continuous `ros2 bag record`
   clipper tails.
-- [`clipper.launch.py`](clipper.launch.py) — the `clipper` binary that cuts
-  clips from it.
+- [`clipper.launch.py`](clipper.launch.py) — the `clipper-tailing` binary that
+  cuts clips from it.
 
 `ros2 launch` inherits the environment you already sourced to call it, so the
 launched processes get the ROS runtime for free — no per-process sourcing.
@@ -63,17 +63,17 @@ def generate_launch_description():
 |----------|---------|---------|
 | `record_dir` | `./record` | recording to tail (match `record.launch.py`) |
 | `clipped_dir` | `./clipped` | where clips are written |
-| `clipper_bin` | `clipper` | clipper executable; set to `./target/release/clipper` for a dev build |
+| `clipper_bin` | `clipper-tailing` | clipper executable; set to `./target/release/clipper-tailing` for a dev build |
 | `grace_secs` | `30` | clipper's coverage grace (size to the storage flush latency) |
 
-Ctrl-C stops a launch. `clipper` runs with `respawn=True` so it restarts on exit
-(it re-discovers the recording); the recorder is not respawned, because rosbag2
-refuses to reuse the bag directory the launch wiped once at startup.
+Ctrl-C stops a launch. `clipper-tailing` runs with `respawn=True` so it restarts
+on exit (it re-discovers the recording); the recorder is not respawned, because
+rosbag2 refuses to reuse the bag directory the launch wiped once at startup.
 
 ## Configuration notes
 
 `ros2 bag record`'s settings are CLI flags only (no env vars) — they are the
-`record.launch.py` arguments above. `clipper`'s flags additionally read
+`record.launch.py` arguments above. `clipper-tailing`'s flags additionally read
 `MOMENTEDGE_*` environment variables (CLI > env > default), so under
 `ros2 launch` they inherit anything you exported in the calling shell.
 

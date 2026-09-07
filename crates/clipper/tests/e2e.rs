@@ -473,7 +473,7 @@ fn copper_sink_recording_produces_clip() {
     // Empty record dir at startup so the tail discovers the copper app's growing
     // file as a live new Recording — the trigger tap fires only for Recordings
     // indexed live — then lifts the json Trigger out of it. Bring clipper up
-    // first (it waits for its "clipper up" line) so it is already tailing the
+    // first (it waits for its "clipper-tailing up" line) so it is already tailing the
     // dir when the app creates the file and writes the near-immediate Trigger.
     std::fs::create_dir_all(env.record_dir()).expect("creating the record dir");
     let mut extractor = env.start_extractor_mcap(10);

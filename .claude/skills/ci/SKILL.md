@@ -148,9 +148,16 @@ type). `ros-tooling/setup-ros@v0.7` (desktop) covers `ros-base`,
 `rmw_fastrtps_cpp`, rosdep, and the `ament_cmake`/`rosidl` generators; the inline
 `apt install` adds `clang libclang-dev` (r2r bindgen) plus `python3-bloom fakeroot
 debhelper dpkg-dev` (bloom + the msgs deb), and `cargo install cargo-deb` follows.
-The job ends with a smoke-test that installs both `.deb` files and runs `clipper`,
-confirming the `Depends` chain resolves. The packaging steps themselves live in the
-`packaging` skill (`.claude/skills/packaging/SKILL.md`).
+The job ends with a smoke-test that installs both `.deb` files and runs the
+recorder against the apt-installed typesupport, confirming the `Depends` chain
+resolves. It covers both installed names: `/opt/momentedge-clipper/bin/clipper`
+is a compatibility symlink onto `clipper-tailing`, kept for one release, so the
+step asserts it is a symlink, lists the package's files (`dpkg -L`), diffs
+`--version` and `--help` between the two names, and makes its live run through
+the symlink. `--help` is compared with the `Usage:` line set aside, since clap
+builds that one from argv[0] and it correctly names whichever path was invoked.
+The packaging steps themselves live in the `packaging` skill
+(`.claude/skills/packaging/SKILL.md`).
 
 **Tag-gated publish, in a single `release` job.** A `v*` tag publishes;
 `workflow_dispatch` has a `publish` boolean (default `false`) so packaging can be

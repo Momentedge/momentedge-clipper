@@ -9,8 +9,8 @@
 # tail only once a chunk fills, so the default 30 s grace leaves headroom (drop
 # it toward 0 only with the fastwrite profile — see examples/continuous).
 #
-# This is a minimal example invocation. examples/systemd shows the same as a
-# long-running service.
+# This is a minimal example invocation. examples/launch/clipper.launch.py runs
+# the same thing under `ros2 launch`, with respawn.
 #
 # Run inside a sourced ROS2 environment (e.g. . /opt/ros/<distro>/setup.bash):
 #   ./scripts/run.sh
@@ -27,16 +27,16 @@ fi
 
 # The installed binary (the momentedge-clipper deb, or `cargo install`). Without
 # an install, run the crate from the workspace instead:
-#   cargo run -p clipper -- --record-dir ./record
-if ! command -v clipper >/dev/null 2>&1; then
-  echo "clipper not on PATH — install the momentedge-clipper package, or run" >&2
-  echo "from the workspace: cargo run -p clipper -- --record-dir ./record" >&2
+#   cargo run -p clipper --bin clipper-tailing -- --record-dir ./record
+if ! command -v clipper-tailing >/dev/null 2>&1; then
+  echo "clipper-tailing not on PATH — install the momentedge-clipper package, or run" >&2
+  echo "from the workspace: cargo run -p clipper --bin clipper-tailing -- --record-dir ./record" >&2
   exit 1
 fi
 
 # Every flag also reads a MOMENTEDGE_* env var (CLI > env > default); keep these
 # defaults aligned with scripts/record.sh's OUT_DIR.
-exec clipper \
+exec clipper-tailing \
   --record-dir "${MOMENTEDGE_RECORD_DIR:-./record}" \
   --out-dir "${MOMENTEDGE_OUT_DIR:-./clipped}" \
   --grace-secs "${MOMENTEDGE_GRACE_SECS:-30}"

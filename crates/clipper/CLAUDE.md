@@ -740,7 +740,9 @@ this section is the rationale.
 - **Everything is a child process; the test owns no ROS node.** The ros2 CLI
   resolves `momentedge_msgs` types from `AMENT_PREFIX_PATH`, so the test
   binary needs no r2r dependency and carries no process-global DDS state.
-  The binary under test is located via `CARGO_BIN_EXE_clipper`.
+  The binary under test is located via `CARGO_BIN_EXE_clipper_tailing` (cargo
+  derives that name from the binary's, with `-` mapped to `_`), and every spawn
+  blocks until its `clipper-tailing up` startup line appears.
 - **nextest is the required runner, not launch_testing**: process-per-test
   isolation, per-test slow-timeouts, leak detection for orphaned children,
   and the `ros-e2e` test group (`.config/nextest.toml`) serializing the suite
@@ -784,8 +786,8 @@ this section is the rationale.
   the clip's every message is in-window on the *selected* stamp while at least
   one message is out-of-window on the *contrasting* stamp — jointly impossible
   unless the two clock domains genuinely select different message sets. The
-  writer binary is resolved beside `CARGO_BIN_EXE_clipper` (built on demand if
-  absent), so the case needs no extra build step.
+  writer binary is resolved beside `CARGO_BIN_EXE_clipper_tailing` (built on
+  demand if absent), so the case needs no extra build step.
 - **A copper (cu29) Producer reaches clipper end to end**
   (`copper_sink_recording_produces_clip`, ROS-free at runtime): the
   `examples/cu-mcap-record` binary — a copper `CuSinkTask` — appends an
@@ -834,7 +836,7 @@ for the flag reference.
 ## Run
 
 ```bash
-nix develop --command cargo run -p clipper
+nix develop --command cargo run -p clipper --bin clipper-tailing
 ```
 
 Needs `scripts/record.sh` running (for `./record`) and a
@@ -846,7 +848,12 @@ trigger publisher (`trigger-pub`). `RUST_LOG=debug` raises verbosity.
 `MOMENTEDGE_*` environment fallback and a per-field default, so precedence is
 CLI flag > env var > default. `load_config` in `main.rs` parses it — clap prints
 `--help`/`--version` and any parse error and exits before it returns, so the
-binary still runs with no setup. The `MOMENTEDGE_*` env names are not wired
+binary still runs with no setup. The command name is pinned on the derive
+(`#[command(name = "clipper-tailing")]`) because clap's default is the cargo
+package name (`clipper`), and `--help`/`--version` name the binary. clap renders
+both from that configured name, not from argv[0], so the deb's `clipper`
+compatibility symlink prints identically; only the `Usage:` line follows the
+path actually invoked. The `MOMENTEDGE_*` env names are not wired
 per field: `with_env_prefix` walks every argument with `Command::mut_args` and
 binds `<field>` to `MOMENTEDGE_<FIELD>` (`grace_secs` → `MOMENTEDGE_GRACE_SECS`),
 leaving the auto-generated `--help`/`--version` untouched. Changing the prefix is

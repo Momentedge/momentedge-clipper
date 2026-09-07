@@ -33,9 +33,10 @@ ros2 bag record --all \
 ## Run clipper
 
 ```bash
-./scripts/run.sh                    # clipper --record-dir ./record …
+./scripts/run.sh                    # clipper-tailing --record-dir ./record …
 # or, in the dev shell without an install:
-cargo run -p clipper -- --record-dir ./record --out-dir ./clipped --grace-secs 30
+cargo run -p clipper --bin clipper-tailing -- \
+  --record-dir ./record --out-dir ./clipped --grace-secs 30
 ```
 
 Fire test triggers with `cargo run -p trigger-pub` (or publish

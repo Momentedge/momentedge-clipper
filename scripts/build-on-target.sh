@@ -15,9 +15,10 @@
 #
 # Produces, under the repo root:
 #   install/                  colcon overlay carrying momentedge_msgs typesupport
-#   target/release/clipper, target/release/trigger-pub
-# trigger-pub is run by examples/trigger-pub/start_demo_trigger_pub.sh; clipper
-# is run with scripts/record.sh per deployment.
+#   target/release/clipper-tailing, target/release/trigger-pub
+# trigger-pub is run by examples/trigger-pub/start_demo_trigger_pub.sh;
+# clipper-tailing is run by scripts/run.sh, against the recording scripts/record.sh
+# writes.
 #
 # Override the ROS install with ROS_SETUP=/opt/ros/<distro>/setup.bash.
 set -euo pipefail
@@ -35,7 +36,8 @@ cd "$REPO_ROOT"
 # 2. Build the binaries through scripts/ros-cargo.sh, which sources ROS + the
 #    just-built overlay and adds the r2r codegen env (IDL_PACKAGE_FILTER) and any
 #    MOMENTEDGE_RPATH. Both deployables by default; the .deb build sets
-#    BUILD_PACKAGES=clipper, the only binary it packages.
+#    BUILD_PACKAGES=clipper (the cargo package; its binary is clipper-tailing),
+#    the only one it packages.
 read -ra _build_pkgs <<< "${BUILD_PACKAGES:-clipper trigger-pub}"
 _pkg_flags=()
 for _p in "${_build_pkgs[@]}"; do _pkg_flags+=(-p "$_p"); done
@@ -44,5 +46,5 @@ for _p in "${_build_pkgs[@]}"; do _pkg_flags+=(-p "$_p"); done
 echo
 echo "built:"
 for _p in "${_build_pkgs[@]}"; do echo "  $REPO_ROOT/target/release/$_p"; done
-echo "run the recorder: scripts/record.sh + target/release/clipper"
+echo "run the recorder: scripts/record.sh + target/release/clipper-tailing"
 echo "run the demo trigger: examples/trigger-pub/start_demo_trigger_pub.sh (needs trigger-pub built)"

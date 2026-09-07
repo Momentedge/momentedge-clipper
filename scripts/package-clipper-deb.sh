@@ -8,7 +8,7 @@
 # This packages only — build first (scripts/build-on-target.sh, or
 # scripts/ros-cargo.sh build --release -p clipper), which is the step that needs
 # the ROS environment. cargo-deb here neither compiles nor links, so it needs no
-# sourced ROS: --no-build takes target/release/clipper as-is.
+# sourced ROS: --no-build takes target/release/clipper-tailing as-is.
 #
 # --variant $ROS_DISTRO selects the matching ros-<distro>-* Depends; the .deb is
 # named with the ubuntu+distro tag so the per-distro packages don't collide.
@@ -30,15 +30,15 @@ OUT_DIR="${OUT_DIR:-$REPO_ROOT/dist}"
 ARCH="$(dpkg --print-architecture)"
 UBUNTU_VERSION="$(. /etc/os-release && echo "$VERSION_ID")"
 
-[[ -x target/release/clipper ]] || {
-  echo "missing target/release/clipper — run scripts/build-on-target.sh first" >&2
+[[ -x target/release/clipper-tailing ]] || {
+  echo "missing target/release/clipper-tailing — run scripts/build-on-target.sh first" >&2
   exit 1
 }
 
 mkdir -p "$OUT_DIR"
 DEB="$OUT_DIR/momentedge-clipper_${VERSION}_ubuntu${UBUNTU_VERSION}-${ROS_DISTRO}_${ARCH}.deb"
 
-echo "cargo-deb: clipper -> momentedge-clipper $VERSION ($ROS_DISTRO, ubuntu $UBUNTU_VERSION, $ARCH)"
+echo "cargo-deb: clipper-tailing -> momentedge-clipper $VERSION ($ROS_DISTRO, ubuntu $UBUNTU_VERSION, $ARCH)"
 cargo deb -p clipper --no-build --variant "$ROS_DISTRO" --deb-version "$VERSION" --output "$DEB"
 
 echo

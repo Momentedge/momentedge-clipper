@@ -163,7 +163,15 @@ impl std::fmt::Display for InterfaceKind {
 /// comments are the `--help` text: the first line is the short help, the rest is
 /// shown under `--help`.
 #[derive(Debug, Parser)]
-#[command(version, about = "Triggered MCAP clip recorder")]
+// `name` is set explicitly because clap's derive would otherwise take it from
+// the cargo *package* (`clipper`), which is not what this binary is called. The
+// deb installs a `clipper` compatibility symlink beside it, and both names must
+// answer with the artefact actually running.
+#[command(
+    name = "clipper-tailing",
+    version,
+    about = "Triggered MCAP clip recorder"
+)]
 struct Config {
     /// Bag directory of the continuous recording that is tailed.
     #[arg(long, default_value = "./record")]
@@ -639,7 +647,7 @@ fn drive<I: Interface>(
     let signal_rx = signal_channel().context("signal handler failed to install")?;
 
     info!(
-        "clipper up: {iface_name} interface, triggers on {TRIGGER_TOPIC}, \
+        "clipper-tailing up: {iface_name} interface, triggers on {TRIGGER_TOPIC}, \
          tailing {}, writing clips to {}",
         cfg.record_dir.display(),
         cfg.out_dir.display(),
