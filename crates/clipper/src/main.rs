@@ -435,7 +435,7 @@ impl Admission {
     /// permit is held by an active handler — the caller rejects the trigger.
     fn try_acquire(self: Arc<Self>) -> Option<AdmissionPermit> {
         self.active
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                 (n < self.limit).then_some(n + 1)
             })
             .ok()
