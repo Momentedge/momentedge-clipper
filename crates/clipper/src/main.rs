@@ -19,14 +19,22 @@
 //! never see a footer-less file).
 //!
 //! Where triggers come from and how completion is signalled is the [`interface`],
-//! one active per run (`--interface`). The `ros` interface subscribes to
-//! `/events/momentedge/trigger` (`momentedge_msgs/Trigger`) on a ROS node and
-//! publishes `/events/momentedge/recorded` (`momentedge_msgs/Recorded`) naming
-//! every durable segment. The `mcap` interface reads triggers out of the tailed
-//! recording itself — decoding each by its MCAP `message_encoding` ([`decode`])
-//! — and runs ROS-free, the clip's atomic move into the output directory
-//! standing in for the `Recorded` publish. The handler cutting the clip is
-//! identical either way; it knows only the neutral [`trigger`] contract.
+//! one active per run (`--interface`). The `mcap` interface reads triggers out
+//! of the tailed recording itself — decoding each by its MCAP `message_encoding`
+//! ([`decode`]) — and runs ROS-free, the clip's atomic move into the output
+//! directory standing in for a completion announcement. The `ros` interface
+//! subscribes to `/events/momentedge/trigger` (`momentedge_msgs/Trigger`) on a
+//! ROS node and publishes `/events/momentedge/recorded`
+//! (`momentedge_msgs/Recorded`) naming every durable segment. The handler
+//! cutting the clip is identical either way; it knows only the neutral
+//! [`trigger`] contract.
+//!
+//! **Two builds.** The `ros` cargo feature is what links the ROS client and
+//! compiles the `ros` interface in. With it — the device build, which every
+//! packaging path selects — `--interface` takes `ros` (the default there) or
+//! `mcap`. Without it the binary links no ROS, builds and runs on a host with no
+//! ROS installation, and offers `mcap` alone. Nothing else differs: the tail, the
+//! window plan, the cut, and every other flag are the same code either way.
 //!
 //! Time base: MCAP `log_time`, the trigger stamp, and the wait clock are all
 //! treated as nanoseconds on the system (ROS) clock — this assumes the default
@@ -76,13 +84,18 @@ use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use clip::trigger::{Trigger, now_ns};
 use clip::{TimeSource, segment};
 use crossbeam_channel::{Receiver, Sender, bounded, select, unbounded};
-use interface::{Anchor, Interface, McapInterface, RosInterface};
+#[cfg(feature = "ros")]
+use interface::ros::RosInterface;
+use interface::{Anchor, Interface, McapInterface};
 use log::{error, info, warn};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use supervision::{Supervised, harvest_panic, spawn_supervised};
 use tail::{Coverage, Tailer, Watch, handler};
 
 const TRIGGER_TOPIC: &str = "/events/momentedge/trigger";
+/// The topic the ROS interface announces finished clips on. Only that interface
+/// publishes, so only the `ros` build has one.
+#[cfg(feature = "ros")]
 const RECORDED_TOPIC: &str = "/events/momentedge/recorded";
 
 /// How many trigger handlers may be active (admitted, waiting, or extracting)
@@ -141,18 +154,61 @@ impl std::fmt::Display for ClipCompression {
 }
 
 /// Where clipper takes triggers from and where it announces completions — one
-/// interface to the outside world, chosen by `--interface`. The two are mutually
-/// exclusive; clipper drives exactly one per run.
+/// interface to the outside world, chosen by `--interface`. The variants are
+/// mutually exclusive; clipper drives exactly one per run.
+///
+/// The variant set is the build: `Ros` exists only under the `ros` feature, so a
+/// ROS-free build's `--interface` accepts (and its `--help` lists) `mcap` alone.
+/// [`DEFAULT_INTERFACE`] is the one clipper takes when the flag is absent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum InterfaceKind {
     /// Subscribe to the trigger topic on a ROS node and publish `Recorded` on
-    /// completion. The default — the deployed, ROS-native path.
+    /// completion. The deployed, ROS-native path, and the default where it
+    /// exists.
+    #[cfg(feature = "ros")]
     Ros,
     /// Read triggers out of the tailed MCAP (decoding each by its
     /// `message_encoding`) and signal completion by the clip's move into
     /// `out_dir`. Runs ROS-free: no node, executor, subscription, or publish.
     Mcap,
 }
+
+/// The interface clipper drives when `--interface` is not given: the ROS one
+/// where the feature built it, and otherwise the only one there is.
+#[cfg(feature = "ros")]
+const DEFAULT_INTERFACE: InterfaceKind = InterfaceKind::Ros;
+#[cfg(not(feature = "ros"))]
+const DEFAULT_INTERFACE: InterfaceKind = InterfaceKind::Mcap;
+
+/// The `--interface` short help. It names the values this build actually
+/// accepts, which is the feature's one visible difference on the command line.
+#[cfg(feature = "ros")]
+const INTERFACE_HELP: &str = "Where triggers come from and completions go: `ros` or `mcap`";
+#[cfg(not(feature = "ros"))]
+const INTERFACE_HELP: &str = "Where triggers come from and completions go: `mcap`";
+
+/// The `--interface` long help (`--help`, not `-h`), likewise per build: the ROS
+/// arm is described only where it can be selected, and the ROS-free build says
+/// outright that it was built without it.
+#[cfg(feature = "ros")]
+const INTERFACE_LONG_HELP: &str = "\
+Where triggers come from and completions go: `ros` or `mcap`.
+
+`ros` (the default) subscribes to the trigger topic on a ROS node and publishes \
+`Recorded` on completion. `mcap` reads triggers out of the tailed recording \
+(decoding each by its `message_encoding`) and signals completion by moving the \
+clip into `out_dir` — it runs ROS-free, with no node, subscription, or publish. \
+Exactly one interface is active per run.";
+#[cfg(not(feature = "ros"))]
+const INTERFACE_LONG_HELP: &str = "\
+Where triggers come from and completions go: `mcap`.
+
+`mcap` reads triggers out of the tailed recording (decoding each by its \
+`message_encoding`) and signals completion by moving the clip into `out_dir` — \
+it runs ROS-free, with no node, subscription, or publish. It is the only \
+interface this binary has: the `ros` interface, which subscribes to the trigger \
+topic on a ROS node and publishes `Recorded`, is compiled in by the `ros` cargo \
+feature, and this build was made without it.";
 
 impl std::fmt::Display for InterfaceKind {
     /// Render as the clap value name (`ros`/`mcap`) so the `--help` default and
@@ -249,14 +305,20 @@ struct Config {
     #[arg(long, value_enum, default_value_t = ClipCompression::Zstd)]
     clip_compression: ClipCompression,
 
-    /// Where triggers come from and completions go: `ros` or `mcap`.
+    /// Where triggers come from and completions go.
     ///
-    /// `ros` (the default) subscribes to the trigger topic on a ROS node and
-    /// publishes `Recorded` on completion. `mcap` reads triggers out of the
-    /// tailed recording (decoding each by its `message_encoding`) and signals
-    /// completion by moving the clip into `out_dir` — it runs ROS-free, with no
-    /// node, subscription, or publish. Exactly one interface is active per run.
-    #[arg(long, value_enum, default_value_t = InterfaceKind::Ros)]
+    /// The one flag whose surface the `ros` cargo feature changes, so its help
+    /// text is per build ([`INTERFACE_HELP`] / [`INTERFACE_LONG_HELP`]) rather
+    /// than this doc comment, and its default is [`DEFAULT_INTERFACE`]. clap
+    /// derives the accepted values from [`InterfaceKind`]'s variants, so
+    /// `--help` lists exactly what this build can select.
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = DEFAULT_INTERFACE,
+        help = INTERFACE_HELP,
+        long_help = INTERFACE_LONG_HELP,
+    )]
     interface: InterfaceKind,
 
     /// Clock domain the clip window lives in: `log` or `publish`.
@@ -519,8 +581,11 @@ fn tail_mode(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
     // decode-free trigger tap — the tail lifts trigger-topic messages out of the
     // recording — so its arm wires the tap channel and hands the receiver to the
     // interface; the ROS interface reads triggers from a live subscription and
-    // needs no tap, so its tailer is built without one.
+    // needs no tap, so its tailer is built without one. The ROS arm exists only
+    // where the `ros` feature compiled that interface in — without it the
+    // variant does not exist and this match has the one arm.
     let result = match cfg.interface {
+        #[cfg(feature = "ros")]
         InterfaceKind::Ros => {
             let (tailer, coverage) = Tailer::new();
             let iface = RosInterface::new(TRIGGER_TOPIC, RECORDED_TOPIC, cfg.time_source)?;
@@ -551,7 +616,8 @@ const MAX_ROLL_NS: u64 = 1_800_000_000_000; // 30 * 60 * 1e9
 /// the *resolved* anchor, whatever cell produced it: `--interface ros
 /// --time-source log` resolves it to `now` and always passes, while a
 /// `ros`+`publish` `trigger_time` or a tail record's own stamp is exactly what it
-/// bites on.
+/// bites on — and a tail record's stamp is the only one a build without the
+/// `ros` feature can present.
 const MAX_ANCHOR_FUTURE_SKEW_NS: u64 = 1_800_000_000_000; // 30 * 60 * 1e9
 
 /// The largest trigger `name`, in bytes. The name is embedded in the clip
@@ -567,10 +633,11 @@ const MAX_TRIGGER_NAME_LEN: usize = 128;
 /// guard is the only clock-relative check). The checks, any one of which
 /// rejects:
 ///
-/// - **`trigger_time` in a cell that ignores it.** Exactly one cell of the
+/// - **`trigger_time` in a cell that ignores it.** At most one cell of the
 ///   interface × `--time-source` matrix reads `trigger_time` — `--interface ros
 ///   --time-source publish`, where it *is* the anchor ([`Anchor::from_trigger_time`]);
-///   every other cell anchors on a transport stamp. Sending `trigger_time` where
+///   a build without the `ros` feature has no such cell, and every other cell
+///   anchors on a transport stamp. Sending `trigger_time` where
 ///   it is ignored would silently anchor the window on the trigger's arrival
 ///   rather than the requested instant, so it is refused loudly. `trigger_time == 0`
 ///   is always accepted.
@@ -925,15 +992,11 @@ mod tests {
         );
     }
 
+    /// `--interface mcap` selects the in-recording interface in every build, and
+    /// an unknown value is rejected. (The `MOMENTEDGE_INTERFACE` env fallback is
+    /// covered by `env_prefix_binds_a_momentedge_name_to_every_field`.)
     #[test]
-    fn config_interface_defaults_to_ros_and_parses_mcap() {
-        // Default is the ROS interface; --interface selects mcap; an unknown
-        // value is rejected. (Its MOMENTEDGE_INTERFACE env fallback is covered by
-        // env_prefix_binds_a_momentedge_name_to_every_field.)
-        assert_eq!(
-            parse_from(["clipper", "tail"]).unwrap().interface,
-            InterfaceKind::Ros
-        );
+    fn config_interface_parses_mcap_and_rejects_an_unknown_value() {
         assert_eq!(
             parse_from(["clipper", "tail", "--interface", "mcap"])
                 .unwrap()
@@ -941,6 +1004,39 @@ mod tests {
             InterfaceKind::Mcap
         );
         assert!(parse_from(["clipper", "tail", "--interface", "bogus"]).is_err());
+    }
+
+    /// The device build: the `ros` feature offers the ROS interface, and clipper
+    /// takes it when `--interface` is absent — the deployed behaviour.
+    #[cfg(feature = "ros")]
+    #[test]
+    fn config_interface_defaults_to_ros_under_the_ros_feature() {
+        assert_eq!(
+            parse_from(["clipper", "tail"]).unwrap().interface,
+            InterfaceKind::Ros
+        );
+        assert_eq!(
+            parse_from(["clipper", "tail", "--interface", "ros"])
+                .unwrap()
+                .interface,
+            InterfaceKind::Ros
+        );
+    }
+
+    /// The ROS-free build has no ROS interface to select: `--interface ros` is
+    /// refused like any other unknown value, and `mcap` is what an absent flag
+    /// means.
+    #[cfg(not(feature = "ros"))]
+    #[test]
+    fn config_interface_is_mcap_only_without_the_ros_feature() {
+        assert_eq!(
+            parse_from(["clipper", "tail"]).unwrap().interface,
+            InterfaceKind::Mcap
+        );
+        assert!(
+            parse_from(["clipper", "tail", "--interface", "ros"]).is_err(),
+            "a build that links no ROS must not accept --interface ros"
+        );
     }
 
     #[test]
@@ -1033,6 +1129,39 @@ mod tests {
             !help.contains("Commands:"),
             "the recorder mode has no submodes: {help}"
         );
+    }
+
+    /// `clipper tail --help` names the interfaces *this* build can select — the
+    /// one place the `ros` cargo feature is visible on the command line. The
+    /// feature build offers both values and defaults to `ros`; the ROS-free
+    /// build offers `mcap` alone and says outright that the ROS interface was
+    /// not built in, so an operator reading `--help` on a host with no ROS is
+    /// told why rather than left guessing.
+    #[test]
+    fn tail_help_names_the_interfaces_this_build_offers() {
+        let err =
+            cli_from(["clipper", "tail", "--help"]).expect_err("--help short-circuits the parse");
+        let help = err.to_string();
+        // `--help` renders a `ValueEnum`'s accepted values as a `Possible
+        // values:` list, one `- <name>:` line each.
+        assert!(help.contains("- mcap:"), "every build offers mcap: {help}");
+        #[cfg(feature = "ros")]
+        {
+            assert!(help.contains("- ros:"), "{help}");
+            assert!(help.contains("[default: ros]"), "{help}");
+        }
+        #[cfg(not(feature = "ros"))]
+        {
+            assert!(
+                !help.contains("- ros:"),
+                "a build that links no ROS must not offer --interface ros: {help}"
+            );
+            assert!(help.contains("[default: mcap]"), "{help}");
+            assert!(
+                help.contains("this build was made without it"),
+                "the help says the ros interface is absent from this build: {help}"
+            );
+        }
     }
 
     /// A failure *inside* a named mode is the mode's own problem, so it carries

@@ -12,24 +12,43 @@ description = "Triggered MCAP clip recorder for ROS2"
 name = "clipper"
 path = "src/main.rs"
 
+[features]
+default = []
+# The ROS interface: a live `momentedge_msgs/Trigger` subscription on a node and
+# the `Recorded` publish answering it (`--interface ros`), plus everything that
+# exists only to serve it — r2r, the futures its typed subscription stream is
+# drained with, and `clip`'s CDR trigger decoder. This is the device build, and
+# every packaging path asks for it: the nix package, the on-target build behind
+# the .deb, and the per-distro CI matrix.
+#
+# Off by default, so a plain `cargo build -p clipper` links no ROS, needs no ROS
+# installation anywhere, and offers `--interface mcap` alone — the recorder
+# reading its triggers out of the recording it already tails. The ROS-free CI
+# lane holds that down by asserting r2r is absent from the default dependency
+# tree before it builds the crate.
+ros = ["dep:r2r", "dep:futures", "clip/ros"]
+
 [dependencies]
-# r2r: ROS2 client bindings. Typed subscription to the Trigger topic and a typed
-# Recorded publisher. No WriteSplitEvent — coverage comes from tailing the file.
-r2r.workspace = true
+# r2r, `ros` only: ROS2 client bindings. Typed subscription to the Trigger topic
+# and a typed Recorded publisher. No WriteSplitEvent — coverage comes from
+# tailing the file.
+r2r = { workspace = true, optional = true }
 # `futures::StreamExt` + `futures::executor::block_on` drain the typed trigger
 # stream on the consumer thread; r2r's subscriptions are futures-channel-backed
-# and need no async runtime.
-futures.workspace = true
+# and need no async runtime. `ros` only — that subscription is its one user.
+futures = { workspace = true, optional = true }
 # FIFO channel plumbing between the threads: the extraction job queue, each
 # job's reply channel, and the exit channels `supervise` select!s over.
 crossbeam-channel.workspace = true
 # SIGINT/SIGTERM delivered as a message on a channel `supervise` selects on.
 signal-hook.workspace = true
 # The shared library: the MCAP format layer and recording index, the cut path,
-# the neutral trigger contract and segment publication. `ros` adds the CDR
-# trigger decoder and the two r2r message conversions; `clap` makes `TimeSource`
-# a `ValueEnum` for the `--time-source` flag.
-clip = { path = "../clip", features = ["ros", "clap"] }
+# the neutral trigger contract and segment publication. `clap` makes `TimeSource`
+# a `ValueEnum` for the `--time-source` flag, and every build needs it. Its `ros`
+# feature — the CDR trigger decoder and the two r2r message conversions — comes
+# through this crate's own `ros` feature above, so the default build takes `clip`
+# ROS-free too.
+clip = { path = "../clip", features = ["clap"] }
 # Live tailing over `clip`: recording discovery, the recording collection and its
 # lifecycle, coverage, retention, and the per-trigger waits a cut from a growing
 # file needs before the shared cut path runs.
