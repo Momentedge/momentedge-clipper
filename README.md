@@ -209,8 +209,8 @@ them:
 
 - **`clipper tail`** — the recorder: follow a continuous recording and cut a clip
   per trigger, until a shutdown signal.
-- **`clipper clip`** — cut one clip out of one finished recording and exit
-  ([below](#cutting-one-clip-clipper-clip)).
+- **`clipper clip`** — cut clips out of one finished recording and exit
+  ([below](#cutting-clips-from-a-finished-recording-clipper-clip)).
 
 A flag handed to the bare `clipper` is refused, with a message naming the mode
 that owns it. Every mode's flags carry a `MOMENTEDGE_*` environment fallback: a
@@ -239,38 +239,43 @@ unchunked `fastwrite` recording, roughly one chunk-fill for a chunked profile.
 The [`examples/continuous`](examples/continuous/README.md) guide explains the
 recorder's latency-vs-size knobs and how to size `--grace-secs` against them.
 
-### Cutting one clip: `clipper clip`
+### Cutting clips from a finished recording: `clipper clip`
 
 `clipper tail` exists because the recording has no end yet: it follows the file
 and waits for each window to land on disk before cutting. A recording that is
-already finished needs no such wait — `clipper clip` takes one, cuts the window a
-trigger names out of it, and exits.
+already finished needs no such wait — `clipper clip` takes one, cuts the window
+each trigger names out of it, and exits.
 
 ```bash
+# one clip, from a trigger named on the command line
 clipper clip ./record/rosbag2_0.mcap \
   --out-dir ./clipped \
   --trigger-time 1738000000000000000 \
   --preroll 5000000000 --postroll 5000000000 \
   --trigger-name brake-event --trigger-description "hard brake over 0.8 g"
+
+# one clip per trigger the recording itself carries
+clipper clip ./record/rosbag2_0.mcap --out-dir ./clipped --trigger-source mcap
 ```
 
 | Argument | Env var | Default | Meaning |
 |---|---|---|---|
 | `<recording>` | `MOMENTEDGE_RECORDING` | — | the finished `.mcap` to cut from (positional) |
-| `--out-dir` | `MOMENTEDGE_OUT_DIR` | — | where the clip is written |
-| `--trigger-time` | `MOMENTEDGE_TRIGGER_TIME` | — | the instant the window centres on, in nanoseconds since the epoch |
-| `--preroll` | `MOMENTEDGE_PREROLL` | — | nanoseconds before that instant to include |
-| `--postroll` | `MOMENTEDGE_POSTROLL` | — | nanoseconds after it to include |
-| `--trigger-name` | `MOMENTEDGE_TRIGGER_NAME` | `clip` | the trigger's name, which also names the clip file |
-| `--trigger-description` | `MOMENTEDGE_TRIGGER_DESCRIPTION` | *(empty)* | the trigger's description, carried into the manifest |
+| `--out-dir` | `MOMENTEDGE_OUT_DIR` | — | where the clips are written |
+| `--trigger-source` | `MOMENTEDGE_TRIGGER_SOURCE` | `param` | where this run's triggers come from: `param` or `mcap` (see [below](#where-a-clip-runs-triggers-come-from-param-and-mcap)) |
+| `--trigger-time` | `MOMENTEDGE_TRIGGER_TIME` | — | the instant the window centres on, in nanoseconds since the epoch (`param` only, required) |
+| `--preroll` | `MOMENTEDGE_PREROLL` | — | nanoseconds before that instant to include (`param` only, required) |
+| `--postroll` | `MOMENTEDGE_POSTROLL` | — | nanoseconds after it to include (`param` only, required) |
+| `--trigger-name` | `MOMENTEDGE_TRIGGER_NAME` | `clip` | the trigger's name, which also names the clip file (`param` only) |
+| `--trigger-description` | `MOMENTEDGE_TRIGGER_DESCRIPTION` | *(empty)* | the trigger's description, carried into the manifest (`param` only) |
 
-The clip lands at `<out-dir>/<trigger-time>_<trigger-name>.mcap` and is the same
+Each clip lands at `<out-dir>/<anchor-ns>_<trigger-name>.mcap` and is the same
 file the recorder would have written from the same recording and window — the
 window plan, the byte copy, the [manifest](#what-a-clip-carries) and the atomic
-publication are all the shared path. The five trigger arguments are the fields
-of a `momentedge_msgs/Trigger`, so the clip states the same trigger a clip cut
-from a live topic does; only `producer.mode` differs, reading `clip` rather than
-`tail`.
+publication are all the shared path. The five `--trigger-*` arguments are the
+fields of a `momentedge_msgs/Trigger`, so the clip states the same trigger a clip
+cut from a live topic does; only `producer.mode` differs, reading `clip` rather
+than `tail`.
 
 Three things follow from the input being finished:
 
@@ -282,7 +287,9 @@ Three things follow from the input being finished:
   `--time-source` is a parse error.
 - **Reading it is cheap.** The recording is indexed from its own summary — a
   footer seek and one read, whatever the file's size — rather than by walking it,
-  so no chunk is decompressed until the copy asks for one.
+  so no chunk is decompressed until the copy asks for one. Reading the
+  recording's own triggers costs the same summary plus the chunks that summary
+  names as holding the trigger channel, and nothing else.
 
 Nothing machine-readable is printed. The result is the output directory's
 contents when the process exits, each clip carrying its own manifest, and the
@@ -404,6 +411,36 @@ rmw typesupport the same feature links, and a ROS-free build skips such a trigge
 with an error naming the feature. So a ROS-free deployment wants a producer that
 writes its triggers as `json` (see
 [`examples/custom-mcap-writer`](examples/custom-mcap-writer/README.md)).
+
+### Where a `clip` run's triggers come from: `param` and `mcap`
+
+`clipper clip` faces the same question from the other side: a finished recording
+holds no live topic to subscribe to, so the triggers come either from the command
+line or from the recording itself. `--trigger-source` picks one, and exactly one
+is active per run.
+
+- **`param`** (the default) cuts the single trigger the `--trigger-*` flags name.
+  It needs `--trigger-time`, `--preroll` and `--postroll`; `--trigger-name` and
+  `--trigger-description` fill in. One run, one clip.
+- **`mcap`** cuts every trigger the recording carries on
+  `/events/momentedge/trigger` — one clip per trigger, each anchored on the
+  `log_time` the recording stamped that trigger message with, with the name,
+  description, preroll and postroll the message itself states. It takes no
+  `--trigger-*` flag at all. Reading the trigger list costs the summary plus the
+  chunks that summary names as holding the trigger channel; no other chunk is
+  decompressed.
+
+This is the same recorded trigger the `mcap` *interface* reads while tailing, and
+the same decoder: `json` decodes in every build, `cdr` needs the `ros` cargo
+feature. A trigger this run cannot use — an undecodable payload, or a name that
+cannot be embedded in a clip pathname — costs that trigger its clip and no more;
+the run logs it and cuts the rest.
+
+Both ways of stating the trigger wrongly are refused while the command line is
+being read, with the flag at fault named and nothing written: `param` without one
+of the three flags it needs, and `mcap` alongside any `--trigger-*` flag. A
+recording holding no trigger at all, read under `mcap`, cuts nothing and says so
+— a normal, zero-status run that leaves the output directory untouched.
 
 ## What a clip carries
 

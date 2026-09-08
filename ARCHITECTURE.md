@@ -76,6 +76,7 @@ e2e-tests the feature half.
 | `src/segment.rs` | One window to durable clips: plan, stage a segment per source recording over a worker pool, drop the empties, publish |
 | `src/trigger.rs` | The neutral contract: `Trigger`, `Stamp`, `TriggerRecord`, `Completion`, the `Announce` trait, `now_ns` — plus the `Completion` → `Recorded` conversion under `ros` |
 | `src/decode.rs` | `decode_trigger`: decode a trigger payload by its MCAP `message_encoding` (`json` always, `cdr` under `ros`) |
+| `src/embedded.rs` | `read_triggers`: the triggers a finished recording carries on the trigger topic, found through the summary's own chunk index so only the chunks holding that channel are decompressed |
 | `src/lib.rs` | `TimeSource` (the clock domain a window lives in) and `panic_text` |
 | `src/testing.rs` | MCAP fixture writers, under the `test-support` feature, so a consumer's tests build recordings the way `clip`'s own do |
 
@@ -302,11 +303,11 @@ the active `--time-source`:
 ## Cutting from a finished recording
 
 `clipper clip <recording.mcap> --out-dir <dir> --trigger-time <ns> --preroll
-<ns> --postroll <ns>` cuts one window out of a recording nobody is writing any
-more and exits. Steps 3–6 above are unchanged — it is `clip::segment::cut_window`
-either way, and the clip is what the device would have written from the same
-recording and window. Two things differ, and both follow from the input having
-an end.
+<ns> --postroll <ns>` cuts a window out of a recording nobody is writing any more
+and exits. Steps 3–6 above are unchanged — it is `clip::segment::cut_window`
+either way, and each clip is what the device would have written from the same
+recording and window. Three things differ, and all of them follow from the input
+having an end.
 
 **The index comes from the summary.** A finalised MCAP carries a chunk index per
 chunk (its byte range and the `log_time` span of the messages inside it), the
@@ -328,6 +329,25 @@ the recording is short, and that is a fact the summary's own statistics answer:
 the cut compares the recording's highest `log_time` against the window end and
 carries the verdict into the manifest's `clip.short`, exactly as the coverage
 wait's verdict travels on the live path.
+
+**The triggers can come out of the recording.** `--trigger-source` says where a
+run's triggers come from, and exactly one source is active. `param` (the default)
+cuts the single trigger the `--trigger-*` flags name. `mcap` cuts every trigger
+the recording itself carries on `/events/momentedge/trigger` — one clip per
+trigger, each anchored on the `log_time` the recording stamped that trigger
+message with, which is the stamp the recorder's `mcap` interface anchors on too,
+so the two agree on where the window sits. The trigger list exists before the
+first cut: `clip::embedded::read_triggers` reads the same summary the index came
+from, and then only the chunks whose message indexes name the trigger channel —
+a recording that never carried the topic is answered from the summary alone. Each
+record is decoded by its `message_encoding` through the same `clip::decode` the
+live interface uses, and a trigger the run cannot use (an undecodable payload, a
+name that cannot be embedded in a clip pathname) costs that trigger its clip and
+no more. A recording holding no trigger cuts nothing, writes nothing and exits
+zero. Both ways of stating the trigger wrongly — `param` without a flag it needs,
+`mcap` alongside any `--trigger-*` flag — are refused during argument parsing,
+because the requirement turns on another flag's *value* and clap's derive can
+only key on presence.
 
 The mode takes no `--time-source`: `log_time` is the clock a summary states and
 the only one a completeness claim over a finished recording can be made on, so
