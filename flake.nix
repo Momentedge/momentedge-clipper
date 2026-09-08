@@ -49,12 +49,12 @@
       # packages each one as `pkgs.rosPackages.<distro>`; everything below
       # (dev shell, nix-built binaries, the recorder closure) is produced once
       # per distro by `mkDistro`. Pick a distro at the command line:
-      #   nix develop .#humble        nix build .#clipper-tailing-rolling
+      #   nix develop .#humble        nix build .#clipper-rolling
       # The overlay also ships `kilted`; add it here to build against it.
       rosDistros = ["humble" "jazzy" "lyrical" "rolling"];
 
       # The distro used when no selector is given — `nix develop` and the
-      # unsuffixed packages (`nix build .#clipper-tailing`). Jazzy is the LTS the
+      # unsuffixed packages (`nix build .#clipper`). Jazzy is the LTS the
       # bench is tuned on. The deployment target builds natively against its own
       # apt ROS2 (Humble; see README "Native build on the target"), independent
       # of this and of the nix-built outputs.
@@ -190,28 +190,28 @@
       distros = lib.genAttrs rosDistros mkDistro;
 
       # Per-distro package outputs: rosEnv-<distro>,
-      # clipper-tailing-<distro>, trigger-pub-<distro>.
+      # clipper-<distro>, trigger-pub-<distro>.
       perDistroPackages =
         lib.concatMapAttrs (distro: d: {
           "rosEnv-${distro}" = d.rosEnv;
-          "clipper-tailing-${distro}" = d.binaries.clipper-tailing;
+          "clipper-${distro}" = d.binaries.clipper;
           "trigger-pub-${distro}" = d.binaries.trigger-pub;
         })
         distros;
 
       # Unsuffixed aliases for the default distro, so
-      # `nix build .#clipper-tailing` keeps working.
+      # `nix build .#clipper` keeps working.
       defaultPackages = {
         rosEnv = distros.${defaultDistro}.rosEnv;
         inherit
           (distros.${defaultDistro}.binaries)
-          clipper-tailing
+          clipper
           trigger-pub
           ;
       };
     in {
       # rosEnv (the dev shell's ROS2 closure) and the nix-built binaries are
-      # exposed mostly as build checks — `nix build .#clipper-tailing-rolling`
+      # exposed mostly as build checks — `nix build .#clipper-rolling`
       # compiles the deployable under nix, against that distro, without the
       # system cargo. The target deploys native apt builds, not these (see
       # README "Deployment").

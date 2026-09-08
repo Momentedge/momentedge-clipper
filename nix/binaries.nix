@@ -3,8 +3,8 @@
 # This is NOT the deployment artifact: the target builds these natively against
 # its own apt ROS2 (see README "Native build on the target"), since a nix-built
 # binary bakes /nix/store RPATHs and would drag the nix closure along instead of
-# using the host's ROS. Both are built: clipper-tailing (the deployable recorder,
-# built from the `clipper` cargo package) and trigger-pub (the example trigger
+# using the host's ROS. Both are built: clipper (the deployable recorder, whose
+# modes are subcommands — `clipper tail`) and trigger-pub (the example trigger
 # publisher, examples/trigger-pub). r2r's build
 # script (bindgen + rcl codegen) needs the same environment the dev shell's
 # shellHook sets: rosEnv's setup hook exports AMENT_PREFIX_PATH, and the explicit
@@ -32,8 +32,8 @@ let
     ROS_DISTRO = rosDistro;
   };
 in {
-  # The cargo package is `clipper`; the binary it produces is `clipper-tailing`.
-  clipper-tailing = mkBin { pname = "clipper-tailing"; cargoPkg = "clipper"; };
+  # The recorder: cargo package and binary are both `clipper`.
+  clipper = mkBin { pname = "clipper"; };
   # The example trigger publisher (examples/trigger-pub), built here too as a check.
   trigger-pub = mkBin { pname = "trigger-pub"; };
 }

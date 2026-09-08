@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Example clipper invocation matching scripts/record.sh.
+# Example `clipper tail` invocation matching scripts/record.sh.
 #
-# clipper tails the split recording scripts/record.sh writes under ./record,
+# `clipper tail` follows the split recording scripts/record.sh writes under ./record,
 # following each rollover to the newest `<bag>_<n>.mcap`, and cuts a clip per
 # trigger into ./clipped. The --record-dir here must match record.sh's output
 # directory, and --grace-secs must exceed the recorder's flush latency: with
@@ -27,16 +27,16 @@ fi
 
 # The installed binary (the momentedge-clipper deb, or `cargo install`). Without
 # an install, run the crate from the workspace instead:
-#   cargo run -p clipper --bin clipper-tailing -- --record-dir ./record
-if ! command -v clipper-tailing >/dev/null 2>&1; then
-  echo "clipper-tailing not on PATH — install the momentedge-clipper package, or run" >&2
-  echo "from the workspace: cargo run -p clipper --bin clipper-tailing -- --record-dir ./record" >&2
+#   cargo run -p clipper -- tail --record-dir ./record
+if ! command -v clipper >/dev/null 2>&1; then
+  echo "clipper not on PATH — install the momentedge-clipper package, or run" >&2
+  echo "from the workspace: cargo run -p clipper -- tail --record-dir ./record" >&2
   exit 1
 fi
 
 # Every flag also reads a MOMENTEDGE_* env var (CLI > env > default); keep these
 # defaults aligned with scripts/record.sh's OUT_DIR.
-exec clipper-tailing \
+exec clipper tail \
   --record-dir "${MOMENTEDGE_RECORD_DIR:-./record}" \
   --out-dir "${MOMENTEDGE_OUT_DIR:-./clipped}" \
   --grace-secs "${MOMENTEDGE_GRACE_SECS:-30}"
