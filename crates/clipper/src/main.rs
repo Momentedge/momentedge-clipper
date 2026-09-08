@@ -734,11 +734,7 @@ fn effective_config(
 }
 
 fn report_line(key: &str, value: &str, origin: &str) -> String {
-    format!(
-        "    {key:<REPORT_KEY_WIDTH$} = {value:<REPORT_VALUE_WIDTH$} <- {origin}\n",
-        key = key,
-        value = value,
-    )
+    format!("    {key:<REPORT_KEY_WIDTH$} = {value:<REPORT_VALUE_WIDTH$} <- {origin}\n")
 }
 
 /// A fully-resolved command line: the mode, the topic selection its clips are

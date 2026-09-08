@@ -193,8 +193,8 @@ impl Layered {
                 settings.insert(key.clone(), Setting::new(value, Layer::System));
             }
         }
-        if let Some(file) = &run_file {
-            let path = run.unwrap_or(Path::new("")).display();
+        if let (Some(file), Some(path)) = (&run_file, run) {
+            let path = path.display();
             for (key, value) in &file.settings {
                 // A refusal is reported and dropped, not fatal: the run is
                 // legitimate, it simply does not get to decide this key.
