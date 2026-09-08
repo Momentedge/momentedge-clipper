@@ -26,6 +26,21 @@
 
 use serde::Deserialize;
 
+/// The topic a [`Trigger`] arrives on: the ROS interface subscribes to it, and
+/// the `mcap` interface lifts trigger records off it out of the recording.
+///
+/// Part of the contract rather than of either interface, because a third thing
+/// needs it: a clip is cut from a recording that carries this topic, and
+/// [`crate::select`] decides whether it keeps it.
+pub const TRIGGER_TOPIC: &str = "/events/momentedge/trigger";
+
+/// The topic a [`Completion`] is announced on by the ROS interface.
+///
+/// Named here, and not only where it is published, because a clip is cut out of
+/// a recording that captured clipper's own announcements: [`crate::select`]
+/// refuses this topic unconditionally, so no clip is ever partly about clipper.
+pub const ANNOUNCE_TOPIC: &str = "/events/momentedge/recorded";
+
 /// A `builtin_interfaces/Time` flattened to its two fields, free of `r2r`. It is
 /// the publisher's own publish-domain timestamp (`trigger_time`), one possible
 /// source of a window's anchor: read only by the ros interface under the
