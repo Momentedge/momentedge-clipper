@@ -1256,6 +1256,54 @@ mod tests {
         Ok(())
     }
 
+    /// One chunk index, with `message_index_length` the only field a test cares
+    /// about.
+    fn chunk_index(message_index_length: u64) -> mcap::records::ChunkIndex {
+        mcap::records::ChunkIndex {
+            message_start_time: 100,
+            message_end_time: 200,
+            chunk_start_offset: 41,
+            chunk_length: 170,
+            message_index_offsets: BTreeMap::new(),
+            message_index_length,
+            compression: "zstd".to_string(),
+            compressed_size: 117,
+            uncompressed_size: 166,
+        }
+    }
+
+    /// A recording where one chunk indexes no message is not a recording whose
+    /// writer had message indexing disabled.
+    ///
+    /// A chunk carrying only schema and channel records legitimately indexes no
+    /// message, so it is a summary where *no* chunk does that names the writer
+    /// setting. Refusing on the first unindexed chunk would refuse a recording
+    /// that is perfectly plannable.
+    #[test]
+    fn one_unindexed_chunk_among_indexed_ones_is_not_a_refusal() {
+        let path = Path::new("/data/rec.mcap");
+        let mixed = mcap::Summary {
+            chunk_indexes: vec![chunk_index(0), chunk_index(47)],
+            ..mcap::Summary::default()
+        };
+        assert!(
+            refuse_unplannable(path, &mixed).is_ok(),
+            "one unindexed chunk beside an indexed one is plannable"
+        );
+
+        let none = mcap::Summary {
+            chunk_indexes: vec![chunk_index(0), chunk_index(0)],
+            ..mcap::Summary::default()
+        };
+        assert!(
+            matches!(
+                refuse_unplannable(path, &none),
+                Err(IndexRefusal::Unindexed { chunks: 2, .. })
+            ),
+            "a summary where no chunk indexes a message is refused"
+        );
+    }
+
     /// A refusal is reached from the footer and the summary alone — no chunk is
     /// decompressed.
     ///
