@@ -88,6 +88,9 @@ pub mod op {
     pub const CHANNEL: u8 = 0x04;
     pub const MESSAGE: u8 = 0x05;
     pub const CHUNK: u8 = 0x06;
+    /// The clip manifest's record type — never produced by the scan, read back
+    /// by [`crate::manifest::read_manifest`].
+    pub const METADATA: u8 = 0x0C;
     pub const DATA_END: u8 = 0x0F;
 }
 
@@ -206,23 +209,38 @@ impl Extent {
     }
 }
 
+/// The recording one [`WindowPlan`] reads: the descriptor the copy pulls its
+/// extents out of, and the path that descriptor was opened at.
+///
+/// The two travel together because a clip's manifest names the file its bytes
+/// came from ([`crate::manifest`]), and a plan holding the descriptor alone
+/// could not say which of a rollover's split files a segment was cut from — the
+/// descriptor outlives the name, since a pruned or rotated recording stays
+/// readable through the pinned `Arc<File>` after its path is gone.
+#[derive(Clone, Debug)]
+pub struct PlanSource {
+    pub path: PathBuf,
+    pub file: Arc<File>,
+}
+
 /// A snapshot for one clip: the open recording, the extents overlapping the
-/// window (in file order), and the channel registry to map IDs with. `file` is
+/// window (in file order), and the channel registry to map IDs with. `source` is
 /// `None` while no recording has been discovered yet.
 #[derive(Debug)]
 pub struct WindowPlan {
-    pub file: Option<Arc<File>>,
+    pub source: Option<PlanSource>,
     pub extents: Vec<Extent>,
     pub channels: HashMap<u16, ChannelDef>,
 }
 
 impl WindowPlan {
-    /// A plan with no source file — stages a channelless empty clip (magic +
-    /// summary + footer) for a window no recording covers. The empty path needs
-    /// no `Arc<File>`, so it serves the "no recording exists yet" case too.
+    /// A plan with no source recording — stages a channelless empty clip
+    /// (magic + manifest + summary + footer) for a window no recording covers.
+    /// The empty path needs no [`PlanSource`], so it serves the "no recording
+    /// exists yet" case too.
     pub fn empty() -> Self {
         WindowPlan {
-            file: None,
+            source: None,
             extents: Vec::new(),
             channels: HashMap::new(),
         }
@@ -397,7 +415,10 @@ impl RecordingIndex {
             .copied()
             .collect();
         (!extents.is_empty()).then(|| WindowPlan {
-            file: Some(self.file.clone()),
+            source: Some(PlanSource {
+                path: self.path.clone(),
+                file: self.file.clone(),
+            }),
             extents,
             channels: self.channels.clone(),
         })

@@ -26,7 +26,7 @@
 //! abort the clip. `Writer::finish` writes the summary section, footer and
 //! closing magic, so a clip is always a complete, standalone MCAP.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::BufWriter;
 use std::os::unix::fs::FileExt;
@@ -38,6 +38,9 @@ use mcap::records::Record;
 
 use crate::TimeSource;
 use crate::index::{ChannelDef, MAX_RECORD_LEN, WindowPlan, op};
+#[cfg(test)]
+use crate::manifest::WindowCoverage;
+use crate::manifest::{ChannelTally, ClipManifest, CutRequest, Planned};
 
 /// The stamp a message's window membership is tested on, per the window's
 /// [`TimeSource`]: its `log_time` or its `publish_time`.
@@ -55,6 +58,9 @@ fn message_stamp(header: &mcap::records::MessageHeader, source: TimeSource) -> u
 pub struct ClipStats {
     pub out_path: PathBuf,
     pub extents_read: usize,
+    /// The bytes those extents spanned — what the copy read off the recording,
+    /// as against `bytes_copied`, what it wrote into the clip.
+    pub bytes_read: u64,
     pub messages_copied: u64,
     pub bytes_copied: u64,
     /// Records skipped over localized damage: an unparseable body, or a
@@ -182,21 +188,14 @@ impl Drop for StagedClip {
 pub fn extract_clip(
     plan: &WindowPlan,
     out_path: &Path,
-    start_ns: u64,
-    end_ns: u64,
+    request: &CutRequest,
     compression: Option<mcap::Compression>,
 ) -> Result<ClipStats> {
-    // The assembly tests window on `log_time`; the domain-selection test drives
-    // `stage_clip` with an explicit source directly.
-    let staged = stage_clip(
-        plan,
-        out_path,
-        start_ns,
-        end_ns,
-        compression,
-        TimeSource::Log,
-    )?;
-    publish_clip(staged)
+    let planned = Planned {
+        files: usize::from(plan.source.is_some()),
+        coverage: WindowCoverage::Covered,
+    };
+    publish_clip(stage_clip(plan, out_path, request, planned, compression)?)
 }
 
 /// Stage one: assemble the clip in the capturing directory under
@@ -209,10 +208,9 @@ pub fn extract_clip(
 pub fn stage_clip(
     plan: &WindowPlan,
     out_path: &Path,
-    start_ns: u64,
-    end_ns: u64,
+    request: &CutRequest,
+    planned: Planned,
     compression: Option<mcap::Compression>,
-    time_source: TimeSource,
 ) -> Result<StagedClip> {
     let out_dir = out_path
         .parent()
@@ -227,15 +225,14 @@ pub fn stage_clip(
         .with_context(|| format!("creating capturing dir {}", capturing.display()))?;
 
     let (file, staged_path) = create_new_file(&capturing.join(&desired_name))?;
-    let stats =
-        copy_window(plan, file, start_ns, end_ns, compression, time_source).inspect_err(|_| {
-            // A failed copy must not leave a half-written, footer-less file even in
-            // the capturing dir; the error itself is what the caller reports. No
-            // `StagedClip` is constructed on this path, so its `Drop` cannot do it.
-            if let Err(e) = std::fs::remove_file(&staged_path) {
-                warn!("removing partial clip {}: {e}", staged_path.display());
-            }
-        })?;
+    let stats = copy_window(plan, file, request, planned, compression).inspect_err(|_| {
+        // A failed copy must not leave a half-written, footer-less file even in
+        // the capturing dir; the error itself is what the caller reports. No
+        // `StagedClip` is constructed on this path, so its `Drop` cannot do it.
+        if let Err(e) = std::fs::remove_file(&staged_path) {
+            warn!("removing partial clip {}: {e}", staged_path.display());
+        }
+    })?;
     Ok(StagedClip {
         staged_path,
         out_dir,
@@ -286,20 +283,24 @@ pub fn publish_clip(mut staged: StagedClip) -> Result<ClipStats> {
 }
 
 /// Assemble the clip into the freshly created `out_file`: register window
-/// channels from the registry on first use, stream the planned extents,
-/// finish and fsync the file. The caller removes the staged file if this fails.
+/// channels from the registry on first use, stream the planned extents, write
+/// the manifest, finish and fsync the file. The caller removes the staged file
+/// if this fails.
 ///
 /// The writer is built from explicit [`mcap::WriteOptions`] with both knobs that
 /// decide what a clip looks like set outright rather than inherited: the
 /// `compression` codec (`None` = uncompressed) the caller chose, and
 /// [`CLIP_CHUNK_SIZE`]. Chunking itself stays on, at the `WriteOptions` default.
+///
+/// The manifest goes in between the last copied message and `finish`, which is
+/// what puts it in the summary's metadata index and the statistics' metadata
+/// count: writing it any earlier would have to guess the counters it reports.
 fn copy_window(
     plan: &WindowPlan,
     out_file: File,
-    start_ns: u64,
-    end_ns: u64,
+    request: &CutRequest,
+    planned: Planned,
     compression: Option<mcap::Compression>,
-    time_source: TimeSource,
 ) -> Result<ClipStats> {
     let mut clip = ClipWriter {
         writer: mcap::WriteOptions::new()
@@ -309,23 +310,26 @@ fn copy_window(
             .context("opening mcap writer")?,
         channels: &plan.channels,
         out_ids: HashMap::new(),
-        start_ns,
-        end_ns,
-        time_source,
+        request,
+        tallies: BTreeMap::new(),
         stats: ClipStats::default(),
     };
 
-    if let Some(file) = &plan.file {
+    if let Some(source) = &plan.source {
         for extent in &plan.extents {
             clip.stats.extents_read += 1;
+            clip.stats.bytes_read += extent.len;
             let mut buf = vec![0u8; extent.len as usize];
-            file.read_exact_at(&mut buf, extent.offset)
+            source
+                .file
+                .read_exact_at(&mut buf, extent.offset)
                 .with_context(|| {
                     format!("reading extent at {} (+{} B)", extent.offset, extent.len)
                 })?;
             clip.copy_extent(&buf)?;
         }
     }
+    clip.write_manifest(planned, plan.source.as_ref().map(|s| s.path.as_path()))?;
 
     let ClipWriter {
         mut writer, stats, ..
@@ -409,8 +413,12 @@ fn with_suffix_retry(
 }
 
 /// One clip being assembled: the output writer, the recording's channel
-/// registry, the window bounds, and the running stats — the state every
+/// registry, the window being cut, and the running counters — the state every
 /// copied message touches.
+///
+/// The window arrives as the whole [`CutRequest`], not as loose bounds, so the
+/// membership test and the manifest's `window.*` keys read one value: a clip
+/// cannot claim a window its messages were not tested against.
 struct ClipWriter<'a> {
     writer: mcap::Writer<BufWriter<File>>,
     channels: &'a HashMap<u16, ChannelDef>,
@@ -418,11 +426,13 @@ struct ClipWriter<'a> {
     /// `None` caches a known-missing Channel record, so the miss is logged
     /// once rather than per message.
     out_ids: HashMap<u16, Option<u16>>,
-    start_ns: u64,
-    end_ns: u64,
-    /// The window's clock domain: which of each message's two stamps the
-    /// membership test compares against `[start_ns, end_ns]`.
-    time_source: TimeSource,
+    /// The window this clip is being cut for: its bounds, its clock domain, and
+    /// the trigger and producer the manifest names.
+    request: &'a CutRequest,
+    /// Per **output** channel id, what that channel has contributed so far —
+    /// the manifest's per-channel keys. Filled by the same step that writes a
+    /// message through, so a channel no message was copied from has no entry.
+    tallies: BTreeMap<u16, ChannelTally>,
     stats: ClipStats,
 }
 
@@ -483,7 +493,11 @@ impl ClipWriter<'_> {
     /// say which of the chunk's bytes are damaged, so the whole chunk is
     /// dropped with an error log and counted. Output-side errors stay fatal.
     fn copy_chunk(&mut self, body: &[u8], at: usize) -> Result<()> {
-        let (start_ns, end_ns, time_source) = (self.start_ns, self.end_ns, self.time_source);
+        let (start_ns, end_ns, time_source) = (
+            self.request.start_ns(),
+            self.request.end_ns(),
+            self.request.time_source(),
+        );
         let mut pending: Vec<(mcap::records::MessageHeader, Vec<u8>)> = Vec::new();
         let salvage = (|| -> mcap::McapResult<()> {
             let Record::Chunk { header, data } = mcap::parse_record(op::CHUNK, body)? else {
@@ -518,8 +532,8 @@ impl ClipWriter<'_> {
     /// [`TimeSource`]. A message on a channel the recording never declared is
     /// skipped and counted — there is no Schema/Channel to emit for it.
     fn copy_message(&mut self, header: &mcap::records::MessageHeader, data: &[u8]) -> Result<()> {
-        let stamp = message_stamp(header, self.time_source);
-        if stamp < self.start_ns || stamp > self.end_ns {
+        let stamp = message_stamp(header, self.request.time_source());
+        if stamp < self.request.start_ns() || stamp > self.request.end_ns() {
             return Ok(());
         }
         let Some(channel_id) = self.output_channel_id(header.channel_id)? else {
@@ -535,9 +549,45 @@ impl ClipWriter<'_> {
                 data,
             )
             .context("writing message")?;
-        self.stats.messages_copied += 1;
-        self.stats.bytes_copied += data.len() as u64;
+        self.count(channel_id, stamp, data.len() as u64);
         Ok(())
+    }
+
+    /// Fold one written message into the clip's counters — the whole-clip totals
+    /// and the manifest's per-channel tally, keyed by the id the clip's own
+    /// `Channel` record carries.
+    ///
+    /// One call site, right after the write, so a message is counted exactly
+    /// when it lands in the clip: whatever decides *which* messages are copied
+    /// (the window test above, a channel selection beside it) cannot leave the
+    /// accounting behind, because a message that is never written is never
+    /// counted here.
+    fn count(&mut self, channel_id: u16, stamp: u64, bytes: u64) {
+        self.stats.messages_copied += 1;
+        self.stats.bytes_copied += bytes;
+        self.tallies
+            .entry(channel_id)
+            .and_modify(|tally| tally.absorb(stamp))
+            .or_insert_with(|| ChannelTally::opened(stamp));
+    }
+
+    /// Write the clip's manifest ([`crate::manifest`]) from what the copy did:
+    /// the caller's window and producer, what the planner offered, this
+    /// segment's own source recording, and the counters above.
+    fn write_manifest(&mut self, planned: Planned, source: Option<&Path>) -> Result<()> {
+        let record = ClipManifest {
+            request: self.request,
+            planned,
+            source,
+            extents_read: self.stats.extents_read,
+            bytes_read: self.stats.bytes_read,
+            messages: self.stats.messages_copied,
+            channels: &self.tallies,
+        }
+        .record();
+        self.writer
+            .write_metadata(&record)
+            .context("writing the clip manifest")
     }
 
     /// Map a recording channel ID into the output file and cache the result.
@@ -579,11 +629,19 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::index::{Extent, RecordingIndex, Span, Stamps, WindowPlan, op};
+    use crate::index::{Extent, PlanSource, RecordingIndex, Span, Stamps, WindowPlan, op};
+    use crate::manifest::{MANIFEST_NAME, MANIFEST_VERSION, read_manifest};
     use crate::testing::{
-        channel_body, index_file, message_body, message_body_pub, raw_record, read_clip,
-        scan_to_end, test_dir, write_raw, write_recording, write_recording_opts,
+        channel_body, index_file, message_body, message_body_pub, metadata_body, planned_one_file,
+        raw_record, read_clip, scan_to_end, test_dir, window_request, write_raw, write_recording,
+        write_recording_opts,
     };
+
+    /// [`window_request`] on the `log` domain — the domain almost every clip
+    /// test windows on, as [`plan_one`] is for the plan that feeds it.
+    fn log_window(start_ns: u64, end_ns: u64) -> CutRequest {
+        window_request(start_ns, end_ns, TimeSource::Log)
+    }
 
     /// Plan the single source recording a clip test cuts from on the `log`
     /// domain — the domain almost every clip test windows on; [`plan_one_src`]
@@ -627,7 +685,7 @@ mod tests {
 
         let out = root.join("clip.mcap");
         let plan = plan_one(&index, 0, 100);
-        let stats = extract_clip(&plan, &out, 0, 100, TEST_COMPRESSION)?;
+        let stats = extract_clip(&plan, &out, &log_window(0, 100), TEST_COMPRESSION)?;
 
         // The final path is the published location, holding a complete clip.
         assert_eq!(stats.out_path, out);
@@ -665,7 +723,13 @@ mod tests {
 
         // After stage 1 only: the final dir holds no clip, but the staged file
         // in the capturing dir is already complete and read_clip-valid.
-        let staged = stage_clip(&plan, &out, 0, 100, TEST_COMPRESSION, TimeSource::Log)?;
+        let staged = stage_clip(
+            &plan,
+            &out,
+            &window_request(0, 100, TimeSource::Log),
+            planned_one_file(),
+            TEST_COMPRESSION,
+        )?;
         assert!(
             !out.exists(),
             "the clip is invisible in the final dir before publication"
@@ -701,7 +765,13 @@ mod tests {
         // A staged clip abandoned without publishing — an early return or a
         // panic between the stages — must not strand the file in the capturing
         // dir; its `Drop` removes it, and nothing ever reaches the final dir.
-        let staged = stage_clip(&plan, &out, 0, 100, TEST_COMPRESSION, TimeSource::Log)?;
+        let staged = stage_clip(
+            &plan,
+            &out,
+            &window_request(0, 100, TimeSource::Log),
+            planned_one_file(),
+            TEST_COMPRESSION,
+        )?;
         assert!(staged.staged_path.exists(), "the staged file exists");
         drop(staged);
 
@@ -770,7 +840,7 @@ mod tests {
 
         let out = out_dir.join("clip.mcap");
         let plan = plan_one(&index, 0, 100);
-        let stats = extract_clip(&plan, &out, 0, 100, TEST_COMPRESSION)?;
+        let stats = extract_clip(&plan, &out, &log_window(0, 100), TEST_COMPRESSION)?;
 
         assert_eq!(stats.out_path, out);
         assert_eq!(
@@ -806,7 +876,7 @@ mod tests {
 
         let out = root.join("clip.mcap");
         let plan = plan_one(&index, 100, 200);
-        let stats = extract_clip(&plan, &out, 100, 200, TEST_COMPRESSION)?;
+        let stats = extract_clip(&plan, &out, &log_window(100, 200), TEST_COMPRESSION)?;
 
         assert_eq!(stats.messages_copied, 3);
         assert_eq!(
@@ -835,7 +905,7 @@ mod tests {
 
         let out = root.join("clip.mcap");
         let plan = plan_one(&index, 20, 40);
-        let stats = extract_clip(&plan, &out, 20, 40, TEST_COMPRESSION)?;
+        let stats = extract_clip(&plan, &out, &log_window(20, 40), TEST_COMPRESSION)?;
 
         assert_eq!(stats.messages_copied, 3);
         assert_eq!(
@@ -859,7 +929,7 @@ mod tests {
         // Nothing is indexed, so no recording offers a plan: the empty plan a
         // trigger arriving before any data still cuts a valid clip from.
         let plan = WindowPlan::empty();
-        let stats = extract_clip(&plan, &out, 0, 100, TEST_COMPRESSION)?;
+        let stats = extract_clip(&plan, &out, &log_window(0, 100), TEST_COMPRESSION)?;
 
         assert_eq!(stats.messages_copied, 0);
         assert!(read_clip(&out)?.is_empty());
@@ -880,8 +950,8 @@ mod tests {
         // at the publish stage against the final dir, so the second lands as a
         // `_1` sibling and both clips are complete.
         let out = root.join("clip.mcap");
-        let first = extract_clip(&plan, &out, 0, 100, TEST_COMPRESSION)?;
-        let second = extract_clip(&plan, &out, 0, 100, TEST_COMPRESSION)?;
+        let first = extract_clip(&plan, &out, &log_window(0, 100), TEST_COMPRESSION)?;
+        let second = extract_clip(&plan, &out, &log_window(0, 100), TEST_COMPRESSION)?;
 
         assert_eq!(first.out_path, out);
         assert_eq!(second.out_path, root.join("clip_1.mcap"));
@@ -905,7 +975,7 @@ mod tests {
 
         let out = root.join("clip.mcap");
         let plan = plan_one(&index, 0, 100);
-        extract_clip(&plan, &out, 0, 100, TEST_COMPRESSION)?;
+        extract_clip(&plan, &out, &log_window(0, 100), TEST_COMPRESSION)?;
 
         let buf = std::fs::read(&out)?;
         let summary = mcap::Summary::read(&buf)?.expect("clip has a summary");
@@ -928,7 +998,7 @@ mod tests {
         // alive, so the extraction must succeed against the deleted path.
         std::fs::remove_file(&rec)?;
         let out = root.join("clip.mcap");
-        let stats = extract_clip(&plan, &out, 0, 100, TEST_COMPRESSION)?;
+        let stats = extract_clip(&plan, &out, &log_window(0, 100), TEST_COMPRESSION)?;
 
         assert_eq!(stats.messages_copied, 2);
         assert_eq!(
@@ -958,7 +1028,7 @@ mod tests {
             .set_len(last.offset + last.len / 2)?;
 
         let out = root.join("clip.mcap");
-        let err = extract_clip(&plan, &out, 0, 100, TEST_COMPRESSION).unwrap_err();
+        let err = extract_clip(&plan, &out, &log_window(0, 100), TEST_COMPRESSION).unwrap_err();
         assert!(
             format!("{err:#}").contains("reading extent"),
             "unexpected error: {err:#}"
@@ -987,7 +1057,7 @@ mod tests {
         plan.channels.clear();
 
         let out = root.join("clip.mcap");
-        let stats = extract_clip(&plan, &out, 0, 100, TEST_COMPRESSION)?;
+        let stats = extract_clip(&plan, &out, &log_window(0, 100), TEST_COMPRESSION)?;
         assert_eq!(stats.messages_copied, 0);
         assert_eq!(stats.records_skipped, 1);
         assert!(read_clip(&out)?.is_empty(), "a valid, empty clip");
@@ -1007,7 +1077,10 @@ mod tests {
         // record *body* (skippable), bad framing leaves no boundary to
         // resync at, so this must stay fatal.
         let plan = WindowPlan {
-            file: Some(Arc::new(File::open(&junk)?)),
+            source: Some(PlanSource {
+                path: junk.clone(),
+                file: Arc::new(File::open(&junk)?),
+            }),
             extents: vec![Extent {
                 offset: 0,
                 len: 64,
@@ -1026,7 +1099,8 @@ mod tests {
         };
 
         let out = root.join("clip.mcap");
-        let err = extract_clip(&plan, &out, 0, u64::MAX, TEST_COMPRESSION).unwrap_err();
+        let err =
+            extract_clip(&plan, &out, &log_window(0, u64::MAX), TEST_COMPRESSION).unwrap_err();
         assert!(
             format!("{err:#}").contains("framing inconsistent"),
             "unexpected error: {err:#}"
@@ -1053,7 +1127,7 @@ mod tests {
         // planned and read — but no individual message falls inside it.
         let out = root.join("clip.mcap");
         let plan = plan_one(&index, 120, 180);
-        let stats = extract_clip(&plan, &out, 120, 180, TEST_COMPRESSION)?;
+        let stats = extract_clip(&plan, &out, &log_window(120, 180), TEST_COMPRESSION)?;
 
         assert!(stats.extents_read > 0, "the covering extent is read");
         assert_eq!(stats.messages_copied, 0);
@@ -1083,7 +1157,7 @@ mod tests {
 
         let out = root.join("clip.mcap");
         let plan = plan_one(&index, 20, 40);
-        let stats = extract_clip(&plan, &out, 20, 40, TEST_COMPRESSION)?;
+        let stats = extract_clip(&plan, &out, &log_window(20, 40), TEST_COMPRESSION)?;
 
         assert_eq!(stats.messages_copied, 3);
         assert_eq!(
@@ -1129,7 +1203,7 @@ mod tests {
         );
 
         let out = root.join("clip.mcap");
-        let stats = extract_clip(&plan, &out, 0, 100, TEST_COMPRESSION)?;
+        let stats = extract_clip(&plan, &out, &log_window(0, 100), TEST_COMPRESSION)?;
         assert_eq!(stats.messages_copied, 1);
         assert_eq!(read_clip(&out)?, vec![("/raw".to_string(), 10)]);
 
@@ -1152,7 +1226,7 @@ mod tests {
         // Staging succeeds — the capturing dir is empty, so the clip assembles
         // there — and the collision only surfaces at publish, where 1000
         // suffixes against the pre-filled final dir are exhausted.
-        let err = extract_clip(&plan, &out, 0, 100, TEST_COMPRESSION).unwrap_err();
+        let err = extract_clip(&plan, &out, &log_window(0, 100), TEST_COMPRESSION).unwrap_err();
         assert!(
             format!("{err:#}").contains("publishing"),
             "unexpected error: {err:#}"
@@ -1194,7 +1268,7 @@ mod tests {
 
         let out = root.join("clip.mcap");
         let plan = plan_one(&index, 30, 70);
-        let stats = extract_clip(&plan, &out, 30, 70, TEST_COMPRESSION)?;
+        let stats = extract_clip(&plan, &out, &log_window(30, 70), TEST_COMPRESSION)?;
 
         assert!(
             stats.extents_read >= 2,
@@ -1239,7 +1313,7 @@ mod tests {
 
         let out = root.join("clip.mcap");
         let plan = plan_one(&index, 15, 25);
-        let stats = extract_clip(&plan, &out, 15, 25, TEST_COMPRESSION)?;
+        let stats = extract_clip(&plan, &out, &log_window(15, 25), TEST_COMPRESSION)?;
 
         assert_eq!(stats.extents_read, 1);
         assert_eq!(stats.messages_copied, 1);
@@ -1280,7 +1354,7 @@ mod tests {
             assert_eq!(plan.channels.len(), 2, "{name}: registry from chunks");
 
             let out = root.join(format!("clip-{name}.mcap"));
-            let stats = extract_clip(&plan, &out, 20, 30, TEST_COMPRESSION)?;
+            let stats = extract_clip(&plan, &out, &log_window(20, 30), TEST_COMPRESSION)?;
             assert_eq!(stats.messages_copied, 2, "{name}");
             assert_eq!(read_clip(&out)?, expected, "{name}");
         }
@@ -1315,7 +1389,7 @@ mod tests {
             (Some(mcap::Compression::Lz4), "lz4"),
         ] {
             let out = root.join(format!("clip-{want}.mcap"));
-            let stats = extract_clip(&plan, &out, 0, 100, compression)?;
+            let stats = extract_clip(&plan, &out, &log_window(0, 100), compression)?;
             assert_eq!(stats.messages_copied, 3, "{want}: every message copied");
             assert_eq!(read_clip(&out)?, expected, "{want}: clip reads back intact");
 
@@ -1368,7 +1442,7 @@ mod tests {
 
         let out = root.join("clip.mcap");
         let plan = plan_one(&index, 0, 1000);
-        let stats = extract_clip(&plan, &out, 0, 1000, TEST_COMPRESSION)?;
+        let stats = extract_clip(&plan, &out, &log_window(0, 1000), TEST_COMPRESSION)?;
         assert_eq!(stats.messages_copied, stamps.len() as u64);
 
         let buf = std::fs::read(&out)?;
@@ -1427,7 +1501,7 @@ mod tests {
 
         let out = root.join("clip.mcap");
         let plan = plan_one(&index, 0, 1000);
-        extract_clip(&plan, &out, 0, 1000, TEST_COMPRESSION)?;
+        extract_clip(&plan, &out, &log_window(0, 1000), TEST_COMPRESSION)?;
 
         let buf = std::fs::read(&out)?;
         let copied: Vec<(String, u64, u64, u32, Vec<u8>)> = mcap::MessageStream::new(&buf)?
@@ -1482,7 +1556,7 @@ mod tests {
         );
 
         let out = root.join("clip.mcap");
-        let stats = extract_clip(&plan, &out, 0, 100, TEST_COMPRESSION)?;
+        let stats = extract_clip(&plan, &out, &log_window(0, 100), TEST_COMPRESSION)?;
         assert_eq!(stats.messages_copied, 1);
         assert_eq!(stats.bytes_copied, 8 << 20);
         assert_eq!(read_clip(&out)?, vec![("/big".to_string(), 10)]);
@@ -1526,7 +1600,7 @@ mod tests {
         std::fs::write(&rec, &bytes)?;
 
         let out = root.join("clip.mcap");
-        let stats = extract_clip(&plan, &out, 0, 100, TEST_COMPRESSION)?;
+        let stats = extract_clip(&plan, &out, &log_window(0, 100), TEST_COMPRESSION)?;
         assert_eq!(stats.chunks_dropped, 1);
         assert_eq!(stats.messages_copied, 3);
         assert_eq!(
@@ -1565,7 +1639,7 @@ mod tests {
         // The scan indexes past the runt, so the message behind it is planned
         // and copied through below.
         let plan = plan_one(&index, 0, 100);
-        let stats = extract_clip(&plan, &out, 0, 100, TEST_COMPRESSION)?;
+        let stats = extract_clip(&plan, &out, &log_window(0, 100), TEST_COMPRESSION)?;
         assert_eq!(stats.records_skipped, 1);
         assert_eq!(stats.messages_copied, 2);
         assert_eq!(
@@ -1615,7 +1689,13 @@ mod tests {
 
         let out = root.join("clip.mcap");
         let plan = plan_one(&index, 0, 100);
-        let staged = stage_clip(&plan, &out, 0, 100, TEST_COMPRESSION, TimeSource::Log)?;
+        let staged = stage_clip(
+            &plan,
+            &out,
+            &window_request(0, 100, TimeSource::Log),
+            planned_one_file(),
+            TEST_COMPRESSION,
+        )?;
 
         // Simulate the staged file disappearing (e.g. an admin removed it or
         // the capturing dir was wiped) before `Drop` runs its cleanup.
@@ -1646,8 +1726,20 @@ mod tests {
 
         // Stage the same desired name twice without publishing between them;
         // both clips land in the capturing dir, each under a distinct path.
-        let first = stage_clip(&plan, &out, 0, 100, TEST_COMPRESSION, TimeSource::Log)?;
-        let second = stage_clip(&plan, &out, 0, 100, TEST_COMPRESSION, TimeSource::Log)?;
+        let first = stage_clip(
+            &plan,
+            &out,
+            &window_request(0, 100, TimeSource::Log),
+            planned_one_file(),
+            TEST_COMPRESSION,
+        )?;
+        let second = stage_clip(
+            &plan,
+            &out,
+            &window_request(0, 100, TimeSource::Log),
+            planned_one_file(),
+            TEST_COMPRESSION,
+        )?;
 
         assert_ne!(
             first.staged_path, second.staged_path,
@@ -1694,10 +1786,9 @@ mod tests {
         let log_clip = publish_clip(stage_clip(
             &plan_one_src(&index, 180, 320, TimeSource::Log),
             &out,
-            180,
-            320,
+            &window_request(180, 320, TimeSource::Log),
+            planned_one_file(),
             TEST_COMPRESSION,
-            TimeSource::Log,
         )?)?;
         let mut log_times: Vec<u64> = read_clip(&log_clip.out_path)?
             .into_iter()
@@ -1709,10 +1800,9 @@ mod tests {
         let pub_clip = publish_clip(stage_clip(
             &plan_one_src(&index, 180, 320, TimeSource::Publish),
             &out,
-            180,
-            320,
+            &window_request(180, 320, TimeSource::Publish),
+            planned_one_file(),
             TEST_COMPRESSION,
-            TimeSource::Publish,
         )?)?;
         let pub_times: Vec<u64> = read_clip(&pub_clip.out_path)?
             .into_iter()
@@ -1723,6 +1813,263 @@ mod tests {
             vec![100],
             "publish windows on publish_time; only the message published at 250 is inside"
         );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// Every clip carries its manifest, and the writer puts it where an MCAP
+    /// reader finds it without a walk: indexed in the summary and counted in the
+    /// statistics.
+    ///
+    /// The three properties are separable and all three matter. A metadata
+    /// record written *after* `finish` would not be in the file at all; one
+    /// written with the summary suppressed would be in the data section but
+    /// unfindable without scanning; and a reader that trusts `metadata_count`
+    /// (`mcap info`) reports the wrong thing if the count and the record
+    /// disagree. Asserting the index, the count, and a round-trip read pins all
+    /// three to the one write.
+    #[test]
+    fn every_clip_carries_a_manifest_the_summary_indexes_and_counts() -> Result<()> {
+        let root = test_dir("clip-manifest")?;
+        let rec = root.join("rec.mcap");
+        write_recording(&rec, false, &[("/t", 10), ("/t", 20), ("/t", 30)])?;
+        let index = index_whole(&rec)?;
+
+        let out = root.join("clip.mcap");
+        let plan = plan_one(&index, 0, 100);
+        let stats = extract_clip(&plan, &out, &log_window(0, 100), TEST_COMPRESSION)?;
+
+        let buf = std::fs::read(&stats.out_path)?;
+        let summary = mcap::Summary::read(&buf)?.expect("a finished clip has a summary");
+        assert_eq!(
+            summary
+                .metadata_indexes
+                .iter()
+                .filter(|i| i.name == MANIFEST_NAME)
+                .count(),
+            1,
+            "the summary indexes exactly one manifest"
+        );
+        assert_eq!(
+            summary
+                .stats
+                .expect("a finished clip has statistics")
+                .metadata_count,
+            1,
+            "the statistics count the manifest"
+        );
+
+        let manifest = read_manifest(&stats.out_path)?.expect("the clip carries a manifest");
+        assert_eq!(manifest["manifest.version"], MANIFEST_VERSION);
+        assert_eq!(manifest["producer.name"], "clipper");
+        assert_eq!(manifest["producer.mode"], "test");
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// The trigger, window, source and per-channel groups report what the cut
+    /// actually did, checked against the clip's own contents rather than against
+    /// the numbers that were handed in.
+    ///
+    /// Every claim is cross-checked: the window against the messages that landed
+    /// inside it, the source path against the file the plan read, the extent and
+    /// byte counts against the plan, the per-channel key against the channel id
+    /// the clip's own `Channel` record carries, and the counts and stamps against
+    /// the messages on that channel.
+    #[test]
+    fn a_manifests_groups_match_the_clip_they_describe() -> Result<()> {
+        let root = test_dir("clip-manifest-truth")?;
+        let rec = root.join("rec.mcap");
+        // 10 and 90 are outside the window [20, 80]; 20/50/80 are inside, so the
+        // per-channel first/last stamps are the window's own edges.
+        write_recording(
+            &rec,
+            false,
+            &[("/t", 10), ("/t", 20), ("/t", 50), ("/t", 80), ("/t", 90)],
+        )?;
+        let index = index_whole(&rec)?;
+
+        let out = root.join("clip.mcap");
+        let plan = plan_one(&index, 20, 80);
+        let extents = plan.extents.len();
+        let bytes: u64 = plan.extents.iter().map(|e| e.len).sum();
+        let stats = extract_clip(&plan, &out, &log_window(20, 80), TEST_COMPRESSION)?;
+        let manifest = read_manifest(&stats.out_path)?.expect("the clip carries a manifest");
+
+        // The trigger group is what asked for the window: `log_window` anchors at
+        // the window end with the whole width as preroll.
+        assert_eq!(manifest["trigger.name"], "test");
+        assert_eq!(manifest["trigger.anchor_ns"], "80");
+        assert_eq!(manifest["trigger.preroll_ns"], "60");
+        assert_eq!(manifest["trigger.postroll_ns"], "0");
+
+        // The window group is the window the messages were actually tested
+        // against: every stamp in the clip lies inside it, and both edges are
+        // present, so a wider or narrower claim would be visibly wrong.
+        assert_eq!(manifest["window.time_source"], "log");
+        assert_eq!(manifest["window.start_ns"], "20");
+        assert_eq!(manifest["window.end_ns"], "80");
+        let stamps: Vec<u64> = read_clip(&stats.out_path)?
+            .into_iter()
+            .map(|(_, t)| t)
+            .collect();
+        assert_eq!(
+            stamps,
+            vec![20, 50, 80],
+            "the clip holds the in-window messages"
+        );
+
+        // The source group names the recording the bytes came from and how much
+        // of it was read.
+        assert_eq!(manifest["source.path"], rec.display().to_string());
+        assert_eq!(manifest["source.files_planned"], "1");
+        assert_eq!(manifest["source.extents_read"], extents.to_string());
+        assert_eq!(manifest["source.bytes_read"], bytes.to_string());
+        assert_eq!(manifest["clip.messages"], "3");
+        assert_eq!(manifest["clip.short"], "false");
+
+        // The per-channel group is keyed by the id the *clip's* own Channel
+        // record carries, not the recording's, so a reader can join the two.
+        let buf = std::fs::read(&stats.out_path)?;
+        let summary = mcap::Summary::read(&buf)?.expect("a finished clip has a summary");
+        let (id, channel) = summary
+            .channels
+            .iter()
+            .next()
+            .expect("the clip declares its one channel");
+        assert_eq!(channel.topic, "/t");
+        assert_eq!(manifest[&format!("channel.{id}.messages")], "3");
+        assert_eq!(manifest[&format!("channel.{id}.first_ns")], "20");
+        assert_eq!(manifest[&format!("channel.{id}.last_ns")], "80");
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// The per-channel keys name the channels the clip actually holds, keyed by
+    /// the id the *clip's own* `Channel` record carries.
+    ///
+    /// Two properties in one fixture, because one fixture is what makes both
+    /// checkable. The recording declares channel 9 and channel 4; only 9 has a
+    /// message inside the window, and the clip renumbers what it copies from
+    /// scratch. So a manifest keyed by the recording's ids would say
+    /// `channel.9.*` — a key no reader of the clip can join to anything — and
+    /// one that walked the registry rather than the copy would describe channel
+    /// 4, which is not in the clip at all.
+    #[test]
+    fn per_channel_keys_name_the_clips_own_channels_by_its_own_ids() -> Result<()> {
+        let root = test_dir("clip-manifest-channels")?;
+        let rec = root.join("rec.mcap");
+        write_raw(
+            &rec,
+            &[
+                raw_record(op::CHANNEL, &channel_body(9, 0, "/kept", "cdr")),
+                raw_record(op::CHANNEL, &channel_body(4, 0, "/left-out", "cdr")),
+                raw_record(op::MESSAGE, &message_body(9, 0, 30, b"a")),
+                raw_record(op::MESSAGE, &message_body(4, 1, 90, b"b")),
+                raw_record(op::MESSAGE, &message_body(9, 2, 35, b"c")),
+            ],
+        )?;
+        let index = index_whole(&rec)?;
+
+        let out = root.join("clip.mcap");
+        let plan = plan_one(&index, 20, 40);
+        assert_eq!(
+            plan.channels.len(),
+            2,
+            "the plan carries both of the recording's channels"
+        );
+        let stats = extract_clip(&plan, &out, &log_window(20, 40), TEST_COMPRESSION)?;
+        let manifest = read_manifest(&stats.out_path)?.expect("the clip carries a manifest");
+
+        let channel_keys: Vec<&String> = manifest
+            .keys()
+            .filter(|k| k.starts_with("channel."))
+            .collect();
+        assert_eq!(
+            channel_keys.len(),
+            3,
+            "exactly one channel is described, in three keys: {channel_keys:?}"
+        );
+
+        let buf = std::fs::read(&stats.out_path)?;
+        let summary = mcap::Summary::read(&buf)?.expect("a finished clip has a summary");
+        let kept: Vec<u16> = summary
+            .channels
+            .iter()
+            .filter(|(_, c)| c.topic == "/kept")
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(kept.len(), 1, "only the copied channel is in the clip");
+        let clip_id = kept[0];
+        assert_ne!(
+            clip_id, 9,
+            "the clip renumbers its channels, so the two id spaces differ here"
+        );
+        assert_eq!(manifest[&format!("channel.{clip_id}.messages")], "2");
+        assert_eq!(manifest[&format!("channel.{clip_id}.first_ns")], "30");
+        assert_eq!(manifest[&format!("channel.{clip_id}.last_ns")], "35");
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// The name a `ros2 bag record` MCAP carries its own metadata record under.
+    /// Nothing in the crate reads it; it is spelled here so the test below
+    /// checks a real name rather than a tautology.
+    const ROSBAG2_METADATA_NAME: &str = "rosbag2";
+
+    /// A clip cut from a recording that carries the recorder's own metadata
+    /// record still has exactly one metadata record — its own manifest, under a
+    /// name that is not the recorder's.
+    ///
+    /// The two records would otherwise be indistinguishable to a reader looking
+    /// one up by name: MCAP allows repeated metadata names, so a manifest called
+    /// `rosbag2` would be found by whichever record a tool happened to read
+    /// first. The vendor prefix is what keeps the lookup unambiguous.
+    #[test]
+    fn the_manifest_does_not_collide_with_the_recorders_own_metadata() -> Result<()> {
+        let root = test_dir("clip-manifest-name")?;
+        let rec = root.join("rec.mcap");
+        // A recording shaped like one `ros2 bag record` writes: its own metadata
+        // record under the bare name `rosbag2`, then the data.
+        write_raw(
+            &rec,
+            &[
+                raw_record(
+                    op::METADATA,
+                    &metadata_body(ROSBAG2_METADATA_NAME, &[("ROS_DISTRO", "jazzy")]),
+                ),
+                raw_record(op::CHANNEL, &channel_body(1, 0, "/t", "cdr")),
+                raw_record(op::MESSAGE, &message_body(1, 0, 50, b"a")),
+            ],
+        )?;
+        let index = index_whole(&rec)?;
+
+        let out = root.join("clip.mcap");
+        let plan = plan_one(&index, 0, 100);
+        let stats = extract_clip(&plan, &out, &log_window(0, 100), TEST_COMPRESSION)?;
+
+        let buf = std::fs::read(&stats.out_path)?;
+        let summary = mcap::Summary::read(&buf)?.expect("a finished clip has a summary");
+        let names: Vec<&str> = summary
+            .metadata_indexes
+            .iter()
+            .map(|i| i.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec![MANIFEST_NAME],
+            "the clip's only metadata record is its manifest"
+        );
+        assert_ne!(MANIFEST_NAME, ROSBAG2_METADATA_NAME);
+        assert!(
+            MANIFEST_NAME.starts_with("momentedge."),
+            "the manifest name is vendor-namespaced: {MANIFEST_NAME}"
+        );
+        assert!(read_manifest(&stats.out_path)?.is_some());
 
         std::fs::remove_dir_all(root)?;
         Ok(())

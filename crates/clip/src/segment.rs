@@ -16,33 +16,36 @@
 //! demand, and reports the returned [`cut::ClipStats`] however it likes.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::thread;
 
 use crossbeam_channel::{Sender, bounded, unbounded};
 
 use crate::index::{WindowPlan, WindowPlanner};
+use crate::manifest::{CutRequest, Planned, WindowCoverage};
 use crate::{cut, panic_text};
 
 /// One queued clip-segment staging: the window-plan snapshot [`cut_window`] took
-/// for one source recording, the window bounds and the clock domain they are
-/// measured in, the base output path, and the reply channel. Queued by
+/// for one source recording, the request that window came from, what the planner
+/// found for it, the base output path, and the reply channel. Queued by
 /// [`cut_window`]; dequeued FIFO by the staging workers, which run the bulk copy
 /// into the capturing dir and reply a [`cut::StagedClip`]. Publication is not
 /// theirs — [`cut_window`] publishes the staged segments itself, once the
 /// window's segment count is known and the names are settled.
 ///
-/// `time_source` rides in the job rather than in the pool because it is a
-/// property of the *window*, not of the workers: the same value has to choose
-/// the extents the planner returns and the stamp each message's membership is
-/// tested on, and a job that carried only the bounds would let those two be
+/// The [`CutRequest`] rides in the job rather than in the pool because it is a
+/// property of the *window*, not of the workers. Its clock domain has to choose
+/// both the extents the planner returned and the stamp each message's membership
+/// is tested on, and a job that carried only the bounds would let those two be
 /// answered from different clocks — a clip silently holding the wrong messages
-/// rather than an error.
+/// rather than an error. It is also what the segment's manifest is written from,
+/// which is why the trigger travels this far down: a clip states what asked for
+/// it, and the only way to state it truthfully is to carry it to the writer.
 #[derive(Debug)]
 pub struct StageJob {
     plan: WindowPlan,
-    start_ns: u64,
-    end_ns: u64,
-    time_source: crate::TimeSource,
+    request: Arc<CutRequest>,
+    planned: Planned,
     out_path: PathBuf,
     reply: Sender<anyhow::Result<cut::StagedClip>>,
 }
@@ -79,10 +82,9 @@ pub fn spawn_stage_workers(
                         cut::stage_clip(
                             &job.plan,
                             &job.out_path,
-                            job.start_ns,
-                            job.end_ns,
+                            &job.request,
+                            job.planned,
                             compression,
-                            job.time_source,
                         )
                     }))
                     .unwrap_or_else(|payload| {
@@ -117,34 +119,43 @@ pub fn spawn_stage_workers(
 /// returned [`cut::ClipStats`] names a durable file, so the caller may announce
 /// them all.
 ///
-/// The window lives entirely in `time_source`: it picks the extents the planner
-/// returns and the stamp each message's membership is tested on. Whatever has
-/// to happen before the cut — a postroll wall floor, a wait for the recording
-/// to cover the window end — is the caller's, and so is telling anyone about
-/// the clips this returns.
+/// The window lives entirely in the request's time source: it picks the extents
+/// the planner returns and the stamp each message's membership is tested on.
+/// Whatever has to happen before the cut — a postroll wall floor, a wait for the
+/// recording to cover the window end — is the caller's, and so is telling anyone
+/// about the clips this returns. `coverage` is that caller's verdict on the wait
+/// it did: every segment's manifest repeats it, so a clip that ends early says
+/// whether the recording had got there yet.
 pub fn cut_window(
     planner: &dyn WindowPlanner,
-    start_ns: u64,
-    end_ns: u64,
+    request: &Arc<CutRequest>,
+    coverage: WindowCoverage,
     base_out_path: &Path,
     stage_tx: &Sender<StageJob>,
-    time_source: crate::TimeSource,
 ) -> anyhow::Result<Vec<cut::ClipStats>> {
     // 1. One multi-file snapshot on the window's time source — each plan pins its
     //    own recording's Arc<File>, so a retention prune or rollover after this
     //    cannot pull the bytes out.
-    let plans = planner.plan_window(start_ns, end_ns, time_source);
+    let plans = planner.plan_window(request.start_ns(), request.end_ns(), request.time_source());
 
-    // 2. Stage one segment per plan (FIFO worker pool), or one empty segment
+    // 2. The window-level facts every segment's manifest repeats. `files` is
+    //    counted here, before the plans are consumed: it is what separates a
+    //    clip empty because no recording held any byte of the window from one
+    //    empty because the bytes held no message inside it.
+    let planned = Planned {
+        files: plans.len(),
+        coverage,
+    };
+
+    // 3. Stage one segment per plan (FIFO worker pool), or one empty segment
     //    when no recording covers the window — the empty path needs no source
-    //    file (a channelless MCAP is just magic + summary + footer).
+    //    file (a channelless MCAP is just magic + manifest + summary + footer).
     let mut staged: Vec<cut::StagedClip> = if plans.is_empty() {
         vec![stage_segment(
             stage_tx,
             WindowPlan::empty(),
-            start_ns,
-            end_ns,
-            time_source,
+            request,
+            planned,
             base_out_path,
         )?]
     } else {
@@ -153,16 +164,15 @@ pub fn cut_window(
             v.push(stage_segment(
                 stage_tx,
                 plan,
-                start_ns,
-                end_ns,
-                time_source,
+                request,
+                planned,
                 base_out_path,
             )?);
         }
         v
     };
 
-    // 3. Drop empty segments when the window produced real data elsewhere, but
+    // 4. Drop empty segments when the window produced real data elsewhere, but
     //    keep one so an all-empty window still announces a valid clip.
     if staged.len() > 1 {
         if staged.iter().any(|c| !c.is_empty()) {
@@ -172,7 +182,7 @@ pub fn cut_window(
         }
     }
 
-    // 4. Publish the staged segments, naming them only now the count is known:
+    // 5. Publish the staged segments, naming them only now the count is known:
     //    one segment keeps the bare name, several get one `_NN` per source file.
     let n = staged.len();
     let mut stats = Vec::with_capacity(n);
@@ -191,18 +201,16 @@ pub fn cut_window(
 fn stage_segment(
     stage_tx: &Sender<StageJob>,
     plan: WindowPlan,
-    start_ns: u64,
-    end_ns: u64,
-    time_source: crate::TimeSource,
+    request: &Arc<CutRequest>,
+    planned: Planned,
     out_path: &Path,
 ) -> anyhow::Result<cut::StagedClip> {
     let (reply_tx, reply_rx) = bounded(1);
     stage_tx
         .send(StageJob {
             plan,
-            start_ns,
-            end_ns,
-            time_source,
+            request: request.clone(),
+            planned,
             out_path: out_path.to_path_buf(),
             reply: reply_tx,
         })
@@ -252,11 +260,18 @@ mod tests {
 
     use super::*;
     use crate::TimeSource;
-    use crate::index::{Extent, RecordingIndex, Span, Stamps, op};
+    use crate::index::{Extent, PlanSource, RecordingIndex, Span, Stamps, op};
+    use crate::manifest::read_manifest;
     use crate::testing::{
-        channel_body, index_file, message_body_pub, raw_record, read_clip, scan_to_end, test_dir,
-        write_raw, write_recording,
+        channel_body, index_file, message_body_pub, planned_one_file, raw_record, read_clip,
+        scan_to_end, test_dir, window_request, write_raw, write_recording,
     };
+
+    /// The window `[start_ns, end_ns]` on `source`, in the `Arc` the cut path
+    /// shares between one window's segments.
+    fn log_request(start_ns: u64, end_ns: u64, source: TimeSource) -> Arc<CutRequest> {
+        Arc::new(window_request(start_ns, end_ns, source))
+    }
 
     /// The clip compression the recorder's default (zstd) maps to; the unit
     /// tests drive the extraction worker pool through the same codec the
@@ -324,11 +339,10 @@ mod tests {
             std::thread::spawn(move || {
                 cut_window(
                     planner.as_ref(),
-                    start_ns,
-                    end_ns,
+                    &log_request(start_ns, end_ns, TimeSource::Log),
+                    WindowCoverage::Covered,
                     &out,
                     &stage_tx,
-                    TimeSource::Log,
                 )
             })
         };
@@ -387,8 +401,20 @@ mod tests {
                 .next()
                 .expect("the recording covers the window")
         };
-        let first = stage_segment(&stage_tx, plan(), 0, 300, TimeSource::Log, &out)?;
-        let second = stage_segment(&stage_tx, plan(), 0, 300, TimeSource::Log, &out)?;
+        let first = stage_segment(
+            &stage_tx,
+            plan(),
+            &log_request(0, 300, TimeSource::Log),
+            planned_one_file(),
+            &out,
+        )?;
+        let second = stage_segment(
+            &stage_tx,
+            plan(),
+            &log_request(0, 300, TimeSource::Log),
+            planned_one_file(),
+            &out,
+        )?;
 
         let a = cut::publish_clip(first)?;
         let b = cut::publish_clip(second)?;
@@ -421,7 +447,13 @@ mod tests {
 
         let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION);
         let base = root.join("clip.mcap");
-        let stats = cut_window(&planner, 1_500, 5_500, &base, &stage_tx, TimeSource::Log)?;
+        let stats = cut_window(
+            &planner,
+            &log_request(1_500, 5_500, TimeSource::Log),
+            WindowCoverage::Covered,
+            &base,
+            &stage_tx,
+        )?;
 
         assert_eq!(stats.len(), 2, "a straddling window yields two segments");
         let mut paths: Vec<_> = stats.iter().map(|s| s.out_path.clone()).collect();
@@ -461,7 +493,13 @@ mod tests {
 
         let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION);
         let base = root.join("clip.mcap");
-        let stats = cut_window(&planner, 500, 600, &base, &stage_tx, TimeSource::Log)?;
+        let stats = cut_window(
+            &planner,
+            &log_request(500, 600, TimeSource::Log),
+            WindowCoverage::Covered,
+            &base,
+            &stage_tx,
+        )?;
 
         // Both segments are empty, so truncate(1) keeps exactly one.
         assert_eq!(
@@ -492,7 +530,13 @@ mod tests {
 
         let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION);
         let base = root.join("clip.mcap");
-        let stats = cut_window(&planner, 1_500, 5_500, &base, &stage_tx, TimeSource::Log)?;
+        let stats = cut_window(
+            &planner,
+            &log_request(1_500, 5_500, TimeSource::Log),
+            WindowCoverage::Covered,
+            &base,
+            &stage_tx,
+        )?;
 
         // split0 contributes message at 2_000; split1's messages are outside.
         // The empty split1 segment is dropped; only the data-carrying segment remains.
@@ -514,7 +558,7 @@ mod tests {
     /// A plan pointing at bytes that are not record-framed, so the stage that
     /// copies it always fails. Its `time` span covers everything, so any window
     /// selects it.
-    struct Unreadable(Arc<File>);
+    struct Unreadable(PlanSource);
 
     impl WindowPlanner for Unreadable {
         fn plan_window(
@@ -524,7 +568,7 @@ mod tests {
             _source: TimeSource,
         ) -> Vec<WindowPlan> {
             vec![WindowPlan {
-                file: Some(self.0.clone()),
+                source: Some(self.0.clone()),
                 extents: vec![Extent {
                     offset: 0,
                     len: 64,
@@ -564,14 +608,16 @@ mod tests {
 
         let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION);
 
-        let doomed = Unreadable(Arc::new(File::open(&junk)?));
+        let doomed = Unreadable(PlanSource {
+            path: junk.clone(),
+            file: Arc::new(File::open(&junk)?),
+        });
         let err = cut_window(
             &doomed,
-            0,
-            u64::MAX,
+            &log_request(0, u64::MAX, TimeSource::Log),
+            WindowCoverage::Covered,
             &root.join("bad.mcap"),
             &stage_tx,
-            TimeSource::Log,
         )
         .unwrap_err();
         assert!(
@@ -584,11 +630,10 @@ mod tests {
         let planner = indexed(&[&rec])?;
         let stats = cut_window(
             &planner,
-            0,
-            1_000,
+            &log_request(0, 1_000, TimeSource::Log),
+            WindowCoverage::Covered,
             &root.join("good.mcap"),
             &stage_tx,
-            TimeSource::Log,
         )?;
         assert_eq!(stats.len(), 1);
         assert_eq!(
@@ -604,7 +649,7 @@ mod tests {
     /// A plan whose extent declares more bytes than any allocation can hold, so
     /// the copy panics rather than returning an error. Its `time` span covers
     /// everything, so any window selects it.
-    struct Unallocatable(Arc<File>);
+    struct Unallocatable(PlanSource);
 
     impl WindowPlanner for Unallocatable {
         fn plan_window(
@@ -614,7 +659,7 @@ mod tests {
             _source: TimeSource,
         ) -> Vec<WindowPlan> {
             vec![WindowPlan {
-                file: Some(self.0.clone()),
+                source: Some(self.0.clone()),
                 // `copy_window` sizes its read buffer from `len`; a length past
                 // `isize::MAX` cannot be a `Vec` capacity, so the allocation
                 // panics with "capacity overflow" instead of returning an error.
@@ -659,14 +704,16 @@ mod tests {
 
         let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION);
 
-        let doomed = Unallocatable(Arc::new(File::open(&src)?));
+        let doomed = Unallocatable(PlanSource {
+            path: src.clone(),
+            file: Arc::new(File::open(&src)?),
+        });
         let err = cut_window(
             &doomed,
-            0,
-            u64::MAX,
+            &log_request(0, u64::MAX, TimeSource::Log),
+            WindowCoverage::Covered,
             &root.join("boom.mcap"),
             &stage_tx,
-            TimeSource::Log,
         )
         .unwrap_err();
         let text = format!("{err:#}");
@@ -681,11 +728,10 @@ mod tests {
         let planner = indexed(&[&rec])?;
         let stats = cut_window(
             &planner,
-            0,
-            1_000,
+            &log_request(0, 1_000, TimeSource::Log),
+            WindowCoverage::Covered,
             &root.join("good.mcap"),
             &stage_tx,
-            TimeSource::Log,
         )?;
         assert_eq!(
             read_clip(&stats[0].out_path)?,
@@ -746,11 +792,10 @@ mod tests {
 
         let on_publish_apart = cut_window(
             &apart_planner,
-            900,
-            1_500,
+            &log_request(900, 1_500, TimeSource::Publish),
+            WindowCoverage::Covered,
             &root.join("apart-publish.mcap"),
             &stage_tx,
-            TimeSource::Publish,
         )?;
         assert_eq!(
             read_clip(&on_publish_apart[0].out_path)?
@@ -767,11 +812,10 @@ mod tests {
         // clip. This is the assertion a planner hard-wired to one domain fails.
         let on_log_apart = cut_window(
             &apart_planner,
-            900,
-            1_500,
+            &log_request(900, 1_500, TimeSource::Log),
+            WindowCoverage::Covered,
             &root.join("apart-log.mcap"),
             &stage_tx,
-            TimeSource::Log,
         )?;
         assert_eq!(
             on_log_apart.len(),
@@ -791,11 +835,10 @@ mod tests {
         // the same extent here, so this pins the copy's membership test alone.
         let on_log = cut_window(
             &planner,
-            180,
-            320,
+            &log_request(180, 320, TimeSource::Log),
+            WindowCoverage::Covered,
             &root.join("log.mcap"),
             &stage_tx,
-            TimeSource::Log,
         )?;
         let mut log_times: Vec<u64> = read_clip(&on_log[0].out_path)?
             .into_iter()
@@ -806,11 +849,10 @@ mod tests {
 
         let on_publish = cut_window(
             &planner,
-            180,
-            320,
+            &log_request(180, 320, TimeSource::Publish),
+            WindowCoverage::Covered,
             &root.join("publish.mcap"),
             &stage_tx,
-            TimeSource::Publish,
         )?;
         assert_eq!(
             read_clip(&on_publish[0].out_path)?
@@ -819,6 +861,141 @@ mod tests {
                 .collect::<Vec<u64>>(),
             vec![100],
             "publish windows on publish_time; only the message published at 250 is inside"
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// The three ways a clip comes out empty are told apart from their manifests
+    /// alone.
+    ///
+    /// This is what the output-directory contract needs and the file itself
+    /// cannot express: all three clips hold zero messages and their message
+    /// sections are byte-identical, so without the record a consumer cannot tell
+    /// a correct empty clip from a broken recorder. Each case is built for real
+    /// here rather than asserted on hand-made keys.
+    #[test]
+    fn an_empty_clip_says_which_kind_of_empty_it_is() -> anyhow::Result<()> {
+        let root = test_dir("empty-kinds")?;
+        let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION);
+
+        // 1. Nothing covered the window: no recording exists, and the wait for
+        //    coverage timed out — the recorder never got there.
+        let nothing = cut_window(
+            &Indexes(Vec::new()),
+            &log_request(500, 600, TimeSource::Log),
+            WindowCoverage::Short,
+            &root.join("nothing.mcap"),
+            &stage_tx,
+        )?;
+
+        // 2. The window fell in a gap between splits: split0 ends at 2_000 and
+        //    split1 starts at 5_000, so no file holds a byte of [2_500, 4_500] —
+        //    but the recording ran well past the window, so the coverage wait
+        //    was satisfied.
+        let split0 = root.join("rec_0.mcap");
+        let split1 = root.join("rec_1.mcap");
+        write_recording(&split0, false, &[("/t", 1_000), ("/t", 2_000)])?;
+        write_recording(&split1, false, &[("/t", 5_000), ("/t", 6_000)])?;
+        let gap = cut_window(
+            &indexed(&[&split0, &split1])?,
+            &log_request(2_500, 4_500, TimeSource::Log),
+            WindowCoverage::Covered,
+            &root.join("gap.mcap"),
+            &stage_tx,
+        )?;
+
+        // 3. No message matched: one recording whose extent brackets the window
+        //    — so it is planned and read — but whose messages all fall outside
+        //    it.
+        let quiet = root.join("quiet.mcap");
+        write_recording(&quiet, false, &[("/t", 100), ("/t", 900)])?;
+        let unmatched = cut_window(
+            &indexed(&[&quiet])?,
+            &log_request(400, 500, TimeSource::Log),
+            WindowCoverage::Covered,
+            &root.join("unmatched.mcap"),
+            &stage_tx,
+        )?;
+
+        // All three are valid, empty, and — without the manifest —
+        // indistinguishable.
+        for stats in [&nothing[0], &gap[0], &unmatched[0]] {
+            assert_eq!(stats.messages_copied, 0);
+            assert!(read_clip(&stats.out_path)?.is_empty());
+        }
+
+        let kind = |stats: &cut::ClipStats| -> anyhow::Result<(String, String)> {
+            let m = read_manifest(&stats.out_path)?.expect("every clip carries a manifest");
+            assert_eq!(m["clip.messages"], "0");
+            Ok((m["source.files_planned"].clone(), m["clip.short"].clone()))
+        };
+        assert_eq!(
+            kind(&nothing[0])?,
+            ("0".to_string(), "true".to_string()),
+            "nothing covered the window: no file planned, and the cut ran short"
+        );
+        assert_eq!(
+            kind(&gap[0])?,
+            ("0".to_string(), "false".to_string()),
+            "a gap between splits: no file planned, but the recording had passed \
+             the window end"
+        );
+        assert_eq!(
+            kind(&unmatched[0])?,
+            ("1".to_string(), "false".to_string()),
+            "no message matched: a file was planned and read, and the recording \
+             covered the window"
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// A window straddling a split writes one manifest per segment, each naming
+    /// its own source file, and both agreeing on the window-level facts.
+    ///
+    /// A single record for the whole window would have to name one of the two
+    /// files and be wrong about the other; the per-segment record is what lets a
+    /// consumer trace each half of a straddling clip back to the recording it
+    /// came from.
+    #[test]
+    fn each_segment_of_a_straddling_window_names_its_own_source() -> anyhow::Result<()> {
+        let root = test_dir("two-seg-manifest")?;
+        let split0 = root.join("rec_0.mcap");
+        let split1 = root.join("rec_1.mcap");
+        write_recording(&split0, false, &[("/t", 1_000), ("/t", 2_000)])?;
+        write_recording(&split1, false, &[("/t", 5_000), ("/t", 6_000)])?;
+
+        let planner = indexed(&[&split0, &split1])?;
+        let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION);
+        let stats = cut_window(
+            &planner,
+            &log_request(1_500, 5_500, TimeSource::Log),
+            WindowCoverage::Covered,
+            &root.join("clip.mcap"),
+            &stage_tx,
+        )?;
+        assert_eq!(stats.len(), 2, "a straddling window yields two segments");
+
+        let mut sources = Vec::new();
+        for seg in &stats {
+            let m = read_manifest(&seg.out_path)?.expect("every segment carries a manifest");
+            assert_eq!(
+                m["source.files_planned"], "2",
+                "both segments report the window's own file count"
+            );
+            assert_eq!(m["window.start_ns"], "1500");
+            assert_eq!(m["window.end_ns"], "5500");
+            assert_eq!(m["clip.messages"], "1");
+            sources.push(m["source.path"].clone());
+        }
+        sources.sort();
+        assert_eq!(
+            sources,
+            vec![split0.display().to_string(), split1.display().to_string()],
+            "each segment names the split it was cut from"
         );
 
         std::fs::remove_dir_all(root)?;

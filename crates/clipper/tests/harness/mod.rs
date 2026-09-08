@@ -1115,6 +1115,47 @@ pub fn clip_trigger_window(path: &Path) -> Option<(u64, u64)> {
 }
 
 /// Every message in the clip lies inside the inclusive trigger window.
+/// Assert the announced clip carries its manifest and that the manifest agrees
+/// with the clip's own name and contents.
+///
+/// The unit tests pin the record's keys; what only a live run can show is that
+/// the deployed binary stamps clips with the subcommand it was actually invoked
+/// as, and that the window the record states is the window the announced
+/// filename's anchor implies. Both interfaces go through the same cut, so
+/// calling this from a `ros` test and an `mcap` test covers every clip the
+/// recorder writes.
+pub fn assert_clip_manifest(path: &Path, preroll_ns: u64, postroll_ns: u64) {
+    let manifest = clip::manifest::read_manifest(path)
+        .unwrap_or_else(|e| panic!("reading the manifest of {}: {e}", path.display()))
+        .unwrap_or_else(|| panic!("clip {} carries no manifest", path.display()));
+    assert_eq!(
+        manifest["manifest.version"],
+        clip::manifest::MANIFEST_VERSION
+    );
+    assert_eq!(manifest["producer.name"], "clipper");
+    assert_eq!(
+        manifest["producer.mode"], "tail",
+        "the record names the subcommand the binary ran"
+    );
+    let anchor = anchor_from_clip(path);
+    assert_eq!(manifest["trigger.anchor_ns"], anchor.to_string());
+    assert_eq!(manifest["trigger.preroll_ns"], preroll_ns.to_string());
+    assert_eq!(manifest["trigger.postroll_ns"], postroll_ns.to_string());
+    assert_eq!(
+        manifest["window.start_ns"],
+        anchor.saturating_sub(preroll_ns).to_string()
+    );
+    assert_eq!(
+        manifest["window.end_ns"],
+        anchor.saturating_add(postroll_ns).to_string()
+    );
+    assert_eq!(
+        manifest["clip.messages"],
+        read_clip(path).len().to_string(),
+        "the record counts the messages the clip actually holds"
+    );
+}
+
 pub fn assert_clip_within_window(msgs: &[(String, u64)], start_ns: u64, end_ns: u64) {
     for (topic, log_time) in msgs {
         assert!(

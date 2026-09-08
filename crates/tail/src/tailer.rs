@@ -1023,7 +1023,12 @@ pub(crate) mod tests {
 
         // The pre-prune plan still reads through its own Arc<File> (POSIX
         // unlink-while-open semantics); the index drop did not invalidate it.
-        let file = in_flight[0].file.clone().expect("plan pins the file");
+        let file = in_flight[0]
+            .source
+            .as_ref()
+            .expect("plan pins the recording")
+            .file
+            .clone();
         assert!(
             file.metadata().is_ok(),
             "the in-flight handle stays readable"

@@ -16,7 +16,10 @@
 //!   incremental scan and its delta, the window plan and the [`index::WindowPlanner`]
 //!   that serves one.
 //! - [`cut`] — the copy: raw message bytes out of the planned extents into a new
-//!   MCAP, finished with a summary and footer.
+//!   MCAP, finished with a manifest record, a summary and a footer.
+//! - [`manifest`] — what a clip says about itself: the metadata record every cut
+//!   writes, naming the producer, the trigger, the window, the source recording
+//!   and what each channel contributed.
 //! - [`trigger`] — the neutral trigger and completion contract every trigger
 //!   source targets.
 //! - [`decode`] — a trigger payload's bytes to a [`trigger::Trigger`], dispatched
@@ -33,6 +36,7 @@
 pub mod cut;
 pub mod decode;
 pub mod index;
+pub mod manifest;
 pub mod segment;
 /// The MCAP fixtures this crate's tests are written against, published for a
 /// downstream crate's tests under the `test-support` feature.
@@ -41,9 +45,10 @@ pub mod testing;
 pub mod trigger;
 
 pub use index::{
-    ChannelDef, Extent, RecordingIndex, ScanDelta, ScanProgress, ScanSeed, SchemaDef, Span, Stamps,
-    TimeBounds, WindowPlan, WindowPlanner,
+    ChannelDef, Extent, PlanSource, RecordingIndex, ScanDelta, ScanProgress, ScanSeed, SchemaDef,
+    Span, Stamps, TimeBounds, WindowPlan, WindowPlanner,
 };
+pub use manifest::{CutRequest, Producer, WindowCoverage};
 pub use trigger::{Announce, Completion, Stamp, Trigger, TriggerRecord};
 
 /// The clock domain a clip's whole window lives in.
