@@ -35,26 +35,35 @@ copper e2e (`copper_sink_recording_produces_clip`) drives; prebuilding it keeps
 the cu29 compile out of the e2e test's own timeout — the test's on-demand `-p
 cu-mcap-record` build then finds it up to date.
 
-**The two libraries have their own lean ROS-free job.** `clip` and `tail` exist
-so a consumer can link the format layer, the recording index, the cut path and
-the tail with no ROS installation anywhere, and the `libraries` job
-(`name: clip + tail (ROS-free)`) is what holds that property down. Before
-anything is compiled it asserts that `cargo tree --locked -p <crate> -e normal`
-names no r2r for either crate — the tree is captured into a variable and grepped
-afterwards rather than piped, because under `pipefail` a `cargo | grep` pipeline
-would let the good case (grep matches nothing, exits 1) decide the step's status
-and invert the check. Then `cargo clippy --locked --all-targets -p clip -p tail
--- -D warnings` and `cargo test --locked -p clip -p tail`, on a plain stable
-toolchain with no nix and no ROS on `PATH`, cached under
-`shared-key: libraries`. An r2r dependency that escapes `clip`'s `ros` feature
-turns this job red in seconds instead of surfacing much later as a missing rmw
-at link time in a downstream build that has no ROS toolchain at all. There is
-deliberately no `--features ros` build here: that arm needs the very toolchain
-this job is defined by not having, and the `recorder` matrix below already
-builds clipper — and so `clip` with `ros` on — under every distro.
+**Everything ROS-free has one lean job.** `clip` and `tail` exist so a consumer
+can link the format layer, the recording index, the cut path and the tail with no
+ROS installation anywhere, and the recorder joins them there because ROS is a
+cargo feature of `clipper` too, off by default — a default-features recorder
+links no ROS and runs its MCAP interface on a host that never had one. The
+`libraries` job (`name: clip + tail + clipper (ROS-free)`) is what holds all of
+that down. Before anything is compiled it asserts that `cargo tree --locked -p
+<crate> -e normal` names no r2r for any of the three — the tree is captured into
+a variable and grepped afterwards rather than piped, because under `pipefail` a
+`cargo | grep` pipeline would let the good case (grep matches nothing, exits 1)
+decide the step's status and invert the check. Then `cargo clippy --locked
+--all-targets -p clip -p tail -p clipper -- -D warnings` and `cargo test --locked
+-p clip -p tail -p clipper`, on a plain stable toolchain with no nix and no ROS
+on `PATH`, cached under `shared-key: libraries`. An r2r dependency that escapes
+`clip`'s or `clipper`'s `ros` feature turns this job red in seconds instead of
+surfacing much later as a missing rmw at link time in a build that has no ROS
+toolchain at all. The e2e binary compiles in this job (it links no ROS itself —
+it drives the `ros2` CLI as a subprocess) and every one of its tests
+short-circuits on the unset `CLIPPER_E2E` gate. There is deliberately no
+`--features ros` build here: that arm needs the very toolchain this job is
+defined by not having, and the `recorder` matrix below already builds the
+recorder with the feature — and so `clip` with `ros` on — under every distro.
 
 **One matrix leg per distro; three steps share one nix shell.**
 Build → unit → e2e reuse the same realized nix closure and compiled artifacts.
+All three pass the recorder's `ros` feature — `--features clipper/ros` where more
+than one package is selected, plain `--features ros` in the `-p clipper`-only e2e
+step — so the matrix is the device build end to end, and the artifacts are shared
+rather than recompiled per feature set.
 Only `humble`, `jazzy`, and `lyrical` are in the matrix — rolling can't build
 the crates (r2r QoS variant issue, beads `clipper-2xb`).
 
@@ -148,7 +157,11 @@ type). `ros-tooling/setup-ros@v0.7` (desktop) covers `ros-base`,
 `rmw_fastrtps_cpp`, rosdep, and the `ament_cmake`/`rosidl` generators; the inline
 `apt install` adds `clang libclang-dev` (r2r bindgen) plus `python3-bloom fakeroot
 debhelper dpkg-dev` (bloom + the msgs deb), and `cargo install cargo-deb` follows.
-The job ends with a smoke-test that installs both `.deb` files and runs
+`scripts/build-on-target.sh` selects the recorder's `ros` feature, so the
+packaged binary is the device build (a default-features one would link no ROS at
+all and offer no `--interface ros`), and the `Unit tests` step passes the same
+`--features ros` so it tests that binary rather than compiling a second feature
+set. The job ends with a smoke-test that installs both `.deb` files and runs
 `clipper tail` against the apt-installed typesupport, confirming the `Depends`
 chain resolves. The package installs one executable,
 `/opt/momentedge-clipper/bin/clipper`, whose modes are subcommands, so the step

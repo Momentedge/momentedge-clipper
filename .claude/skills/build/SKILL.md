@@ -2,12 +2,12 @@
 name: build
 description: >
   Dev-shell and build mechanics for the clipper workspace — the per-distro Nix
-  ROS 2 shells, the system Rust toolchain, the ROS-free `clip` and `tail`
-  libraries that need neither, the r2r/IDL codegen model, which distros the
-  crates build on, and how to run unit tests, coverage, and the live e2e suite.
-  Use when building or testing clipper, entering the dev shell, adding a ROS
-  distro, editing flake.nix / nix/, or running cargo-llvm-cov or the gated e2e
-  tests.
+  ROS 2 shells, the system Rust toolchain, the recorder's two builds (ROS-free by
+  default, `--features ros` for the device), the ROS-free `clip` and `tail`
+  libraries, the r2r/IDL codegen model, which distros the crates build on, and
+  how to run unit tests, coverage, and the live e2e suite. Use when building or
+  testing clipper, entering the dev shell, adding a ROS distro, editing
+  flake.nix / nix/, or running cargo-llvm-cov or the gated e2e tests.
 ---
 
 # Build & dev environment
@@ -26,8 +26,9 @@ flake deliberately provides no Rust):
 nix develop --command cargo build        # likewise clippy, test, run
 ```
 
-`crates/clip` and `crates/tail` are the exception: they need no dev shell and no
-nix (below).
+The dev shell is what a build that links ROS needs. `crates/clip`,
+`crates/tail`, and the recorder's own default build need neither it nor nix
+(below).
 
 - **Coverage** is `cargo-llvm-cov`, also from the system, not the flake. The
   system toolchain ships the `llvm-tools` component, so `cargo-llvm-cov` finds
@@ -37,26 +38,56 @@ nix (below).
   the sysroot tools and force a hand-maintained LLVM-major constraint).
 - **nextest** (the e2e runner) is likewise a system prerequisite, not flaked.
 
-### `clip` and `tail` build without the dev shell
+### The recorder's two builds
+
+ROS is the `ros` cargo feature of `crates/clipper`, and it is **off by default**:
+
+```bash
+cargo build -p clipper                        # ROS-free: no r2r, no ROS install needed
+nix develop --command \
+  cargo build -p clipper --features ros       # the device build
+```
+
+Both produce the same one binary with the same subcommand (`clipper tail`) and
+the same flags. The feature buys exactly one thing: the `ros` interface — a live
+`momentedge_msgs/Trigger` subscription on a node, the `Recorded` publish that
+answers it, and `clip`'s CDR trigger decoder underneath. So:
+
+|  | default build | `--features ros` |
+|---|---|---|
+| links r2r / needs a ROS install | no | yes |
+| needs the dev shell | no | yes |
+| `--interface` accepts | `mcap` | `ros`, `mcap` |
+| default `--interface` | `mcap` | `ros` |
+| `cdr` triggers in the recording | skipped, with an error naming the feature | decoded |
+
+Every packaging path asks for the feature, so a shipped binary is always the
+device build: `nix/binaries.nix` passes `--features ros`, `scripts/build-on-target.sh`
+passes `--features clipper/ros` (the package-qualified spelling, since it may
+select `trigger-pub` too), and the CI recorder matrix passes it to build, unit
+tests and e2e alike.
+
+### `clip`, `tail`, and the default recorder build without the dev shell
 
 `crates/clip` — the MCAP format layer and recording index, the cut path, the
 neutral trigger contract — and `crates/tail` — discovery, the recording
 collection and its lifecycle, coverage, retention, and the waits before a cut —
-pull no r2r in their default feature sets, so they need no ROS installation and
-no nix realization:
+pull no r2r in their default feature sets, and neither does `clipper` with its
+`ros` feature off. All three need no ROS installation and no nix realization:
 
 ```bash
-cargo clippy -p clip -p tail --all-targets
-cargo test -p clip -p tail
+cargo clippy -p clip -p tail -p clipper --all-targets
+cargo test -p clip -p tail -p clipper
 ```
 
 Straight from the repo root, on the system toolchain. That is the fast inner
-loop for anything in the index, the cut, the trigger types or the tail; `cargo
-test -p clipper`, the e2e suite, and `clip` with `ros` on all link r2r and go
-back through `nix develop`.
+loop for anything in the index, the cut, the trigger types, the tail, or the
+recorder's own CLI, supervision and MCAP interface. Only what actually links r2r
+goes back through `nix develop`: `--features ros` on the recorder, `clip` with
+`ros` on, and the e2e suite (which drives the binary on `--interface ros`).
 
-`clip` carries three features and `tail` one, all off by default, so nothing a
-consumer has not asked for gets linked:
+`clip` carries three features, `tail` one, and `clipper` one, all off by
+default, so nothing a consumer has not asked for gets linked:
 
 - **`clip/ros`** — the CDR arm of the trigger decoder and the two r2r message
   conversions. They live in `clip` rather than in the recorder because the
@@ -74,12 +105,16 @@ consumer has not asked for gets linked:
   calls (its own coverage updates go through `send_if_modified`); the recorder's
   admission-gate test drives waiters with them. The same dev-only opt-in, under
   `[dev-dependencies]`.
+- **`clipper/ros`** — the ROS interface, and with it `dep:r2r`, `dep:futures`
+  and `clip/ros`. The one feature that decides which of the recorder's two
+  builds you get.
 
-The recorder takes `ros` + `clap` on its normal dependency on `clip`, and both
-crates' `test-support` under `[dev-dependencies]`. The featureless build is the
-one CI holds down: the `libraries` job asserts `cargo tree` names no r2r for
-either crate before compiling anything, then clippies and tests both on a stock
-toolchain with no ROS on the machine at all — see the `ci` skill.
+The recorder takes `clap` on its normal dependency on `clip` and adds `clip`'s
+`ros` through its own, plus both crates' `test-support` under
+`[dev-dependencies]`. The featureless build is the one CI holds down: the
+`libraries` job asserts `cargo tree` names no r2r for `clip`, `tail` or
+`clipper` before compiling anything, then clippies and tests all three on a
+stock toolchain with no ROS on the machine at all — see the `ci` skill.
 
 ## One ROS 2 distro per shell
 
@@ -108,8 +143,8 @@ distro is one entry in `rosDistros`. The shellHook exports
 
 ## r2r / IDL build model and distro support
 
-Every crate that links r2r — the recorder, `trigger-pub`, and `clip` with `ros`
-on — uses one build model: r2r generates bindings at build time from
+Every crate that links r2r — the recorder with `ros` on, `trigger-pub`, and
+`clip` with `ros` on — uses one build model: r2r generates bindings at build time from
 `AMENT_PREFIX_PATH`, gated by `IDL_PACKAGE_FILTER`
 (`builtin_interfaces;momentedge_msgs` — the only packages the crates decode) plus
 bindgen (`LIBCLANG_PATH`).
@@ -122,8 +157,8 @@ build on **humble, jazzy, lyrical** — but **not rolling**, which r2r `0.9.6`
 still references the variant for (beads `clipper-2xb`). The pin returns to
 crates.io once `0.9.6` ships there (beads `clipper-4rw`). `rolling` still gets a
 working ROS 2 shell for everything but the Rust build. None of this reaches the
-two libraries' default builds: `clip` links r2r only with `ros` on and `tail`
-never links it at all, so neither answers to a distro.
+default builds: `clip` and `clipper` link r2r only with `ros` on and `tail` never
+links it at all, so none of the three answers to a distro until the feature is on.
 
 `momentedge_msgs/` is a **local `ament_cmake` interface package** built by the
 flake via `ros.buildRosPackage` and added to both the env and
@@ -140,15 +175,16 @@ consumes no split events.
 
 ## Tests and coverage
 
-Unit/integration tests run with plain `cargo test` in the dev shell; the two
-libraries' run outside it (above). The suite spans all three crates, so coverage
-names all three:
+Unit/integration tests run with plain `cargo test` in the dev shell; everything
+ROS-free runs outside it (above). The suite spans all three crates, so coverage
+names all three, and `--features clipper/ros` is what puts the ROS interface's
+lines in the report at all:
 
 ```bash
-cargo llvm-cov -p clip -p tail                                                  # both libraries, no shell
-nix develop --command cargo llvm-cov -p clip -p tail -p clipper                 # summary table
-nix develop --command cargo llvm-cov -p clip -p tail -p clipper --html          # target/llvm-cov/html/index.html
-nix develop --command cargo llvm-cov -p clip -p tail -p clipper --lcov --output-path lcov.info
+cargo llvm-cov -p clip -p tail -p clipper                                       # everything ROS-free, no shell
+nix develop --command cargo llvm-cov --features clipper/ros -p clip -p tail -p clipper                 # summary table
+nix develop --command cargo llvm-cov --features clipper/ros -p clip -p tail -p clipper --html          # target/llvm-cov/html/index.html
+nix develop --command cargo llvm-cov --features clipper/ros -p clip -p tail -p clipper --lcov --output-path lcov.info
 ```
 
 `-p clipper` alone builds no test binary for `clip` or `tail`, so the libraries'
@@ -170,15 +206,20 @@ which the explicit `-p` list keeps out of the recorder's coverage.
 `crates/clipper/tests/e2e.rs` drives the real stack: a real `ros2 bag record`
 (matching `scripts/record.sh`), CLI-published triggers, and `ros2 topic echo`
 for `Recorded`. It is gated on `CLIPPER_E2E`: unset, every e2e test prints a
-skip notice and passes (so `cargo test`/`llvm-cov` are unaffected); set, a
-missing prerequisite fails loudly. [cargo-nextest](https://nexte.st/) is required
+skip notice and passes (so `cargo test`/`llvm-cov` are unaffected, and the test
+binary compiles in the ROS-free lane too — it links no ROS itself, it drives the
+`ros2` CLI); set, a missing prerequisite fails loudly. [cargo-nextest](https://nexte.st/) is required
 for the gated run — its `e2e` profile (`.config/nextest.toml`) runs each test in
 its own process, serializes the suite, and enforces per-test timeouts:
 
 ```bash
 nix develop --command bash -c \
-  'CLIPPER_E2E=1 cargo nextest run -p clipper --profile e2e -E "binary(e2e)"'
+  'CLIPPER_E2E=1 cargo nextest run -p clipper --features ros --profile e2e -E "binary(e2e)"'
 ```
+
+`--features ros` is not optional here: the suite starts the recorder on
+`--interface ros` and reads its `Recorded` announcements, and only the device
+build has either.
 
 The copper live e2e (`copper_sink_recording_produces_clip`) drives the
 `cu-mcap-record` member binary as its Producer fixture, building it on demand
@@ -200,7 +241,7 @@ and must not collide):
 for d in humble jazzy lyrical; do
   nix develop ".#$d" --command bash -c \
     "CARGO_TARGET_DIR=target/e2e-$d CLIPPER_E2E=1 \
-     cargo nextest run -p clipper --profile e2e -E 'binary(e2e)'"
+     cargo nextest run -p clipper --features ros --profile e2e -E 'binary(e2e)'"
 done
 ```
 

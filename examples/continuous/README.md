@@ -35,12 +35,17 @@ ros2 bag record --all \
 ```bash
 ./scripts/run.sh                    # clipper tail --record-dir ./record …
 # or, in the dev shell without an install:
-cargo run -p clipper -- tail \
+cargo run -p clipper --features ros -- tail \
   --record-dir ./record --out-dir ./clipped --grace-secs 30
 ```
 
 Fire test triggers with `cargo run -p trigger-pub` (or publish
 `momentedge_msgs/Trigger` on `/events/momentedge/trigger` yourself).
+
+`--features ros` is what puts the live trigger subscription in the binary: ROS is
+a cargo feature of the recorder and it is off by default, so without it clipper
+runs on `--interface mcap` and reads its triggers out of the recording instead of
+off the topic. See the README's [From source](../../README.md#from-source).
 
 ## The two latency knobs
 
