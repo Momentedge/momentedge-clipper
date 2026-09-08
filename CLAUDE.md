@@ -19,12 +19,14 @@ own their angle, and this file does not repeat them:
 Build, CI, packaging, and release mechanics live in **skills** (loaded on demand):
 
 - **`build`** ([`.claude/skills/build/SKILL.md`](.claude/skills/build/SKILL.md))
-  — the Nix dev shell, per-distro builds, the r2r/IDL model, tests and coverage,
-  the live e2e suite, the binary cache.
+  — the Nix dev shell, the recorder's two builds and the two nix packages that
+  match them, the r2r/IDL model, tests and coverage, the live e2e suite, the
+  binary cache.
 - **`ci`** ([`.claude/skills/ci/SKILL.md`](.claude/skills/ci/SKILL.md)) — the
   GitHub Actions workflows, skip rules, and local `act` testing.
 - **`packaging`** ([`.claude/skills/packaging/SKILL.md`](.claude/skills/packaging/SKILL.md))
-  — the two-deb (bloom + cargo-deb) release pipeline and its gotchas.
+  — the device build's two-deb (bloom + cargo-deb) release pipeline, the ROS-free
+  build's nix package, and the gotchas of both.
 - **`release`** ([`.claude/skills/release/SKILL.md`](.claude/skills/release/SKILL.md))
   — writing the tag annotation that becomes the release headline and overview.
 
@@ -101,9 +103,10 @@ crates/clipper/         # the clipper binary (`clipper tail` is the recorder): i
 momentedge_msgs/        # local ROS2 interface package (Trigger, Recorded)
 examples/               # setup guides + trigger-pub + mcap-writer examples + cu-mcap-record (copper)
 sim/                    # synthetic gscam camera (sim/cam_sim.sh) — see sim/README.md
-nix/                    # flake package defs: momentedge-msgs, ros-env, binaries
+nix/                    # flake package defs: momentedge-msgs, ros-env, the per-distro
+                        #   ROS binaries, and the ROS-free clipper package
 scripts/                # record.sh, run.sh, build-on-target.sh, packaging scripts
-flake.nix               # per-distro ROS2 dev shells + nix-built binaries
+flake.nix               # per-distro ROS2 dev shells + nix-built binaries + clipper-ros-free
 ```
 
 ## Sibling repositories

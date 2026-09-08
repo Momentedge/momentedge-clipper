@@ -45,6 +45,21 @@
       };
       lib = pkgs.lib;
 
+      # The workspace version, read from the one place it is set
+      # (`[workspace.package].version` in Cargo.toml), so every nix-built binary
+      # reports what a cargo-built one does instead of a hand-kept copy.
+      version = (lib.importTOML ./Cargo.toml).workspace.package.version;
+
+      # Vendor hashes for the lockfile's git sources, shared by every
+      # rustPlatform build below. r2r is pinned to its 0.9.6 git tag (for
+      # lyrical support — see Cargo.toml) until 0.9.6 reaches crates.io, and a
+      # git source has no registry checksum to vendor against. Nix vendors the
+      # whole lockfile before cargo picks a feature set, so this is needed by the
+      # ROS-free package too, which fetches r2r and never compiles it.
+      cargoOutputHashes = {
+        "r2r-0.9.6" = "sha256-1DQPrRQOYzxTckzyH0p6pnyEy1lOw/OmU0sDAMNzHpg=";
+      };
+
       # The ROS2 distros this repo is built and tested against. nix-ros-overlay
       # packages each one as `pkgs.rosPackages.<distro>`; everything below
       # (dev shell, nix-built binaries, the recorder closure) is produced once
@@ -139,7 +154,7 @@
         };
         rosEnv = import ./nix/ros-env.nix {inherit ros momentedge-msgs lib withSim;};
         binaries = import ./nix/binaries.nix {
-          inherit pkgs rosEnv idlPackageFilter rosDistro;
+          inherit pkgs rosEnv idlPackageFilter rosDistro version cargoOutputHashes;
           src = ./.;
           cargoLockFile = ./Cargo.lock;
         };
@@ -189,6 +204,17 @@
       # only humble's devShell, never the others.
       distros = lib.genAttrs rosDistros mkDistro;
 
+      # The ROS-free recorder, built once and for no distro — with the `ros`
+      # cargo feature off there is no ROS closure to build against and so nothing
+      # a distro would select. It sits outside `mkDistro` for that reason, and
+      # unlike everything in it, the result is a shippable artefact: see
+      # nix/clipper-ros-free.nix.
+      clipper-ros-free = import ./nix/clipper-ros-free.nix {
+        inherit pkgs version cargoOutputHashes;
+        src = ./.;
+        cargoLockFile = ./Cargo.lock;
+      };
+
       # Per-distro package outputs: rosEnv-<distro>,
       # clipper-<distro>, trigger-pub-<distro>.
       perDistroPackages =
@@ -210,12 +236,16 @@
           ;
       };
     in {
-      # rosEnv (the dev shell's ROS2 closure) and the nix-built binaries are
-      # exposed mostly as build checks — `nix build .#clipper-rolling`
+      # `clipper-ros-free` is the one shippable package here: the recorder with
+      # its `ros` feature off, which links no ROS and so carries none of the nix
+      # ROS closure into whatever runs it.
+      #
+      # rosEnv (the dev shell's ROS2 closure) and the per-distro binaries are
+      # exposed as build checks instead — `nix build .#clipper-rolling`
       # compiles the deployable under nix, against that distro, without the
-      # system cargo. The target deploys native apt builds, not these (see
+      # system cargo. The device target deploys native apt builds, not those (see
       # README "Deployment").
-      packages = perDistroPackages // defaultPackages;
+      packages = perDistroPackages // defaultPackages // {inherit clipper-ros-free;};
 
       # `nix develop .#<distro>` selects a distro; bare `nix develop` is the
       # default (jazzy). Each shell pins ROS_DISTRO and the matching ROS2 closure.

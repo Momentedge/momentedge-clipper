@@ -179,9 +179,14 @@ nix develop --command cargo build -p clipper --features ros  # the device build
 - **Default (no feature):** the binary links no ROS at all and builds and runs on
   a host with no ROS installation. It offers `--interface mcap` — triggers read
   out of the recording it tails — and nothing else. Plain `cargo build`, no ROS 2
-  environment, no dev shell.
-- **`--features ros`:** the device build, and what every release artefact is. It
-  links `rcl`/`rmw` and the `momentedge_msgs` typesupport, so it needs a ROS 2
+  environment, no dev shell. It also ships as a nix package — the flake's one
+  deployable output, which runs anywhere the store path goes:
+
+  ```bash
+  nix build .#clipper-ros-free      # -> ./result/bin/clipper
+  ```
+- **`--features ros`:** the device build, and what every Debian release artefact
+  is. It links `rcl`/`rmw` and the `momentedge_msgs` typesupport, so it needs a ROS 2
   environment to compile against, and it adds `--interface ros` (its default
   there): the live trigger subscription and the `Recorded` publish.
 

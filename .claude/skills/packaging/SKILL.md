@@ -1,15 +1,61 @@
 ---
 name: packaging
 description: >
-  How clipper ships as Debian packages — the bloom (momentedge_msgs) + cargo-deb
-  (clipper) two-deb pipeline, its run model, and the gotchas. Use when editing the
-  packaging scripts, crates/clipper/Cargo.toml [package.metadata.deb], the
+  How clipper ships — the device build's bloom (momentedge_msgs) + cargo-deb
+  (clipper) two-deb pipeline, and the ROS-free build's nix package. Their run
+  models and gotchas. Use when editing the packaging scripts,
+  crates/clipper/Cargo.toml [package.metadata.deb], nix/clipper-ros-free.nix, the
   release.yml deb job, or building/verifying the .debs on the target or under act.
 ---
 
-# Packaging — two debs, two tools
+# Packaging
 
-clipper deploys as **two Debian packages**, each built the way the ROS2 ecosystem
+The recorder's two builds ship as two kinds of artefact, and neither is a
+repackaging of the other:
+
+| Build | Ships as | Produced by | Runs on |
+|---|---|---|---|
+| `--features ros` — the device build | two Debian packages | bloom + cargo-deb, natively on the target | a ROS 2 device, against its own apt ROS 2 |
+| default — ROS-free | one nix package, `clipper-ros-free` | `nix build .#clipper-ros-free` | anywhere; it links no ROS |
+
+Both carry the same single executable, `clipper`, whose modes are subcommands.
+The **`build`** skill owns the cargo feature and the flake's package set; this
+skill owns how each artefact is produced and verified.
+
+## The ROS-free artefact: one nix package, no deb
+
+```bash
+nix build .#clipper-ros-free              # -> ./result/bin/clipper
+nix run .#clipper-ros-free -- tail --help
+```
+
+[`nix/clipper-ros-free.nix`](nix/clipper-ros-free.nix) is a plain
+`rustPlatform.buildRustPackage` of `-p clipper` with no features: no `rosEnv`, no
+`IDL_PACKAGE_FILTER`, no distro. The result's only dynamic dependencies are libc
+and libgcc, so the store path is the whole artefact — `nix copy` it to a host
+with no ROS 2 and it runs. It still needs the r2r vendor hash
+(`cargoOutputHashes` in `flake.nix`), because `Cargo.lock` carries r2r's git
+source whether or not a feature enables it: nix fetches the crate and cargo never
+compiles it.
+
+**It gets no Debian package, deliberately.** A deb earns its keep by letting apt
+resolve the device build's ROS dependencies — `ros-<distro>-ros-base`,
+`rmw-fastrtps-cpp`, `momentedge-msgs`. That entire `Depends` list is precisely
+what the ROS-free binary does not have, and nothing about the way it is deployed
+wants apt. An OCI image built from this package is the natural next artefact, and
+belongs to whatever pipeline runs it.
+
+**What proves it.** The derivation's `installCheckPhase`, in a sandbox that holds
+no ROS 2 of any kind: `clipper --help` running at all proves the binary needs
+none, and `clipper tail --interface ros` must fail with clap's
+`invalid value 'ros'`. Asserting that parse error rather than merely a non-zero
+exit is what makes the check bite — a build that leaked the `ros` feature would
+accept the flag and start a recorder, whose own exit status says nothing about
+which interfaces the binary offers.
+
+## The device artefact: two debs, two tools
+
+The device build deploys as **two Debian packages**, each built the way the ROS2 ecosystem
 builds its kind. This is the rule, not an accident: **bloom only understands ament
 build types (`ament_cmake`/`ament_python`/`cmake`/`catkin`) — it has no cargo build
 type**, so it cannot build the Rust crate; **cargo-deb is the idiomatic deb tool for

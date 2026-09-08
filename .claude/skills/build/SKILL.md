@@ -12,9 +12,10 @@ description: >
 
 # Build & dev environment
 
-The Nix flake is for **development** (the dev shell, and
-`nix build .#clipper` as a build check) and CI. Deployment is a native
-build on the target — see the `packaging` skill and
+The Nix flake is for **development** (the dev shell, and the per-distro
+`nix build .#clipper` as a build check), CI, and one shipping artefact:
+`nix build .#clipper-ros-free`, the recorder without ROS. The device deploys as a
+native build on the target instead — see the `packaging` skill and
 [ARCHITECTURE.md § Deployment](ARCHITECTURE.md#deployment).
 
 ## Dev shell and toolchain
@@ -63,11 +64,12 @@ of that and runs identically in either build. So:
 | default `--interface` | `mcap` | `ros` |
 | `cdr` triggers in the recording | skipped, with an error naming the feature | decoded |
 
-Every packaging path asks for the feature, so a shipped binary is always the
-device build: `nix/binaries.nix` passes `--features ros`, `scripts/build-on-target.sh`
-passes `--features clipper/ros` (the package-qualified spelling, since it may
-select `trigger-pub` too), and the CI recorder matrix passes it to build, unit
-tests and e2e alike.
+Every packaging path that ships to a ROS 2 device asks for the feature:
+`nix/binaries.nix` passes `--features ros`, `scripts/build-on-target.sh` passes
+`--features clipper/ros` (the package-qualified spelling, since it may select
+`trigger-pub` too), and the CI recorder matrix passes it to build, unit tests and
+e2e alike. The default build ships too, as its own nix package — see
+[The two nix packages](#the-two-nix-packages).
 
 ### `clip`, `tail`, and the default recorder build without the dev shell
 
@@ -129,9 +131,13 @@ once per distro:
 ```bash
 nix develop            # jazzy (the default)
 nix develop .#humble   # or .#lyrical / .#rolling
-nix build .#clipper            # default distro
-nix build .#clipper-rolling    # per-distro; also .#rosEnv-humble, etc.
 ```
+
+The packages that closure also produces — `.#clipper-<distro>`,
+`.#rosEnv-<distro>`, `.#trigger-pub-<distro>` — are in
+[The two nix packages](#the-two-nix-packages). `clipper-ros-free` is outside all
+of this: with the `ros` feature off there is no ROS closure to build against, and
+so no distro to select.
 
 The flake outputs are named for the binary, which for the recorder is also the
 cargo package name: `cargo build -p clipper` produces `target/release/clipper`,
@@ -142,6 +148,54 @@ distro is one entry in `rosDistros`. The shellHook exports
 `RMW_IMPLEMENTATION=rmw_fastrtps_cpp`, `ROS_DOMAIN_ID=0`, and
 `ROS_DISTRO=<selected>`. The single `IDL_PACKAGE_FILTER` and the
 `nix/ros-env.nix` package list serve every distro unchanged.
+
+## The two nix packages
+
+The flake's `packages` split the same way the cargo builds do, and only one half
+is shippable:
+
+| | `clipper-ros-free` | `clipper` / `clipper-<distro>` |
+|---|---|---|
+| defined in | [`nix/clipper-ros-free.nix`](nix/clipper-ros-free.nix) | [`nix/binaries.nix`](nix/binaries.nix) |
+| cargo features | none (the default build) | `ros` |
+| ROS 2 distro | none — one package, no suffix | one package per `rosDistros` entry |
+| built against | nothing but its own closure | `rosEnv`, the nix ROS 2 closure |
+| what it is for | a shippable artefact | a build check |
+
+```bash
+nix build .#clipper-ros-free   # the ROS-free binary, distro-independent
+nix build .#clipper            # the device build, default distro (jazzy)
+nix build .#clipper-rolling    # per-distro; also .#rosEnv-humble, etc.
+```
+
+Both install the same one executable, `bin/clipper`, whose modes are
+subcommands.
+
+**Why only one of them ships.** A `clipper-<distro>` binary links the nix ROS
+closure and bakes `/nix/store` RPATHs, so it would load that closure instead of
+the target's own apt ROS 2 and break ABI compatibility with the rest of the
+host's ROS graph — which is why the device builds natively on the target
+(`packaging` skill). `clipper-ros-free` links no ROS at all: its only dynamic
+dependencies are libc and libgcc, there is no distro to answer to, and it runs
+anywhere the store path is available.
+
+**What the package build checks.** `doCheck = false` — unit tests are CI's
+ROS-free lane, far cheaper there than a release-profile rebuild in the sandbox.
+The derivation runs an `installCheckPhase` instead, asserting the one property
+that makes it this artefact: the sandbox holds no ROS 2 of any kind, so
+`clipper --help` running at all proves the binary needs none, and
+`clipper tail --interface ros` must fail with clap's `invalid value 'ros'` —
+that parse error, not merely a non-zero exit, since a build that leaked the
+feature would accept the flag and start a recorder, whose own exit status says
+nothing about which interfaces the binary offers.
+
+**Both take the r2r vendor hash.** `Cargo.lock` carries r2r's git source
+regardless of features, and nix vendors the whole lockfile before cargo picks a
+feature set. So `cargoOutputHashes` in `flake.nix` — one entry, shared by both
+package definitions — is needed by the ROS-free build too, which fetches r2r and
+never compiles it. `flake.nix` reads the package `version` from
+`[workspace.package]` in `Cargo.toml` for the same reason: one value, both
+packages.
 
 ## r2r / IDL build model and distro support
 
