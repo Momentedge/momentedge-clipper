@@ -15,6 +15,9 @@
 //!   their `log_time`/`publish_time` spans, the per-recording index, the
 //!   incremental scan and its delta, the window plan and the [`index::WindowPlanner`]
 //!   that serves one.
+//! - [`whole`] — the same index for a recording that is already finished, taken
+//!   from its summary rather than by walking it: a footer seek and one read,
+//!   whatever the recording's size.
 //! - [`cut`] — the copy: raw message bytes out of the planned extents into a new
 //!   MCAP, finished with a manifest record, a summary and a footer.
 //! - [`manifest`] — what a clip says about itself: the metadata record every cut
@@ -43,6 +46,7 @@ pub mod segment;
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing;
 pub mod trigger;
+pub mod whole;
 
 pub use index::{
     ChannelDef, Extent, PlanSource, RecordingIndex, ScanDelta, ScanProgress, ScanSeed, SchemaDef,
@@ -50,6 +54,7 @@ pub use index::{
 };
 pub use manifest::{CutRequest, Producer, WindowCoverage};
 pub use trigger::{Announce, Completion, Stamp, Trigger, TriggerRecord};
+pub use whole::WholeFileIndex;
 
 /// The clock domain a clip's whole window lives in.
 ///
