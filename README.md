@@ -443,22 +443,22 @@ is logged at startup, so a run's log states the configuration it ran with:
 $ clipper tail --config ./night-run.toml --grace-secs 12 --print-config
 clipper tail effective configuration
   [settings]
-    clip_compression         = zstd                  <- built-in default
-    delete_old_files         = false                 <- built-in default
-    extract_parallelism      = 1                     <- system file /etc/momentedge/clipper.toml
-    grace_secs               = 12                    <- flag
-    interface                = ros                   <- system file /etc/momentedge/clipper.toml
-    out_dir                  = ./clips/night-run     <- per-run file ./night-run.toml
-    record_dir               = /data/record          <- system file /etc/momentedge/clipper.toml
-    time_source              = log                   <- built-in default
-    watch_old_files_duration = 600                   <- built-in default
+    clip_compression         = zstd                   <- built-in default
+    delete_old_files         = false                  <- built-in default
+    extract_parallelism      = 1                      <- system file /etc/momentedge/clipper.toml
+    grace_secs               = 12                     <- flag
+    interface                = ros                    <- system file /etc/momentedge/clipper.toml
+    out_dir                  = ./clips/night-run      <- per-run file ./night-run.toml
+    record_dir               = /data/record           <- system file /etc/momentedge/clipper.toml
+    time_source              = log                    <- built-in default
+    watch_old_files_duration = 600                    <- built-in default
   [topics]
-    all                      = false                 <- per-run file ./night-run.toml
-    exclude                  = []                    <- built-in default
-    exclude_regex            = ^/diagnostics         <- system file /etc/momentedge/clipper.toml
-    exclude_trigger_topic    = false                 <- built-in default
-    include                  = ["/camera/front/image_raw", "/imu/data"]  <- per-run file ./night-run.toml
-    include_regex            = (unset)               <- built-in default
+    all                      = false                  <- built-in default
+    include                  = ["/camera/front/image_raw", "/imu/data"] <- per-run file ./night-run.toml
+    include_regex            = (unset)                <- built-in default
+    exclude                  = []                     <- built-in default
+    exclude_regex            = ^/diagnostics          <- system file /etc/momentedge/clipper.toml
+    exclude_trigger_topic    = false                  <- built-in default
 ```
 
 The values are read back out of the parsed command line rather than re-derived,
