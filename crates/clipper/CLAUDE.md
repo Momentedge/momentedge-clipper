@@ -842,7 +842,9 @@ nix develop --command cargo run -p clipper --bin clipper-tailing
 ```
 
 Needs `scripts/record.sh` running (for `./record`) and a
-trigger publisher (`trigger-pub`). `RUST_LOG=debug` raises verbosity.
+trigger publisher (`trigger-pub`). Logs go to stdout (`main` says why);
+`RUST_LOG=debug` raises verbosity. Where the ROS layer's own diagnostics land
+is in the [README](../../README.md#operational-notes).
 
 ## Configuration
 

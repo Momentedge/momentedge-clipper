@@ -29,8 +29,9 @@
 //! recorder sees varied clip lengths during development. Pass either flag to pin
 //! that side to a fixed nanosecond value.
 //!
-//! Logging uses the `log` facade with a pretty_env_logger backend; `RUST_LOG`
-//! controls verbosity (defaults to `info`).
+//! Logging uses the `log` facade with a pretty_env_logger backend and goes to
+//! **stdout**, matching the recorder; `RUST_LOG` controls verbosity (defaults
+//! to `info`).
 
 use std::time::Duration;
 
@@ -93,7 +94,10 @@ fn resolve_roll(fixed: Option<u64>) -> u64 {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // stdout, like the recorder; `Target` comes through the `env_logger` that
+    // `pretty_env_logger` re-exports.
     pretty_env_logger::formatted_builder()
+        .target(pretty_env_logger::env_logger::fmt::Target::Stdout)
         .filter_level(log::LevelFilter::Info)
         .parse_default_env()
         .init();

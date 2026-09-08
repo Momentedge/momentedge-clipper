@@ -52,8 +52,10 @@
 //! authoritative per-flag reference (the README configuration table is the
 //! user-facing copy of the same set).
 //!
-//! Logging uses the `log` facade with a pretty_env_logger backend; `RUST_LOG`
-//! controls verbosity.
+//! Logging uses the `log` facade with a pretty_env_logger backend and goes to
+//! **stdout**; `RUST_LOG` controls verbosity. Under `--interface ros` the ROS
+//! layer's own diagnostics are a separate stream — rcutils writes them to
+//! stderr unless `RCUTILS_LOGGING_USE_STDOUT=1`.
 
 mod interface;
 mod supervision;
@@ -375,7 +377,14 @@ impl Drop for AdmissionPermit {
 /// startup reclaims any stranded staged file, and `out_dir` only ever holds
 /// complete clips.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Logs go to stdout: there is no machine-readable contract on that stream
+    // and there will not be one — a run's result is the contents of `out_dir`
+    // when the process exits, each clip carrying its own metadata record — so
+    // the stream an operator reads first is free for human-readable output.
+    // `Target` comes through the `env_logger` that `pretty_env_logger`
+    // re-exports; no direct dependency on it.
     pretty_env_logger::formatted_builder()
+        .target(pretty_env_logger::env_logger::fmt::Target::Stdout)
         .filter_level(log::LevelFilter::Info)
         .parse_default_env()
         .init();

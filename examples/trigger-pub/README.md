@@ -24,8 +24,10 @@ the recorder's own receipt instant and rejects a trigger that sets
 at publish — the publish-domain anchor for a `--time-source publish` clipper.
 
 Flags (all optional): `--period <secs>`, `--preroll <ns>`, `--postroll <ns>`,
-`--name <prefix>`, `--description <text>`, `--stamp-trigger-time`. `RUST_LOG`
-controls verbosity (default `info`).
+`--name <prefix>`, `--description <text>`, `--stamp-trigger-time`. Logs go to
+stdout, like the recorder's (the [README](../../README.md#operational-notes)
+covers the streams, the ROS layer's own included); `RUST_LOG` controls
+verbosity (default `info`).
 
 ## Run
 

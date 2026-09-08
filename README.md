@@ -317,6 +317,14 @@ Both cut identical clips; only the trigger and completion edges differ.
 - **Lifecycle.** Ctrl-C (SIGINT/SIGTERM) stops clipper cleanly with exit 0. Any
   internal fault — a dead tail thread, an unrecoverable scan fault — exits
   non-zero so a process supervisor (systemd, …) restarts it.
+- **Logs go to stdout.** `clipper-tailing` logs at `info` on stdout; `RUST_LOG`
+  raises or lowers that. A run publishes nothing machine-readable on stdout —
+  its result is the clips in `--out-dir`, each carrying its own metadata — so
+  the stream is free for the output an operator reads first, and discarding
+  stderr keeps the logs. Under `--interface ros` the ROS layer's own
+  diagnostics are a separate stream: rcutils writes them to stderr unless
+  `RCUTILS_LOGGING_USE_STDOUT=1`. Under systemd both streams land in the
+  journal; under `ros2 launch` see [`examples/launch`](examples/launch/README.md).
 - **No startup back-indexing.** clipper recovers only rollovers it observed
   during its own run. A recording already on disk before clipper started
   contributes nothing to a trigger fired afterwards.

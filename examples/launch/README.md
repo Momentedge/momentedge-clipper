@@ -77,6 +77,10 @@ rosbag2 refuses to reuse the bag directory the launch wiped once at startup.
 `MOMENTEDGE_*` environment variables (CLI > env > default), so under
 `ros2 launch` they inherit anything you exported in the calling shell.
 
+Both launch files set `output="screen"`, which is what puts `clipper-tailing`'s
+logs on the terminal: it logs to stdout, and launch's default `output="log"`
+shows only stderr on screen, filing stdout in the launch log alone.
+
 ## Start on boot
 
 `ros2 launch` is the orchestration layer, not a boot supervisor. To start it at
