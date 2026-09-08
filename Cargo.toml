@@ -63,6 +63,10 @@ signal-hook = "0.3"
 # ships with.
 mcap = "0.25"
 anyhow = "1"
+# Typed error enums for the library crates: a `thiserror` enum is what lets a
+# caller branch on *which* way something failed, where an `anyhow` context chain
+# only lets it print. `clip::whole`'s refusal taxonomy is the first user.
+thiserror = "2"
 # CLI + env parsing: `derive` for the `Config` parser, `env` so each arg falls
 # back to a `MOMENTEDGE_*` environment variable, `string` so the runtime-built
 # env names (one prefix applied to every arg) can be set on the args.
