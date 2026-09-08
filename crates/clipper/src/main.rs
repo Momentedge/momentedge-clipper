@@ -730,6 +730,13 @@ const CLIP_MODE_COMPRESSION: ClipCompression = ClipCompression::Zstd;
 /// there is nothing to wait for, so a window reaching past it is simply short,
 /// and the manifest says so ([`clip::manifest::WindowCoverage`]).
 ///
+/// **A recording it cannot index is refused by name**, from that same footer
+/// and summary, before anything is created: [`clip::whole::IndexRefusal`] is
+/// the taxonomy, the message names the fault and the `mcap` command that
+/// repairs it, and the run exits non-zero having written nothing — not the
+/// output directory, not the staging directory inside it. clipper runs no
+/// repair itself; recovering and re-indexing a recording are the operator's.
+///
 /// Nothing is printed for a caller to parse. The result is the output
 /// directory's contents when the process exits, each clip carrying its own
 /// manifest; the exit status is the verdict.
@@ -740,12 +747,16 @@ fn clip_mode(cfg: ClipConfig, producer: Producer) -> anyhow::Result<()> {
         anyhow::bail!("--trigger-name {:?} {why}", cfg.trigger_name);
     }
 
+    // Index the recording before anything is created: a recording clipper
+    // cannot index is refused by name (`clip::whole::IndexRefusal`), and a
+    // refusal writes nothing anywhere — not the output directory, not the
+    // staging directory inside it.
+    let index = clip::whole::WholeFileIndex::open(&cfg.recording)?;
+
     // Start from a clean capturing dir, which also creates out_dir: a clip is
     // assembled there and hard-linked into place, so the output directory only
     // ever holds complete clips.
     clip::cut::reset_capturing_dir(&cfg.out_dir)?;
-
-    let index = clip::whole::WholeFileIndex::open(&cfg.recording)?;
 
     let anchor_ns = cfg.trigger_time;
     let trigger = Trigger {
@@ -1676,6 +1687,77 @@ mod tests {
         assert!(
             !out_dir.exists(),
             "a refused command line writes nothing at all"
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// A recording clipper cannot index reaches the operator as the refusal it
+    /// is: the fault named, the repair named, a non-zero exit, and nothing
+    /// written anywhere.
+    ///
+    /// The fixture is an unchunked recording — a perfectly valid MCAP that
+    /// carries no chunk index to plan a window from — so this exercises the
+    /// refusal rather than a corrupt file. `clip::whole` owns the taxonomy and
+    /// tests every variant of it; what is tested here is that a refusal
+    /// survives the trip out of `clip_mode` with its message intact and takes
+    /// the output directory with it.
+    #[test]
+    fn clip_mode_refuses_a_recording_it_cannot_index() -> anyhow::Result<()> {
+        let root = clip::testing::test_dir("clip-unindexable")?;
+        let rec = root.join("rec.mcap");
+        clip::testing::write_recording(&rec, false, &[("/t", 1_000), ("/t", 2_000)])?;
+        let out_dir = root.join("clipped");
+
+        let err = clip_mode(
+            ClipConfig {
+                recording: rec.clone(),
+                out_dir: out_dir.clone(),
+                trigger_time: 1_500,
+                preroll: 500,
+                postroll: 500,
+                trigger_name: "brake".to_string(),
+                trigger_description: String::new(),
+            },
+            Producer {
+                program: PROGRAM,
+                mode: "clip",
+            },
+        )
+        .unwrap_err();
+
+        let text = format!("{err:#}");
+        assert!(
+            text.contains(&rec.display().to_string()),
+            "the refusal names the recording: {text}"
+        );
+        assert!(
+            text.contains("indexes no chunk"),
+            "the refusal names the fault: {text}"
+        );
+        assert!(
+            text.contains("mcap recover"),
+            "the refusal names the repair: {text}"
+        );
+        assert!(
+            err.downcast_ref::<clip::OpenError>().is_some(),
+            "the refusal keeps its type all the way out: {text}"
+        );
+        assert!(
+            !out_dir.exists(),
+            "a refusal writes nothing, not even the staging directory"
+        );
+
+        // What the operator actually sees: `main` boxes the error and returns
+        // it, and the runtime renders that box's `Debug` before exiting
+        // non-zero. A refusal whose text is lost on the way out is a refusal
+        // nobody can act on.
+        let boxed: Box<dyn std::error::Error> = err.into();
+        let printed = format!("{boxed:?}");
+        assert!(
+            printed.contains("indexes no chunk") && printed.contains("mcap recover"),
+            "the refusal survives the boxing `main` does: {printed}"
         );
 
         std::fs::remove_dir_all(root)?;

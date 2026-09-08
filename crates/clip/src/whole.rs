@@ -30,19 +30,28 @@
 //! where the summary carries them), so [`WholeFileIndex::log_end_ns`] answers
 //! whether the *recording* reached a window end — the question a clip's
 //! `clip.short` key is about — rather than whether this index can plan it.
+//!
+//! **What it refuses.** A summary is not something every recording has, and the
+//! ones that have one do not all carry an index worth planning from. Every
+//! input this cannot index is refused by name — [`IndexRefusal`] is the whole
+//! taxonomy, one variant per fault an operator repairs differently — and each
+//! refusal names the `mcap` command that repairs it. Every verdict
+//! is reached from the footer and the summary alone, so refusing a recording
+//! costs the same seek and read that accepting one does, whatever its size, and
+//! the input is opened read-only and left exactly as it was found: recovering
+//! and re-indexing are the operator's, never this crate's.
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{Read, Seek};
-use std::path::Path;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result, bail};
-use mcap::sans_io::summary_reader::{SummaryReadEvent, SummaryReader};
+use mcap::sans_io::summary_reader::{SummaryReadEvent, SummaryReader, SummaryReaderOptions};
 
 use crate::TimeSource;
 use crate::index::{
-    ChannelDef, Extent, RecordingIndex, SchemaDef, Span, Stamps, TimeBounds, WindowPlan,
+    ChannelDef, Extent, MAGIC, RecordingIndex, SchemaDef, Span, Stamps, TimeBounds, WindowPlan,
     WindowPlanner,
 };
 
@@ -52,6 +61,134 @@ const UNBOUNDED: Span = Span {
     min: 0,
     max: u64::MAX,
 };
+
+/// The fixed frame every MCAP file ends with: the footer record — its opcode,
+/// its length prefix and its 20-byte body (`summary_start`,
+/// `summary_offset_start`, `summary_crc`) — followed by the closing magic.
+const FOOTER_FRAME_LEN: u64 = 1 + 8 + 20 + 8;
+
+/// The shortest byte count an MCAP file can have: the opening magic and the
+/// footer frame, with no records between them. Anything smaller cannot carry a
+/// footer, so it is not an MCAP file.
+const MIN_MCAP_LEN: u64 = MAGIC.len() as u64 + FOOTER_FRAME_LEN;
+
+/// The repair every [`IndexRefusal`] names, spelled once because it is the same
+/// three commands whichever fault the recording has.
+///
+/// `mcap recover` rewrites a recording into the shape this reads — chunked,
+/// summarised, message-indexed — and is what turns a refused input into one
+/// clipper cuts from; `mcap compress` writes the same shape where the copy
+/// should also be smaller. `mcap list chunks` prints the per-chunk
+/// `message index length` column that [`IndexRefusal::Unindexed`] reads, so an
+/// operator sees the field the refusal is about rather than taking its word.
+///
+/// clipper runs none of them. It opens a recording read-only and never writes
+/// to one, so recovering and re-indexing stay the operator's, with the repaired
+/// copy under a name they chose.
+const REPAIR: &str = "`mcap recover <in.mcap> -o <out.mcap>` rewrites it into \
+     the chunked, summarised, message-indexed shape this reads, and `mcap \
+     compress <in.mcap> -o <out.mcap>` writes that shape where the copy should \
+     also be smaller; `mcap list chunks <out.mcap>` prints the per-chunk \
+     `message index length` this reads. clipper never rewrites, recovers or \
+     re-indexes a recording itself";
+
+/// A recording clipper will not build an index out of, named by the fault.
+///
+/// Each variant is a different thing to do about it, which is why they are
+/// separate: a truncated file wants recovering, an unchunked one wants
+/// rewriting with chunks, a recording holding no message wants a different
+/// recording. Every one of them is decided from the footer and the summary
+/// section alone — no chunk is decompressed and no data byte is read — so a
+/// refusal costs a seek and one read whatever the recording's size.
+///
+/// The variant set is the promise, so it is exhaustive: a caller matches every
+/// way this can refuse, and a new one is a compile error at the match rather
+/// than a message that reads differently.
+#[derive(Debug, thiserror::Error)]
+pub enum IndexRefusal {
+    /// Shorter than the frame an MCAP file cannot be smaller than.
+    #[error(
+        "{} is {len} bytes: the magic-footer-magic frame an MCAP file cannot be \
+         written without takes {MIN_MCAP_LEN} bytes on its own, so this is not \
+         an MCAP recording. {REPAIR}",
+        path.display()
+    )]
+    NotMcap { path: PathBuf, len: u64 },
+    /// The last eight bytes are not the closing magic.
+    #[error(
+        "{} does not end with the MCAP magic: it is truncated, or was copied \
+         off a device while it was still being written. {REPAIR}",
+        path.display()
+    )]
+    Unfinalised { path: PathBuf },
+    /// A well-formed footer whose `summary_start` is zero.
+    #[error(
+        "{}'s footer points at no summary section: the writer was configured \
+         without one, so the recording carries no index to read. {REPAIR}",
+        path.display()
+    )]
+    NoSummary { path: PathBuf },
+    /// The summary's statistics report a message count of zero.
+    #[error(
+        "{} holds no message: its summary's statistics report a message count \
+         of zero, and no window can be cut out of an empty recording. {REPAIR}",
+        path.display()
+    )]
+    Empty { path: PathBuf },
+    /// A summary with messages behind it and no chunk index at all.
+    #[error(
+        "{}'s summary indexes no chunk: the writer used an unchunked profile, \
+         and an unchunked recording carries nothing to plan a window from. \
+         {REPAIR}",
+        path.display()
+    )]
+    Unchunked { path: PathBuf },
+    /// Chunk indexes that address bytes but index no message.
+    #[error(
+        "none of {}'s {chunks} chunk indexes carries a message index: the \
+         writer had message indexing disabled, so its summary indexes bytes \
+         rather than messages. {REPAIR}",
+        path.display()
+    )]
+    Unindexed { path: PathBuf, chunks: usize },
+}
+
+/// Everything [`WholeFileIndex::open`] can fail with: the file could not be
+/// read, its tail is not MCAP, or it is MCAP and clipper refuses to index it.
+///
+/// The three are separated because they are three different things to do: fix
+/// the path or the permissions, treat the file as corrupt, or apply the repair
+/// the [`IndexRefusal`] names.
+#[derive(Debug, thiserror::Error)]
+pub enum OpenError {
+    /// The file could not be opened, stat'd, seeked or read.
+    #[error("cannot read {}", path.display())]
+    Unreadable {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    /// The bytes are there and are not MCAP: a footer that is not a footer
+    /// record, or a summary section that does not parse.
+    #[error("the footer or summary section of {} does not parse as MCAP", path.display())]
+    Unparsable {
+        path: PathBuf,
+        #[source]
+        source: mcap::McapError,
+    },
+    /// The recording parses and holds no index clipper will plan a window from.
+    #[error(transparent)]
+    Refused(#[from] IndexRefusal),
+}
+
+/// Every read [`WholeFileIndex::open`] makes is a small one near the footer, and
+/// they all fail the same way.
+fn unreadable(path: &Path) -> impl Fn(std::io::Error) -> OpenError {
+    move |source| OpenError::Unreadable {
+        path: path.to_path_buf(),
+        source,
+    }
+}
 
 /// One finished recording, indexed from its own summary and ready to cut
 /// windows out of.
@@ -72,46 +209,45 @@ impl WholeFileIndex {
     /// Reads the footer and the summary section and nothing else — the data
     /// section is not walked and no chunk is decompressed, so the cost is
     /// independent of the recording's size and is not paid twice when the cut
-    /// then reads the extents it was given.
+    /// then reads the extents it was given. The file is opened read-only and
+    /// never written to: a recording this refuses is left exactly as it was
+    /// found, and repairing it is the operator's.
     ///
-    /// Fails on a recording this cannot index at all: one with no summary
-    /// section (never finalised, or its tail lost), and one whose summary
-    /// reports messages but indexes no chunk — a plan built from it would be
-    /// empty, and an empty clip is the wrong answer to "this recording holds
-    /// your window".
-    pub fn open(path: &Path) -> Result<Self> {
-        let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-        let end_of_scan = file
-            .metadata()
-            .with_context(|| format!("stat of {}", path.display()))?
-            .len();
-        // Two shapes reach the same verdict, and the operator is told which:
-        // a file whose tail is not a footer at all (one still being written, or
-        // one truncated) fails the parse, and a finalised file whose footer
-        // points at no summary parses to nothing.
-        let summary = read_summary(&file)
-            .and_then(|summary| summary.context("its footer names no summary section"))
-            .with_context(|| {
-                format!(
-                    "{} carries no summary to index from; a recording is \
-                     indexable this way only once it has been finalised",
-                    path.display()
-                )
-            })?;
+    /// Every recording this cannot index is refused by name, from the same two
+    /// reads: [`IndexRefusal`] is the taxonomy, and the checks run in the order
+    /// its variants are declared, since each one is what makes the next
+    /// meaningful. The statistics get the first word over the chunk indexes —
+    /// a chunked recording that holds no message indexes no chunk either, and
+    /// [`IndexRefusal::Empty`] is the honest name for it, not
+    /// [`IndexRefusal::Unchunked`].
+    pub fn open(path: &Path) -> Result<Self, OpenError> {
+        let file = File::open(path).map_err(unreadable(path))?;
+        let end_of_scan = file.metadata().map_err(unreadable(path))?.len();
 
-        if summary.chunk_indexes.is_empty()
-            && let Some(messages) = summary
-                .stats
-                .as_ref()
-                .map(|stats| stats.message_count)
-                .filter(|count| *count > 0)
-        {
-            bail!(
-                "{} indexes no chunk but its summary reports {messages} messages; \
-                 nothing of it can be planned",
-                path.display(),
-            );
+        if end_of_scan < MIN_MCAP_LEN {
+            return Err(IndexRefusal::NotMcap {
+                path: path.to_path_buf(),
+                len: end_of_scan,
+            }
+            .into());
         }
+        // The closing magic is what separates a finalised recording from one
+        // still being written or truncated in transit, and it is eight bytes at
+        // a known offset — cheaper and more specific than letting the summary
+        // reader discover it as a parse failure.
+        if !ends_with_magic(&file, end_of_scan).map_err(unreadable(path))? {
+            return Err(IndexRefusal::Unfinalised {
+                path: path.to_path_buf(),
+            }
+            .into());
+        }
+        let Some(summary) = read_summary(&file, end_of_scan, path)? else {
+            return Err(IndexRefusal::NoSummary {
+                path: path.to_path_buf(),
+            }
+            .into());
+        };
+        refuse_unplannable(path, &summary)?;
 
         let mut index = RecordingIndex::new(path.to_path_buf(), Arc::new(file));
         // The magic is behind the summary this file just parsed, and there is
@@ -152,24 +288,89 @@ impl WindowPlanner for WholeFileIndex {
     }
 }
 
+/// Whether the file's last eight bytes are the MCAP closing magic — the mark a
+/// writer lays down only once it has written the footer.
+///
+/// Reads those eight bytes and nothing else. The subtraction is sound because
+/// the caller has already refused anything shorter than [`MIN_MCAP_LEN`].
+fn ends_with_magic(mut file: &File, len: u64) -> std::io::Result<bool> {
+    let mut tail = [0u8; MAGIC.len()];
+    file.seek(SeekFrom::Start(len - MAGIC.len() as u64))?;
+    file.read_exact(&mut tail)?;
+    Ok(tail == MAGIC)
+}
+
 /// Drive the sans-io summary reader over `file`: it asks for a seek to the
 /// footer and reads the summary section back, so the bytes this touches are the
-/// tail of the file and nothing else. `Ok(None)` is a well-formed MCAP with no
-/// summary section.
-fn read_summary(mut file: &File) -> Result<Option<mcap::Summary>> {
-    let mut reader = SummaryReader::new();
+/// tail of the file and nothing else. `Ok(None)` is a well-formed MCAP whose
+/// footer points at no summary section.
+///
+/// The reader is told the file length, so it seeks straight to the footer and
+/// bounds every record it is willing to read by what is left of the file.
+fn read_summary(
+    mut file: &File,
+    len: u64,
+    path: &Path,
+) -> Result<Option<mcap::Summary>, OpenError> {
+    let mut reader =
+        SummaryReader::new_with_options(SummaryReaderOptions::default().with_file_size(len));
     while let Some(event) = reader.next_event() {
-        match event.context("parsing the summary section")? {
+        let event = event.map_err(|source| OpenError::Unparsable {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        match event {
             SummaryReadEvent::ReadRequest(need) => {
-                let read = file.read(reader.insert(need)).context("reading")?;
+                let read = file.read(reader.insert(need)).map_err(unreadable(path))?;
                 reader.notify_read(read);
             }
             SummaryReadEvent::SeekRequest(to) => {
-                reader.notify_seeked(file.seek(to).context("seeking")?);
+                reader.notify_seeked(file.seek(to).map_err(unreadable(path))?);
             }
         }
     }
     Ok(reader.finish())
+}
+
+/// The refusals the summary itself decides, in the order that makes each one
+/// mean what it says.
+///
+/// The statistics are asked first: a recording holding no message has no chunk
+/// to index, so testing the chunk indexes first would call every empty
+/// recording unchunked and send an operator after a writer profile that is not
+/// the problem. Only where the statistics vouch for messages — or say nothing,
+/// the record being optional — does an absent chunk index mean an unchunked
+/// writer, and only then does an indexed chunk that indexes no message mean a
+/// writer with message indexing turned off.
+fn refuse_unplannable(path: &Path, summary: &mcap::Summary) -> Result<(), IndexRefusal> {
+    if summary
+        .stats
+        .as_ref()
+        .is_some_and(|stats| stats.message_count == 0)
+    {
+        return Err(IndexRefusal::Empty {
+            path: path.to_path_buf(),
+        });
+    }
+    if summary.chunk_indexes.is_empty() {
+        return Err(IndexRefusal::Unchunked {
+            path: path.to_path_buf(),
+        });
+    }
+    // Every chunk, not any: a chunk carrying only schema and channel records
+    // legitimately indexes no message, and it is a summary where *no* chunk
+    // does that names a writer with message indexing disabled.
+    if summary
+        .chunk_indexes
+        .iter()
+        .all(|chunk| chunk.message_index_length == 0)
+    {
+        return Err(IndexRefusal::Unindexed {
+            path: path.to_path_buf(),
+            chunks: summary.chunk_indexes.len(),
+        });
+    }
+    Ok(())
 }
 
 /// The summary's schema registry, owned.
@@ -289,8 +490,9 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
+    use anyhow::Result;
+
     use super::*;
-    use crate::index::MAGIC;
     use crate::manifest::WindowCoverage;
     use crate::segment::{cut_window, spawn_stage_workers};
     use crate::testing::{index_file, scan_to_end, test_dir, window_request};
@@ -314,15 +516,23 @@ mod tests {
     /// through unchanged.
     type Copied = (String, u64, u64, u32, usize);
 
-    /// A finished, chunked recording holding `msgs`. The chunk size is tiny, so
-    /// the messages spread over several chunks and a window selects a subset of
-    /// them — which is the whole point of indexing per chunk.
-    fn write_chunked(path: &Path, msgs: &[Msg]) -> Result<()> {
-        let mut writer = mcap::WriteOptions::new()
+    /// The writer options a chunked fixture is written with. The chunk size is
+    /// tiny, so the messages spread over several chunks and a window selects a
+    /// subset of them — which is the whole point of indexing per chunk.
+    ///
+    /// A fixture that exists to exercise one writer setting starts here and
+    /// changes that one setting, so the rest of its shape is the shape every
+    /// other fixture has.
+    fn chunked_opts() -> mcap::WriteOptions {
+        mcap::WriteOptions::new()
             .use_chunks(true)
             .compression(TEST_COMPRESSION)
             .chunk_size(Some(128))
-            .create(BufWriter::new(File::create(path)?))?;
+    }
+
+    /// A finished recording holding `msgs`, written with `opts`.
+    fn write_with(path: &Path, opts: mcap::WriteOptions, msgs: &[Msg]) -> Result<()> {
+        let mut writer = opts.create(BufWriter::new(File::create(path)?))?;
         let mut ids: HashMap<&str, u16> = HashMap::new();
         for msg in msgs {
             let id = match ids.get(msg.topic) {
@@ -347,6 +557,12 @@ mod tests {
         }
         writer.finish()?;
         Ok(())
+    }
+
+    /// A finished, chunked recording holding `msgs` — the shape every accepting
+    /// test cuts from.
+    fn write_chunked(path: &Path, msgs: &[Msg]) -> Result<()> {
+        write_with(path, chunked_opts(), msgs)
     }
 
     /// Read a finished clip back as one [`Copied`] per message, in file order.
@@ -707,18 +923,488 @@ mod tests {
         Ok(())
     }
 
-    /// A recording that was never finalised carries no summary, and there is
-    /// nothing to index it from.
+    // ── the refusal taxonomy ───────────────────────────────────────────────
+
+    /// One message, so a fixture that needs *some* data says so in one line.
+    fn one_message() -> [Msg; 1] {
+        [Msg {
+            topic: "/a",
+            log_time: 100,
+            publish_time: 100,
+            sequence: 0,
+            payload_len: 64,
+        }]
+    }
+
+    /// A chunked recording whose writer had message indexing turned off: its
+    /// chunk indexes address bytes and index no message, which is what the
+    /// `message-index-length` column of `mcap list chunks` shows as zero.
+    fn write_unindexed(path: &Path, msgs: &[Msg]) -> Result<()> {
+        write_with(path, chunked_opts().emit_message_indexes(false), msgs)
+    }
+
+    /// Copy `src` to `dst` with the footer's `summary_start` zeroed — a
+    /// well-formed footer that points at no summary section, which is what a
+    /// writer configured without one lays down.
+    fn blank_summary_pointer(src: &Path, dst: &Path) -> Result<PathBuf> {
+        let mut buf = std::fs::read(src)?;
+        // The footer's `summary_start` field sits 28 bytes from the end: the
+        // closing magic (8) behind `summary_crc` (4) and `summary_offset_start`
+        // (8) behind the field itself (8).
+        let at = buf.len() - 28;
+        buf[at..at + 8].fill(0);
+        std::fs::write(dst, &buf)?;
+        Ok(dst.to_path_buf())
+    }
+
+    /// Open `path` and take the refusal it has to fail with, so a test asserts
+    /// on the variant rather than on a message.
+    fn refusal(path: &Path) -> IndexRefusal {
+        match WholeFileIndex::open(path) {
+            Err(OpenError::Refused(refusal)) => refusal,
+            Err(other) => panic!("{} must be refused, not {other:?}", path.display()),
+            Ok(_) => panic!("{} must not be indexable", path.display()),
+        }
+    }
+
+    /// One instance of every [`IndexRefusal`] variant, each paired with the
+    /// phrase its message has to carry.
+    ///
+    /// The `match` is exhaustive with no catch-all, so a variant added to the
+    /// taxonomy is a compile error here until it states what it names.
+    fn every_refusal(path: &Path) -> Vec<(IndexRefusal, &'static str)> {
+        let at = || path.to_path_buf();
+        [
+            IndexRefusal::NotMcap { path: at(), len: 3 },
+            IndexRefusal::Unfinalised { path: at() },
+            IndexRefusal::NoSummary { path: at() },
+            IndexRefusal::Empty { path: at() },
+            IndexRefusal::Unchunked { path: at() },
+            IndexRefusal::Unindexed {
+                path: at(),
+                chunks: 4,
+            },
+        ]
+        .into_iter()
+        .map(|refusal| {
+            let phrase = match &refusal {
+                IndexRefusal::NotMcap { .. } => "not an MCAP recording",
+                IndexRefusal::Unfinalised { .. } => "does not end with the MCAP magic",
+                IndexRefusal::NoSummary { .. } => "points at no summary section",
+                IndexRefusal::Empty { .. } => "holds no message",
+                IndexRefusal::Unchunked { .. } => "indexes no chunk",
+                IndexRefusal::Unindexed { .. } => "carries a message index",
+            };
+            (refusal, phrase)
+        })
+        .collect()
+    }
+
+    /// Every refusal names three things: the recording, the fault, and the
+    /// commands that repair it.
+    ///
+    /// The messages are also all different from one another — the point of a
+    /// taxonomy is that an operator reading one knows which of the six they
+    /// have, and two variants sharing a sentence would hide that.
     #[test]
-    fn a_recording_with_no_summary_is_refused() -> Result<()> {
+    fn every_refusal_names_the_recording_the_fault_and_the_repair() {
+        let path = Path::new("/data/record/rosbag2_0.mcap");
+        let refusals = every_refusal(path);
+        for (refusal, phrase) in &refusals {
+            let text = refusal.to_string();
+            assert!(
+                text.contains("/data/record/rosbag2_0.mcap"),
+                "the refusal names the recording: {text}"
+            );
+            assert!(text.contains(phrase), "the refusal names the fault: {text}");
+            for command in ["mcap recover", "mcap compress", "mcap list chunks"] {
+                assert!(
+                    text.contains(command),
+                    "the refusal names `{command}`: {text}"
+                );
+            }
+        }
+
+        // The two variants carrying a number render it: a count no message
+        // shows is a payload nobody can act on.
+        assert!(
+            IndexRefusal::NotMcap {
+                path: path.to_path_buf(),
+                len: 3,
+            }
+            .to_string()
+            .contains("is 3 bytes"),
+            "the size a too-small file has is in its message"
+        );
+        assert!(
+            IndexRefusal::Unindexed {
+                path: path.to_path_buf(),
+                chunks: 4,
+            }
+            .to_string()
+            .contains("4 chunk indexes"),
+            "the number of unindexed chunks is in its message"
+        );
+
+        let mut messages: Vec<String> = refusals.iter().map(|(r, _)| r.to_string()).collect();
+        messages.sort();
+        messages.dedup();
+        assert_eq!(
+            messages.len(),
+            refusals.len(),
+            "each refusal says its own thing"
+        );
+    }
+
+    /// The two failures that are not refusals say their own layer and let the
+    /// cause say the rest, rather than printing the cause twice.
+    #[test]
+    fn a_failure_that_is_not_a_refusal_states_its_own_layer() {
+        let source = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        let denied = source.to_string();
+        let err = OpenError::Unreadable {
+            path: PathBuf::from("/data/rec.mcap"),
+            source,
+        };
+        let text = err.to_string();
+        assert!(text.contains("/data/rec.mcap"), "{text}");
+        assert!(
+            !text.contains(&denied),
+            "the cause prints itself through the source chain: {text}"
+        );
+
+        let err = OpenError::Unparsable {
+            path: PathBuf::from("/data/rec.mcap"),
+            source: mcap::McapError::BadFooter,
+        };
+        let text = err.to_string();
+        assert!(text.contains("/data/rec.mcap"), "{text}");
+        assert!(
+            !text.contains(&mcap::McapError::BadFooter.to_string()),
+            "the cause prints itself through the source chain: {text}"
+        );
+    }
+
+    /// A file too short to hold a footer is not an MCAP recording at all.
+    #[test]
+    fn a_file_smaller_than_a_footer_is_not_an_mcap_recording() -> Result<()> {
+        let root = test_dir("whole-tiny")?;
+        let rec = root.join("rec.mcap");
+        // The opening magic and nothing else: the eight bytes that make a file
+        // look like an MCAP to anything that only checks the front.
+        std::fs::write(&rec, MAGIC)?;
+
+        let refused = refusal(&rec);
+        let IndexRefusal::NotMcap { path, len } = &refused else {
+            panic!("a {}-byte file is not an MCAP: {refused}", MAGIC.len())
+        };
+        assert_eq!(path, &rec);
+        assert_eq!(*len, MAGIC.len() as u64);
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// A recording that never got its footer written — one still being written,
+    /// or copied off a device mid-write — has no closing magic, and that is what
+    /// it is told.
+    #[test]
+    fn a_recording_with_no_closing_magic_is_refused_as_unfinalised() -> Result<()> {
         let root = test_dir("whole-unfinished")?;
         let rec = root.join("rec.mcap");
         crate::testing::write_unfinished_recording(&rec, "/a", &[100, 200])?;
 
-        let err = WholeFileIndex::open(&rec).unwrap_err();
+        let refused = refusal(&rec);
+        let IndexRefusal::Unfinalised { path } = &refused else {
+            panic!("a recording with no footer is unfinalised, not: {refused}")
+        };
+        assert_eq!(path, &rec);
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// A finalised recording whose footer names no summary section carries no
+    /// index, and the writer that omitted it is what the refusal names.
+    #[test]
+    fn a_footer_pointing_at_no_summary_is_refused() -> Result<()> {
+        let root = test_dir("whole-nosummary")?;
+        let chunked = root.join("chunked.mcap");
+        write_chunked(&chunked, &one_message())?;
+        let rec = blank_summary_pointer(&chunked, &root.join("rec.mcap"))?;
+
+        // The fixture is only worth anything if the file is otherwise intact:
+        // the one it was copied from indexes fine.
+        WholeFileIndex::open(&chunked)?;
+        let refused = refusal(&rec);
+        let IndexRefusal::NoSummary { path } = &refused else {
+            panic!("a footer with no summary pointer is refused as such, not: {refused}")
+        };
+        assert_eq!(path, &rec);
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// A recording written without chunks has a summary that indexes nothing,
+    /// and the unchunked writer profile is what the refusal names.
+    #[test]
+    fn an_unchunked_recording_is_refused_as_unchunked() -> Result<()> {
+        let root = test_dir("whole-unchunked")?;
+        let rec = root.join("rec.mcap");
+        crate::testing::write_recording(&rec, false, &[("/a", 100), ("/a", 200)])?;
+
+        let refused = refusal(&rec);
+        let IndexRefusal::Unchunked { path } = &refused else {
+            panic!("an unchunked recording is refused as unchunked, not: {refused}")
+        };
+        assert_eq!(path, &rec);
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// A chunked recording that holds no message is refused as empty, not as
+    /// unchunked.
+    ///
+    /// It has no chunk index either — a writer emits a chunk when there is
+    /// something to put in one — so the chunk indexes alone cannot tell the two
+    /// apart, and reading them first would send an operator after a writer
+    /// profile that is not the problem. The statistics record is what
+    /// distinguishes them, and it gets the first word.
+    #[test]
+    fn a_chunked_recording_holding_no_messages_is_refused_as_empty() -> Result<()> {
+        let root = test_dir("whole-empty")?;
+        let rec = root.join("rec.mcap");
+        write_chunked(&rec, &[])?;
+
+        // The fixture has to be the confusable one: written chunked, and with
+        // no chunk index for the taxonomy to read.
+        let summary = read_summary(&File::open(&rec)?, std::fs::metadata(&rec)?.len(), &rec)?
+            .expect("a finished recording carries a summary");
         assert!(
-            format!("{err:#}").contains("carries no summary to index from"),
-            "the refusal names what is missing: {err:#}"
+            summary.chunk_indexes.is_empty(),
+            "a recording holding no message indexes no chunk either"
+        );
+        assert_eq!(
+            summary.stats.as_ref().map(|stats| stats.message_count),
+            Some(0),
+            "the statistics are what say it is empty rather than unchunked"
+        );
+
+        let refused = refusal(&rec);
+        let IndexRefusal::Empty { path } = &refused else {
+            panic!("a recording holding no message is refused as empty, not: {refused}")
+        };
+        assert_eq!(path, &rec);
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// A chunked recording whose writer had message indexing disabled is
+    /// refused as unindexed: its chunk indexes address bytes and index no
+    /// message.
+    #[test]
+    fn chunk_indexes_with_no_message_index_are_refused() -> Result<()> {
+        let root = test_dir("whole-unindexed")?;
+        let rec = root.join("rec.mcap");
+        write_unindexed(
+            &rec,
+            &[
+                Msg {
+                    topic: "/a",
+                    log_time: 100,
+                    publish_time: 100,
+                    sequence: 0,
+                    payload_len: 64,
+                },
+                Msg {
+                    topic: "/a",
+                    log_time: 200,
+                    publish_time: 200,
+                    sequence: 1,
+                    payload_len: 64,
+                },
+            ],
+        )?;
+
+        // The fixture differs from an accepted recording in exactly one field —
+        // the one `mcap list chunks` prints as `message-index-length`.
+        let summary = read_summary(&File::open(&rec)?, std::fs::metadata(&rec)?.len(), &rec)?
+            .expect("a finished recording carries a summary");
+        assert!(
+            !summary.chunk_indexes.is_empty(),
+            "the recording is chunked, and its chunks are indexed by byte range"
+        );
+        assert!(
+            summary
+                .chunk_indexes
+                .iter()
+                .all(|chunk| chunk.message_index_length == 0),
+            "no chunk carries a message index"
+        );
+
+        let refused = refusal(&rec);
+        let IndexRefusal::Unindexed { path, chunks } = &refused else {
+            panic!("a recording with no message indexes is refused as such, not: {refused}")
+        };
+        assert_eq!(path, &rec);
+        assert_eq!(*chunks, summary.chunk_indexes.len());
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// One chunk index, with `message_index_length` the only field a test cares
+    /// about.
+    fn chunk_index(message_index_length: u64) -> mcap::records::ChunkIndex {
+        mcap::records::ChunkIndex {
+            message_start_time: 100,
+            message_end_time: 200,
+            chunk_start_offset: 41,
+            chunk_length: 170,
+            message_index_offsets: BTreeMap::new(),
+            message_index_length,
+            compression: "zstd".to_string(),
+            compressed_size: 117,
+            uncompressed_size: 166,
+        }
+    }
+
+    /// A recording where one chunk indexes no message is not a recording whose
+    /// writer had message indexing disabled.
+    ///
+    /// A chunk carrying only schema and channel records legitimately indexes no
+    /// message, so it is a summary where *no* chunk does that names the writer
+    /// setting. Refusing on the first unindexed chunk would refuse a recording
+    /// that is perfectly plannable.
+    #[test]
+    fn one_unindexed_chunk_among_indexed_ones_is_not_a_refusal() {
+        let path = Path::new("/data/rec.mcap");
+        let mixed = mcap::Summary {
+            chunk_indexes: vec![chunk_index(0), chunk_index(47)],
+            ..mcap::Summary::default()
+        };
+        assert!(
+            refuse_unplannable(path, &mixed).is_ok(),
+            "one unindexed chunk beside an indexed one is plannable"
+        );
+
+        let none = mcap::Summary {
+            chunk_indexes: vec![chunk_index(0), chunk_index(0)],
+            ..mcap::Summary::default()
+        };
+        assert!(
+            matches!(
+                refuse_unplannable(path, &none),
+                Err(IndexRefusal::Unindexed { chunks: 2, .. })
+            ),
+            "a summary where no chunk indexes a message is refused"
+        );
+    }
+
+    /// A refusal is reached from the footer and the summary alone — no chunk is
+    /// decompressed.
+    ///
+    /// Each fixture's whole data section is replaced with bytes that are neither
+    /// valid record framing nor decompressible as a chunk, so an implementation
+    /// that walked it — or opened one chunk to count what is inside — fails
+    /// outright instead of naming the fault. The verdict is the intact
+    /// recording's.
+    #[test]
+    fn a_refusal_reads_no_chunk() -> Result<()> {
+        let root = test_dir("whole-refuse-summary")?;
+
+        let unindexed = root.join("unindexed.mcap");
+        write_unindexed(&unindexed, &one_message())?;
+        let gutted_unindexed =
+            clobber_data_section(&unindexed, &root.join("gutted-unindexed.mcap"))?;
+
+        let unchunked = root.join("unchunked.mcap");
+        crate::testing::write_recording(&unchunked, false, &[("/a", 100)])?;
+        let gutted_unchunked =
+            clobber_data_section(&unchunked, &root.join("gutted-unchunked.mcap"))?;
+
+        assert!(
+            matches!(refusal(&gutted_unindexed), IndexRefusal::Unindexed { .. }),
+            "the message-index verdict comes from the summary"
+        );
+        assert!(
+            matches!(refusal(&gutted_unchunked), IndexRefusal::Unchunked { .. }),
+            "the chunk-index verdict comes from the summary"
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// A refused recording is left exactly as it was found, and nothing is
+    /// written anywhere: clipper opens an input read-only and never rewrites,
+    /// recovers or re-indexes one — [`REPAIR`] names the commands that do, and
+    /// the operator runs them.
+    #[test]
+    fn a_refused_recording_is_left_untouched() -> Result<()> {
+        let root = test_dir("whole-untouched")?;
+
+        let tiny = root.join("tiny.mcap");
+        std::fs::write(&tiny, MAGIC)?;
+        let unfinalised = root.join("unfinalised.mcap");
+        crate::testing::write_unfinished_recording(&unfinalised, "/a", &[100])?;
+        let chunked = root.join("chunked.mcap");
+        write_chunked(&chunked, &one_message())?;
+        let no_summary = blank_summary_pointer(&chunked, &root.join("no-summary.mcap"))?;
+        let empty = root.join("empty.mcap");
+        write_chunked(&empty, &[])?;
+        let unchunked = root.join("unchunked.mcap");
+        crate::testing::write_recording(&unchunked, false, &[("/a", 100)])?;
+        let unindexed = root.join("unindexed.mcap");
+        write_unindexed(&unindexed, &one_message())?;
+
+        let refused = [
+            &tiny,
+            &unfinalised,
+            &no_summary,
+            &empty,
+            &unchunked,
+            &unindexed,
+        ];
+        let before: Vec<(Vec<u8>, std::time::SystemTime)> = refused
+            .iter()
+            .map(|path| Ok((std::fs::read(path)?, std::fs::metadata(path)?.modified()?)))
+            .collect::<Result<Vec<_>>>()?;
+
+        let contents = |dir: &Path| -> Result<Vec<PathBuf>> {
+            let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)?
+                .map(|entry| Ok(entry?.path()))
+                .collect::<Result<Vec<_>>>()?;
+            paths.sort();
+            Ok(paths)
+        };
+        let listing = contents(&root)?;
+
+        for path in refused {
+            let _ = refusal(path);
+        }
+
+        for (path, (bytes, modified)) in refused.iter().zip(before) {
+            assert_eq!(
+                std::fs::read(path)?,
+                bytes,
+                "{} was rewritten by a refusal",
+                path.display()
+            );
+            assert_eq!(
+                std::fs::metadata(path)?.modified()?,
+                modified,
+                "{} was touched by a refusal",
+                path.display()
+            );
+        }
+        assert_eq!(
+            contents(&root)?,
+            listing,
+            "a refusal writes nothing, not even beside the recording"
         );
 
         std::fs::remove_dir_all(root)?;

@@ -34,6 +34,10 @@ test-support = []
 mcap.workspace = true
 # Error plumbing for the scan and the cut.
 anyhow.workspace = true
+# The typed error enums this crate hands its callers: `whole::OpenError` and the
+# `whole::IndexRefusal` taxonomy under it, where the caller branches on which
+# fault a recording has rather than on the text of a message.
+thiserror.workspace = true
 # Logging via the `log` facade; the binary picks the backend.
 log.workspace = true
 # The scan's trigger tap and the staging worker pool are both channel-shaped: the

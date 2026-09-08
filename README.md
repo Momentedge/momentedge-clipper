@@ -272,7 +272,7 @@ of a `momentedge_msgs/Trigger`, so the clip states the same trigger a clip cut
 from a live topic does; only `producer.mode` differs, reading `clip` rather than
 `tail`.
 
-Three things follow from the input being finished:
+Four things follow from the input being finished:
 
 - **Nothing waits.** No postroll sleep, no wait for coverage. A window reaching
   past the end of the recording is simply short, and the clip's `clip.short` key
@@ -283,6 +283,36 @@ Three things follow from the input being finished:
 - **Reading it is cheap.** The recording is indexed from its own summary — a
   footer seek and one read, whatever the file's size — rather than by walking it,
   so no chunk is decompressed until the copy asks for one.
+- **A recording it cannot index is refused by name**, from that same footer and
+  summary, before anything is written — see below.
+
+#### When a recording is refused
+
+Not every `.mcap` carries a summary worth planning a window from. `clipper clip`
+decides that from the footer and the summary alone, names the fault, exits
+non-zero, and writes nothing at all — no output directory, no staged file.
+
+| The message says | The recording is |
+|---|---|
+| *is N bytes … not an MCAP recording* | too small to hold a footer |
+| *does not end with the MCAP magic* | truncated, or copied off a device while it was still being written |
+| *footer points at no summary section* | written by a writer configured without a summary |
+| *holds no message* | empty — its statistics report a message count of zero |
+| *summary indexes no chunk* | written with an unchunked profile |
+| *no … chunk index carries a message index* | written by a writer with message indexing disabled |
+
+Every one of them but the empty recording is repaired by rewriting the file,
+which clipper never does itself — it opens an input read-only and leaves it
+exactly as it found it:
+
+```bash
+mcap recover  ./record/rosbag2_0.mcap -o ./record/fixed.mcap   # rebuild the index
+mcap compress ./record/rosbag2_0.mcap -o ./record/fixed.mcap   # rebuild it smaller
+mcap list chunks ./record/fixed.mcap                           # check the result
+```
+
+`mcap list chunks` prints a `message index length` per chunk; that column is the
+field the last refusal above reads, and a repaired recording has it non-zero.
 
 Nothing machine-readable is printed. The result is the output directory's
 contents when the process exits, each clip carrying its own manifest, and the

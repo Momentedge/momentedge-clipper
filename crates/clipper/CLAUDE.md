@@ -459,9 +459,8 @@ cannot tell the two apart.
 Two consequences worth knowing:
 
 - **Only chunk-indexed bytes are planned.** A message a chunked recording wrote
-  outside a chunk is in no extent. `open` refuses a summary that reports messages
-  but indexes no chunk, rather than cutting a silently empty clip; the fuller
-  taxonomy of unusable inputs is not here yet.
+  outside a chunk is in no extent, which is why a summary that indexes no chunk
+  is refused rather than cut into a silently empty clip.
 - **The summary bounds no publish time.** A chunk index's span and the
   statistics' bounds are both `log_time`, so an extent built here carries the
   unbounded publish span: a `publish` window selects every chunk rather than
@@ -470,6 +469,35 @@ Two consequences worth knowing:
   flag and cuts on `log` (`CLIP_TIME_SOURCE`), because that is the clock a
   summary states and the only one a completeness claim over a finished recording
   can be made on. Passing `--time-source` is a parse error.
+
+**Every input it cannot index is refused by name** (`clip::whole::OpenError`,
+whose `Refused` arm carries the `IndexRefusal` taxonomy). One variant per fault
+an operator repairs differently:
+
+| Variant | The recording | Decided by |
+|---|---|---|
+| `NotMcap` | shorter than the 45-byte magic-footer-magic frame | the file length |
+| `Unfinalised` | no closing magic — truncated or copied mid-write | the last eight bytes |
+| `NoSummary` | a footer whose `summary_start` is zero | `SummaryReader::finish() == None` |
+| `Empty` | holds no message | `stats.message_count == 0` |
+| `Unchunked` | an unchunked writer profile | no `ChunkIndex` in the summary |
+| `Unindexed` | message indexing disabled | every chunk index's `message_index_length == 0` |
+
+The order is load-bearing at one place: the statistics are read before the chunk
+indexes, because a chunked recording holding no message emits no chunk either, so
+testing the chunk indexes first would call every empty recording unchunked. Each
+variant's `Display` names the recording, the fault and the same three commands —
+`mcap recover`, `mcap compress`, `mcap list chunks` (whose `message index length`
+column is what `Unindexed` reads). `clip_mode` opens the index *before*
+`reset_capturing_dir`, so a refusal creates neither `out_dir` nor the staging
+directory inside it, and the input is opened read-only and left byte for byte and
+mtime for mtime as it was found. clipper runs no repair; `mcap` does.
+
+`OpenError`'s other two arms are not refusals: `Unreadable` (the file could not be
+opened, stat'd, seeked or read) and `Unparsable` (a footer that is not a footer
+record, or a summary section that does not parse). They are separate because they
+are separate things to do — fix the path, treat the file as corrupt, or run the
+repair the refusal names.
 
 Nothing machine-readable is printed: the run's result is `out_dir`'s contents
 when the process exits, each clip carrying its own manifest, and the exit status

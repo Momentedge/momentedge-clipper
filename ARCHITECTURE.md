@@ -322,6 +322,18 @@ an extent built this way carries the unbounded publish span: a window on
 `publish` selects every chunk rather than dropping one the summary cannot vouch
 for, and the copy's own per-message test still decides membership.
 
+**A recording it cannot index is refused by name.** The same footer and summary
+decide that too, so a refusal costs the same seek and read an acceptance does and
+no chunk is decompressed to reach one. `clip::whole::IndexRefusal` is the whole
+taxonomy — a file too small to hold a footer, one with no closing magic, a footer
+pointing at no summary section, a recording holding no message, an unchunked one,
+and chunk indexes that index no message — and each variant's message names the
+fault and the `mcap recover` / `mcap compress` / `mcap list chunks` commands an
+operator repairs it with. The empty and unchunked cases are told apart by the
+statistics record, since a recording holding no message indexes no chunk either.
+The run exits non-zero having written nothing, and the input is left byte for
+byte as it was found: clipper never rewrites, recovers or re-indexes a recording.
+
 **Neither wait runs.** There is no later data to wait for, so nothing sleeps out
 the postroll and nothing blocks on coverage. A window reaching past the end of
 the recording is short, and that is a fact the summary's own statistics answer:
