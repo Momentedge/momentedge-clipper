@@ -43,14 +43,19 @@
 //! orderly exit 0). Clip copies run on a fixed pool of `extract_parallelism`
 //! worker threads consuming one FIFO job channel.
 //!
-//! Configuration is parsed by clap into [`Config`]: each setting is a CLI flag
-//! that falls back to a `MOMENTEDGE_<KEY>` environment variable, then to a
-//! built-in default — the CLI flag wins over the env var, which wins over the
-//! default. The `MOMENTEDGE_*` env names are derived from one prefix applied to
-//! every field ([`with_env_prefix`]). `--help` lists the flags and `--version`
-//! prints the version; [`Config`]'s field docs are that `--help` text and the
-//! authoritative per-flag reference (the README configuration table is the
-//! user-facing copy of the same set).
+//! `clipper` is one binary and the mode is a subcommand ([`Mode`]): the device
+//! recorder this module describes is `clipper tail`. `clipper --help` lists the
+//! modes, `clipper tail --help` lists the recorder's own flags, and a flag
+//! offered to `clipper` itself is a parse error pointing at the subcommand.
+//!
+//! Configuration is parsed by clap into [`Config`]: each setting is a flag of
+//! `clipper tail` that falls back to a `MOMENTEDGE_<KEY>` environment variable,
+//! then to a built-in default — the CLI flag wins over the env var, which wins
+//! over the default. The `MOMENTEDGE_*` env names are derived from one prefix
+//! applied to every field of every mode ([`with_env_prefix`]). `--version`
+//! prints the version; [`Config`]'s field docs are the `clipper tail --help`
+//! text and the authoritative per-flag reference (the README configuration
+//! table is the user-facing copy of the same set).
 //!
 //! Logging uses the `log` facade with a pretty_env_logger backend and goes to
 //! **stdout**; `RUST_LOG` controls verbosity. Under `--interface ros` the ROS
@@ -67,7 +72,7 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::Context;
-use clap::{CommandFactory, FromArgMatches, Parser, ValueEnum};
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use clip::trigger::{Trigger, now_ns};
 use clip::{TimeSource, segment};
 use crossbeam_channel::{Receiver, Sender, bounded, select, unbounded};
@@ -160,20 +165,53 @@ impl std::fmt::Display for InterfaceKind {
     }
 }
 
-/// Recorder configuration, parsed by clap from CLI flags with a `MOMENTEDGE_*`
-/// environment-variable fallback per field (see [`load_config`]). The field doc
-/// comments are the `--help` text: the first line is the short help, the rest is
-/// shown under `--help`.
+/// The command line: one binary, one mode per invocation, and the mode is a
+/// subcommand. `clipper tail` is the device recorder; every flag belongs to the
+/// mode rather than to `clipper` itself, so a bare `clipper --record-dir …` is
+/// rejected ([`mode_hint`] says where the flag belongs).
+///
+/// The `mode` field is what makes naming no mode an error: it is not an
+/// `Option`, so clap's derive requires the subcommand and answers a bare
+/// `clipper` with the mode listing and a non-zero exit. No
+/// `subcommand_required`/`arg_required_else_help` is needed on top of that, and
+/// adding them changes nothing.
+///
+/// `long_about` is written out rather than taken from this doc comment: clap's
+/// derive would otherwise put the rationale above — rustdoc links and all — in
+/// front of an operator running `clipper --help`.
 #[derive(Debug, Parser)]
-// `name` is set explicitly because clap's derive would otherwise take it from
-// the cargo *package* (`clipper`), which is not what this binary is called. The
-// deb installs a `clipper` compatibility symlink beside it, and both names must
-// answer with the artefact actually running.
 #[command(
-    name = "clipper-tailing",
+    name = "clipper",
     version,
-    about = "Triggered MCAP clip recorder"
+    about = "Triggered MCAP clip recorder",
+    long_about = "Triggered MCAP clip recorder.\n\n\
+                  One mode runs per invocation, and the mode is a subcommand: \
+                  `clipper tail` follows a continuous recording and cuts a clip \
+                  per trigger. Every flag belongs to a mode, so `clipper tail \
+                  --help` is the recorder's own flag reference."
 )]
+struct Cli {
+    #[command(subcommand)]
+    mode: Mode,
+}
+
+/// The modes clipper runs, one per invocation. Each carries its own flags, so
+/// `clipper <mode> --help` lists that mode's surface and nothing else.
+#[derive(Debug, Subcommand)]
+enum Mode {
+    /// Tail a continuous recording and cut a clip per trigger.
+    ///
+    /// Discovers and follows the growing MCAP files a continuous `ros2 bag
+    /// record` writes, and cuts the window each trigger asks for out of them.
+    /// Runs until a shutdown signal.
+    Tail(Config),
+}
+
+/// Recorder configuration for [`Mode::Tail`], parsed by clap from CLI flags with
+/// a `MOMENTEDGE_*` environment-variable fallback per field (see
+/// [`load_cli`]). The field doc comments are the `clipper tail --help` text:
+/// the first line is the short help, the rest is shown under `--help`.
+#[derive(Debug, Args)]
 struct Config {
     /// Bag directory of the continuous recording that is tailed.
     #[arg(long, default_value = "./record")]
@@ -270,32 +308,82 @@ impl Config {
     }
 }
 
-/// Prefix shared by every `MOMENTEDGE_*` environment variable. [`with_env_prefix`]
-/// applies it to all of [`Config`]'s arguments, so the env names track the field
-/// names (`grace_secs` → `MOMENTEDGE_GRACE_SECS`) with no per-field wiring.
+/// Prefix shared by every `MOMENTEDGE_*` environment variable.
+/// [`with_env_prefix`] applies it to every argument of every [`Mode`], so the
+/// env names track the field names (`grace_secs` → `MOMENTEDGE_GRACE_SECS`)
+/// with no per-field wiring.
 const ENV_PREFIX: &str = "MOMENTEDGE";
 
-/// Give every argument an environment-variable fallback named `<ENV_PREFIX>_` +
-/// the field name upper-cased (`record_dir` → `MOMENTEDGE_RECORD_DIR`). One place
-/// defines the prefix; the auto-generated `--help`/`--version` flags are left
-/// without an env binding.
+/// Give every mode's arguments an environment-variable fallback named
+/// `<ENV_PREFIX>_` + the field name upper-cased (`record_dir` →
+/// `MOMENTEDGE_RECORD_DIR`). One place defines the prefix; the auto-generated
+/// `--help`/`--version` flags are left without an env binding.
+///
+/// The flags live on the subcommands, not on `clipper` itself, so the walk goes
+/// through every subcommand. The names are collected first because
+/// [`clap::Command::mut_subcommand`] consumes the command it mutates.
 fn with_env_prefix(cmd: clap::Command) -> clap::Command {
-    cmd.mut_args(|arg| match arg.get_id().as_str() {
-        "help" | "version" => arg,
-        id => {
-            let env = format!("{ENV_PREFIX}_{}", id.to_uppercase());
-            arg.env(env)
-        }
+    let modes: Vec<String> = cmd
+        .get_subcommands()
+        .map(|sub| sub.get_name().to_owned())
+        .collect();
+    modes.into_iter().fold(cmd, |cmd, mode| {
+        cmd.mut_subcommand(mode, |sub| {
+            sub.mut_args(|arg| match arg.get_id().as_str() {
+                "help" | "version" => arg,
+                id => {
+                    let env = format!("{ENV_PREFIX}_{}", id.to_uppercase());
+                    arg.env(env)
+                }
+            })
+        })
     })
 }
 
-/// Parse [`Config`] from the command line, each field falling back to its
-/// `MOMENTEDGE_*` environment variable and then its default (CLI > env > default).
-/// clap prints `--help`/`--version` and any parse error, then exits the process,
-/// so this returns only a fully-populated config.
-fn load_config() -> Config {
-    let matches = with_env_prefix(Config::command()).get_matches();
-    Config::from_arg_matches(&matches).unwrap_or_else(|e| e.exit())
+/// The line appended to a parse failure that left the mode unnamed, since
+/// clap's own text says the argument is unexpected without saying where it
+/// belongs. `None` for a failure that named a mode (a bad value for one of its
+/// flags), and for `--help`/`--version`, which are not failures at all.
+fn mode_hint(kind: clap::error::ErrorKind) -> Option<&'static str> {
+    use clap::error::ErrorKind::{
+        DisplayHelpOnMissingArgumentOrSubcommand, InvalidSubcommand, MissingSubcommand,
+        UnknownArgument,
+    };
+    matches!(
+        kind,
+        UnknownArgument
+            | InvalidSubcommand
+            | MissingSubcommand
+            | DisplayHelpOnMissingArgumentOrSubcommand
+    )
+    .then_some(
+        "clipper runs one mode per invocation, named as a subcommand. \
+         The recorder is `clipper tail` — try `clipper tail --help`.",
+    )
+}
+
+/// Parse the [`Cli`] from the command line, each mode's field falling back to
+/// its `MOMENTEDGE_*` environment variable and then its default (CLI > env >
+/// default). Diverges the way [`clap::Error::exit`] does — printing the message
+/// and ending the process — for `--help`, `--version` and any parse error, so
+/// this returns only a fully-populated mode. A failure that left the mode
+/// unnamed carries [`mode_hint`] after clap's own text.
+fn load_cli() -> Cli {
+    let parsed = with_env_prefix(Cli::command())
+        .try_get_matches()
+        .and_then(|matches| Cli::from_arg_matches(&matches));
+    match parsed {
+        Ok(cli) => cli,
+        Err(err) => {
+            let hint = mode_hint(err.kind());
+            let code = err.exit_code();
+            let _ = err.print();
+            if let Some(hint) = hint {
+                eprintln!("\n{hint}");
+            }
+            std::process::exit(code);
+        }
+    }
 }
 
 /// Deliver SIGINT/SIGTERM as a message on the returned channel: a dedicated
@@ -364,18 +452,10 @@ impl Drop for AdmissionPermit {
     }
 }
 
-/// Entry point and supervisor. Spawns the long-lived threads — the tail, the
-/// interface (which owns its own trigger source, and for ROS its node spin),
-/// the staging worker pool, and the signal forwarder — then blocks in
-/// [`supervise`] until a shutdown signal (exit 0) or the first dead critical
-/// thread (exit non-zero, for a supervisor to restart the process).
+/// Entry point: install logging, then run the mode the command line named.
 ///
-/// Returning ends the process, which kills the remaining threads: the
-/// immortal tail and interface loops, parked handlers, and any in-flight
-/// extraction.
-/// That is safe for clips by construction — the capturing-dir reset at
-/// startup reclaims any stranded staged file, and `out_dir` only ever holds
-/// complete clips.
+/// The `match` is the dispatch table over [`Mode`], so a mode added to the enum
+/// is a compile error here until it has a body to run.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Logs go to stdout: there is no machine-readable contract on that stream
     // and there will not be one — a run's result is the contents of `out_dir`
@@ -389,7 +469,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .parse_default_env()
         .init();
 
-    let cfg = Arc::new(load_config());
+    match load_cli().mode {
+        Mode::Tail(cfg) => tail_mode(cfg),
+    }
+}
+
+/// `clipper tail`: supervisor for the device recorder. Spawns the long-lived
+/// threads — the tail, the interface (which owns its own trigger source, and for
+/// ROS its node spin), the staging worker pool, and the signal forwarder — then
+/// blocks in [`supervise`] until a shutdown signal (exit 0) or the first dead
+/// critical thread (exit non-zero, for a supervisor to restart the process).
+///
+/// Returning ends the process, which kills the remaining threads: the
+/// immortal tail and interface loops, parked handlers, and any in-flight
+/// extraction.
+/// That is safe for clips by construction — the capturing-dir reset at
+/// startup reclaims any stranded staged file, and `out_dir` only ever holds
+/// complete clips.
+fn tail_mode(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
+    let cfg = Arc::new(cfg);
 
     // Start each run with a clean capturing dir: a crash mid-publish can strand
     // a stale staged file there, and clearing it at startup bounds that clutter
@@ -656,7 +754,7 @@ fn drive<I: Interface>(
     let signal_rx = signal_channel().context("signal handler failed to install")?;
 
     info!(
-        "clipper-tailing up: {iface_name} interface, triggers on {TRIGGER_TOPIC}, \
+        "clipper tail up: {iface_name} interface, triggers on {TRIGGER_TOPIC}, \
          tailing {}, writing clips to {}",
         cfg.record_dir.display(),
         cfg.out_dir.display(),
@@ -726,20 +824,31 @@ fn supervise(
 mod tests {
     use super::*;
 
-    /// Parse a `Config` from an explicit argv through the same env-prefixed
-    /// command `load_config` builds, so the tests exercise the real wiring.
+    /// Parse a `Cli` from an explicit argv through the same env-prefixed
+    /// command `load_cli` builds, so the tests exercise the real wiring.
+    fn cli_from<I, T>(argv: I) -> Result<Cli, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        let matches = with_env_prefix(Cli::command()).try_get_matches_from(argv)?;
+        Cli::from_arg_matches(&matches)
+    }
+
+    /// The recorder's `Config` out of an argv naming the `tail` mode.
     fn parse_from<I, T>(argv: I) -> Result<Config, clap::Error>
     where
         I: IntoIterator<Item = T>,
         T: Into<std::ffi::OsString> + Clone,
     {
-        let matches = with_env_prefix(Config::command()).try_get_matches_from(argv)?;
-        Config::from_arg_matches(&matches)
+        cli_from(argv).map(|cli| match cli.mode {
+            Mode::Tail(cfg) => cfg,
+        })
     }
 
     #[test]
     fn config_defaults_when_no_flags_given() {
-        let cfg = parse_from(["clipper"]).unwrap();
+        let cfg = parse_from(["clipper", "tail"]).unwrap();
         assert_eq!(cfg.record_dir, PathBuf::from("./record"));
         assert_eq!(cfg.out_dir, PathBuf::from("./clipped"));
         assert_eq!(cfg.grace(), Duration::from_secs(30));
@@ -752,6 +861,7 @@ mod tests {
     fn config_cli_flags_populate_every_field() {
         let cfg = parse_from([
             "clipper",
+            "tail",
             "--record-dir",
             "/data/record",
             "--out-dir",
@@ -790,7 +900,10 @@ mod tests {
     /// leave the newest field, the one most likely to be mis-wired, untested.
     #[test]
     fn env_prefix_binds_a_momentedge_name_to_every_field() {
-        let cmd = with_env_prefix(Config::command());
+        let cli = with_env_prefix(Cli::command());
+        let cmd = cli
+            .find_subcommand("tail")
+            .expect("the tail mode is a subcommand of clipper");
         let mut bound = 0;
         for arg in cmd.get_arguments() {
             let id = arg.get_id().as_str();
@@ -818,16 +931,16 @@ mod tests {
         // value is rejected. (Its MOMENTEDGE_INTERFACE env fallback is covered by
         // env_prefix_binds_a_momentedge_name_to_every_field.)
         assert_eq!(
-            parse_from(["clipper"]).unwrap().interface,
+            parse_from(["clipper", "tail"]).unwrap().interface,
             InterfaceKind::Ros
         );
         assert_eq!(
-            parse_from(["clipper", "--interface", "mcap"])
+            parse_from(["clipper", "tail", "--interface", "mcap"])
                 .unwrap()
                 .interface,
             InterfaceKind::Mcap
         );
-        assert!(parse_from(["clipper", "--interface", "bogus"]).is_err());
+        assert!(parse_from(["clipper", "tail", "--interface", "bogus"]).is_err());
     }
 
     #[test]
@@ -836,21 +949,99 @@ mod tests {
         // value is rejected. (Its MOMENTEDGE_TIME_SOURCE env fallback is covered
         // by env_prefix_binds_a_momentedge_name_to_every_field.)
         assert_eq!(
-            parse_from(["clipper"]).unwrap().time_source,
+            parse_from(["clipper", "tail"]).unwrap().time_source,
             TimeSource::Log
         );
         assert_eq!(
-            parse_from(["clipper", "--time-source", "publish"])
+            parse_from(["clipper", "tail", "--time-source", "publish"])
                 .unwrap()
                 .time_source,
             TimeSource::Publish
         );
-        assert!(parse_from(["clipper", "--time-source", "bogus"]).is_err());
+        assert!(parse_from(["clipper", "tail", "--time-source", "bogus"]).is_err());
     }
 
     #[test]
     fn config_rejects_a_non_numeric_grace() {
-        assert!(parse_from(["clipper", "--grace-secs", "soon"]).is_err());
+        assert!(parse_from(["clipper", "tail", "--grace-secs", "soon"]).is_err());
+    }
+
+    // ── the command shape: one binary, the mode is a subcommand ────────────
+
+    /// A recorder flag offered to `clipper` itself belongs to `clipper tail`,
+    /// and the message says so. The process exits non-zero on it: `load_cli`
+    /// exits with `Error::exit_code`, which is 2 for a parse failure.
+    #[test]
+    fn a_bare_recorder_flag_is_rejected_and_points_at_the_tail_mode() {
+        let err = cli_from(["clipper", "--record-dir", "/data/record"])
+            .expect_err("a recorder flag on the bare command is not a valid command line");
+        assert_ne!(err.exit_code(), 0, "a rejected command line exits non-zero");
+        let hint = mode_hint(err.kind()).expect("the failure left the mode unnamed");
+        assert!(
+            hint.contains("clipper tail"),
+            "the hint names the subcommand that owns the flag: {hint}"
+        );
+    }
+
+    /// Naming no mode at all is the same rejection: `clipper` alone runs
+    /// nothing.
+    #[test]
+    fn naming_no_mode_is_rejected_and_points_at_the_tail_mode() {
+        let err = cli_from(["clipper"]).expect_err("clipper with no mode runs nothing");
+        assert_ne!(err.exit_code(), 0, "a rejected command line exits non-zero");
+        assert!(mode_hint(err.kind()).is_some_and(|h| h.contains("clipper tail")));
+    }
+
+    /// `clipper --help` lists the modes. It is not a failure — exit code 0 and
+    /// no hint, since nothing went wrong.
+    #[test]
+    fn top_level_help_lists_the_modes() {
+        let err = cli_from(["clipper", "--help"]).expect_err("--help short-circuits the parse");
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
+        assert_eq!(err.exit_code(), 0);
+        assert_eq!(mode_hint(err.kind()), None);
+        let help = err.to_string();
+        assert!(help.contains("Commands:"), "{help}");
+        assert!(help.contains("tail"), "{help}");
+    }
+
+    /// `clipper tail --help` is the recorder's own surface: its flags, and no
+    /// list of modes to descend into.
+    #[test]
+    fn tail_help_lists_the_recorder_flags_and_no_modes() {
+        let err =
+            cli_from(["clipper", "tail", "--help"]).expect_err("--help short-circuits the parse");
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
+        let help = err.to_string();
+        for flag in [
+            "--record-dir",
+            "--out-dir",
+            "--grace-secs",
+            "--extract-parallelism",
+            "--clip-compression",
+            "--interface",
+            "--time-source",
+            "--watch-old-files-duration",
+            "--delete-old-files",
+        ] {
+            assert!(
+                help.contains(flag),
+                "clipper tail --help lists {flag}: {help}"
+            );
+        }
+        assert!(
+            !help.contains("Commands:"),
+            "the recorder mode has no submodes: {help}"
+        );
+    }
+
+    /// A failure *inside* a named mode is the mode's own problem, so it carries
+    /// no subcommand hint — the caller already said `tail`.
+    #[test]
+    fn a_bad_flag_value_inside_the_mode_carries_no_hint() {
+        let err = cli_from(["clipper", "tail", "--time-source", "bogus"])
+            .expect_err("an unknown --time-source value is rejected");
+        assert_eq!(mode_hint(err.kind()), None);
     }
 
     // ── supervise() tests ──────────────────────────────────────────────────

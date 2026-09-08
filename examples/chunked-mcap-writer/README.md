@@ -1,7 +1,7 @@
 # chunked-mcap-writer — tailable chunked + compressed MCAP
 
 A standalone program that writes a **chunked, zstd-compressed MCAP file that
-`clipper-tailing --interface mcap` can still tail live** — the second producer path
+`clipper tail --interface mcap` can still follow live** — the second producer path
 that satisfies clipper's tailability contract, next to
 [`custom-mcap-writer`](../custom-mcap-writer/README.md)'s unchunked output.
 Its only job is to show the [`mcap`](https://crates.io/crates/mcap) crate

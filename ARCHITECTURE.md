@@ -11,8 +11,13 @@ The system is **two cooperating processes that share only a file**:
 
 - A continuous `ros2 bag record` (rosbag2 with MCAP storage) writes a growing
   recording. clipper never starts, stops, or configures it.
-- `clipper` keeps that recording open, tails it, and on each trigger cuts a
-  standalone clip out of the bytes already on disk.
+- `clipper tail` keeps that recording open, follows it, and on each trigger
+  cuts a standalone clip out of the bytes already on disk.
+
+`clipper` is one binary and the mode is a subcommand, so a mode that reaches a
+recording some other way is a sibling of `tail` rather than a second
+executable to deploy. `tail` is the mode this document describes; the flags it
+takes are tabulated in the [README](README.md#configuration).
 
 The split is deliberate. Recording and deciding-what-matters are different jobs
 with different change rates: the recorder keeps its own config, lifecycle, and
@@ -71,7 +76,7 @@ there rather than downstream.
 
 | `clipper` source file | Role |
 |---|---|
-| `src/main.rs` | Entry point, configuration (clap), admission gate, thread supervision |
+| `src/main.rs` | Entry point, the subcommand surface (`clipper tail`) and its configuration (clap), admission gate, thread supervision |
 | `src/interface.rs` | `trait Interface` + the `ros` and `mcap` implementations and their announcers |
 | `src/supervision.rs` | `spawn_supervised`/`harvest_panic`: pair each long-lived thread with a channel carrying its verdict |
 
@@ -443,12 +448,10 @@ shared-memory transport and direct DDS interop work.
 clipper ships as **two Debian packages**: `ros-<distro>-momentedge-msgs` (the
 `ament_cmake` interface package, built with bloom into `/opt/ros/<distro>`) and
 `momentedge-clipper` (the Rust binary, built with cargo-deb), the latter
-declaring an apt `Depends` on the former. `momentedge-clipper` installs the
-recorder as `/opt/momentedge-clipper/bin/clipper-tailing`, with a `clipper`
-compatibility symlink beside it — a transitional measure kept for one release
-so units and scripts invoking that path keep working until every device has
-been re-deployed, and dropped after that. The binary carries no bundled overlay
-and no baked rpath; it resolves its typesupport through the standard
+declaring an apt `Depends` on the former. `momentedge-clipper` installs one
+executable, `/opt/momentedge-clipper/bin/clipper`, whose modes are subcommands:
+the recorder a unit file names is `clipper tail`. The binary carries no bundled
+overlay and no baked rpath; it resolves its typesupport through the standard
 `/opt/ros/<distro>/setup.bash`, like every ROS executable.
 
 The dev-shell build (Nix, per-distro), the CI matrix, and the Debian packaging

@@ -1,5 +1,5 @@
 //! A copper (cu29) `CuSinkTask` that appends routed task outputs to an MCAP
-//! Recording `clipper-tailing --interface mcap` can tail live — the copper producer
+//! Recording `clipper tail --interface mcap` can follow live — the copper producer
 //! path beside the two plain-`mcap`-crate writer examples
 //! (`examples/custom-mcap-writer`, `examples/chunked-mcap-writer`). No ROS
 //! stack is involved anywhere: the Trigger travels in-band, written into the

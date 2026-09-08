@@ -167,17 +167,12 @@ jobs:
       # missing/unresolved typesupport would crash it immediately instead of
       # idling to the SIGINT.
       #
-      # Both installed names are exercised. `clipper` is a compatibility symlink
-      # onto `clipper-tailing`, kept for one release so units written before the
-      # rename keep working; a symlink that does not resolve, or resolves to some
-      # other program, is exactly the failure this catches. `--version` must match
-      # exactly — clap renders it from the command's configured name, so the same
-      # program reports the same string however it was invoked. `--help` is
-      # compared with its `Usage:` line dropped, because clap builds that line
-      # from argv[0]: through the symlink it reads `Usage: clipper`, which is
-      # right — the help tells you how to invoke the name you actually used. The
-      # live run goes through the symlink, which is the path an un-migrated unit
-      # file still has.
+      # The package installs one executable, `clipper`, whose modes are
+      # subcommands. The step lists the package's files, asserts the mode
+      # listing and the recorder's own help both render, and asserts that a
+      # recorder flag handed to the bare command is refused — the deployment
+      # contract is `clipper tail`, and a build that silently accepted the bare
+      # form would let a wrong unit file reach a device.
       - name: Smoke-test the installed packages
         run: |
           sudo apt-get install -y ./dist/ros-${{ matrix.distro }}-momentedge-msgs_*.deb
@@ -185,17 +180,19 @@ jobs:
           source /opt/ros/${{ matrix.distro }}/setup.bash
           bin=/opt/momentedge-clipper/bin
           dpkg -L momentedge-clipper
-          test -L "$bin/clipper" || { echo "::error::$bin/clipper is not a symlink"; exit 1; }
-          "$bin/clipper-tailing" --help
-          diff <("$bin/clipper-tailing" --version) <("$bin/clipper" --version)
-          diff <("$bin/clipper-tailing" --help | grep -v '^Usage:') \
-               <("$bin/clipper" --help | grep -v '^Usage:')
+          "$bin/clipper" --help
+          "$bin/clipper" tail --help
+          "$bin/clipper" --version
+          if "$bin/clipper" --record-dir /tmp >/dev/null 2>&1; then
+            echo "::error::bare 'clipper --record-dir' was accepted; the mode must be a subcommand"
+            exit 1
+          fi
           rec="$(mktemp -d)"
           # `|| code=$?` so timeout's exit (124 when it fires the SIGINT after the
           # full window — the healthy case) doesn't fail the step.
           code=0
           RUST_LOG=info MOMENTEDGE_RECORD_DIR="$rec" timeout -s INT 6 \
-            "$bin/clipper" || code=$?
+            "$bin/clipper" tail || code=$?
           echo "recorder live-run exit code: $code (124 = ran the full window, then SIGINT)"
 
       # The only handoff to the `release` job below. Skipped under act (its artifact

@@ -746,10 +746,9 @@ this section is the rationale.
 - **Everything is a child process; the test owns no ROS node.** The ros2 CLI
   resolves `momentedge_msgs` types from `AMENT_PREFIX_PATH`, so the test
   binary needs no r2r dependency and carries no process-global DDS state.
-  The binary under test is located via `CARGO_BIN_EXE_clipper-tailing` (cargo
-  builds that variable from the bin target's name verbatim, hyphen included — it
-  does not translate `-` to `_` the way it does for package names in `cfg`
-  paths), and every spawn blocks until its `clipper-tailing up` startup line
+  The binary under test is located via `CARGO_BIN_EXE_clipper`, spawned with
+  `tail` as its one command-line argument (everything else is `MOMENTEDGE_*`
+  env), and every spawn blocks until its `clipper tail up` startup line
   appears.
 - **nextest is the required runner, not launch_testing**: process-per-test
   isolation, per-test slow-timeouts, leak detection for orphaned children,
@@ -794,7 +793,7 @@ this section is the rationale.
   the clip's every message is in-window on the *selected* stamp while at least
   one message is out-of-window on the *contrasting* stamp — jointly impossible
   unless the two clock domains genuinely select different message sets. The
-  writer binary is resolved beside `CARGO_BIN_EXE_clipper-tailing` (built on
+  writer binary is resolved beside `CARGO_BIN_EXE_clipper` (built on
   demand if absent), so the case needs no extra build step.
 - **A copper (cu29) Producer reaches clipper end to end**
   (`copper_sink_recording_produces_clip`, ROS-free at runtime): the
@@ -844,7 +843,7 @@ for the flag reference.
 ## Run
 
 ```bash
-nix develop --command cargo run -p clipper --bin clipper-tailing
+nix develop --command cargo run -p clipper -- tail
 ```
 
 Needs `scripts/record.sh` running (for `./record`) and a
@@ -854,23 +853,39 @@ is in the [README](../../README.md#operational-notes).
 
 ## Configuration
 
-`Config` is a clap `derive(Parser)`: every field is a CLI flag with a
+**One binary, and the mode is a subcommand.** `Cli` is the clap
+`derive(Parser)` and carries a single field, the `Mode` enum whose one variant
+is `Tail(Config)`; `main`'s `match` over that enum is the dispatch table, so a
+mode added to the enum is a compile error until it has a body to run. Every flag
+belongs to a mode rather than to `clipper` itself: `clipper --help` lists the
+modes, `clipper tail --help` lists the recorder's flags, and a bare
+`clipper --record-dir …` is a parse error. What makes naming no mode an error
+rather than a run with defaults is `Cli`'s `mode` field being a plain `Mode`
+and not an `Option`: clap's derive requires the subcommand and answers a bare
+`clipper` with the mode listing and a non-zero exit, so
+`subcommand_required`/`arg_required_else_help` would add nothing.
+`mode_hint` maps the error kinds that mean the
+mode went unnamed — an unknown argument, an unknown or missing subcommand — to
+the line `load_cli` prints after clap's own text, so the message names
+`clipper tail`; a failure *inside* a mode (a bad `--time-source` value) gets no
+hint, because the caller already said which mode they wanted. `main.rs`'s
+`a_bare_recorder_flag_is_rejected_and_points_at_the_tail_mode` and
+`tail_help_lists_the_recorder_flags_and_no_modes` hold that shape down.
+
+`Config` is the recorder mode's `derive(Args)`: every field is a CLI flag with a
 `MOMENTEDGE_*` environment fallback and a per-field default, so precedence is
-CLI flag > env var > default. `load_config` in `main.rs` parses it — clap prints
-`--help`/`--version` and any parse error and exits before it returns, so the
-binary still runs with no setup. The command name is pinned on the derive
-(`#[command(name = "clipper-tailing")]`) because clap's default is the cargo
-package name (`clipper`), and `--help`/`--version` name the binary. clap renders
-both from that configured name, not from argv[0], so the deb's `clipper`
-compatibility symlink prints identically; only the `Usage:` line follows the
-path actually invoked. The `MOMENTEDGE_*` env names are not wired
-per field: `with_env_prefix` walks every argument with `Command::mut_args` and
-binds `<field>` to `MOMENTEDGE_<FIELD>` (`grace_secs` → `MOMENTEDGE_GRACE_SECS`),
-leaving the auto-generated `--help`/`--version` untouched. Changing the prefix is
-the one `ENV_PREFIX` constant. clap's `env` feature provides the per-arg env
-fallback and `string` lets the runtime-built env names be set on the args. The
-flags, env vars, and defaults are tabulated in the
-[README](../../README.md#configuration).
+CLI flag > env var > default. `load_cli` in `main.rs` parses it — clap prints
+`--help`/`--version` and any parse error and the process exits before it
+returns, so `clipper tail` still runs with no further setup. The `MOMENTEDGE_*`
+env names are not wired per field: `with_env_prefix` walks every subcommand with
+`Command::mut_subcommand` and each of its arguments with `Command::mut_args`,
+binding `<field>` to `MOMENTEDGE_<FIELD>` (`grace_secs` →
+`MOMENTEDGE_GRACE_SECS`) and leaving the auto-generated `--help`/`--version`
+untouched — so a mode added later inherits the same env fallback with no new
+wiring. Changing the prefix is the one `ENV_PREFIX` constant. clap's `env`
+feature provides the per-arg env fallback and `string` lets the runtime-built
+env names be set on the args. The flags, env vars, and defaults are tabulated in
+the [README](../../README.md#configuration).
 
 The interface seam is one such flag: `--interface {ros|mcap}` (env
 `MOMENTEDGE_INTERFACE`, default `ros`), a clap `ValueEnum` over `InterfaceKind`

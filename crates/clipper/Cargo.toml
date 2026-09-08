@@ -5,11 +5,11 @@ edition.workspace = true
 license.workspace = true
 description = "Triggered MCAP clip recorder for ROS2"
 
-# The device recorder. `clipper` is reserved for the cloud binary that cuts clips
-# from a recording nobody is writing; this one is named for what distinguishes
-# it — it tails.
+# One binary, and the mode is a subcommand: `clipper tail` is the device
+# recorder, and a mode that cuts clips from a recording nobody is writing joins
+# it as a sibling subcommand rather than as a second executable.
 [[bin]]
-name = "clipper-tailing"
+name = "clipper"
 path = "src/main.rs"
 
 [dependencies]
@@ -81,28 +81,18 @@ section = "utils"
 priority = "optional"
 # Vendor-namespaced under /opt rather than /usr/bin (the `clipper` binary name is
 # taken by an unrelated Debian package); the deb name and prefix match.
-#
-# The second entry is a compatibility symlink `clipper -> clipper-tailing`, kept
-# for one release so units and scripts written against the old path keep working
-# until every device has been re-deployed. cargo-deb writes it into the archive
-# as a real symlink (so it shows up in the package's file list, which a postinst
-# would not), and normalises the absolute `link_name` to a sibling-relative link
-# per Debian policy.
-assets = [
-    ["target/release/clipper-tailing", "opt/momentedge-clipper/bin/", "755"],
-    { dest = "opt/momentedge-clipper/bin/clipper", link_name = "/opt/momentedge-clipper/bin/clipper-tailing" },
-]
+# One executable, no symlinks: the mode is an argument (`clipper tail`), so the
+# package has a single entry point to install and to name in a unit file.
+assets = [["target/release/clipper", "opt/momentedge-clipper/bin/", "755"]]
 # Per-distro Depends live in the variants below; this base default targets humble.
 depends = "ros-humble-ros-base, ros-humble-rmw-fastrtps-cpp, ros-humble-momentedge-msgs"
 extended-description = """\
-Triggered MCAP clip recorder for ROS2. clipper tails one continuous ros2 bag MCAP \
-recording and cuts clips around momentedge_msgs/Trigger events, announcing each via \
-momentedge_msgs/Recorded. Built natively against the host ROS2 distro for ABI \
+Triggered MCAP clip recorder for ROS2. clipper tail follows one continuous ros2 bag \
+MCAP recording and cuts clips around momentedge_msgs/Trigger events, announcing each \
+via momentedge_msgs/Recorded. Built natively against the host ROS2 distro for ABI \
 compatibility; the momentedge_msgs interface package, ros-base, and rmw_fastrtps_cpp \
 are pulled from apt. Run by sourcing /opt/ros/<distro>/setup.bash, then \
-/opt/momentedge-clipper/bin/clipper-tailing. A clipper symlink beside it resolves \
-to the same binary; it is a compatibility path kept for one release, so point \
-units and scripts at clipper-tailing."""
+/opt/momentedge-clipper/bin/clipper tail."""
 
 # `--variant <distro>` selects the matching dependency set; `name` is repeated so the
 # package stays `momentedge-clipper` (cargo-deb would otherwise append the variant).

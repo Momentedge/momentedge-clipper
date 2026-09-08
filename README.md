@@ -125,9 +125,9 @@ ros2 bag record --all --storage mcap --output ./record
 #    or ./scripts/record.sh for storage-tuned defaults
 
 # 2. clipper, tailing ./record, writing clips to ./clipped
-clipper-tailing --record-dir ./record --out-dir ./clipped --clip-compression zstd
+clipper tail --record-dir ./record --out-dir ./clipped --clip-compression zstd
 #    from a source checkout:
-#    cargo run -p clipper --bin clipper-tailing -- --record-dir ./record --out-dir ./clipped
+#    cargo run -p clipper -- tail --record-dir ./record --out-dir ./clipped
 
 # 3. Fire a trigger: 5 s before and 5 s after the instant clipper receives it.
 #    Under the default --time-source log the window anchors on clipper's own
@@ -155,13 +155,12 @@ Humble host, Jazzy on Jazzy, …):
 ```bash
 sudo apt install ./ros-humble-momentedge-msgs_*.deb ./momentedge-clipper_*.deb
 source /opt/ros/humble/setup.bash
-/opt/momentedge-clipper/bin/clipper-tailing --help
+/opt/momentedge-clipper/bin/clipper --help
 ```
 
-The package installs the recorder as `/opt/momentedge-clipper/bin/clipper-tailing`
-and, beside it, a `clipper` symlink to the same binary — a compatibility symlink
-kept for one release so units and scripts naming that path keep running. Point
-them at `clipper-tailing`: the symlink is gone in the release after.
+The package installs one executable, `/opt/momentedge-clipper/bin/clipper`.
+Its modes are subcommands, and the recorder is `clipper tail` — that is the
+command a unit file names.
 
 `momentedge-clipper` resolves its message typesupport from the
 `ros-<distro>-momentedge-msgs` package through the distro's own `setup.bash`,
@@ -176,18 +175,22 @@ environment (for `rcl`/`rmw` and the message typesupport):
   `nix develop --command cargo build`. See [CLAUDE.md](CLAUDE.md) for the
   dev-shell and per-distro build details.
 - **On a deployment target:** `./scripts/build-on-target.sh` compiles
-  `clipper-tailing` and `momentedge_msgs` natively against the host's apt ROS 2
+  `clipper` and `momentedge_msgs` natively against the host's apt ROS 2
   install (the binaries are ABI-compatible with the rest of the host's ROS graph
   by construction). See [ARCHITECTURE.md](ARCHITECTURE.md#deployment) for the
   rationale.
 
 ## Configuration
 
-`clipper-tailing` is configured by CLI flags, each with a `MOMENTEDGE_*`
+clipper is one binary and the mode is a subcommand: `clipper tail` is the
+recorder, and `clipper --help` lists the modes. A recorder flag handed to the
+bare `clipper` is refused, with a message naming `clipper tail`.
+
+`clipper tail` is configured by CLI flags, each with a `MOMENTEDGE_*`
 environment fallback and a built-in default: a flag overrides the env var, which
-overrides the default. `clipper-tailing --help` lists them;
-`clipper-tailing --version` prints the version. Everything is optional —
-`clipper-tailing` runs with no arguments.
+overrides the default. `clipper tail --help` lists them; `clipper --version`
+prints the version. Every flag is optional — `clipper tail` runs with no
+further arguments.
 
 | Flag | Env var | Default | Meaning |
 |---|---|---|---|
@@ -317,7 +320,7 @@ Both cut identical clips; only the trigger and completion edges differ.
 - **Lifecycle.** Ctrl-C (SIGINT/SIGTERM) stops clipper cleanly with exit 0. Any
   internal fault — a dead tail thread, an unrecoverable scan fault — exits
   non-zero so a process supervisor (systemd, …) restarts it.
-- **Logs go to stdout.** `clipper-tailing` logs at `info` on stdout; `RUST_LOG`
+- **Logs go to stdout.** `clipper tail` logs at `info` on stdout; `RUST_LOG`
   raises or lowers that. A run publishes nothing machine-readable on stdout —
   its result is the clips in `--out-dir`, each carrying its own metadata — so
   the stream is free for the output an operator reads first, and discarding
