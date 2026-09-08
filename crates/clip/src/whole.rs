@@ -35,7 +35,7 @@
 //! ones that have one do not all carry an index worth planning from. Every
 //! input this cannot index is refused by name — [`IndexRefusal`] is the whole
 //! taxonomy, one variant per fault an operator repairs differently — and each
-//! refusal names the `mcap` command that repairs it ([`REPAIR`]). Every verdict
+//! refusal names the `mcap` command that repairs it. Every verdict
 //! is reached from the footer and the summary alone, so refusing a recording
 //! costs the same seek and read that accepting one does, whatever its size, and
 //! the input is opened read-only and left exactly as it was found: recovering
@@ -183,7 +183,7 @@ pub enum OpenError {
 
 /// Every read [`WholeFileIndex::open`] makes is a small one near the footer, and
 /// they all fail the same way.
-fn unreadable(path: &Path) -> impl Fn(std::io::Error) -> OpenError + use<'_> {
+fn unreadable(path: &Path) -> impl Fn(std::io::Error) -> OpenError {
     move |source| OpenError::Unreadable {
         path: path.to_path_buf(),
         source,
@@ -211,7 +211,7 @@ impl WholeFileIndex {
     /// independent of the recording's size and is not paid twice when the cut
     /// then reads the extents it was given. The file is opened read-only and
     /// never written to: a recording this refuses is left exactly as it was
-    /// found, and repairing it is the operator's ([`REPAIR`]).
+    /// found, and repairing it is the operator's.
     ///
     /// Every recording this cannot index is refused by name, from the same two
     /// reads: [`IndexRefusal`] is the taxonomy, and the checks run in the order
