@@ -6,6 +6,10 @@
   inputs = {
     nix-ros-overlay.url = "github:lopsided98/nix-ros-overlay/master";
     nixpkgs.follows = "nix-ros-overlay/nixpkgs";
+    mcap-cli = {
+      url = "https://flakehub.com/f/stfl/mcap-cli/*";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   # Pull prebuilt ROS2 packages from the ROS binary cache instead of compiling.
@@ -25,12 +29,19 @@
   outputs = {
     nixpkgs,
     nix-ros-overlay,
+    mcap-cli,
     ...
   }:
     nix-ros-overlay.inputs.flake-utils.lib.eachDefaultSystem (system: let
       pkgs = import nixpkgs {
         inherit system;
-        overlays = [nix-ros-overlay.overlays.default];
+        overlays = [
+          nix-ros-overlay.overlays.default
+          # nixpkgs binds `mcap-cli` to the Go implementation (0.0.6x). This
+          # overlay rebinds the name to the Rust CLI (0.3.0), so `pkgs.mcap-cli`
+          # in the dev shell below is the Rust one.
+          mcap-cli.overlays.default
+        ];
       };
       lib = pkgs.lib;
 
@@ -61,7 +72,7 @@
       # a distro left off this list still gets the full recorder/e2e core
       # (nix/ros-env.nix `withSim`). Add a distro here (and a `simOverlays` entry
       # only if its closure needs the pkg-config fix) to put sim in its shell.
-      simDistros = [ "jazzy" "humble" "lyrical" "rolling" ];
+      simDistros = ["jazzy" "humble" "lyrical" "rolling"];
 
       # Distro-specific overlays correcting upstream sim-stack packaging.
       # nix-ros-overlay's gscam and ffmpeg_image_transport omit pkg-config from
@@ -76,11 +87,11 @@
       simOverlays = {
         humble = _final: prev: {
           gscam = prev.gscam.overrideAttrs (old: {
-            nativeBuildInputs = (old.nativeBuildInputs or []) ++ [ pkgs.pkg-config ];
+            nativeBuildInputs = (old.nativeBuildInputs or []) ++ [pkgs.pkg-config];
           });
           ffmpeg-image-transport = prev.ffmpeg-image-transport.overrideAttrs (old: {
-            nativeBuildInputs = (old.nativeBuildInputs or []) ++ [ pkgs.pkg-config ];
-            cmakeFlags = (old.cmakeFlags or []) ++ [ "-DFFMPEG_PKGCONFIG=${pkgs.ffmpeg.dev}/lib/pkgconfig" ];
+            nativeBuildInputs = (old.nativeBuildInputs or []) ++ [pkgs.pkg-config];
+            cmakeFlags = (old.cmakeFlags or []) ++ ["-DFFMPEG_PKGCONFIG=${pkgs.ffmpeg.dev}/lib/pkgconfig"];
           });
         };
       };
@@ -115,10 +126,12 @@
       mkDistro = rosDistro: let
         # Apply the distro's sim packaging fix (if any) so the patched gscam /
         # ffmpeg-image-transport flow through to every consumer of `ros`.
-        ros = let base = pkgs.rosPackages.${rosDistro};
-        in if simOverlays ? ${rosDistro}
-           then base.overrideScope simOverlays.${rosDistro}
-           else base;
+        ros = let
+          base = pkgs.rosPackages.${rosDistro};
+        in
+          if simOverlays ? ${rosDistro}
+          then base.overrideScope simOverlays.${rosDistro}
+          else base;
         withSim = lib.elem rosDistro simDistros;
         momentedge-msgs = import ./nix/momentedge-msgs.nix {
           inherit ros;
@@ -141,6 +154,7 @@
               rosEnv
               pkgs.clang # r2r's build script invokes clang/bindgen
               pkgs.pkg-config
+              pkgs.mcap-cli # inspect/convert recorded bags (`mcap info`, `mcap cat`)
             ]
             # the sim camera's GStreamer pipeline (sim/) — only where the sim
             # stack is in the closure (see simDistros).
