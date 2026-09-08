@@ -50,7 +50,14 @@ r2r = { git = "https://github.com/sequenceplanner/r2r.git", tag = "0.9.6" }
 futures = "0.3"
 crossbeam-channel = "0.5"
 signal-hook = "0.3"
-mcap = "0.24"
+# The MCAP format layer: record parsing for the scan and the cut, and the clip
+# writer. One version across the workspace, matching the `mcap` CLI on the dev
+# shell, so a recording and a clip are read and written by the same format code
+# the CLI inspects them with. The crate's write defaults are not a contract —
+# the cut path names the codec and `clip::cut::CLIP_CHUNK_SIZE` outright, so a
+# clip's layout is this workspace's decision rather than whatever the crate
+# ships with.
+mcap = "0.25"
 anyhow = "1"
 # CLI + env parsing: `derive` for the `Config` parser, `env` so each arg falls
 # back to a `MOMENTEDGE_*` environment variable, `string` so the runtime-built

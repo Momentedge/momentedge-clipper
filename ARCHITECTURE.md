@@ -283,9 +283,10 @@ its own opcode + length framing — the same walk the tail performed, so the
 extent boundaries are known to tile. Messages whose stamp on the window's time
 source falls in the inclusive window are written through with their raw
 serialized bytes; CDR bodies are never decoded. The clip writer is built from
-explicit `mcap::WriteOptions` with the codec set deliberately
-(`--clip-compression`), and finished with `Writer::finish()` (summary + footer +
-closing magic) so every clip is a complete, standalone MCAP file.
+explicit `mcap::WriteOptions` with both knobs that decide a clip's layout set
+deliberately — the codec (`--clip-compression`) and the 1 MiB chunk size
+(`clip::cut::CLIP_CHUNK_SIZE`) — and finished with `Writer::finish()` (summary +
+footer + closing magic) so every clip is a complete, standalone MCAP file.
 
 Publication is **two-staged** so `out_dir` only ever holds finished clips:
 
