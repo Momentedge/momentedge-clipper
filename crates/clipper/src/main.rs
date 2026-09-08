@@ -92,8 +92,11 @@ use std::time::Duration;
 
 use anyhow::Context;
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
+use clip::config::{Layer, Layered};
 use clip::manifest::Producer;
-use clip::trigger::{Trigger, now_ns};
+#[cfg(feature = "ros")]
+use clip::trigger::ANNOUNCE_TOPIC;
+use clip::trigger::{TRIGGER_TOPIC, Trigger, now_ns};
 use clip::{TimeSource, segment};
 use crossbeam_channel::{Receiver, Sender, bounded, select, unbounded};
 #[cfg(feature = "ros")]
@@ -103,12 +106,6 @@ use log::{error, info, warn};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use supervision::{Supervised, harvest_panic, spawn_supervised};
 use tail::{Coverage, Tailer, Watch, handler};
-
-const TRIGGER_TOPIC: &str = "/events/momentedge/trigger";
-/// The topic the ROS interface announces finished clips on. Only that interface
-/// publishes, so only the `ros` build has one.
-#[cfg(feature = "ros")]
-const RECORDED_TOPIC: &str = "/events/momentedge/recorded";
 
 /// How many trigger handlers may be active (admitted, waiting, or extracting)
 /// at once. Beyond this limit an arriving trigger is rejected at admission:
@@ -519,19 +516,284 @@ fn mode_hint(kind: clap::error::ErrorKind) -> Option<&'static str> {
     )
 }
 
-/// Parse the [`Cli`] from the command line, each mode's field falling back to
-/// its `MOMENTEDGE_*` environment variable and then its default (CLI > env >
-/// default). Diverges the way [`clap::Error::exit`] does — printing the message
-/// and ending the process — for `--help`, `--version` and any parse error, so
-/// this returns only a fully-populated mode. A failure that left the mode
-/// unnamed carries [`mode_hint`] after clap's own text.
-fn load_cli() -> Cli {
-    let parsed = with_env_prefix(Cli::command())
-        .try_get_matches()
-        .and_then(|matches| Cli::from_arg_matches(&matches));
-    match parsed {
-        Ok(cli) => cli,
-        Err(err) => {
+/// The three flags every mode carries that are *about* the configuration rather
+/// than in it: the two file locations and the request to print what they came
+/// to. They are injected onto each mode rather than declared as fields of
+/// [`Config`] and [`ClipConfig`], so one definition serves every mode and no
+/// mode's own struct grows a field it never reads.
+///
+/// Their ids are what [`with_env_prefix`] turns into `MOMENTEDGE_CONFIG`,
+/// `MOMENTEDGE_SYSTEM_CONFIG` and `MOMENTEDGE_PRINT_CONFIG`. None of them is a
+/// `[settings]` key, so a configuration file can never name another one.
+const CONFIG_ARG: &str = "config";
+const SYSTEM_CONFIG_ARG: &str = "system_config";
+const PRINT_CONFIG_ARG: &str = "print_config";
+
+/// Add the three configuration flags to every mode.
+fn with_config_args(cmd: clap::Command) -> clap::Command {
+    let modes: Vec<String> = cmd
+        .get_subcommands()
+        .map(|sub| sub.get_name().to_owned())
+        .collect();
+    modes.into_iter().fold(cmd, |cmd, mode| {
+        cmd.mut_subcommand(mode, |sub| {
+            sub.arg(
+                clap::Arg::new(CONFIG_ARG)
+                    .long("config")
+                    .value_name("PATH")
+                    .value_parser(clap::value_parser!(PathBuf))
+                    .help("Per-run configuration file (TOML)")
+                    .long_help(
+                        "Per-run configuration file (TOML). It may set the keys this run \
+                         decides — where the clips go, how long to wait, which topics to \
+                         cut — and a key reserved to the system file is refused by name. \
+                         Optional: there is no per-run file unless one is named.",
+                    ),
+            )
+            .arg(
+                clap::Arg::new(SYSTEM_CONFIG_ARG)
+                    .long("system-config")
+                    .value_name("PATH")
+                    .value_parser(clap::value_parser!(PathBuf))
+                    .help("System configuration file (TOML)")
+                    .long_help(
+                        "System configuration file (TOML), read from \
+                         /etc/momentedge/clipper.toml unless this moves it. It may set \
+                         every key. A file that is not there is not an error.",
+                    ),
+            )
+            .arg(
+                clap::Arg::new(PRINT_CONFIG_ARG)
+                    .long("print-config")
+                    .action(clap::ArgAction::SetTrue)
+                    .help("Print the effective configuration and exit")
+                    .long_help(
+                        "Print every setting this run would use, the value it resolved to \
+                         and the layer that decided it, then exit. The same text is logged \
+                         at startup.",
+                    ),
+            )
+        })
+    })
+}
+
+/// The value `flag` carries in `argv`, in either spelling (`--flag VALUE` or
+/// `--flag=VALUE`), or `None`.
+///
+/// The configuration files decide the defaults the parser is *built* with, so
+/// they have to be known before the parser exists — which is why this is a scan
+/// and not a parse. clap parses the same two flags afterwards, so a bad spelling
+/// is still reported the ordinary way. The scan stops at `--`, past which
+/// nothing is a flag, and works on bytes so a path that is not UTF-8 is found in
+/// both spellings.
+fn scan_flag(argv: &[std::ffi::OsString], flag: &str) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let with_eq = format!("{flag}=");
+    let mut args = argv.iter();
+    while let Some(arg) = args.next() {
+        let bytes = arg.as_bytes();
+        if bytes == b"--" {
+            return None;
+        }
+        if bytes == flag.as_bytes() {
+            return args.next().map(PathBuf::from);
+        }
+        if let Some(value) = bytes.strip_prefix(with_eq.as_bytes()) {
+            return Some(PathBuf::from(std::ffi::OsStr::from_bytes(value)));
+        }
+    }
+    None
+}
+
+/// Where the two configuration files are for this run: the command line first,
+/// then the environment variable clap would have read for the same flag, then
+/// nothing (the system file falls back to its built-in location inside
+/// [`Layered::load`]).
+fn config_paths(argv: &[std::ffi::OsString]) -> (Option<PathBuf>, Option<PathBuf>) {
+    let located = |flag: &str, id: &str| {
+        scan_flag(argv, flag).or_else(|| {
+            std::env::var_os(format!("{ENV_PREFIX}_{}", id.to_uppercase())).map(PathBuf::from)
+        })
+    };
+    (
+        located("--system-config", SYSTEM_CONFIG_ARG),
+        located("--config", CONFIG_ARG),
+    )
+}
+
+/// Give each argument the value the configuration files resolved for it, as its
+/// default.
+///
+/// This is the whole join between the file layers and the top two: clap already
+/// resolves a flag over an environment variable over a default, so handing it a
+/// file's value *as* the default puts the four layers in the documented order
+/// with no further wiring — and makes a file's value pass exactly the value
+/// parser a flag's value passes. An argument no file named keeps the default
+/// compiled into it.
+fn with_file_defaults(cmd: clap::Command, layered: &Layered) -> clap::Command {
+    let modes: Vec<String> = cmd
+        .get_subcommands()
+        .map(|sub| sub.get_name().to_owned())
+        .collect();
+    modes.into_iter().fold(cmd, |cmd, mode| {
+        cmd.mut_subcommand(mode, |sub| {
+            sub.mut_args(|arg| match layered.setting(arg.get_id().as_str()) {
+                // `required` is cleared with the same stroke: an argument a file
+                // answers has been provided, and clap's required check does not
+                // count a default as an answer.
+                Some(setting) => arg
+                    .default_value(setting.value().to_string())
+                    .required(false),
+                None => arg,
+            })
+        })
+    })
+}
+
+/// The column the `=` and the `<-` of a report line are aligned on: the longest
+/// key (`watch_old_files_duration`) and a value column wide enough for the
+/// ordinary ones. A longer value pushes its own origin right rather than moving
+/// every other line's.
+const REPORT_KEY_WIDTH: usize = 24;
+const REPORT_VALUE_WIDTH: usize = 22;
+
+/// The effective configuration: every setting this run uses, the value it
+/// resolved to, and the layer that decided it.
+///
+/// It is read back out of the **parsed** command line — the same `ArgMatches`
+/// the mode's own struct is built from — rather than re-derived from the layers,
+/// so the report cannot claim a value the run does not use. clap knows the top
+/// two layers apart (a flag from an environment variable); everything it calls a
+/// default is a file's value or the built-in one, which [`Layered`] tells apart.
+fn effective_config(
+    mode: &str,
+    args: &clap::Command,
+    matches: &clap::ArgMatches,
+    layered: &Layered,
+) -> String {
+    let mut out = format!("clipper {mode} effective configuration\n  [settings]\n");
+    // The mode's own arguments, taken off the command rather than out of the
+    // matches: `ArgMatches::ids` also yields the argument *group* clap's derive
+    // names after the mode's config struct, which is not a setting.
+    let mut keys: Vec<&str> = args
+        .get_arguments()
+        .map(|arg| arg.get_id().as_str())
+        .filter(|id| {
+            !matches!(
+                *id,
+                CONFIG_ARG | SYSTEM_CONFIG_ARG | PRINT_CONFIG_ARG | "help" | "version"
+            )
+        })
+        .collect();
+    keys.sort_unstable();
+    for key in keys {
+        let value = matches
+            .get_raw(key)
+            .map(|values| {
+                values
+                    .map(|v| v.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        let layer = match matches.value_source(key) {
+            Some(clap::parser::ValueSource::CommandLine) => Layer::Flag,
+            Some(clap::parser::ValueSource::EnvVariable) => Layer::Env,
+            // Everything else clap can report is a default it was built with,
+            // which is a file's value where a file named the key.
+            _ => layered
+                .setting(key)
+                .map_or(Layer::Builtin, clip::config::Setting::layer),
+        };
+        out.push_str(&report_line(key, &value, &layered.origin(layer)));
+    }
+    out.push_str("  [topics]\n");
+    for (key, setting) in layered.topics() {
+        out.push_str(&report_line(
+            key,
+            setting.value(),
+            &layered.origin(setting.layer()),
+        ));
+    }
+    if !layered.refusals().is_empty() {
+        out.push_str("  refused\n");
+        for refusal in layered.refusals() {
+            out.push_str(&format!("    {refusal}\n"));
+        }
+    }
+    out
+}
+
+fn report_line(key: &str, value: &str, origin: &str) -> String {
+    format!(
+        "    {key:<REPORT_KEY_WIDTH$} = {value:<REPORT_VALUE_WIDTH$} <- {origin}\n",
+        key = key,
+        value = value,
+    )
+}
+
+/// A fully-resolved command line: the mode, the topic selection its clips are
+/// cut with, and the effective-configuration report.
+struct Loaded {
+    cli: Cli,
+    selection: clip::ChannelSelection,
+    report: String,
+    print_config: bool,
+}
+
+/// What can go wrong before the run begins.
+enum StartupError {
+    /// clap's own: a parse error, or `--help`/`--version`, which clap reports
+    /// through the same channel.
+    Cli(clap::Error),
+    /// A configuration file that exists and cannot be used.
+    Config(anyhow::Error),
+}
+
+/// Parse `argv` into a fully-resolved [`Loaded`], four layers deep.
+///
+/// The two configuration files are located in `argv` (and the environment)
+/// first, since what they say becomes the parser's defaults; clap then resolves
+/// the flag and the environment on top of them, so a setting present in all four
+/// layers comes out of the strongest that named it.
+fn parse_cli(argv: &[std::ffi::OsString]) -> Result<Loaded, StartupError> {
+    let (system, run) = config_paths(argv);
+    let layered = Layered::load(system.as_deref(), run.as_deref()).map_err(StartupError::Config)?;
+    let cmd = with_file_defaults(with_env_prefix(with_config_args(Cli::command())), &layered);
+    // The command is cloned before parsing consumes it, so the report can list
+    // the mode's arguments rather than guess at them from the matches.
+    let definition = cmd.clone();
+    let matches = cmd.try_get_matches_from(argv).map_err(StartupError::Cli)?;
+    let (mode, sub) = matches
+        .subcommand()
+        .expect("a parsed Cli names one of its modes");
+    let args = definition
+        .find_subcommand(mode)
+        .expect("the parsed mode is one of the command's subcommands");
+    let report = effective_config(mode, args, sub, &layered);
+    let print_config = sub.get_flag(PRINT_CONFIG_ARG);
+    let cli = Cli::from_arg_matches(&matches).map_err(StartupError::Cli)?;
+    Ok(Loaded {
+        cli,
+        selection: layered.into_selection(),
+        report,
+        print_config,
+    })
+}
+
+/// Parse the process's command line, or end the process saying why.
+///
+/// Diverges the way [`clap::Error::exit`] does — printing the message and ending
+/// the process — for `--help`, `--version` and any parse error, so this returns
+/// only a fully-populated mode. A failure that left the mode unnamed carries
+/// [`mode_hint`] after clap's own text. A configuration file that cannot be used
+/// ends the run the same way, at clap's usage exit code: it is the same class of
+/// mistake, made in a file instead of on the command line.
+fn load_cli() -> Loaded {
+    match parse_cli(&std::env::args_os().collect::<Vec<_>>()) {
+        Ok(loaded) => loaded,
+        Err(StartupError::Cli(err)) => {
             let hint = mode_hint(err.kind());
             let code = err.exit_code();
             let _ = err.print();
@@ -540,8 +802,17 @@ fn load_cli() -> Cli {
             }
             std::process::exit(code);
         }
+        Err(StartupError::Config(err)) => {
+            eprintln!("clipper: {err:#}");
+            std::process::exit(CONFIG_EXIT_CODE);
+        }
     }
 }
+
+/// The status a configuration file this run cannot use exits with — clap's own
+/// usage code, since a file that names an unknown key is the same mistake as a
+/// command line that does.
+const CONFIG_EXIT_CODE: i32 = 2;
 
 /// Deliver SIGINT/SIGTERM as a message on the returned channel: a dedicated
 /// thread blocks on signal-hook's iterator and forwards the first shutdown
@@ -626,13 +897,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .parse_default_env()
         .init();
 
+    let loaded = load_cli();
+    // The effective configuration goes out on demand and at startup alike, from
+    // the one report, so a run's log states the configuration it ran with in the
+    // words `--print-config` would have used.
+    if loaded.print_config {
+        println!("{}", loaded.report);
+        return Ok(());
+    }
+    info!("{}", loaded.report);
+
     // The producer is read off the mode before it is destructured, so every clip
     // the run writes is stamped with the subcommand that produced it.
-    let mode = load_cli().mode;
+    let mode = loaded.cli.mode;
     let producer = mode.producer();
+    let selection = loaded.selection;
     match mode {
-        Mode::Tail(cfg) => tail_mode(cfg, producer),
-        Mode::Clip(cfg) => clip_mode(cfg, producer).map_err(Into::into),
+        Mode::Tail(cfg) => tail_mode(cfg, producer, selection),
+        Mode::Clip(cfg) => clip_mode(cfg, producer, selection).map_err(Into::into),
     }
 }
 
@@ -648,7 +930,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// That is safe for clips by construction — the capturing-dir reset at
 /// startup reclaims any stranded staged file, and `out_dir` only ever holds
 /// complete clips.
-fn tail_mode(cfg: Config, producer: Producer) -> Result<(), Box<dyn std::error::Error>> {
+fn tail_mode(
+    cfg: Config,
+    producer: Producer,
+    selection: clip::ChannelSelection,
+) -> Result<(), Box<dyn std::error::Error>> {
     let cfg = Arc::new(cfg);
 
     // Start each run with a clean capturing dir: a crash mid-publish can strand
@@ -659,10 +945,14 @@ fn tail_mode(cfg: Config, producer: Producer) -> Result<(), Box<dyn std::error::
     clip::cut::reset_capturing_dir(&cfg.out_dir)?;
 
     // One staging worker per allowed concurrent clip copy; see
-    // Config::extract_parallelism. The clip compression codec is process-global,
-    // captured in the workers; each window's clock domain travels with its job.
-    let extract_tx =
-        segment::spawn_stage_workers(cfg.extract_parallelism, cfg.clip_compression.to_mcap());
+    // Config::extract_parallelism. The clip compression codec and the topic
+    // selection are process-global, captured in the workers; each window's clock
+    // domain travels with its job.
+    let extract_tx = segment::spawn_stage_workers(
+        cfg.extract_parallelism,
+        cfg.clip_compression.to_mcap(),
+        selection,
+    );
 
     // Admission gate for trigger handlers; see [`Admission`].
     let admission = Admission::new(MAX_ACTIVE_TRIGGERS);
@@ -688,7 +978,7 @@ fn tail_mode(cfg: Config, producer: Producer) -> Result<(), Box<dyn std::error::
         #[cfg(feature = "ros")]
         InterfaceKind::Ros => {
             let (tailer, coverage) = Tailer::new();
-            let iface = RosInterface::new(TRIGGER_TOPIC, RECORDED_TOPIC, cfg.time_source)?;
+            let iface = RosInterface::new(TRIGGER_TOPIC, ANNOUNCE_TOPIC, cfg.time_source)?;
             drive(
                 iface, cfg, tailer, coverage, extract_tx, admission, producer,
             )
@@ -733,7 +1023,11 @@ const CLIP_MODE_COMPRESSION: ClipCompression = ClipCompression::Zstd;
 /// Nothing is printed for a caller to parse. The result is the output
 /// directory's contents when the process exits, each clip carrying its own
 /// manifest; the exit status is the verdict.
-fn clip_mode(cfg: ClipConfig, producer: Producer) -> anyhow::Result<()> {
+fn clip_mode(
+    cfg: ClipConfig,
+    producer: Producer,
+    selection: clip::ChannelSelection,
+) -> anyhow::Result<()> {
     // A trigger name reaches the filesystem through the clip's pathname, so it
     // passes the gate every trigger passes, whichever source it arrived from.
     if let Err(why) = validate_name(&cfg.trigger_name) {
@@ -790,7 +1084,7 @@ fn clip_mode(cfg: ClipConfig, producer: Producer) -> anyhow::Result<()> {
 
     // One window, one recording, one copy: the pool is sized to the work there
     // is. It exists at all because staging is the pool's job either way.
-    let stage_tx = segment::spawn_stage_workers(1, CLIP_MODE_COMPRESSION.to_mcap());
+    let stage_tx = segment::spawn_stage_workers(1, CLIP_MODE_COMPRESSION.to_mcap(), selection);
     let base_out_path = cfg.out_dir.join(format!(
         "{anchor_ns}_{}.mcap",
         segment::sanitize(&trigger.name)
@@ -1559,7 +1853,7 @@ mod tests {
         let Mode::Clip(cfg) = mode else {
             unreachable!("the mode was just built as Clip")
         };
-        clip_mode(cfg, producer)?;
+        clip_mode(cfg, producer, clip::ChannelSelection::default())?;
 
         let clip_path = out_dir.join("3000_brake.mcap");
         assert_eq!(
@@ -1624,6 +1918,7 @@ mod tests {
                 program: PROGRAM,
                 mode: "clip",
             },
+            clip::ChannelSelection::default(),
         )?;
         let elapsed = began.elapsed();
 
@@ -1667,6 +1962,7 @@ mod tests {
                 program: PROGRAM,
                 mode: "clip",
             },
+            clip::ChannelSelection::default(),
         )
         .unwrap_err();
         assert!(
@@ -2085,5 +2381,535 @@ mod tests {
             "path traversal is rejected"
         );
         assert!(with_name("a..b").is_err(), "an embedded '..' is rejected");
+    }
+
+    // ---- the layered configuration file -------------------------------------
+
+    /// Parse an argv through the whole four-layer path `load_cli` drives, minus
+    /// the exit-on-failure.
+    fn loaded_from(argv: &[&str]) -> Result<Loaded, StartupError> {
+        parse_cli(
+            &argv
+                .iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// The `(value, origin)` a report line carries for `key`.
+    fn reported(report: &str, key: &str) -> (String, String) {
+        let line = report
+            .lines()
+            .find(|line| line.trim_start().starts_with(&format!("{key} ")))
+            .unwrap_or_else(|| panic!("the report has a line for {key}:\n{report}"));
+        let (name, rest) = line.split_once(" = ").expect("a report line has a value");
+        assert_eq!(name.trim(), key);
+        let (value, origin) = rest
+            .split_once(" <- ")
+            .expect("a report line has an origin");
+        (value.trim().to_string(), origin.trim().to_string())
+    }
+
+    /// A `MOMENTEDGE_*` variable set for one test and removed again.
+    ///
+    /// The environment is process-wide, so the variable is chosen to be one no
+    /// other test in this binary can read: every test that parses a `clipper
+    /// clip` command line passes `--trigger-description` explicitly, and a flag
+    /// outranks the environment.
+    struct EnvVar(&'static str);
+
+    impl EnvVar {
+        fn set(name: &'static str, value: &str) -> Self {
+            // SAFETY: see the type's note — no other test reads this variable,
+            // and it is removed again when the guard drops.
+            unsafe { std::env::set_var(name, value) };
+            EnvVar(name)
+        }
+    }
+
+    impl Drop for EnvVar {
+        fn drop(&mut self) {
+            // SAFETY: as above.
+            unsafe { std::env::remove_var(self.0) };
+        }
+    }
+
+    /// A `clipper clip` system file answering every required argument, so a test
+    /// argv can be about the one key it is testing.
+    fn write_clip_system_file(
+        dir: &std::path::Path,
+        name: &str,
+        description: Option<&str>,
+    ) -> anyhow::Result<PathBuf> {
+        let path = dir.join(name);
+        let mut text = String::from(
+            "[settings]\n\
+             recording = \"/tmp/rec.mcap\"\n\
+             out_dir = \"/tmp/out\"\n\
+             trigger_time = 1\n\
+             preroll = 2\n\
+             postroll = 3\n",
+        );
+        if let Some(description) = description {
+            text.push_str(&format!("trigger_description = {description:?}\n"));
+        }
+        std::fs::write(&path, text)?;
+        Ok(path)
+    }
+
+    /// A setting present in all four layers resolves to the flag, and removing
+    /// layers walks it back in the documented order — environment, per-run file,
+    /// system file, built-in default.
+    #[test]
+    fn a_setting_in_all_four_layers_resolves_to_the_flag_and_walks_back() -> anyhow::Result<()> {
+        let dir = clip::testing::test_dir("cli-four-layers")?;
+        let system = write_clip_system_file(&dir, "system.toml", Some("from the system file"))?;
+        let run = dir.join("run.toml");
+        std::fs::write(
+            &run,
+            "[settings]\ntrigger_description = \"from the per-run file\"\n",
+        )?;
+        // The same required arguments, with nothing to say about the key under
+        // test: dropping the description's system layer must not drop the
+        // arguments that make the command line parse at all.
+        let bare = write_clip_system_file(&dir, "bare.toml", None)?;
+        let (system, run, bare) = (
+            system.display().to_string(),
+            run.display().to_string(),
+            bare.display().to_string(),
+        );
+
+        let described = |argv: &[&str]| -> anyhow::Result<(String, String, String)> {
+            let loaded = loaded_from(argv).map_err(|e| match e {
+                StartupError::Cli(e) => anyhow::anyhow!("{e}"),
+                StartupError::Config(e) => e,
+            })?;
+            let Mode::Clip(cfg) = loaded.cli.mode else {
+                unreachable!("this argv names the clip mode")
+            };
+            let (value, origin) = reported(&loaded.report, "trigger_description");
+            Ok((cfg.trigger_description, value, origin))
+        };
+
+        let all_four = [
+            "clipper",
+            "clip",
+            "--system-config",
+            &system,
+            "--config",
+            &run,
+            "--trigger-description",
+            "from the flag",
+        ];
+        let without_flag = &all_four[..6];
+        let without_run_file = ["clipper", "clip", "--system-config", &system];
+        let without_files = ["clipper", "clip", "--system-config", &bare];
+
+        {
+            let _env = EnvVar::set("MOMENTEDGE_TRIGGER_DESCRIPTION", "from the environment");
+            let (used, reported, origin) = described(&all_four)?;
+            assert_eq!(used, "from the flag");
+            assert_eq!(
+                (reported.as_str(), origin.as_str()),
+                ("from the flag", "flag")
+            );
+
+            let (used, reported, origin) = described(without_flag)?;
+            assert_eq!(used, "from the environment");
+            assert_eq!(
+                (reported.as_str(), origin.as_str()),
+                ("from the environment", "environment")
+            );
+        }
+
+        let (used, reported, origin) = described(without_flag)?;
+        assert_eq!(used, "from the per-run file");
+        assert_eq!(reported, "from the per-run file");
+        assert!(origin.starts_with("per-run file"), "{origin}");
+
+        let (used, reported, origin) = described(&without_run_file)?;
+        assert_eq!(used, "from the system file");
+        assert_eq!(reported, "from the system file");
+        assert!(origin.starts_with("system file"), "{origin}");
+
+        let (used, reported, origin) = described(&without_files)?;
+        assert_eq!(used, "", "the built-in default is the empty description");
+        assert_eq!(reported, "");
+        assert_eq!(origin, "built-in default");
+
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    /// A missing system file, a missing per-run file, and both missing are all
+    /// legal: the run takes the built-in defaults and starts.
+    #[test]
+    fn missing_configuration_files_are_legal() -> anyhow::Result<()> {
+        let dir = clip::testing::test_dir("cli-missing-files")?;
+        let absent = dir.join("absent.toml").display().to_string();
+        let system = dir.join("system.toml");
+        std::fs::write(&system, "[settings]\ngrace_secs = 45\n")?;
+        let system = system.display().to_string();
+
+        for argv in [
+            vec!["clipper", "tail", "--system-config", &absent],
+            vec!["clipper", "tail", "--config", &absent],
+            vec![
+                "clipper",
+                "tail",
+                "--system-config",
+                &absent,
+                "--config",
+                &absent,
+            ],
+        ] {
+            let loaded = loaded_from(&argv).unwrap_or_else(|_| panic!("{argv:?} must load"));
+            let Mode::Tail(cfg) = loaded.cli.mode else {
+                unreachable!("this argv names the tail mode")
+            };
+            assert_eq!(cfg.grace(), Duration::from_secs(30), "{argv:?}");
+        }
+
+        // …and a system file that *is* there, with the per-run one missing, is
+        // the layer below an absent one rather than a casualty of it.
+        let loaded = loaded_from(&[
+            "clipper",
+            "tail",
+            "--system-config",
+            &system,
+            "--config",
+            &absent,
+        ])
+        .map_err(|_| anyhow::anyhow!("a present system file and an absent run file must load"))?;
+        let Mode::Tail(cfg) = loaded.cli.mode else {
+            unreachable!("this argv names the tail mode")
+        };
+        assert_eq!(cfg.grace(), Duration::from_secs(45));
+
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    /// A per-run file setting a key reserved to the system file is reported by
+    /// name, and the system value stands.
+    #[test]
+    fn a_per_run_file_overriding_a_system_key_is_reported_and_ignored() -> anyhow::Result<()> {
+        let dir = clip::testing::test_dir("cli-refusal")?;
+        let system = dir.join("system.toml");
+        std::fs::write(
+            &system,
+            "[settings]\nrecord_dir = \"/data/record\"\ngrace_secs = 45\n",
+        )?;
+        let run = dir.join("run.toml");
+        std::fs::write(
+            &run,
+            "[settings]\nrecord_dir = \"/tmp/mine\"\ngrace_secs = 20\n",
+        )?;
+        let (system, run) = (system.display().to_string(), run.display().to_string());
+
+        let loaded = loaded_from(&[
+            "clipper",
+            "tail",
+            "--system-config",
+            &system,
+            "--config",
+            &run,
+        ])
+        .map_err(|_| anyhow::anyhow!("a refused key must not fail the run"))?;
+        let report = loaded.report.clone();
+        let Mode::Tail(cfg) = loaded.cli.mode else {
+            unreachable!("this argv names the tail mode")
+        };
+
+        assert_eq!(
+            cfg.record_dir,
+            PathBuf::from("/data/record"),
+            "the system value stands"
+        );
+        assert_eq!(
+            cfg.grace(),
+            Duration::from_secs(20),
+            "and the per-run file keeps the keys it may set"
+        );
+        assert!(
+            report.contains("record_dir") && report.contains("run.toml"),
+            "the report names the refused key and the file:\n{report}"
+        );
+        let (_, origin) = reported(&report, "record_dir");
+        assert!(origin.starts_with("system file"), "{origin}");
+
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    /// The effective configuration a report prints is the configuration the run
+    /// uses: every line is checked against the field the mode actually reads.
+    #[test]
+    fn the_effective_configuration_equals_what_the_run_uses() -> anyhow::Result<()> {
+        let dir = clip::testing::test_dir("cli-effective")?;
+        let system = dir.join("system.toml");
+        std::fs::write(
+            &system,
+            "[settings]\n\
+             record_dir = \"/data/record\"\n\
+             extract_parallelism = 3\n\
+             watch_old_files_duration = 90\n\
+             delete_old_files = true\n\
+             time_source = \"publish\"\n\
+             [topics]\n\
+             exclude_regex = \"^/diagnostics\"\n",
+        )?;
+        let run = dir.join("run.toml");
+        std::fs::write(
+            &run,
+            "[settings]\n\
+             out_dir = \"/tmp/clips\"\n\
+             clip_compression = \"lz4\"\n\
+             [topics]\n\
+             include = [\"/imu/data\"]\n",
+        )?;
+        let (system, run) = (system.display().to_string(), run.display().to_string());
+
+        let loaded = loaded_from(&[
+            "clipper",
+            "tail",
+            "--system-config",
+            &system,
+            "--config",
+            &run,
+            "--grace-secs",
+            "12",
+        ])
+        .map_err(|_| anyhow::anyhow!("this configuration must load"))?;
+        let report = loaded.report.clone();
+        let selection = loaded.selection.clone();
+        let Mode::Tail(cfg) = loaded.cli.mode else {
+            unreachable!("this argv names the tail mode")
+        };
+
+        // Every settings line against the field the run reads.
+        for (key, used, layer) in [
+            ("record_dir", cfg.record_dir.display().to_string(), "system"),
+            ("out_dir", cfg.out_dir.display().to_string(), "per-run"),
+            ("grace_secs", cfg.grace_secs.to_string(), "flag"),
+            (
+                "extract_parallelism",
+                cfg.extract_parallelism.to_string(),
+                "system",
+            ),
+            (
+                "clip_compression",
+                cfg.clip_compression.to_string(),
+                "per-run",
+            ),
+            ("time_source", cfg.time_source.to_string(), "system"),
+            (
+                "watch_old_files_duration",
+                cfg.watch_old_files_duration.to_string(),
+                "system",
+            ),
+            (
+                "delete_old_files",
+                cfg.delete_old_files.to_string(),
+                "system",
+            ),
+            ("interface", cfg.interface.to_string(), "built-in"),
+        ] {
+            let (value, origin) = reported(&report, key);
+            assert_eq!(value, used, "{key}: the report is the value in use");
+            assert!(origin.starts_with(layer), "{key}: {origin}");
+        }
+
+        // …and the topics section against the selection the clips are cut with.
+        assert_eq!(reported(&report, "include").0, "[\"/imu/data\"]");
+        assert_eq!(reported(&report, "exclude_regex").0, "^/diagnostics");
+        assert_eq!(reported(&report, "all").0, "false");
+        assert!(selection.selects("/imu/data"));
+        assert!(!selection.selects("/camera/image_raw"));
+        assert!(!selection.selects("/diagnostics"));
+
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    /// A file that exists and cannot be used ends the run rather than being
+    /// quietly ignored, and says which file and which key.
+    #[test]
+    fn an_unusable_configuration_file_fails_the_run() -> anyhow::Result<()> {
+        let dir = clip::testing::test_dir("cli-bad-file")?;
+        let bad = dir.join("bad.toml");
+        std::fs::write(&bad, "[settings]\ngrace_secondz = 3\n")?;
+        let bad = bad.display().to_string();
+
+        match loaded_from(&["clipper", "tail", "--system-config", &bad]) {
+            Err(StartupError::Config(err)) => {
+                let rendered = format!("{err:#}");
+                assert!(rendered.contains("grace_secondz"), "{rendered}");
+                assert!(rendered.contains("bad.toml"), "{rendered}");
+            }
+            Err(StartupError::Cli(err)) => panic!("a file fault is not a parse fault: {err}"),
+            Ok(_) => panic!("an unknown key must not be ignored"),
+        }
+
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    /// Every argument of every mode is a `[settings]` key, and every key is some
+    /// mode's argument.
+    ///
+    /// The scope table lives in the library and the arguments live here, so
+    /// nothing but this test stops the two drifting: a flag added to a mode
+    /// would otherwise be unsettable from a file, and a key removed from a mode
+    /// would name nothing. The three configuration flags are excluded by name —
+    /// they are about the configuration rather than in it.
+    #[test]
+    fn every_mode_argument_is_a_settings_key_and_back() {
+        let cmd = with_config_args(Cli::command());
+        let mut named = std::collections::BTreeSet::new();
+        for mode in ["tail", "clip"] {
+            let sub = cmd
+                .find_subcommand(mode)
+                .unwrap_or_else(|| panic!("{mode} is a subcommand of clipper"));
+            for arg in sub.get_arguments() {
+                let id = arg.get_id().as_str();
+                if matches!(
+                    id,
+                    "help" | "version" | CONFIG_ARG | SYSTEM_CONFIG_ARG | PRINT_CONFIG_ARG
+                ) {
+                    assert_eq!(
+                        clip::config::scope_of(id),
+                        None,
+                        "{id} must not be a settings key"
+                    );
+                    continue;
+                }
+                assert!(
+                    clip::config::scope_of(id).is_some(),
+                    "{mode}: {id} is a flag with no `[settings]` key"
+                );
+                named.insert(id.to_string());
+            }
+        }
+        for key in clip::config::setting_keys() {
+            assert!(
+                named.contains(key),
+                "the `{key}` settings key names no mode's argument"
+            );
+        }
+    }
+
+    /// The three configuration flags reach every mode, and carry the same
+    /// `MOMENTEDGE_*` fallback every other argument does.
+    #[test]
+    fn the_configuration_flags_reach_every_mode_with_their_env_names() {
+        let cmd = with_env_prefix(with_config_args(Cli::command()));
+        for mode in ["tail", "clip"] {
+            let sub = cmd
+                .find_subcommand(mode)
+                .unwrap_or_else(|| panic!("{mode} is a subcommand of clipper"));
+            for (id, env) in [
+                (CONFIG_ARG, "MOMENTEDGE_CONFIG"),
+                (SYSTEM_CONFIG_ARG, "MOMENTEDGE_SYSTEM_CONFIG"),
+                (PRINT_CONFIG_ARG, "MOMENTEDGE_PRINT_CONFIG"),
+            ] {
+                let arg = sub
+                    .get_arguments()
+                    .find(|arg| arg.get_id().as_str() == id)
+                    .unwrap_or_else(|| panic!("{mode} carries --{id}"));
+                assert_eq!(
+                    arg.get_env().map(|e| e.to_string_lossy().into_owned()),
+                    Some(env.to_string()),
+                    "{mode}: {id}"
+                );
+            }
+        }
+    }
+
+    /// `--print-config` is what a caller asks the report for; every mode takes
+    /// it and nothing else is run.
+    #[test]
+    fn print_config_is_requested_per_mode() -> anyhow::Result<()> {
+        for mode in ["tail", "clip"] {
+            let dir = clip::testing::test_dir(&format!("cli-print-{mode}"))?;
+            let system = write_clip_system_file(&dir, "system.toml", None)?
+                .display()
+                .to_string();
+            let loaded = loaded_from(&[
+                "clipper",
+                mode,
+                "--system-config",
+                &system,
+                "--print-config",
+            ])
+            .map_err(|_| anyhow::anyhow!("{mode} --print-config must parse"))?;
+            assert!(loaded.print_config, "{mode}");
+            assert!(
+                loaded.report.starts_with(&format!("clipper {mode} ")),
+                "{mode}"
+            );
+
+            let quiet = loaded_from(&["clipper", mode, "--system-config", &system])
+                .map_err(|_| anyhow::anyhow!("{mode} must parse without --print-config"))?;
+            assert!(!quiet.print_config, "{mode}");
+            std::fs::remove_dir_all(dir)?;
+        }
+        Ok(())
+    }
+
+    /// The one-shot cutter cuts the topics the configuration selects, so the
+    /// mode that runs off a finished recording filters exactly as the recorder
+    /// does.
+    #[test]
+    fn clip_mode_cuts_only_the_selected_topics() -> anyhow::Result<()> {
+        let root = clip::testing::test_dir("clip-mode-topics")?;
+        let rec = root.join("rec.mcap");
+        clip::testing::write_recording(
+            &rec,
+            true,
+            &[("/imu/data", 1_000), ("/camera/image_raw", 1_100)],
+        )?;
+        let out_dir = root.join("clipped");
+        let selection = clip::ChannelSelection::try_from(clip::select::Spec {
+            include: vec!["/imu/data".to_string()],
+            ..clip::select::Spec::default()
+        })?;
+
+        clip_mode(
+            ClipConfig {
+                recording: rec,
+                out_dir: out_dir.clone(),
+                trigger_time: 1_000,
+                preroll: 0,
+                postroll: 1_000,
+                trigger_name: "sel".to_string(),
+                trigger_description: String::new(),
+            },
+            Producer {
+                program: PROGRAM,
+                mode: "clip",
+            },
+            selection,
+        )?;
+
+        let clip_path = out_dir.join("1000_sel.mcap");
+        assert_eq!(
+            clip::testing::read_clip(&clip_path)?,
+            vec![("/imu/data".to_string(), 1_000)],
+            "only the selected topic is cut"
+        );
+        let manifest =
+            clip::manifest::read_manifest(&clip_path)?.expect("every clip carries a manifest");
+        assert_eq!(
+            manifest
+                .keys()
+                .filter(|k| k.starts_with("channel."))
+                .count(),
+            3,
+            "the excluded topic has no per-channel manifest keys: {manifest:?}"
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
     }
 }
