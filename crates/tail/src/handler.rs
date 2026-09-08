@@ -198,6 +198,7 @@ fn record_clip(
 
 #[cfg(test)]
 mod tests {
+    use clip::ChannelSelection;
     use clip::index::op;
     use clip::manifest::read_manifest;
     use clip::testing::{
@@ -223,7 +224,8 @@ mod tests {
     fn record_clip_grace_timeout_cuts_what_is_on_disk() -> anyhow::Result<()> {
         let root = test_dir("grace")?;
         let (tailer, coverage) = Tailer::new();
-        let extract_tx = segment::spawn_stage_workers(1, TEST_COMPRESSION);
+        let extract_tx =
+            segment::spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
 
         // The window end is far in the past on the wall clock (no postroll
         // sleep), but coverage never reaches it — no recording was ever
@@ -264,7 +266,8 @@ mod tests {
             scan_to_end(&scanner, &file, 8).unwrap();
         });
 
-        let extract_tx = segment::spawn_stage_workers(1, TEST_COMPRESSION);
+        let extract_tx =
+            segment::spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
         let stats = record_clip(
             &tailer,
             &window((100, 1_000), TimeSource::Log),
@@ -299,7 +302,8 @@ mod tests {
         tailer.attach(file.clone());
         scan_to_end(&tailer, &file, 8)?;
 
-        let extract_tx = segment::spawn_stage_workers(1, TEST_COMPRESSION);
+        let extract_tx =
+            segment::spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
         let end_ns = now + 150_000_000; // 150 ms past the trigger stamp
         let started = std::time::Instant::now();
         let stats = record_clip(
@@ -337,7 +341,8 @@ mod tests {
         tailer.attach(file.clone());
         scan_to_end(&tailer, &file, 8)?;
 
-        let extract_tx = segment::spawn_stage_workers(1, TEST_COMPRESSION);
+        let extract_tx =
+            segment::spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
         let grace = Duration::from_millis(200);
         let started = std::time::Instant::now();
         let stats = record_clip(
@@ -379,7 +384,8 @@ mod tests {
         scan_to_end(&tailer, &file, 8)?;
         assert_eq!(coverage.get().high_water_ns, 1_000);
 
-        let extract_tx = segment::spawn_stage_workers(1, TEST_COMPRESSION);
+        let extract_tx =
+            segment::spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
         let started = std::time::Instant::now();
         let stats = record_clip(
             &tailer,
@@ -432,7 +438,8 @@ mod tests {
         let file = Arc::new(std::fs::File::open(&rec)?);
         tailer.attach(file.clone());
         scan_to_end(&tailer, &file, 8)?;
-        let extract_tx = segment::spawn_stage_workers(1, TEST_COMPRESSION);
+        let extract_tx =
+            segment::spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
 
         let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
         let announcer = CapturingAnnouncer(captured.clone());
@@ -506,7 +513,8 @@ mod tests {
         tailer.index_recording(&split1);
         drain(&tailer)?;
 
-        let extract_tx = segment::spawn_stage_workers(1, TEST_COMPRESSION);
+        let extract_tx =
+            segment::spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
         let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
         let announcer = CapturingAnnouncer(captured.clone());
 
@@ -587,7 +595,8 @@ mod tests {
         assert_eq!(coverage.get().high_water_ns, 200);
         assert_eq!(coverage.get().publish_high_water_ns, 2_000);
 
-        let extract_tx = segment::spawn_stage_workers(1, TEST_COMPRESSION);
+        let extract_tx =
+            segment::spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
         // Window [900, 1_500] on `publish`: the publish high-water (2_000)
         // satisfies the coverage wait, and only the message published at 1_000
         // (log_time 100) falls inside — the log high-water (200) is nowhere near
@@ -630,7 +639,8 @@ mod tests {
         let file = Arc::new(std::fs::File::open(&rec)?);
         tailer.attach(file.clone());
         scan_to_end(&tailer, &file, 8)?;
-        let extract_tx = segment::spawn_stage_workers(1, TEST_COMPRESSION);
+        let extract_tx =
+            segment::spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
         let short_key = |stats: &clip::cut::ClipStats| -> anyhow::Result<String> {
             Ok(read_manifest(&stats.out_path)?.expect("every clip carries a manifest")["clip.short"]
                 .clone())
@@ -685,7 +695,8 @@ mod tests {
         let file = Arc::new(std::fs::File::open(&rec)?);
         tailer.attach(file.clone());
         scan_to_end(&tailer, &file, 8)?;
-        let extract_tx = segment::spawn_stage_workers(1, TEST_COMPRESSION);
+        let extract_tx =
+            segment::spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
 
         let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
         let trig = Trigger {

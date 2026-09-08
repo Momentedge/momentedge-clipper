@@ -293,6 +293,7 @@ mod tests {
     use crate::index::MAGIC;
     use crate::manifest::WindowCoverage;
     use crate::segment::{cut_window, spawn_stage_workers};
+    use crate::select::{ChannelSelection, Spec};
     use crate::testing::{index_file, scan_to_end, test_dir, window_request};
     use crate::trigger::now_ns;
 
@@ -364,6 +365,18 @@ mod tests {
                 ))
             })
             .collect()
+    }
+
+    /// The topics a finished clip declares, sorted — what the topic selection
+    /// decided, read back off the clip rather than off the messages, so a clip
+    /// that declared a channel it never wrote is not mistaken for one that
+    /// excluded it.
+    fn channels(path: &Path) -> Result<Vec<String>> {
+        let buf = std::fs::read(path)?;
+        let summary = mcap::Summary::read(&buf)?.expect("a finished clip has a summary");
+        let mut topics: Vec<String> = summary.channels.values().map(|c| c.topic.clone()).collect();
+        topics.sort();
+        Ok(topics)
     }
 
     /// The device's planner over the same recording: the index a full
@@ -451,7 +464,7 @@ mod tests {
             ],
         )?;
 
-        let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION);
+        let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
         let request = Arc::new(window_request(150, 450, TimeSource::Log));
 
         let from_summary = cut_window(
@@ -483,6 +496,95 @@ mod tests {
             summary_msgs,
             read_messages(&from_scan[0].out_path)?,
             "a summary-built cut and a scanned one are the same clip"
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// One configuration cuts one channel set out of one recording, whichever
+    /// index found the window.
+    ///
+    /// `clipper clip` plans over the summary-built index and `clipper tail` over
+    /// a scanned one, but the selection rides in the staging pool both drive, so
+    /// the clip a device cuts and the clip cut from the same recording
+    /// afterwards declare the same channels — the property that lets a cloud cut
+    /// stand in for a device one.
+    #[test]
+    fn one_selection_cuts_one_channel_set_from_either_index() -> Result<()> {
+        let root = test_dir("whole-select")?;
+        let rec = root.join("rec.mcap");
+        write_chunked(
+            &rec,
+            &[
+                Msg {
+                    topic: "/camera/image_raw",
+                    log_time: 100,
+                    publish_time: 100,
+                    sequence: 1,
+                    payload_len: 40,
+                },
+                Msg {
+                    topic: "/imu/data",
+                    log_time: 200,
+                    publish_time: 200,
+                    sequence: 2,
+                    payload_len: 50,
+                },
+                Msg {
+                    topic: "/diagnostics",
+                    log_time: 300,
+                    publish_time: 300,
+                    sequence: 3,
+                    payload_len: 60,
+                },
+                Msg {
+                    topic: "/camera/depth",
+                    log_time: 400,
+                    publish_time: 400,
+                    sequence: 4,
+                    payload_len: 70,
+                },
+            ],
+        )?;
+
+        let selection = ChannelSelection::try_from(Spec {
+            include_regex: Some("^/camera/".to_string()),
+            exclude: vec!["/camera/depth".to_string()],
+            ..Spec::default()
+        })?;
+        let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION, selection);
+        let request = Arc::new(window_request(0, 1000, TimeSource::Log));
+
+        let from_summary = cut_window(
+            &WholeFileIndex::open(&rec)?,
+            &request,
+            WindowCoverage::Covered,
+            &root.join("summary.mcap"),
+            &stage_tx,
+        )?;
+        let from_scan = cut_window(
+            &scanned(&rec)?,
+            &request,
+            WindowCoverage::Covered,
+            &root.join("scan.mcap"),
+            &stage_tx,
+        )?;
+
+        assert_eq!(
+            channels(&from_summary[0].out_path)?,
+            vec!["/camera/image_raw"],
+            "the configuration's channel set, and only it"
+        );
+        assert_eq!(
+            channels(&from_summary[0].out_path)?,
+            channels(&from_scan[0].out_path)?,
+            "a cloud cut and a device cut declare the same channels"
+        );
+        assert_eq!(
+            read_messages(&from_summary[0].out_path)?,
+            read_messages(&from_scan[0].out_path)?,
+            "and hold the same messages"
         );
 
         std::fs::remove_dir_all(root)?;
@@ -609,7 +711,7 @@ mod tests {
 
         let out_dir = root.join("clipped");
         crate::cut::reset_capturing_dir(&out_dir)?;
-        let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION);
+        let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
         let err = cut_window(
             &WholeFileIndex::open(&gutted)?,
             &Arc::new(window_request(0, 1_000, TimeSource::Log)),
@@ -683,7 +785,7 @@ mod tests {
             "the recording stops well inside the window"
         );
 
-        let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION);
+        let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
         let began = Instant::now();
         let stats = cut_window(
             &index,
@@ -763,7 +865,7 @@ mod tests {
             "every chunk is planned on a clock the summary does not bound"
         );
 
-        let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION);
+        let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
         let stats = cut_window(
             &index,
             &Arc::new(window_request(4_500, 5_500, TimeSource::Publish)),
