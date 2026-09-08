@@ -43,11 +43,12 @@ triggers back out of it.
 ## Three crates, two lines
 
 **What every consumer of a recording shares** is [`clip`](../clip): the MCAP
-format layer and its recording index (`clip::index`), the copy that cuts a
-window out of one (`clip::cut`), the neutral trigger and completion contract
-(`clip::trigger`, `clip::decode`), the segment assembly that turns one window
-into published clips (`clip::segment`), and the record each of those clips
-carries saying what it is (`clip::manifest`).
+format layer and its recording index (`clip::index`, and `clip::whole` for a
+recording that is already finished), the copy that cuts a window out of one
+(`clip::cut`), the neutral trigger and completion contract (`clip::trigger`,
+`clip::decode`), the segment assembly that turns one window into published clips
+(`clip::segment`), and the record each of those clips carries saying what it is
+(`clip::manifest`).
 
 **What following a recording still being written adds** is [`tail`](../tail):
 discovery, the recording collection and its lifecycle, coverage, retention, the
@@ -58,11 +59,20 @@ lifecycle to run, nothing to wait for.
 
 **What is left is the binary**, four files in this crate: the interface seam and
 its MCAP implementation (`src/interface.rs`), the ROS implementation behind the
-`ros` feature (`src/interface/ros.rs`), and the clap `Config`, the admission gate
-and the thread supervision (`src/main.rs`, `src/supervision.rs`). Telling ROS
-from MCAP, taking configuration, and deciding what to do when a thread dies is
-the whole of what a device recorder adds over the two libraries. The per-module
-table is in [ARCHITECTURE.md](../../ARCHITECTURE.md#module-map).
+`ros` feature (`src/interface/ros.rs`), and the clap configuration of each mode,
+the admission gate and the thread supervision (`src/main.rs`,
+`src/supervision.rs`). Telling ROS from MCAP, taking configuration, and deciding
+what to do when a thread dies is the whole of what a device recorder adds over
+the two libraries. The per-module table is in
+[ARCHITECTURE.md](../../ARCHITECTURE.md#module-map).
+
+**The binary has two modes** (`Mode`, `src/main.rs`), and both flow through the
+same libraries. `clipper tail` is the device recorder everything below
+describes; `clipper clip` cuts one window out of one finished recording and exits
+— see [`clipper clip`](#clipper-clip-one-window-one-finished-recording). Adding a
+mode to the enum is a compile error until it has a body to run *and* says what
+its clips are stamped with (`Mode::producer`), so a clip names the subcommand
+that cut it without the cut path learning anything about modes.
 
 ### Two builds
 
@@ -411,6 +421,60 @@ ignored: no handler runs, no clip is extracted, and no completion is announced.
    published on `/events/momentedge/recorded`; the `mcap` interface's announcer
    is a no-op — the segments' atomic move into `out_dir` (step 5) is the only
    completion signal, with the per-clip `info!` lines as the log.
+
+## `clipper clip`: one window, one finished recording
+
+`clipper clip <recording.mcap> --out-dir <dir> --trigger-time <ns> --preroll
+<ns> --postroll <ns>` (plus optional `--trigger-name`/`--trigger-description`)
+is `clip_mode` in `src/main.rs`. It builds the same `CutRequest` the handler
+builds — the trigger's five values are spelled as flags, and `--trigger-time` is
+both the `Stamp` the trigger carries (`Stamp::from_ns`) and the anchor the window
+centres on — and hands it to the same `clip::segment::cut_window`. Steps 3–5
+above are therefore unchanged, and so are the manifest, the
+`<anchor_ns>_<name>.mcap` name and the atomic publication. `--trigger-name`
+passes the same `validate_name` gate a name arriving on a topic does, so a name
+accepted by one mode is accepted by the other.
+
+**The waits are what is absent, and that is the whole difference.** Steps 1 and 2
+exist because a window may reach past the last byte on disk. This input has an
+end: nothing sleeps out the postroll, nothing blocks on coverage, and a window
+reaching past the recording's end is simply short. The coverage verdict is still
+a real decision rather than an assumption — `WholeFileIndex::log_end_ns()`
+against `request.end_ns()` — and it travels into the cut as the same
+`WindowCoverage`, so `clip.short` means what it means everywhere else.
+
+**The index is the summary** (`clip::whole::WholeFileIndex`). A finalised MCAP
+already carries a chunk index per chunk (byte range plus the `log_time` span
+inside it), the resolved schema/channel registry, and the file's statistics —
+everything the incremental scan rebuilds by walking the data section. `open`
+drives the mcap crate's sans-io `SummaryReader`, which seeks to the footer and
+reads the summary back, and nothing else: accepting a recording costs a seek and
+one read whatever the file's size, and no chunk is decompressed until the copy
+asks for one. Each chunk index becomes one `Extent` — `chunk_start_offset` is the
+opcode and `chunk_length` counts the 9-byte record header in, which is exactly
+the framed `Chunk` record `clip::cut` walks — and the filled `RecordingIndex` is
+served through the same `WindowPlanner` the tailer implements, so the cut path
+cannot tell the two apart.
+
+Two consequences worth knowing:
+
+- **Only chunk-indexed bytes are planned.** A message a chunked recording wrote
+  outside a chunk is in no extent. `open` refuses a summary that reports messages
+  but indexes no chunk, rather than cutting a silently empty clip; the fuller
+  taxonomy of unusable inputs is not here yet.
+- **The summary bounds no publish time.** A chunk index's span and the
+  statistics' bounds are both `log_time`, so an extent built here carries the
+  unbounded publish span: a `publish` window selects every chunk rather than
+  dropping one the summary cannot vouch for, and the copy's per-message test
+  decides membership. `clipper clip` itself never asks — it has no clock-domain
+  flag and cuts on `log` (`CLIP_TIME_SOURCE`), because that is the clock a
+  summary states and the only one a completeness claim over a finished recording
+  can be made on. Passing `--time-source` is a parse error.
+
+Nothing machine-readable is printed: the run's result is `out_dir`'s contents
+when the process exits, each clip carrying its own manifest, and the exit status
+is the verdict. No ROS is involved anywhere on this path, so a default (ROS-free)
+`cargo build -p clipper` cuts these clips.
 
 ## The copy is direct (`clip::cut`)
 
@@ -971,15 +1035,24 @@ trigger publisher (`trigger-pub`). Logs go to stdout (`main` says why);
 `RUST_LOG=debug` raises verbosity. Where the ROS layer's own diagnostics land
 is in the [README](../../README.md#operational-notes).
 
+The other mode needs neither, and no ROS toolchain either — it takes a finished
+recording and exits:
+
+```bash
+cargo run -p clipper -- clip ./record/rosbag2_0.mcap \
+  --out-dir ./clipped --trigger-time 1738000000000000000 \
+  --preroll 5000000000 --postroll 5000000000
+```
+
 ## Configuration
 
 **One binary, and the mode is a subcommand.** `Cli` is the clap
-`derive(Parser)` and carries a single field, the `Mode` enum whose one variant
-is `Tail(Config)`; `main`'s `match` over that enum is the dispatch table, so a
-mode added to the enum is a compile error until it has a body to run. Every flag
-belongs to a mode rather than to `clipper` itself: `clipper --help` lists the
-modes, `clipper tail --help` lists the recorder's flags, and a bare
-`clipper --record-dir …` is a parse error. What makes naming no mode an error
+`derive(Parser)` and carries a single field, the `Mode` enum — `Tail(Config)`
+for the recorder, `Clip(ClipConfig)` for the one-shot cutter; `main`'s `match`
+over that enum is the dispatch table, so a mode added to the enum is a compile
+error until it has a body to run. Every flag belongs to a mode rather than to
+`clipper` itself: `clipper --help` lists the modes, `clipper tail --help` lists
+the recorder's flags, and a bare `clipper --record-dir …` is a parse error. What makes naming no mode an error
 rather than a run with defaults is `Cli`'s `mode` field being a plain `Mode`
 and not an `Option`: clap's derive requires the subcommand and answers a bare
 `clipper` with the mode listing and a non-zero exit, so
@@ -992,9 +1065,14 @@ hint, because the caller already said which mode they wanted. `main.rs`'s
 `a_bare_recorder_flag_is_rejected_and_points_at_the_tail_mode` and
 `tail_help_lists_the_recorder_flags_and_no_modes` hold that shape down.
 
-`Config` is the recorder mode's `derive(Args)`: every field is a CLI flag with a
-`MOMENTEDGE_*` environment fallback and a per-field default, so precedence is
-CLI flag > env var > default. `load_cli` in `main.rs` parses it — clap prints
+`Config` is the recorder mode's `derive(Args)` and `ClipConfig` the cutter's:
+every field is a CLI flag (or, for the cutter's recording, the positional) with a
+`MOMENTEDGE_*` environment fallback, so precedence is CLI flag > env var >
+default where there is one. `Config`'s fields all have defaults, so
+`clipper tail` runs bare; `ClipConfig`'s window arguments deliberately do not —
+which moment a clip is about is the one thing only the caller knows, so omitting
+`--trigger-time` is a parse error naming the flag rather than a clip about some
+arbitrary instant. `load_cli` in `main.rs` parses it — clap prints
 `--help`/`--version` and any parse error and the process exits before it
 returns, so `clipper tail` still runs with no further setup. The `MOMENTEDGE_*`
 env names are not wired per field: `with_env_prefix` walks every subcommand with

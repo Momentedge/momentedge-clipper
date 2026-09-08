@@ -48,10 +48,12 @@ nix develop --command \
   cargo build -p clipper --features ros       # the device build
 ```
 
-Both produce the same one binary with the same subcommand (`clipper tail`) and
-the same flags. The feature buys exactly one thing: the `ros` interface — a live
-`momentedge_msgs/Trigger` subscription on a node, the `Recorded` publish that
-answers it, and `clip`'s CDR trigger decoder underneath. So:
+Both produce the same one binary with the same subcommands (`clipper tail`,
+`clipper clip`) and the same flags. The feature buys exactly one thing: the `ros`
+interface — a live `momentedge_msgs/Trigger` subscription on a node, the
+`Recorded` publish that answers it, and `clip`'s CDR trigger decoder underneath.
+`clipper clip`, which cuts one window out of one finished recording, touches none
+of that and runs identically in either build. So:
 
 |  | default build | `--features ros` |
 |---|---|---|
