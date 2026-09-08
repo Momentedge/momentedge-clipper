@@ -2266,6 +2266,37 @@ mod tests {
         );
     }
 
+    /// A refused trigger command line writes nothing at all: both faults are
+    /// raised while the arguments are being read, so `clip_mode` never runs and
+    /// the output directory it named is never created.
+    #[test]
+    fn a_refused_trigger_command_line_writes_nothing() -> anyhow::Result<()> {
+        let root = clip::testing::test_dir("clip-refused")?;
+        let out_dir = root.join("clipped");
+        let out = out_dir.to_string_lossy().into_owned();
+        for extra in [
+            // `param` (by default) without the instant it needs.
+            vec!["--preroll", "10", "--postroll", "20"],
+            // `mcap` alongside a flag it has no use for.
+            vec!["--trigger-source", "mcap", "--trigger-time", "1000"],
+        ] {
+            let argv: Vec<String> = ["clipper", "clip", "rec.mcap", "--out-dir", out.as_str()]
+                .into_iter()
+                .chain(extra)
+                .map(str::to_string)
+                .collect();
+            let err = cli_from(argv).expect_err("these trigger arguments are wrong");
+            assert_ne!(err.exit_code(), 0, "a rejected command line exits non-zero");
+            assert!(
+                !out_dir.exists(),
+                "a refused command line writes nothing, not even an output directory"
+            );
+        }
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
     /// A recording carrying N triggers produces N clips, each anchored on its
     /// own trigger and holding the window that trigger asked for.
     #[test]
