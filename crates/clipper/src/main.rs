@@ -233,6 +233,122 @@ impl std::fmt::Display for InterfaceKind {
     }
 }
 
+/// Where `clipper clip` takes the triggers it cuts from — one source per run,
+/// chosen by `--trigger-source`.
+///
+/// The variants are mutually exclusive, and which one is active is what the
+/// `--trigger-*` flags mean: under [`Param`](TriggerSource::Param) they *are*
+/// the trigger, and under [`Mcap`](TriggerSource::Mcap) the recording states
+/// every trigger and they have nothing left to say — so a command line naming
+/// both is refused rather than silently preferring one
+/// ([`ClipConfig::trigger_argument_fault`]). [`DEFAULT_TRIGGER_SOURCE`] is the
+/// one a run takes when the flag is absent.
+///
+/// Unlike [`InterfaceKind`] the variant set is not the build's: both sources
+/// exist in every build. The `ros` feature is visible here only in what a
+/// recorded trigger may be encoded as — `json` decodes anywhere, `cdr` needs the
+/// typesupport that feature links ([`clip::decode`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum TriggerSource {
+    /// Cut the one trigger the `--trigger-*` flags name. One run, one clip.
+    Param,
+    /// Cut every trigger the recording itself carries on the trigger topic, each
+    /// clip anchored on its own trigger. One run, one clip per trigger.
+    Mcap,
+}
+
+/// The trigger source `clipper clip` takes when `--trigger-source` is absent:
+/// the command line, the source that needs nothing of the recording but its
+/// messages.
+const DEFAULT_TRIGGER_SOURCE: TriggerSource = TriggerSource::Param;
+
+/// The trigger name a `param` run takes when `--trigger-name` is absent. A name
+/// is not optional — it goes in the clip's filename and its manifest — so the
+/// one flag a caller may leave out has a value spelled here rather than at the
+/// argument, which carries no clap default (a default would be
+/// indistinguishable from a name the caller typed, and `mcap` refuses the flag
+/// on exactly that distinction).
+const DEFAULT_TRIGGER_NAME: &str = "clip";
+
+/// The `--trigger-source` short help.
+const TRIGGER_SOURCE_HELP: &str = "Where this run's triggers come from: `param` or `mcap`";
+
+/// The `--trigger-source` long help (`--help`, not `-h`): what each source cuts,
+/// which flags it takes, and the one thing an operator has to get right about a
+/// recorded trigger's encoding.
+const TRIGGER_SOURCE_LONG_HELP: &str = "\
+Where this run's triggers come from: `param` or `mcap`.
+
+`param` (the default) cuts the single trigger the `--trigger-*` flags name, and \
+needs `--trigger-time`, `--preroll` and `--postroll`. `mcap` cuts every trigger \
+the recording itself carries on /events/momentedge/trigger — one clip each, \
+anchored on the log time the recording stamped that trigger message with — and \
+takes no `--trigger-*` flag at all, since the recorded trigger states its own \
+name, description, preroll and postroll. A recording holding no trigger cuts \
+nothing and says so. A recorded trigger encoded as `json` is decoded by every \
+build; `cdr` needs the rmw typesupport the `ros` cargo feature links, and a \
+build without it skips such a trigger with an error naming the feature. Exactly \
+one source is active per run.";
+
+impl std::fmt::Display for TriggerSource {
+    /// Render as the clap value name (`param`/`mcap`) so the `--help` default
+    /// and the accepted flag values share the `ValueEnum` possible-value names.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.to_possible_value()
+            .expect("no TriggerSource variant is skipped")
+            .get_name()
+            .fmt(f)
+    }
+}
+
+/// The one way a `clipper clip` command line can state its trigger wrongly:
+/// choosing the source that reads the `--trigger-*` flags and then not giving
+/// one they need, or choosing the source that reads the recording and giving one
+/// anyway.
+///
+/// Both are argument faults, not run faults: [`parse_cli`] turns either into the
+/// clap error that ends the process, so the flag at fault is named while the
+/// command line is being read and nothing is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TriggerArgFault {
+    /// `--trigger-source param` cuts the trigger the flags name, and this flag
+    /// is not there.
+    Missing(&'static str),
+    /// `--trigger-source mcap` takes every trigger from the recording, so this
+    /// flag has nothing to say.
+    Conflicting(&'static str),
+}
+
+impl TriggerArgFault {
+    /// The clap error kind this reports as, so a trigger fault exits the way
+    /// every other bad command line does.
+    fn kind(self) -> clap::error::ErrorKind {
+        match self {
+            TriggerArgFault::Missing(_) => clap::error::ErrorKind::MissingRequiredArgument,
+            TriggerArgFault::Conflicting(_) => clap::error::ErrorKind::ArgumentConflict,
+        }
+    }
+
+    /// The message clap prints above its usage line: the flag at fault, then
+    /// which source reads which flags, since the fault is always about that.
+    fn message(self) -> String {
+        match self {
+            TriggerArgFault::Missing(flag) => format!(
+                "the following required argument was not provided: {flag}\n\n\
+                 `--trigger-source param` cuts the trigger the `--trigger-*` flags name, so it \
+                 needs `--trigger-time`, `--preroll` and `--postroll`; `--trigger-source mcap` \
+                 cuts the triggers the recording carries and needs none of them"
+            ),
+            TriggerArgFault::Conflicting(flag) => format!(
+                "the argument '{flag}' cannot be used with '--trigger-source mcap'\n\n\
+                 `mcap` takes every trigger from the recording itself: the name, description, \
+                 preroll, postroll and instant of each clip all come from its own recorded \
+                 trigger message"
+            ),
+        }
+    }
+}
+
 /// The command line: one binary, one mode per invocation, and the mode is a
 /// subcommand. `clipper tail` is the device recorder; every flag belongs to the
 /// mode rather than to `clipper` itself, so a bare `clipper --record-dir …` is
@@ -255,8 +371,8 @@ impl std::fmt::Display for InterfaceKind {
     long_about = "Triggered MCAP clip recorder.\n\n\
                   One mode runs per invocation, and the mode is a subcommand: \
                   `clipper tail` follows a continuous recording and cuts a clip \
-                  per trigger, while `clipper clip` cuts one clip out of one \
-                  finished recording and exits. Every flag belongs to a mode, so \
+                  per trigger, while `clipper clip` cuts a clip per trigger out \
+                  of one finished recording and exits. Every flag belongs to a mode, so \
                   `clipper <mode> --help` is that mode's own flag reference."
 )]
 struct Cli {
@@ -274,20 +390,26 @@ enum Mode {
     /// record` writes, and cuts the window each trigger asks for out of them.
     /// Runs until a shutdown signal.
     Tail(Config),
-    /// Cut one clip out of one finished recording and exit.
+    /// Cut a clip per trigger out of one finished recording and exit.
     ///
-    /// Takes a recording nobody is writing any more and a trigger named on the
-    /// command line, and writes the window that trigger asks for. The recording
-    /// is indexed from its own summary rather than by walking it, and nothing
-    /// is waited for — the input has an end. The run's result is the contents
-    /// of the output directory when the process exits; the exit status is the
-    /// verdict.
+    /// Takes a recording nobody is writing any more, and writes the window each
+    /// trigger asks for. `--trigger-source` says where the triggers come from:
+    /// the command line, or the recording itself. The recording is indexed from
+    /// its own summary rather than by walking it, and nothing is waited for —
+    /// the input has an end. The run's result is the contents of the output
+    /// directory when the process exits; the exit status is the verdict.
     Clip(ClipConfig),
 }
 
 /// The program name every clip's manifest carries under `producer.name`: this
 /// binary, as an operator invokes it.
 const PROGRAM: &str = "clipper";
+
+/// clap's name for [`Mode::Clip`] — the word an operator types after `clipper`,
+/// derived by the derive from the variant name. Spelled here so [`parse_cli`]
+/// can raise a trigger-argument fault against that subcommand and get its usage
+/// line; a test pins it to the command clap actually built.
+const CLIP_MODE: &str = "clip";
 
 impl Mode {
     /// What this mode's clips record as having cut them. The subcommand name is
@@ -414,12 +536,19 @@ impl Config {
     }
 }
 
-/// Configuration for [`Mode::Clip`]: the recording to cut from, where the clip
-/// goes, and the trigger — spelled out as the five fields a
-/// `momentedge_msgs/Trigger` carries, so a clip cut here states the same trigger
-/// a clip cut from a live topic does. As with every mode, each field falls back
-/// to its `MOMENTEDGE_*` environment variable ([`load_cli`]) and the field doc
-/// comments are the `clipper clip --help` text.
+/// Configuration for [`Mode::Clip`]: the recording to cut from, where the clips
+/// go, and where the triggers that name them come from. As with every mode, each
+/// field falls back to its `MOMENTEDGE_*` environment variable ([`load_cli`])
+/// and the field doc comments are the `clipper clip --help` text.
+///
+/// The five `--trigger-*` flags spell out the fields a `momentedge_msgs/Trigger`
+/// carries, so a clip cut here states the same trigger a clip cut from a live
+/// topic does. They belong to `--trigger-source param` alone and are all
+/// `Option`, with no clap default between them: a default is indistinguishable
+/// from a value the caller typed, and `--trigger-source mcap` — which takes
+/// every trigger from the recording — refuses the flags on exactly that
+/// distinction. What each source then needs, and what it refuses, is
+/// [`Self::trigger_argument_fault`].
 ///
 /// There is no clock-domain flag. The window lives on `log_time` ([`CLIP_TIME_SOURCE`]),
 /// the clock a recording's summary states its message times on and the one a
@@ -427,41 +556,147 @@ impl Config {
 /// where coverage is something a caller waits for.
 #[derive(Debug, Args)]
 struct ClipConfig {
-    /// The finished MCAP recording to cut the clip out of.
+    /// The finished MCAP recording to cut the clips out of.
     recording: PathBuf,
 
-    /// Directory the finished clip is written to.
+    /// Directory the finished clips are written to.
     #[arg(long)]
     out_dir: PathBuf,
 
-    /// The instant the clip window centres on, in nanoseconds since the epoch.
+    /// Where this run's triggers come from.
+    ///
+    /// Its help text is spelled out ([`TRIGGER_SOURCE_HELP`] /
+    /// [`TRIGGER_SOURCE_LONG_HELP`]) rather than taken from this doc comment,
+    /// because it has to say which flags each source reads; its default is
+    /// [`DEFAULT_TRIGGER_SOURCE`]. clap derives the accepted values from
+    /// [`TriggerSource`]'s variants, so `--help` lists exactly what can be
+    /// selected.
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = DEFAULT_TRIGGER_SOURCE,
+        help = TRIGGER_SOURCE_HELP,
+        long_help = TRIGGER_SOURCE_LONG_HELP,
+    )]
+    trigger_source: TriggerSource,
+
+    /// The instant the clip window centres on, in nanoseconds since the epoch
+    /// (`--trigger-source param` only, and required there).
     ///
     /// The window is `[trigger-time - preroll, trigger-time + postroll]` on the
     /// recording's `log_time`, and the instant also names the clip
     /// (`<trigger-time>_<trigger-name>.mcap`). There is no default: the one
-    /// thing only the caller knows is which moment the clip is about.
+    /// thing only the caller knows is which moment the clip is about. Under
+    /// `--trigger-source mcap` each recorded trigger's own log time is that
+    /// instant, and passing this flag is a parse error.
     #[arg(long)]
-    trigger_time: u64,
+    trigger_time: Option<u64>,
 
-    /// Nanoseconds before the trigger instant to include in the clip.
+    /// Nanoseconds before the trigger instant to include in the clip
+    /// (`--trigger-source param` only, and required there).
     #[arg(long)]
-    preroll: u64,
+    preroll: Option<u64>,
 
-    /// Nanoseconds after the trigger instant to include in the clip.
+    /// Nanoseconds after the trigger instant to include in the clip
+    /// (`--trigger-source param` only, and required there).
     #[arg(long)]
-    postroll: u64,
+    postroll: Option<u64>,
 
-    /// The trigger's name, which also names the clip file.
+    /// The trigger's name, which also names the clip file
+    /// (`--trigger-source param` only; defaults to `clip`).
     ///
     /// Carried into the clip's manifest under `trigger.name` and embedded in the
     /// output filename, so it is bounded and kept filename-safe the same way a
     /// name arriving on a topic is.
-    #[arg(long, default_value = "clip")]
-    trigger_name: String,
+    #[arg(long)]
+    trigger_name: Option<String>,
 
-    /// The trigger's description, carried into the clip's manifest.
-    #[arg(long, default_value = "")]
-    trigger_description: String,
+    /// The trigger's description, carried into the clip's manifest
+    /// (`--trigger-source param` only; defaults to empty).
+    #[arg(long)]
+    trigger_description: Option<String>,
+}
+
+/// One trigger this run cuts a clip for, and the instant its window centres on.
+///
+/// The anchor rides beside the trigger rather than inside it because the two
+/// sources resolve it differently: `--trigger-time` names it outright, while a
+/// trigger the recording carries is anchored on the `log_time` the recording
+/// stamped its trigger message with — the same stamp the recorder's `mcap`
+/// interface anchors on, so a clip cut here and the one the device cut from that
+/// trigger centre on the same instant.
+#[derive(Debug, Clone)]
+struct AnchoredTrigger {
+    trigger: Trigger,
+    anchor_ns: u64,
+}
+
+impl ClipConfig {
+    /// Every flag that states part of a command-line trigger, paired with
+    /// whether this command line gave it, in `--help` order — so a run that got
+    /// several of them wrong is told about the first.
+    fn trigger_params(&self) -> [(&'static str, bool); 5] {
+        [
+            ("--trigger-time", self.trigger_time.is_some()),
+            ("--preroll", self.preroll.is_some()),
+            ("--postroll", self.postroll.is_some()),
+            ("--trigger-name", self.trigger_name.is_some()),
+            ("--trigger-description", self.trigger_description.is_some()),
+        ]
+    }
+
+    /// The trigger the `--trigger-*` flags name, or the first flag that keeps
+    /// them from naming one.
+    ///
+    /// One function, called twice with the same answer: [`parse_cli`] calls it
+    /// to end a bad command line before anything is written, and the cut calls
+    /// it for the trigger it builds. The flags that have to be there and the
+    /// trigger they add up to are one fact, so they are decided in one place.
+    fn param_trigger(&self) -> Result<AnchoredTrigger, TriggerArgFault> {
+        let anchor_ns = self
+            .trigger_time
+            .ok_or(TriggerArgFault::Missing("--trigger-time"))?;
+        let preroll = self.preroll.ok_or(TriggerArgFault::Missing("--preroll"))?;
+        let postroll = self
+            .postroll
+            .ok_or(TriggerArgFault::Missing("--postroll"))?;
+        Ok(AnchoredTrigger {
+            trigger: Trigger {
+                name: self
+                    .trigger_name
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_TRIGGER_NAME.to_string()),
+                description: self.trigger_description.clone().unwrap_or_default(),
+                // The instant is the anchor, and the stamp the trigger carries
+                // states the same instant — a clip cut here echoes the trigger a
+                // clip cut from a live topic echoes.
+                trigger_time: clip::Stamp::from_ns(anchor_ns),
+                preroll,
+                postroll,
+            },
+            anchor_ns,
+        })
+    }
+
+    /// The `--trigger-*` flag this command line got wrong, if any: one
+    /// `--trigger-source param` needs and did not get, or one
+    /// `--trigger-source mcap` has no use for.
+    ///
+    /// This is the cross-field check clap's derive cannot state, because the
+    /// requirement depends on another flag's *value* rather than its presence:
+    /// an absent `--trigger-source` still selects `param`, so a conflict or a
+    /// requirement keyed on the flag being given would miss the default run
+    /// entirely.
+    fn trigger_argument_fault(&self) -> Option<TriggerArgFault> {
+        match self.trigger_source {
+            TriggerSource::Param => self.param_trigger().err(),
+            TriggerSource::Mcap => self
+                .trigger_params()
+                .into_iter()
+                .find(|(_, given)| *given)
+                .map(|(flag, _)| TriggerArgFault::Conflicting(flag)),
+        }
+    }
 }
 
 /// Prefix shared by every `MOMENTEDGE_*` environment variable.
@@ -519,17 +754,53 @@ fn mode_hint(kind: clap::error::ErrorKind) -> Option<&'static str> {
     )
 }
 
-/// Parse the [`Cli`] from the command line, each mode's field falling back to
-/// its `MOMENTEDGE_*` environment variable and then its default (CLI > env >
-/// default). Diverges the way [`clap::Error::exit`] does — printing the message
-/// and ending the process — for `--help`, `--version` and any parse error, so
-/// this returns only a fully-populated mode. A failure that left the mode
-/// unnamed carries [`mode_hint`] after clap's own text.
+/// Parse `argv` into a [`Cli`], each mode's field falling back to its
+/// `MOMENTEDGE_*` environment variable and then its default (CLI > env >
+/// default), and then check the one thing clap's derive cannot state: a flag
+/// whose requirement or conflict depends on another flag's *value*
+/// ([`ClipConfig::trigger_argument_fault`]).
+///
+/// The check is part of parsing, not of running, so both ways of naming a
+/// trigger wrongly end the process with the flag at fault named and nothing
+/// written — no output directory, no clip. What a mode's body receives has
+/// already passed it.
+fn parse_cli<I, T>(argv: I) -> Result<Cli, clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    let cli = with_env_prefix(Cli::command())
+        .try_get_matches_from(argv)
+        .and_then(|matches| Cli::from_arg_matches(&matches))?;
+    let fault = match &cli.mode {
+        Mode::Tail(_) => None,
+        Mode::Clip(cfg) => cfg.trigger_argument_fault(),
+    };
+    match fault {
+        None => Ok(cli),
+        Some(fault) => {
+            // Raised against `clipper clip` so the usage line clap prints under
+            // the message is the mode's own flag list, not the mode listing.
+            // The subcommand is lifted out of a freshly built command, which
+            // never parsed an argv and so carries no binary name of its own.
+            let mut cmd = with_env_prefix(Cli::command());
+            let mut clip = cmd
+                .find_subcommand_mut(CLIP_MODE)
+                .expect("clip is a mode of clipper")
+                .clone()
+                .bin_name(format!("{PROGRAM} {CLIP_MODE}"));
+            Err(clip.error(fault.kind(), fault.message()))
+        }
+    }
+}
+
+/// Parse the [`Cli`] from the process's own command line ([`parse_cli`]).
+/// Diverges the way [`clap::Error::exit`] does — printing the message and ending
+/// the process — for `--help`, `--version` and any parse error, so this returns
+/// only a fully-populated, checked mode. A failure that left the mode unnamed
+/// carries [`mode_hint`] after clap's own text.
 fn load_cli() -> Cli {
-    let parsed = with_env_prefix(Cli::command())
-        .try_get_matches()
-        .and_then(|matches| Cli::from_arg_matches(&matches));
-    match parsed {
+    match parse_cli(std::env::args_os()) {
         Ok(cli) => cli,
         Err(err) => {
             let hint = mode_hint(err.kind());
@@ -717,12 +988,69 @@ const CLIP_TIME_SOURCE: TimeSource = TimeSource::Log;
 /// spelled once here because this mode takes no compression flag.
 const CLIP_MODE_COMPRESSION: ClipCompression = ClipCompression::Zstd;
 
-/// `clipper clip`: cut one window out of one finished recording and exit.
+/// The triggers this run cuts, in the order their clips are written: the one the
+/// `--trigger-*` flags name, or every one the recording carries.
+///
+/// The `param` arm cannot fail on a command line [`parse_cli`] accepted — the
+/// same [`ClipConfig::param_trigger`] decided both — so a fault here is that
+/// gate's bug and is reported as one.
+fn clip_triggers(cfg: &ClipConfig) -> anyhow::Result<Vec<AnchoredTrigger>> {
+    match cfg.trigger_source {
+        TriggerSource::Param => cfg
+            .param_trigger()
+            .map(|trigger| vec![trigger])
+            .map_err(|fault| anyhow::anyhow!("{}", fault.message())),
+        TriggerSource::Mcap => embedded_triggers(&cfg.recording),
+    }
+}
+
+/// The triggers the recording itself carries on [`TRIGGER_TOPIC`], each anchored
+/// on the `log_time` the recording stamped its trigger message with.
+///
+/// The list exists before the first cut, because the input has an end: reading
+/// it is a summary read plus the chunks that summary names as holding the
+/// trigger channel ([`clip::embedded::read_triggers`]), and no other chunk is
+/// decompressed to find it.
+///
+/// An undecodable trigger is logged and skipped rather than fatal, exactly as
+/// the recorder's `mcap` interface treats one: a single trigger nobody can read
+/// must not cost the caller every other clip in the recording. A `cdr` payload
+/// is undecodable in a build without the `ros` feature; `json` decodes in every
+/// build.
+fn embedded_triggers(recording: &std::path::Path) -> anyhow::Result<Vec<AnchoredTrigger>> {
+    let records = clip::embedded::read_triggers(recording, TRIGGER_TOPIC)?;
+    let mut triggers = Vec::with_capacity(records.len());
+    for record in records {
+        match clip::decode::decode_trigger(&record.message_encoding, &record.body) {
+            Ok(trigger) => triggers.push(AnchoredTrigger {
+                trigger,
+                anchor_ns: record.log_time,
+            }),
+            Err(e) => warn!(
+                "skipping the trigger at log_time {} in {} (encoding={}): {e:#}",
+                record.log_time,
+                recording.display(),
+                record.message_encoding,
+            ),
+        }
+    }
+    Ok(triggers)
+}
+
+/// `clipper clip`: cut one clip per trigger out of one finished recording and
+/// exit.
 ///
 /// The recording is indexed from its own summary ([`clip::whole::WholeFileIndex`])
 /// — a footer seek and one read, no chunk decompressed — and handed to the same
-/// [`clip::segment::cut_window`] the recorder drives, so the clip is byte-for-byte
-/// what the device would have cut from the same recording and window.
+/// [`clip::segment::cut_window`] the recorder drives, so each clip is
+/// byte-for-byte what the device would have cut from the same recording and
+/// window.
+///
+/// **How many clips a run writes is the trigger source's answer**
+/// ([`clip_triggers`]). `--trigger-source param` names one trigger and writes
+/// one clip. `--trigger-source mcap` writes one per trigger the recording
+/// carries — none at all for a recording that carries none, which is a normal,
+/// zero-status run that says so and leaves the output directory untouched.
 ///
 /// **The waits are what is absent.** `tail::handler` sleeps until the wall clock
 /// passes the window end, then blocks until the tail's coverage reaches it,
@@ -741,10 +1069,39 @@ const CLIP_MODE_COMPRESSION: ClipCompression = ClipCompression::Zstd;
 /// directory's contents when the process exits, each clip carrying its own
 /// manifest; the exit status is the verdict.
 fn clip_mode(cfg: ClipConfig, producer: Producer) -> anyhow::Result<()> {
+    let triggers = clip_triggers(&cfg)?;
+
     // A trigger name reaches the filesystem through the clip's pathname, so it
     // passes the gate every trigger passes, whichever source it arrived from.
-    if let Err(why) = validate_name(&cfg.trigger_name) {
-        anyhow::bail!("--trigger-name {:?} {why}", cfg.trigger_name);
+    // What an unsafe one costs differs with who wrote it: a name the operator
+    // typed is a command line to fix and ends the run, while one the recording
+    // carried costs that trigger its clip and no more — the same isolation an
+    // undecodable trigger gets.
+    let mut cuts = Vec::with_capacity(triggers.len());
+    for anchored in triggers {
+        match (validate_name(&anchored.trigger.name), cfg.trigger_source) {
+            (Ok(()), _) => cuts.push(anchored),
+            (Err(why), TriggerSource::Param) => {
+                anyhow::bail!("--trigger-name {:?} {why}", anchored.trigger.name)
+            }
+            (Err(why), TriggerSource::Mcap) => warn!(
+                "skipping the trigger at log_time {} in {}: its name {:?} {why}",
+                anchored.anchor_ns,
+                cfg.recording.display(),
+                anchored.trigger.name,
+            ),
+        }
+    }
+
+    // A run with nothing to cut is a normal run: it writes no clip, creates no
+    // output directory, and says why. Only `mcap` reaches this — `param` either
+    // yields its one trigger or has already failed.
+    if cuts.is_empty() {
+        info!(
+            "{} carries no trigger on {TRIGGER_TOPIC}; nothing to cut",
+            cfg.recording.display(),
+        );
+        return Ok(());
     }
 
     // Index the recording before anything is created: a recording clipper
@@ -758,72 +1115,74 @@ fn clip_mode(cfg: ClipConfig, producer: Producer) -> anyhow::Result<()> {
     // ever holds complete clips.
     clip::cut::reset_capturing_dir(&cfg.out_dir)?;
 
-    let anchor_ns = cfg.trigger_time;
-    let trigger = Trigger {
-        name: cfg.trigger_name,
-        description: cfg.trigger_description,
-        trigger_time: clip::Stamp::from_ns(anchor_ns),
-        preroll: cfg.preroll,
-        postroll: cfg.postroll,
-    };
-    let request = Arc::new(clip::CutRequest::new(
-        producer,
-        trigger.clone(),
-        anchor_ns,
-        CLIP_TIME_SOURCE,
-    ));
-
-    // The one thing a finished clip cannot show from its own contents: whether
-    // the recording ever reached the window end, or simply stops inside it.
-    let coverage = if index
-        .log_end_ns()
-        .is_some_and(|end_ns| end_ns >= request.end_ns())
-    {
-        clip::WindowCoverage::Covered
-    } else {
-        warn!(
-            "{} ends before the window end {}; the clip stops where the \
-             recording does",
-            cfg.recording.display(),
-            request.end_ns(),
-        );
-        clip::WindowCoverage::Short
-    };
+    // One copy at a time: the windows are cut in trigger order, and the pool is
+    // sized to the work in front of it. It exists at all because staging is the
+    // pool's job either way.
+    let stage_tx = segment::spawn_stage_workers(1, CLIP_MODE_COMPRESSION.to_mcap());
 
     info!(
-        "cutting {} window=[{}, {}] source={CLIP_TIME_SOURCE} from {} into {}",
-        trigger.name,
-        request.start_ns(),
-        request.end_ns(),
+        "cutting {} clip(s) from {} into {} (source={CLIP_TIME_SOURCE})",
+        cuts.len(),
         cfg.recording.display(),
         cfg.out_dir.display(),
     );
 
-    // One window, one recording, one copy: the pool is sized to the work there
-    // is. It exists at all because staging is the pool's job either way.
-    let stage_tx = segment::spawn_stage_workers(1, CLIP_MODE_COMPRESSION.to_mcap());
-    let base_out_path = cfg.out_dir.join(format!(
-        "{anchor_ns}_{}.mcap",
-        segment::sanitize(&trigger.name)
-    ));
-    let segments = segment::cut_window(&index, &request, coverage, &base_out_path, &stage_tx)?;
+    for AnchoredTrigger { trigger, anchor_ns } in cuts {
+        let request = Arc::new(clip::CutRequest::new(
+            producer,
+            trigger.clone(),
+            anchor_ns,
+            CLIP_TIME_SOURCE,
+        ));
 
-    for stats in &segments {
-        info!(
-            "clip {} written: {} msgs from {} extents, {:.1} MiB",
-            stats.out_path.display(),
-            stats.messages_copied,
-            stats.extents_read,
-            stats.bytes_copied as f64 / 1_048_576.0,
-        );
-        if stats.records_skipped > 0 || stats.chunks_dropped > 0 {
+        // The one thing a finished clip cannot show from its own contents:
+        // whether the recording ever reached the window end, or simply stops
+        // inside it.
+        let coverage = if index
+            .log_end_ns()
+            .is_some_and(|end_ns| end_ns >= request.end_ns())
+        {
+            clip::WindowCoverage::Covered
+        } else {
             warn!(
-                "clip {} is missing data over damage in the recording: \
-                 {} records skipped, {} chunks dropped",
-                stats.out_path.display(),
-                stats.records_skipped,
-                stats.chunks_dropped,
+                "{} ends before the window end {}; the clip stops where the \
+                 recording does",
+                cfg.recording.display(),
+                request.end_ns(),
             );
+            clip::WindowCoverage::Short
+        };
+
+        info!(
+            "cutting {} window=[{}, {}] anchor={anchor_ns}",
+            trigger.name,
+            request.start_ns(),
+            request.end_ns(),
+        );
+
+        let base_out_path = cfg.out_dir.join(format!(
+            "{anchor_ns}_{}.mcap",
+            segment::sanitize(&trigger.name)
+        ));
+        let segments = segment::cut_window(&index, &request, coverage, &base_out_path, &stage_tx)?;
+
+        for stats in &segments {
+            info!(
+                "clip {} written: {} msgs from {} extents, {:.1} MiB",
+                stats.out_path.display(),
+                stats.messages_copied,
+                stats.extents_read,
+                stats.bytes_copied as f64 / 1_048_576.0,
+            );
+            if stats.records_skipped > 0 || stats.chunks_dropped > 0 {
+                warn!(
+                    "clip {} is missing data over damage in the recording: \
+                     {} records skipped, {} chunks dropped",
+                    stats.out_path.display(),
+                    stats.records_skipped,
+                    stats.chunks_dropped,
+                );
+            }
         }
     }
     Ok(())
@@ -1119,18 +1478,53 @@ fn supervise(
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
 
-    /// Parse a `Cli` from an explicit argv through the same env-prefixed
-    /// command `load_cli` builds, so the tests exercise the real wiring.
+    /// Parse a `Cli` from an explicit argv through [`parse_cli`] — the same
+    /// env-prefixed command and the same cross-field checks `load_cli` runs, so
+    /// the tests exercise the real wiring rather than half of it.
     fn cli_from<I, T>(argv: I) -> Result<Cli, clap::Error>
     where
         I: IntoIterator<Item = T>,
         T: Into<std::ffi::OsString> + Clone,
     {
-        let matches = with_env_prefix(Cli::command()).try_get_matches_from(argv)?;
-        Cli::from_arg_matches(&matches)
+        parse_cli(argv)
     }
+
+    /// A `clipper clip` argv over `rec.mcap` into `/data/clips`, with `extra`
+    /// appended — the trigger flags each test names for itself.
+    fn clip_argv(extra: &[&str]) -> Vec<String> {
+        ["clipper", "clip", "rec.mcap", "--out-dir", "/data/clips"]
+            .into_iter()
+            .chain(extra.iter().copied())
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// A `--trigger-source param` config over `recording` writing into
+    /// `out_dir`, with a trigger a test overrides field by field through struct
+    /// update syntax.
+    fn param_clip_cfg(recording: &Path, out_dir: &Path) -> ClipConfig {
+        ClipConfig {
+            recording: recording.to_path_buf(),
+            out_dir: out_dir.to_path_buf(),
+            trigger_source: TriggerSource::Param,
+            trigger_time: Some(0),
+            preroll: Some(0),
+            postroll: Some(0),
+            trigger_name: None,
+            trigger_description: None,
+        }
+    }
+
+    /// The producer `clip_mode` is handed when a test builds its config
+    /// directly rather than through [`Mode::producer`].
+    const CLIP_PRODUCER: Producer = Producer {
+        program: PROGRAM,
+        mode: CLIP_MODE,
+    };
 
     /// The recorder's `Config` out of an argv naming the `tail` mode.
     fn parse_from<I, T>(argv: I) -> Result<Config, clap::Error>
@@ -1241,7 +1635,7 @@ mod tests {
         );
         assert_eq!(
             bound("clip"),
-            7,
+            8,
             "every ClipConfig field is bound (update on a new field)"
         );
     }
@@ -1459,11 +1853,19 @@ mod tests {
             "the recording is the positional argument"
         );
         assert_eq!(cfg.out_dir, PathBuf::from("/data/clips"));
-        assert_eq!(cfg.trigger_time, 1_738_000_000_000_000_000);
-        assert_eq!(cfg.preroll, 5_000_000_000);
-        assert_eq!(cfg.postroll, 2_000_000_000);
-        assert_eq!(cfg.trigger_name, "brake-event");
-        assert_eq!(cfg.trigger_description, "hard brake over 0.8 g");
+        assert_eq!(cfg.trigger_time, Some(1_738_000_000_000_000_000));
+        assert_eq!(cfg.preroll, Some(5_000_000_000));
+        assert_eq!(cfg.postroll, Some(2_000_000_000));
+        assert_eq!(cfg.trigger_name.as_deref(), Some("brake-event"));
+        assert_eq!(
+            cfg.trigger_description.as_deref(),
+            Some("hard brake over 0.8 g")
+        );
+        assert_eq!(
+            cfg.trigger_source,
+            TriggerSource::Param,
+            "a command line that names a trigger takes it from the command line"
+        );
     }
 
     /// The window is what only the caller knows, so leaving out the instant it
@@ -1558,13 +1960,12 @@ mod tests {
         let out_dir = root.join("clipped");
 
         let mode = Mode::Clip(ClipConfig {
-            recording: rec.clone(),
-            out_dir: out_dir.clone(),
-            trigger_time: 3_000,
-            preroll: 1_500,
-            postroll: 500,
-            trigger_name: "brake".to_string(),
-            trigger_description: "hard brake".to_string(),
+            trigger_time: Some(3_000),
+            preroll: Some(1_500),
+            postroll: Some(500),
+            trigger_name: Some("brake".to_string()),
+            trigger_description: Some("hard brake".to_string()),
+            ..param_clip_cfg(&rec, &out_dir)
         });
         let producer = mode.producer();
         let Mode::Clip(cfg) = mode else {
@@ -1623,18 +2024,12 @@ mod tests {
         let began = std::time::Instant::now();
         clip_mode(
             ClipConfig {
-                recording: rec,
-                out_dir: out_dir.clone(),
-                trigger_time: base,
-                preroll: 0,
-                postroll,
-                trigger_name: "late".to_string(),
-                trigger_description: String::new(),
+                trigger_time: Some(base),
+                postroll: Some(postroll),
+                trigger_name: Some("late".to_string()),
+                ..param_clip_cfg(&rec, &out_dir)
             },
-            Producer {
-                program: PROGRAM,
-                mode: "clip",
-            },
+            CLIP_PRODUCER,
         )?;
         let elapsed = began.elapsed();
 
@@ -1666,18 +2061,11 @@ mod tests {
 
         let err = clip_mode(
             ClipConfig {
-                recording: rec,
-                out_dir: out_dir.clone(),
-                trigger_time: 1_000,
-                preroll: 0,
-                postroll: 0,
-                trigger_name: "../escape".to_string(),
-                trigger_description: String::new(),
+                trigger_time: Some(1_000),
+                trigger_name: Some("../escape".to_string()),
+                ..param_clip_cfg(&rec, &out_dir)
             },
-            Producer {
-                program: PROGRAM,
-                mode: "clip",
-            },
+            CLIP_PRODUCER,
         )
         .unwrap_err();
         assert!(
@@ -1714,11 +2102,12 @@ mod tests {
             ClipConfig {
                 recording: rec.clone(),
                 out_dir: out_dir.clone(),
-                trigger_time: 1_500,
-                preroll: 500,
-                postroll: 500,
-                trigger_name: "brake".to_string(),
-                trigger_description: String::new(),
+                trigger_source: TriggerSource::Param,
+                trigger_time: Some(1_500),
+                preroll: Some(500),
+                postroll: Some(500),
+                trigger_name: Some("brake".to_string()),
+                trigger_description: None,
             },
             Producer {
                 program: PROGRAM,
@@ -1758,6 +2147,499 @@ mod tests {
         assert!(
             printed.contains("indexes no chunk") && printed.contains("mcap recover"),
             "the refusal survives the boxing `main` does: {printed}"
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    // ── `clipper clip --trigger-source`: where the run's triggers come from ─
+
+    /// The topic a fixture recording carries its triggers on: the recorder's
+    /// own, since that is the one `clipper clip --trigger-source mcap` reads.
+    const FIXTURE_TRIGGER_TOPIC: &str = TRIGGER_TOPIC;
+
+    /// A trigger a fixture recording carries, stamped `log_time`.
+    fn embedded(
+        log_time: u64,
+        name: &str,
+        preroll: u64,
+        postroll: u64,
+    ) -> clip::testing::FixtureMsg<'static> {
+        clip::testing::FixtureMsg::Trigger {
+            log_time,
+            trigger: Trigger {
+                name: name.to_string(),
+                description: format!("{name} happened"),
+                // A recorded trigger states its instant on the wire too, but the
+                // window anchors on the record's own log time; a distinct value
+                // here is what proves which of the two was read.
+                trigger_time: clip::Stamp { sec: 0, nanosec: 0 },
+                preroll,
+                postroll,
+            },
+        }
+    }
+
+    /// A data message on `/t` at `log_time` — the messages a clip copies.
+    fn recorded(log_time: u64) -> clip::testing::FixtureMsg<'static> {
+        clip::testing::FixtureMsg::Data {
+            topic: "/t",
+            log_time,
+        }
+    }
+
+    /// The `/t` messages a clip holds. A window that contains a trigger message
+    /// copies that message too, like any other; the data topic is what the
+    /// window assertions are about.
+    fn clip_data(path: &Path) -> anyhow::Result<Vec<u64>> {
+        Ok(clip::testing::read_clip(path)?
+            .into_iter()
+            .filter(|(topic, _)| topic == "/t")
+            .map(|(_, log_time)| log_time)
+            .collect())
+    }
+
+    /// `CLIP_MODE` is the name clap gave [`Mode::Clip`] — `parse_cli` raises a
+    /// trigger fault against that subcommand, so a rename that left the constant
+    /// behind would panic there instead of reporting the fault.
+    #[test]
+    fn clip_mode_is_the_name_clap_built() {
+        assert!(
+            Cli::command().find_subcommand(CLIP_MODE).is_some(),
+            "CLIP_MODE must name a subcommand clipper actually has"
+        );
+    }
+
+    /// The flag defaults to the command line, parses `mcap`, and refuses
+    /// anything else. (Its `MOMENTEDGE_TRIGGER_SOURCE` env fallback is covered
+    /// by `env_prefix_binds_a_momentedge_name_to_every_field`.)
+    #[test]
+    fn clip_trigger_source_defaults_to_param_and_parses_mcap() {
+        let source = |extra: &[&str]| clip_from(clip_argv(extra)).map(|cfg| cfg.trigger_source);
+        assert_eq!(
+            source(&[
+                "--trigger-time",
+                "1000",
+                "--preroll",
+                "0",
+                "--postroll",
+                "0"
+            ])
+            .unwrap(),
+            TriggerSource::Param,
+            "an absent --trigger-source takes the trigger from the command line"
+        );
+        assert_eq!(
+            source(&["--trigger-source", "mcap"]).unwrap(),
+            TriggerSource::Mcap
+        );
+        assert_eq!(
+            source(&[
+                "--trigger-source",
+                "param",
+                "--trigger-time",
+                "1000",
+                "--preroll",
+                "0",
+                "--postroll",
+                "0"
+            ])
+            .unwrap(),
+            TriggerSource::Param,
+            "naming the default source explicitly is not a conflict with the flags it reads"
+        );
+        assert!(source(&["--trigger-source", "bogus"]).is_err());
+    }
+
+    /// `clipper clip --help` names the sources it accepts and the default it
+    /// takes, rendered from the `ValueEnum` itself, and says where a recorded
+    /// trigger is read from.
+    #[test]
+    fn clip_help_names_the_trigger_sources() {
+        let err =
+            cli_from(["clipper", "clip", "--help"]).expect_err("--help short-circuits the parse");
+        let help = err.to_string();
+        assert!(help.contains("--trigger-source"), "{help}");
+        // `--help` renders a `ValueEnum`'s accepted values as a `Possible
+        // values:` list, one `- <name>:` line each.
+        for value in ["- param:", "- mcap:"] {
+            assert!(help.contains(value), "the help lists {value}: {help}");
+        }
+        assert!(
+            help.contains("[default: param]"),
+            "the default is rendered from the enum's own value name: {help}"
+        );
+        assert!(
+            help.contains(TRIGGER_TOPIC),
+            "the long help names the topic a recorded trigger is read from: {help}"
+        );
+    }
+
+    /// The `Display` a `--help` default is rendered through and the values clap
+    /// accepts are two spellings of one thing, and must not drift.
+    #[test]
+    fn trigger_source_display_matches_the_clap_value_names() {
+        for source in TriggerSource::value_variants() {
+            assert_eq!(
+                source.to_string(),
+                source
+                    .to_possible_value()
+                    .expect("no TriggerSource variant is skipped")
+                    .get_name(),
+            );
+        }
+    }
+
+    /// `param` cuts the trigger the flags name, so each flag it cannot do
+    /// without is refused by name — while the parse is running, so nothing is
+    /// written.
+    #[test]
+    fn param_without_a_trigger_flag_is_refused_by_name() {
+        let full = [
+            ("--trigger-time", "1000"),
+            ("--preroll", "10"),
+            ("--postroll", "20"),
+        ];
+        for missing in 0..full.len() {
+            let extra: Vec<&str> = full
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != missing)
+                .flat_map(|(_, (flag, value))| [*flag, *value])
+                .collect();
+            let err = cli_from(clip_argv(&extra))
+                .expect_err("a param run missing a trigger flag names no window");
+            assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+            assert_ne!(err.exit_code(), 0, "a rejected command line exits non-zero");
+            assert!(
+                err.to_string().contains(full[missing].0),
+                "the refusal names the missing flag {}: {err}",
+                full[missing].0
+            );
+        }
+    }
+
+    /// `mcap` takes every trigger from the recording, so any flag that states
+    /// part of a trigger is a conflict — named, refused, and refused while the
+    /// parse is running.
+    #[test]
+    fn mcap_with_any_trigger_parameter_names_the_conflict() {
+        for (flag, value) in [
+            ("--trigger-time", "1000"),
+            ("--preroll", "10"),
+            ("--postroll", "20"),
+            ("--trigger-name", "brake"),
+            ("--trigger-description", "hard brake"),
+        ] {
+            let err = cli_from(clip_argv(&["--trigger-source", "mcap", flag, value]))
+                .expect_err("a recorded trigger leaves nothing for the flags to say");
+            assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+            assert_ne!(err.exit_code(), 0, "a rejected command line exits non-zero");
+            let msg = err.to_string();
+            assert!(msg.contains(flag), "the refusal names {flag}: {msg}");
+            assert!(
+                msg.contains("--trigger-source mcap"),
+                "the refusal names the source it conflicts with: {msg}"
+            );
+        }
+        assert!(
+            cli_from(clip_argv(&["--trigger-source", "mcap"])).is_ok(),
+            "mcap on its own is a complete command line"
+        );
+    }
+
+    /// A refused trigger command line writes nothing at all: both faults are
+    /// raised while the arguments are being read, so `clip_mode` never runs and
+    /// the output directory it named is never created.
+    #[test]
+    fn a_refused_trigger_command_line_writes_nothing() -> anyhow::Result<()> {
+        let root = clip::testing::test_dir("clip-refused")?;
+        let out_dir = root.join("clipped");
+        let out = out_dir.to_string_lossy().into_owned();
+        for extra in [
+            // `param` (by default) without the instant it needs.
+            vec!["--preroll", "10", "--postroll", "20"],
+            // `mcap` alongside a flag it has no use for.
+            vec!["--trigger-source", "mcap", "--trigger-time", "1000"],
+        ] {
+            let argv: Vec<String> = ["clipper", "clip", "rec.mcap", "--out-dir", out.as_str()]
+                .into_iter()
+                .chain(extra)
+                .map(str::to_string)
+                .collect();
+            let err = cli_from(argv).expect_err("these trigger arguments are wrong");
+            assert_ne!(err.exit_code(), 0, "a rejected command line exits non-zero");
+            assert!(
+                !out_dir.exists(),
+                "a refused command line writes nothing, not even an output directory"
+            );
+        }
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// A recording carrying N triggers produces N clips, each anchored on its
+    /// own trigger and holding the window that trigger asked for.
+    #[test]
+    fn mcap_cuts_one_clip_per_embedded_trigger() -> anyhow::Result<()> {
+        let root = clip::testing::test_dir("clip-embedded")?;
+        let rec = root.join("rec.mcap");
+        clip::testing::write_recording_with_triggers(
+            &rec,
+            FIXTURE_TRIGGER_TOPIC,
+            &[
+                &[recorded(1_000), recorded(2_000)],
+                &[embedded(2_500, "first", 1_000, 500)],
+                &[recorded(3_000), recorded(4_000)],
+                &[embedded(4_200, "second", 300, 1_000)],
+                &[recorded(5_000), recorded(6_000)],
+            ],
+        )?;
+        let out_dir = root.join("clipped");
+
+        clip_mode(
+            ClipConfig {
+                trigger_source: TriggerSource::Mcap,
+                trigger_time: None,
+                preroll: None,
+                postroll: None,
+                ..param_clip_cfg(&rec, &out_dir)
+            },
+            CLIP_PRODUCER,
+        )?;
+
+        // One clip per trigger, each named by its own trigger's log time.
+        let mut written: Vec<String> = std::fs::read_dir(&out_dir)?
+            .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
+            .collect::<anyhow::Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|name| name.ends_with(".mcap"))
+            .collect();
+        written.sort();
+        assert_eq!(written, vec!["2500_first.mcap", "4200_second.mcap"]);
+
+        // Each window is its own trigger's, both bounds inclusive:
+        // [2500-1000, 2500+500] and [4200-300, 4200+1000].
+        assert_eq!(
+            clip_data(&out_dir.join("2500_first.mcap"))?,
+            vec![2_000, 3_000]
+        );
+        assert_eq!(
+            clip_data(&out_dir.join("4200_second.mcap"))?,
+            vec![4_000, 5_000]
+        );
+
+        let first = clip::manifest::read_manifest(&out_dir.join("2500_first.mcap"))?
+            .expect("every clip carries a manifest");
+        assert_eq!(first["trigger.name"], "first");
+        assert_eq!(first["trigger.description"], "first happened");
+        assert_eq!(
+            first["trigger.anchor_ns"], "2500",
+            "the window anchors on the recorded trigger message's own log time"
+        );
+        assert_eq!(first["trigger.preroll_ns"], "1000");
+        assert_eq!(first["trigger.postroll_ns"], "500");
+        assert_eq!(first["window.start_ns"], "1500");
+        assert_eq!(first["window.end_ns"], "3000");
+        assert_eq!(first["producer.mode"], "clip");
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// A clip cut from a command-line trigger and one cut from the equivalent
+    /// trigger inside the recording carry the same trigger record — the whole
+    /// manifest, key for key, since the two runs differ in nothing else.
+    #[test]
+    fn a_param_clip_and_an_equivalent_embedded_one_agree() -> anyhow::Result<()> {
+        let root = clip::testing::test_dir("clip-agree")?;
+        let rec = root.join("rec.mcap");
+        clip::testing::write_recording_with_triggers(
+            &rec,
+            FIXTURE_TRIGGER_TOPIC,
+            &[
+                &[recorded(1_000), recorded(2_000)],
+                &[embedded(3_000, "brake", 1_500, 500)],
+                &[recorded(3_500), recorded(4_000)],
+            ],
+        )?;
+
+        let from_recording = root.join("from-recording");
+        clip_mode(
+            ClipConfig {
+                trigger_source: TriggerSource::Mcap,
+                trigger_time: None,
+                preroll: None,
+                postroll: None,
+                ..param_clip_cfg(&rec, &from_recording)
+            },
+            CLIP_PRODUCER,
+        )?;
+
+        let from_flags = root.join("from-flags");
+        clip_mode(
+            ClipConfig {
+                trigger_time: Some(3_000),
+                preroll: Some(1_500),
+                postroll: Some(500),
+                trigger_name: Some("brake".to_string()),
+                trigger_description: Some("brake happened".to_string()),
+                ..param_clip_cfg(&rec, &from_flags)
+            },
+            CLIP_PRODUCER,
+        )?;
+
+        let clip_name = "3000_brake.mcap";
+        let recorded_manifest = clip::manifest::read_manifest(&from_recording.join(clip_name))?
+            .expect("every clip carries a manifest");
+        let flagged_manifest = clip::manifest::read_manifest(&from_flags.join(clip_name))?
+            .expect("every clip carries a manifest");
+        assert_eq!(
+            recorded_manifest, flagged_manifest,
+            "the same trigger states the same clip, whichever source stated it"
+        );
+        assert_eq!(
+            clip_data(&from_recording.join(clip_name))?,
+            clip_data(&from_flags.join(clip_name))?,
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// A recording holding no trigger, read under `mcap`, is a normal run: it
+    /// exits zero, writes nothing at all, and says so.
+    #[test]
+    fn a_recording_with_no_triggers_cuts_nothing() -> anyhow::Result<()> {
+        let root = clip::testing::test_dir("clip-notriggers")?;
+        let rec = root.join("rec.mcap");
+        clip::testing::write_recording(&rec, true, &[("/t", 1_000), ("/t", 2_000)])?;
+        let out_dir = root.join("clipped");
+
+        clip_mode(
+            ClipConfig {
+                trigger_source: TriggerSource::Mcap,
+                trigger_time: None,
+                preroll: None,
+                postroll: None,
+                ..param_clip_cfg(&rec, &out_dir)
+            },
+            CLIP_PRODUCER,
+        )?;
+
+        assert!(
+            !out_dir.exists(),
+            "a run with nothing to cut writes nothing, not even an output directory"
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// A `param` run decompresses no chunk to find its trigger, and an `mcap`
+    /// run over the same recording proves it: the chunk holding the trigger
+    /// channel is destroyed, so the run that reads it fails and the run that
+    /// does not cuts its clip.
+    #[test]
+    fn a_param_run_decompresses_no_chunk_before_the_cut() -> anyhow::Result<()> {
+        let root = clip::testing::test_dir("clip-param-nochunk")?;
+        let rec = root.join("rec.mcap");
+        clip::testing::write_recording_with_triggers(
+            &rec,
+            FIXTURE_TRIGGER_TOPIC,
+            &[
+                &[recorded(1_000), recorded(2_000)],
+                &[embedded(9_000, "late", 100, 100)],
+            ],
+        )?;
+        // Chunk 1 holds the trigger channel and nothing else. Destroyed, it is
+        // unreadable to anyone who opens it.
+        let gutted = clip::testing::clobber_chunks(&rec, &root.join("gutted.mcap"), &[1])?;
+
+        // The window covers the surviving chunk only, so the cut itself never
+        // asks for the destroyed one.
+        let out_dir = root.join("clipped");
+        clip_mode(
+            ClipConfig {
+                trigger_time: Some(1_500),
+                preroll: Some(1_000),
+                postroll: Some(1_000),
+                trigger_name: Some("window".to_string()),
+                ..param_clip_cfg(&gutted, &out_dir)
+            },
+            CLIP_PRODUCER,
+        )?;
+        assert_eq!(
+            clip_data(&out_dir.join("1500_window.mcap"))?,
+            vec![1_000, 2_000],
+            "a param run reads the chunks its window needs and no others"
+        );
+
+        // The same recording under `mcap` must touch that chunk, and cannot.
+        let err = clip_mode(
+            ClipConfig {
+                trigger_source: TriggerSource::Mcap,
+                trigger_time: None,
+                preroll: None,
+                postroll: None,
+                ..param_clip_cfg(&gutted, &root.join("clipped-mcap"))
+            },
+            CLIP_PRODUCER,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("decompressing the chunk"),
+            "the trigger chunk really is destroyed: {err:#}"
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// A recorded trigger whose name cannot be embedded in a clip pathname
+    /// costs that trigger its clip and no more — the same isolation an
+    /// undecodable trigger gets, and the opposite of what an operator's own
+    /// `--trigger-name` gets.
+    #[test]
+    fn an_unsafe_embedded_trigger_name_skips_only_that_trigger() -> anyhow::Result<()> {
+        let root = clip::testing::test_dir("clip-badembedded")?;
+        let rec = root.join("rec.mcap");
+        clip::testing::write_recording_with_triggers(
+            &rec,
+            FIXTURE_TRIGGER_TOPIC,
+            &[
+                &[recorded(1_000), recorded(2_000)],
+                &[
+                    embedded(2_500, "../escape", 1_000, 500),
+                    embedded(2_600, "good", 1_000, 500),
+                ],
+            ],
+        )?;
+        let out_dir = root.join("clipped");
+
+        clip_mode(
+            ClipConfig {
+                trigger_source: TriggerSource::Mcap,
+                trigger_time: None,
+                preroll: None,
+                postroll: None,
+                ..param_clip_cfg(&rec, &out_dir)
+            },
+            CLIP_PRODUCER,
+        )?;
+
+        let written: Vec<String> = std::fs::read_dir(&out_dir)?
+            .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
+            .collect::<anyhow::Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|name| name.ends_with(".mcap"))
+            .collect();
+        assert_eq!(
+            written,
+            vec!["2600_good.mcap"],
+            "the safe trigger still gets its clip, and the unsafe one none"
         );
 
         std::fs::remove_dir_all(root)?;

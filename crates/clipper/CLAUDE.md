@@ -68,8 +68,9 @@ the two libraries. The per-module table is in
 
 **The binary has two modes** (`Mode`, `src/main.rs`), and both flow through the
 same libraries. `clipper tail` is the device recorder everything below
-describes; `clipper clip` cuts one window out of one finished recording and exits
-— see [`clipper clip`](#clipper-clip-one-window-one-finished-recording). Adding a
+describes; `clipper clip` cuts a window per trigger out of one finished recording
+and exits — see [`clipper clip`](#clipper-clip-one-window-one-finished-recording).
+Adding a
 mode to the enum is a compile error until it has a body to run *and* says what
 its clips are stamped with (`Mode::producer`), so a clip names the subcommand
 that cut it without the cut path learning anything about modes.
@@ -434,6 +435,56 @@ above are therefore unchanged, and so are the manifest, the
 `<anchor_ns>_<name>.mcap` name and the atomic publication. `--trigger-name`
 passes the same `validate_name` gate a name arriving on a topic does, so a name
 accepted by one mode is accepted by the other.
+
+**Where the triggers come from is `--trigger-source`** (`TriggerSource`), and
+exactly one source is active per run — the same shape `--interface` has on the
+recorder, down to rendering its `--help` default through a `Display` that reads
+the `ValueEnum`'s own possible-value name, so the accepted values and the help
+text cannot drift. Unlike `InterfaceKind` the variant set is not the build's:
+both sources exist in every build, and the `ros` feature is visible here only in
+what a *recorded* trigger may be encoded as.
+
+- **`param`** (the default) cuts the one trigger the flags name.
+  `ClipConfig::param_trigger` is where the flags become that trigger, and it is
+  called twice with the same answer: once by `parse_cli`, where a missing flag
+  ends the process, and once by the cut, which takes the trigger it built.
+- **`mcap`** cuts every trigger the recording itself carries on `TRIGGER_TOPIC`.
+  `clip::embedded::read_triggers` returns them as the same undecoded
+  `TriggerRecord`s the tail's trigger tap emits, `clip::decode::decode_trigger`
+  turns each into a `Trigger`, and the window anchors on the record's own
+  `log_time` — the stamp `resolve_mcap_anchor` picks under `--time-source log`,
+  so a clip cut here and the one the device cut from that trigger centre on the
+  same instant. One run, one clip per trigger, cut in trigger order.
+
+**Reading the trigger list costs the summary and the chunks it names.** A
+finalised MCAP's chunk index carries, per chunk, the offset of a message index
+for every channel with a message in it, so naming the trigger channel names its
+chunks: `read_triggers` drives the mcap crate's sans-io `IndexedReader` with that
+one topic and seeks to those chunks alone. A recording that never carried the
+topic is answered from the summary with no chunk read at all — and that early
+return is load-bearing, because an empty channel filter is no filter to the
+indexed reader, which would then stream the whole file. Under `param` no trigger
+is read and no chunk is decompressed before the cut asks for one.
+
+**A trigger nobody can use costs that trigger its clip and no more**, the
+isolation the recorder's interface gives an undecodable trigger: an unreadable
+payload or a recorded name that cannot be embedded in a clip pathname is logged
+and skipped, and the run cuts the rest. An unsafe name in the operator's own
+`--trigger-name` is the opposite — a command line to fix — and ends the run. A
+run left with nothing to cut writes nothing, not even the output directory, and
+exits zero.
+
+**Both ways of stating the trigger wrongly fail while the command line is being
+read** (`ClipConfig::trigger_argument_fault`, raised by `parse_cli` as a
+`clap::Error` against the `clip` subcommand): `param` without `--trigger-time`,
+`--preroll` or `--postroll`, and `mcap` alongside any `--trigger-*` flag. The
+check is hand-written because clap's derive cannot state it — `required_if_eq`
+and `conflicts_with` key on an argument being *given*, and an absent
+`--trigger-source` still selects `param`, so a defaulted run would slip past
+both. It is also why the five `--trigger-*` arguments carry no clap default: a
+default is indistinguishable from a value the caller typed, and the conflict
+turns on exactly that distinction (`DEFAULT_TRIGGER_NAME` is applied when the
+trigger is built instead).
 
 **The waits are what is absent, and that is the whole difference.** Steps 1 and 2
 exist because a window may reach past the last byte on disk. This input has an
@@ -806,6 +857,12 @@ no interface's:
   `cbor`, schema-bound `protobuf`/`flatbuffer`, `ros1`, and any unknown encoding
   return an error the interface logs and skips — one undecodable trigger never
   stops the recorder.
+- **`clip::embedded`** — `read_triggers`, the trigger list a *finished* recording
+  states about itself, found through the summary's own chunk index so that only
+  the chunks holding the trigger channel are decompressed. It is the trigger tap
+  answered all at once instead of a record at a time, which is what a recording
+  with an end makes possible, and `clipper clip --trigger-source mcap` is its
+  caller.
 - **`src/interface.rs`** — the `trait Interface` (generic, dispatched statically,
   no `Box<dyn>`) and the `Anchor` it resolves, with `McapInterface` (drains the
   tail's trigger tap and decodes each raw trigger) and its no-op `NullAnnouncer`.

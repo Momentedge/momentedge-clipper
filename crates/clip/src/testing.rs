@@ -134,6 +134,137 @@ pub fn write_recording_opts(
     Ok(())
 }
 
+/// One message of a fixture recording that carries its own triggers: either
+/// ordinary data, the shape a cut copies, or a trigger on the recording's
+/// trigger topic.
+#[derive(Clone, Debug)]
+pub enum FixtureMsg<'a> {
+    /// A data message on `topic`, stamped `log_time` in both clocks.
+    Data { topic: &'a str, log_time: u64 },
+    /// A trigger on the recording's trigger topic, stamped `log_time` in both
+    /// clocks and written as a `json` payload — the encoding every build
+    /// decodes, so a fixture is readable without the `ros` feature.
+    Trigger { log_time: u64, trigger: Trigger },
+}
+
+/// How far a message's `publish_time` sits ahead of its `log_time` in a
+/// recording [`write_recording_with_triggers`] writes.
+///
+/// The two clocks are deliberately different here, unlike in
+/// [`write_recording_opts`], so a test can tell a reader that anchored on the
+/// log time from one that anchored on the publish time — a distinction a
+/// fixture stamping both alike cannot make.
+pub const FIXTURE_PUBLISH_SKEW_NS: u64 = 7;
+
+/// Write a finished, chunked recording whose chunk layout is stated rather than
+/// left to the writer: every message of one slice lands in one MCAP chunk, and
+/// no message outside that slice does.
+///
+/// That is what lets a test confine the trigger channel to chunks it names and
+/// then prove that a reader touched only those. Triggers go on `trigger_topic`
+/// as `json`; data messages go on their own topics as `cdr`, the way
+/// [`write_recording`] writes them. Every message's `publish_time` sits
+/// [`FIXTURE_PUBLISH_SKEW_NS`] ahead of the `log_time` it is given.
+pub fn write_recording_with_triggers(
+    path: &Path,
+    trigger_topic: &str,
+    chunks: &[&[FixtureMsg<'_>]],
+) -> Result<()> {
+    let mut writer = mcap::WriteOptions::new()
+        .use_chunks(true)
+        .compression(Some(mcap::Compression::Zstd))
+        // Far above any fixture's chunk, so the writer never splits one on its
+        // own: the slices below are the layout, closed one at a time.
+        .chunk_size(Some(1 << 20))
+        .create(BufWriter::new(File::create(path)?))?;
+    let mut ids: HashMap<String, u16> = HashMap::new();
+    let mut sequence: u32 = 0;
+    for group in chunks {
+        for msg in group.iter() {
+            let (topic, encoding, log_time, payload) = match msg {
+                FixtureMsg::Data { topic, log_time } => {
+                    ((*topic).to_string(), "cdr", *log_time, b"payload".to_vec())
+                }
+                FixtureMsg::Trigger { log_time, trigger } => (
+                    trigger_topic.to_string(),
+                    "json",
+                    *log_time,
+                    trigger_json(trigger),
+                ),
+            };
+            let id = match ids.get(&topic) {
+                Some(id) => *id,
+                None => {
+                    let schema =
+                        writer.add_schema("std_msgs/msg/String", "ros2msg", b"string data")?;
+                    let id = writer.add_channel(schema, &topic, encoding, &BTreeMap::new())?;
+                    ids.insert(topic, id);
+                    id
+                }
+            };
+            writer.write_to_known_channel(
+                &mcap::records::MessageHeader {
+                    channel_id: id,
+                    sequence,
+                    log_time,
+                    publish_time: log_time.saturating_add(FIXTURE_PUBLISH_SKEW_NS),
+                },
+                &payload,
+            )?;
+            sequence = sequence.saturating_add(1);
+        }
+        // Close this group's chunk so the next group opens a new one.
+        writer.flush()?;
+    }
+    writer.finish()?;
+    Ok(())
+}
+
+/// Copy `src` to `dst` with the chunk records at the given positions (in file
+/// order) overwritten by bytes that are neither valid framing nor
+/// decompressible, leaving every other byte — the remaining chunks, the message
+/// indexes, the summary and the footer — untouched.
+///
+/// This is how a test proves a reader touched only the chunks it should have:
+/// destroy the rest, and any implementation that decompressed one of them fails
+/// outright. `clobber_data_section` is its blunt twin for the whole data
+/// section.
+pub fn clobber_chunks(src: &Path, dst: &Path, positions: &[usize]) -> Result<PathBuf> {
+    let mut buf = std::fs::read(src)?;
+    let summary = crate::whole::read_summary(&File::open(src)?, buf.len() as u64, src)?
+        .context("a fixture to clobber chunks in must be finalised")?;
+    let mut chunks = summary.chunk_indexes.clone();
+    chunks.sort_by_key(|chunk| chunk.chunk_start_offset);
+    for position in positions {
+        let chunk = chunks
+            .get(*position)
+            .with_context(|| format!("the fixture has no chunk {position}"))?;
+        let at = chunk.chunk_start_offset as usize;
+        let end = at + chunk.chunk_length as usize;
+        buf[at..end].fill(0xFF);
+    }
+    std::fs::write(dst, &buf)?;
+    Ok(dst.to_path_buf())
+}
+
+/// A `momentedge_msgs/Trigger` as the `json` payload a recording carries — the
+/// wire shape `clip::decode` reads back, built through `serde_json` so a name or
+/// description needing escaping is written correctly.
+fn trigger_json(trigger: &Trigger) -> Vec<u8> {
+    serde_json::json!({
+        "name": trigger.name,
+        "description": trigger.description,
+        "trigger_time": {
+            "sec": trigger.trigger_time.sec,
+            "nanosec": trigger.trigger_time.nanosec,
+        },
+        "preroll": trigger.preroll,
+        "postroll": trigger.postroll,
+    })
+    .to_string()
+    .into_bytes()
+}
+
 /// A fresh scratch directory under the system temp dir, named for the test and
 /// made unique by pid and nanosecond, so tests that run concurrently (and reruns
 /// of a test that left its directory behind on failure) never collide.

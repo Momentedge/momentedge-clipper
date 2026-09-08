@@ -307,7 +307,11 @@ fn ends_with_magic(mut file: &File, len: u64) -> std::io::Result<bool> {
 ///
 /// The reader is told the file length, so it seeks straight to the footer and
 /// bounds every record it is willing to read by what is left of the file.
-fn read_summary(
+///
+/// Shared with [`crate::embedded`], which reads a finished recording's own
+/// triggers out of the same summary: the two ask it different questions, and
+/// neither should own a second copy of the read.
+pub(crate) fn read_summary(
     mut file: &File,
     len: u64,
     path: &Path,
