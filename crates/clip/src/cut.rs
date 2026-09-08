@@ -64,6 +64,16 @@ pub struct ClipStats {
     pub chunks_dropped: u64,
 }
 
+/// The uncompressed size a clip's chunks are cut at: 1 MiB.
+///
+/// The mcap writer closes a chunk on the first message that carries it past
+/// this target, so a chunk holds a little over 1 MiB of pre-compression bytes
+/// and the clip's seek granularity — and the memory a reader spends
+/// decompressing one chunk — follow from it. It is set on every clip's
+/// [`mcap::WriteOptions`] rather than inherited, so the layout a clip is
+/// written in is this crate's decision and moves only when this line does.
+pub const CLIP_CHUNK_SIZE: u64 = 1 << 20;
+
 /// The name of the capturing subdirectory under the final output directory.
 /// A clip is assembled here and moved out only once complete; observers of the
 /// final directory therefore never see an in-progress or footer-less file. A
@@ -279,10 +289,10 @@ pub fn publish_clip(mut staged: StagedClip) -> Result<ClipStats> {
 /// channels from the registry on first use, stream the planned extents,
 /// finish and fsync the file. The caller removes the staged file if this fails.
 ///
-/// The writer is built from explicit [`mcap::WriteOptions`] with `compression`
-/// set (`None` = uncompressed), so the codec is a deliberate choice rather than
-/// the mcap crate default. Chunk size and chunking stay at the `WriteOptions`
-/// default.
+/// The writer is built from explicit [`mcap::WriteOptions`] with both knobs that
+/// decide what a clip looks like set outright rather than inherited: the
+/// `compression` codec (`None` = uncompressed) the caller chose, and
+/// [`CLIP_CHUNK_SIZE`]. Chunking itself stays on, at the `WriteOptions` default.
 fn copy_window(
     plan: &WindowPlan,
     out_file: File,
@@ -294,6 +304,7 @@ fn copy_window(
     let mut clip = ClipWriter {
         writer: mcap::WriteOptions::new()
             .compression(compression)
+            .chunk_size(Some(CLIP_CHUNK_SIZE))
             .create(BufWriter::new(out_file))
             .context("opening mcap writer")?,
         channels: &plan.channels,
@@ -1321,6 +1332,71 @@ mod tests {
                 "{want}: chunks must use the set codec, got {codecs:?}"
             );
         }
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// The clip's chunk layout is the size the cut path names, not whatever the
+    /// mcap crate defaults to. Messages a sixteenth of [`CLIP_CHUNK_SIZE`] fill
+    /// several chunks, and the writer closes a chunk on the first message that
+    /// carries it past the target, so every chunk but the last holds more than
+    /// `CLIP_CHUNK_SIZE` uncompressed bytes and less than one message more. Both
+    /// bounds are derived from the constant, so they move with it: a cut path
+    /// that inherited the crate default instead would fail here as soon as the
+    /// named size and the default disagree. The acceptance test for beads
+    /// clipper-z8r.
+    #[test]
+    fn clip_chunk_size_is_the_size_the_cut_path_names() -> Result<()> {
+        let root = test_dir("clip-chunksize")?;
+        let rec = root.join("rec.mcap");
+
+        // Four targets' worth of payload, in messages small enough that the
+        // overshoot past the target is a small fraction of a chunk.
+        const MSG_LEN: u64 = CLIP_CHUNK_SIZE / 16;
+        let payload = vec![b'p'; MSG_LEN as usize];
+        let stamps: Vec<(&str, u64)> = (0..64u64).map(|i| ("/t", 10 + i)).collect();
+        write_recording_opts(
+            &rec,
+            mcap::WriteOptions::new()
+                .use_chunks(false)
+                .compression(None),
+            &payload,
+            &stamps,
+        )?;
+        let index = index_whole(&rec)?;
+
+        let out = root.join("clip.mcap");
+        let plan = plan_one(&index, 0, 1000);
+        let stats = extract_clip(&plan, &out, 0, 1000, TEST_COMPRESSION)?;
+        assert_eq!(stats.messages_copied, stamps.len() as u64);
+
+        let buf = std::fs::read(&out)?;
+        let sizes: Vec<u64> = mcap::read::LinearReader::new(&buf)?
+            .filter_map(|rec| match rec {
+                Ok(Record::Chunk { header, .. }) => Some(header.uncompressed_size),
+                _ => None,
+            })
+            .collect();
+        let (last, closed) = sizes.split_last().expect("the clip is chunked");
+        assert!(
+            closed.len() >= 3,
+            "the payload must fill several chunks, got {sizes:?}"
+        );
+        for size in closed {
+            assert!(
+                *size > CLIP_CHUNK_SIZE,
+                "a chunk is closed only past the named size, got {size} of {CLIP_CHUNK_SIZE}"
+            );
+            // One message plus a kilobyte of record framing (and, in the first
+            // chunk, the schema and channel records) is all a chunk may carry
+            // past the target.
+            assert!(
+                *size <= CLIP_CHUNK_SIZE + MSG_LEN + 1024,
+                "a chunk overshoots the named size by at most one message, got {size}"
+            );
+        }
+        assert!(*last > 0, "the final chunk holds the remainder");
 
         std::fs::remove_dir_all(root)?;
         Ok(())

@@ -392,16 +392,22 @@ its `log_time` or its `publish_time` — falls in the inclusive bounds; those th
 are get written through with their **raw serialized bytes**
 (`write_to_known_channel`); CDR bodies are never decoded.
 
-The clip writer is built from explicit `mcap::WriteOptions` with `.compression(..)`
-set — the codec is a deliberate choice (`--clip-compression`, default zstd; see
-the [README](../../README.md#configuration)), not inherited from the mcap crate
-default, so a future default change cannot silently alter clip output. The codec
-travels as an `Option<mcap::Compression>` (`None` = uncompressed) from `Config`
-into the staging worker pool, which captures it for its lifetime — it is a
-property of the output, not of any one window, and no window may disagree with
-it — and through `stage_clip` into the copy; chunk size and chunking
-stay at the `WriteOptions` default. Output channels are registered from the
-registry per source channel ID and
+The clip writer is built from explicit `mcap::WriteOptions` with both knobs that
+decide what a clip looks like set outright, not inherited from the mcap crate
+defaults, so a change of those defaults cannot silently alter clip output.
+`.compression(..)` carries the codec — a deliberate choice
+(`--clip-compression`, default zstd; see the
+[README](../../README.md#configuration)) — travelling as an
+`Option<mcap::Compression>` (`None` = uncompressed) from `Config` into the
+staging worker pool, which captures it for its lifetime (it is a property of the
+output, not of any one window, and no window may disagree with it) and through
+`stage_clip` into the copy. `.chunk_size(..)` carries
+`clip::cut::CLIP_CHUNK_SIZE`, 1 MiB of pre-compression bytes: the writer closes
+a chunk on the first message that carries it past that target, so the constant
+sets a clip's seek granularity and the memory a reader spends on one chunk.
+Chunking itself stays on, at the `WriteOptions` default.
+
+Output channels are registered from the registry per source channel ID and
 cached; `mcap::Writer` deduplicates schemas/channels by content. The clip ends
 with `Writer::finish()`, which writes the summary section, footer and closing
 magic — every clip is a complete, standalone MCAP file
