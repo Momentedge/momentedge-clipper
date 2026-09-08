@@ -81,6 +81,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
+use clip::manifest::Producer;
 use clip::trigger::{Trigger, now_ns};
 use clip::{TimeSource, segment};
 use crossbeam_channel::{Receiver, Sender, bounded, select, unbounded};
@@ -261,6 +262,27 @@ enum Mode {
     /// record` writes, and cuts the window each trigger asks for out of them.
     /// Runs until a shutdown signal.
     Tail(Config),
+}
+
+/// The program name every clip's manifest carries under `producer.name`: this
+/// binary, as an operator invokes it.
+const PROGRAM: &str = "clipper";
+
+impl Mode {
+    /// What this mode's clips record as having cut them. The subcommand name is
+    /// spelled here rather than recovered from the parser, so a mode added to
+    /// the enum is a compile error until it says what its clips are stamped
+    /// with — and a clip cut by a later mode is told apart from a recorder's
+    /// without opening the file it came from.
+    fn producer(&self) -> Producer {
+        let mode = match self {
+            Mode::Tail(_) => "tail",
+        };
+        Producer {
+            program: PROGRAM,
+            mode,
+        }
+    }
 }
 
 /// Recorder configuration for [`Mode::Tail`], parsed by clap from CLI flags with
@@ -531,8 +553,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .parse_default_env()
         .init();
 
-    match load_cli().mode {
-        Mode::Tail(cfg) => tail_mode(cfg),
+    // The producer is read off the mode before it is destructured, so every clip
+    // the run writes is stamped with the subcommand that produced it.
+    let mode = load_cli().mode;
+    let producer = mode.producer();
+    match mode {
+        Mode::Tail(cfg) => tail_mode(cfg, producer),
     }
 }
 
@@ -548,7 +574,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// That is safe for clips by construction — the capturing-dir reset at
 /// startup reclaims any stranded staged file, and `out_dir` only ever holds
 /// complete clips.
-fn tail_mode(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
+fn tail_mode(cfg: Config, producer: Producer) -> Result<(), Box<dyn std::error::Error>> {
     let cfg = Arc::new(cfg);
 
     // Start each run with a clean capturing dir: a crash mid-publish can strand
@@ -589,13 +615,17 @@ fn tail_mode(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
         InterfaceKind::Ros => {
             let (tailer, coverage) = Tailer::new();
             let iface = RosInterface::new(TRIGGER_TOPIC, RECORDED_TOPIC, cfg.time_source)?;
-            drive(iface, cfg, tailer, coverage, extract_tx, admission)
+            drive(
+                iface, cfg, tailer, coverage, extract_tx, admission, producer,
+            )
         }
         InterfaceKind::Mcap => {
             let (tx, rx) = unbounded();
             let (tailer, coverage) = Tailer::with_trigger_tap(TRIGGER_TOPIC, tx);
             let iface = McapInterface::new(TRIGGER_TOPIC, rx, cfg.time_source);
-            drive(iface, cfg, tailer, coverage, extract_tx, admission)
+            drive(
+                iface, cfg, tailer, coverage, extract_tx, admission, producer,
+            )
         }
     };
     result.map_err(Into::into)
@@ -730,6 +760,7 @@ fn drive<I: Interface>(
     coverage: Arc<Watch<Coverage>>,
     extract_tx: Sender<segment::StageJob>,
     admission: Arc<Admission>,
+    producer: Producer,
 ) -> anyhow::Result<()> {
     let iface_name = iface.name();
     let announcer = iface.announcer();
@@ -789,6 +820,7 @@ fn drive<I: Interface>(
                         extract_tx,
                         announcer,
                         time_source,
+                        producer,
                     ) {
                         error!("trigger handling failed: {e:#}");
                     }

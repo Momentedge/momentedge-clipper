@@ -45,8 +45,9 @@ triggers back out of it.
 **What every consumer of a recording shares** is [`clip`](../clip): the MCAP
 format layer and its recording index (`clip::index`), the copy that cuts a
 window out of one (`clip::cut`), the neutral trigger and completion contract
-(`clip::trigger`, `clip::decode`), and the segment assembly that turns one
-window into published clips (`clip::segment`).
+(`clip::trigger`, `clip::decode`), the segment assembly that turns one window
+into published clips (`clip::segment`), and the record each of those clips
+carries saying what it is (`clip::manifest`).
 
 **What following a recording still being written adds** is [`tail`](../tail):
 discovery, the recording collection and its lifecycle, coverage, retention, the
@@ -342,6 +343,13 @@ window's `anchor_ns` and [time source](#time-source) — nothing of ROS or any
 wire encoding. The interface resolves the `anchor_ns` (the window centre) and hands it
 in; the handler never derives an anchor itself.
 
+The handler's first act is to fold those into one `clip::manifest::CutRequest`
+— the producer, the trigger, the anchor and the time source, with the window
+bounds derived from them — which is then the only window value the flow below
+carries. Everything that names the window afterwards, from the `info!` line to
+each segment's manifest to the membership test on every copied message, reads
+that one request.
+
 **The flow crosses the crate seam at the waits.** `tail::handler::record_clip`
 is steps 1–2 and nothing else: they are the only part that needs a file still
 being written, and they are why `tail` exists at all. Steps 3–5 are
@@ -369,7 +377,10 @@ ignored: no handler runs, no clip is extracted, and no completion is announced.
    out the full grace; on `publish` the high-water is a liveness signal, so a
    later out-of-order message can still be missed. The grace must exceed the
    recorder's flush latency: near zero for the fastwrite profile, roughly one
-   chunk fill (chunk size / aggregate data rate) for chunked profiles.
+   chunk fill (chunk size / aggregate data rate) for chunked profiles. The
+   wait's outcome is not only a log line: it travels into the cut as a
+   `clip::manifest::WindowCoverage`, which is what every segment's manifest
+   reports under `clip.short`.
 3. **Multi-file snapshot** (`cut_window`). Call `planner.plan_window(start_ns,
    end_ns, time_source)` once — `tail::Tailer` is the planner here — producing a
    `Vec<WindowPlan>`: one plan per recording whose extents overlap the window on
@@ -379,9 +390,13 @@ ignored: no handler runs, no clip is extracted, and no completion is announced.
 4. **Stage** (`cut_window`) via the staging worker pool (`extract_parallelism`
    `stage-N` threads, default 1): one `StageJob` per plan is enqueued on the
    shared FIFO channel and `cut_window` blocks on each reply. A worker runs
-   `clip::cut::stage_clip` into `.capturing/` and replies a `StagedClip`. When no
+   `clip::cut::stage_clip` into `.capturing/` and replies a `StagedClip`. Each
+   job carries the `CutRequest` and the window's `Planned` facts (how many
+   recordings were planned over, and the coverage verdict), which is how the
+   trigger reaches the writer that stamps the segment's manifest. When no
    recording covers the window, one empty plan is staged so every trigger
-   produces a valid (possibly empty) clip.
+   produces a valid (possibly empty) clip — and its manifest says which kind of
+   empty it is.
 5. **Publish** (`cut_window`). Empty segments are dropped when the window
    produced real data elsewhere (one is kept if all are empty). The count
    determines naming, which is why the workers stage but never publish: a
@@ -489,6 +504,68 @@ parsing or a CRC. The default fastwrite profile is unchunked and carries no
 CRCs, so corruption inside a message *body* that leaves the framing and the
 22-byte message header intact is invisible to every MCAP reader and is copied
 into clips as-is — only a CDR decode downstream would notice.
+
+## Every clip carries its manifest (`clip::manifest`)
+
+A clip leaves the output directory and is read somewhere with neither the
+recorder's logs nor the recording beside it, so it states what it is: one
+`mcap::records::Metadata` record under the vendor-namespaced name
+`momentedge.clip`, flat dotted keys and string values. The key groups and what a
+consumer does with them are in the
+[README](../../README.md#what-a-clip-carries); this section is where they come
+from. The name is namespaced because a recording `ros2 bag record` wrote carries
+its *own* metadata record under the bare name `rosbag2` — a manifest under that
+name would be found by whichever record a tool read first.
+
+**Written between the last message and `finish`.** `copy_window` walks the
+extents, then calls `ClipWriter::write_manifest`, then `Writer::finish()`. That
+position is what earns the two properties a reader depends on: the mcap writer
+appends a `MetadataIndex` to the summary and increments the statistics'
+`metadata_count`, both of which are written by `finish`, so a reader finds the
+record by name through the index rather than by walking the file (`mcap get
+metadata --name momentedge.clip`, and `mcap info` reports `metadata: 1`).
+Writing it earlier would mean guessing counters the copy has not finished
+producing.
+
+**Two halves meet at the writer.** The copy knows what it read and wrote; it
+does not know who asked or what the planner offered. So:
+
+- `clip::manifest::CutRequest` is the caller's half — the `Producer` (the binary
+  and the subcommand: `clipper` / `tail`, from `Mode::producer()` in `main.rs`),
+  the neutral `Trigger`, the resolved anchor, and the time source. It **derives**
+  `start_ns`/`end_ns` from the anchor and the trigger's rolls and exposes them
+  read-only, so the window the manifest states, the window the planner selects
+  extents for, and the window each message's membership is tested against are
+  one value that cannot drift. `tail::handler::handle_trigger` builds one per
+  trigger, in an `Arc` shared by that window's segments.
+- `clip::manifest::Planned` is the window-level pair every segment repeats:
+  `files`, the number of source recordings `cut_window` was given plans for, and
+  `coverage`, a `WindowCoverage` the *caller* supplies — `Short` when the
+  coverage wait timed out. Both ride in the `StageJob` alongside the request.
+- The copy's own half is per segment: `PlanSource::path` (which split this
+  segment came from), the extents and bytes read, the messages copied, and the
+  per-channel tallies.
+
+**Per-channel accounting sits on the write.** `ClipWriter::count` is called
+immediately after `write_to_known_channel` and does both the whole-clip counters
+and the `BTreeMap<u16, ChannelTally>` the manifest's `channel.<id>.*` keys come
+from, keyed by the **output** channel id so a reader can join the keys to the
+clip's own `Channel` records. One call site is the point: whatever decides which
+messages are copied — the window test today, a channel selection beside it
+tomorrow — cannot leave the accounting behind, and a channel nothing was copied
+from simply never gets an entry, so it has no keys rather than a row of zeroes.
+
+**An empty clip says which kind of empty it is.** `source.files_planned`,
+`clip.messages` and `clip.short` are what separate "nothing covered the window"
+from "the window fell in a gap between splits" from "no message matched" —
+three outcomes whose clips are otherwise byte-identical, and the reason
+`WindowCoverage` is plumbed from the wait rather than logged and dropped. The
+table is in the README; `segment::tests::an_empty_clip_says_which_kind_of_empty_it_is`
+builds all three for real and asserts they differ.
+
+`clip::manifest::read_manifest` is the other half of the contract: it reads the
+record back through the summary's metadata index — a bounded seek and one
+record, never a walk — and is what the tests assert through.
 
 ## Time base
 

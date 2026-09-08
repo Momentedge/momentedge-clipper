@@ -68,6 +68,7 @@ e2e-tests the feature half.
 |---|---|
 | `src/index.rs` | The format layer: schema/channel definitions, extents carrying both time spans, the per-recording index, the incremental scan and its delta, the window plan and the `WindowPlanner` that serves one |
 | `src/cut.rs` | Window extraction: read planned extents, assemble and atomically publish a standalone MCAP clip |
+| `src/manifest.rs` | What a clip says about itself: the `momentedge.clip` metadata record, the `CutRequest` a caller names a window with, and the reader that pulls the record back out |
 | `src/segment.rs` | One window to durable clips: plan, stage a segment per source recording over a worker pool, drop the empties, publish |
 | `src/trigger.rs` | The neutral contract: `Trigger`, `Stamp`, `TriggerRecord`, `Completion`, the `Announce` trait, `now_ns` — plus the `Completion` → `Recorded` conversion under `ros` |
 | `src/decode.rs` | `decode_trigger`: decode a trigger payload by its MCAP `message_encoding` (`json` always, `cdr` under `ros`) |
@@ -272,7 +273,9 @@ the active `--time-source`:
    time source.
 2. **Coverage wait.** Block on the coverage watch until the window's source
    high-water reaches `end_ns`, bounded by `grace_secs`. On timeout the clip is
-   cut from whatever is on disk, with a warning.
+   cut from whatever is on disk, with a warning — and the verdict travels into
+   the cut as a `clip::manifest::WindowCoverage`, so every segment's manifest
+   says whether the recording had reached the window end (`clip.short`).
 3. **Multi-file snapshot.** `plan_window(start_ns, end_ns, source)` — the tail's
    implementation of `clip::index::WindowPlanner`, the one seam the cut path
    reaches a live collection through — produces a `Vec<WindowPlan>`, one per
@@ -280,9 +283,12 @@ the active `--time-source`:
    plan pins its recording's `Arc<File>`, so a later prune or rollover cannot
    pull the bytes out.
 4. **Stage.** Enqueue one `StageJob` per plan on the FIFO staging channel and
-   block on each reply. A worker copies each message whose stamp on `source` is
-   in the window. A window covered by nothing still stages one empty plan, so
-   every trigger produces a valid (possibly empty) clip.
+   block on each reply. Each job carries the `CutRequest` — the producer, the
+   trigger, and the window derived from it — so the copy writes the segment's
+   manifest from the request that produced it. A worker copies each message
+   whose stamp on `source` is in the window. A window covered by nothing still
+   stages one empty plan, so every trigger produces a valid (possibly empty)
+   clip, and its manifest says which kind of empty it is.
 5. **Publish.** Drop empty segments when the window produced real data elsewhere.
    One segment keeps the bare `<anchor_ns>_<name>.mcap`; multiple get
    `_00`/`_01`/… suffixes. Each is published into `out_dir` atomically.
@@ -300,6 +306,14 @@ explicit `mcap::WriteOptions` with both knobs that decide a clip's layout set
 deliberately — the codec (`--clip-compression`) and the 1 MiB chunk size
 (`clip::cut::CLIP_CHUNK_SIZE`) — and finished with `Writer::finish()` (summary +
 footer + closing magic) so every clip is a complete, standalone MCAP file.
+
+Between the last copied message and `finish()` the writer emits the clip's
+**manifest**: one `mcap::records::Metadata` record named `momentedge.clip`
+(`clip::manifest`). Written there and not earlier, it lands in the summary's
+metadata index and the statistics' metadata count, so a reader finds it by name
+without walking the file — and its counters are the copy's final ones rather
+than a guess. See [What a clip carries](README.md#what-a-clip-carries) for the
+keys; `crates/clipper/CLAUDE.md` for how the two halves reach the writer.
 
 Publication is **two-staged** so `out_dir` only ever holds finished clips:
 

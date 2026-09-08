@@ -36,6 +36,10 @@ members = [
 version = "0.1.3"
 edition = "2024"
 license = "Apache-2.0"
+# The project URL a clip's manifest carries under `producer.url`
+# (`clip::manifest`), so a clip read far from here names where it came from.
+# Members inherit it with `repository.workspace = true`.
+repository = "https://github.com/Momentedge/momentedge-clipper"
 
 # Shared dependency versions; members inherit with `<crate>.workspace = true` and
 # keep their own role comment (and any crate-specific features) at the use site.

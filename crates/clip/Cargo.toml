@@ -3,6 +3,9 @@ name = "clip"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+# Read at compile time as `producer.url` in every clip's manifest, so the crate
+# that writes the record is the crate that names the project.
+repository.workspace = true
 description = "MCAP recording index, cut path and trigger contract shared by every consumer of a recording"
 
 [features]

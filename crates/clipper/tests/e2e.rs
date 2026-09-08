@@ -114,6 +114,7 @@ fn trigger_produces_clip_and_announcement(
             .map(|(t, _)| t)
             .collect::<std::collections::HashSet<_>>(),
     );
+    assert_clip_manifest(Path::new(recorded.only()), preroll, postroll);
     env.assert_capturing_drained();
     assert!(extractor.is_running(), "the extractor must outlive the cut");
 }
@@ -214,6 +215,9 @@ fn mcap_interface_reads_trigger_from_the_recording() {
         msgs.iter().any(|(topic, _)| topic == SRC_TOPIC),
         "the source topic must be in the clip"
     );
+    // The manifest is written by the shared cut, so the ROS-free interface's
+    // clips carry the same record the ros interface's do.
+    assert_clip_manifest(&clip, preroll, postroll);
     env.assert_capturing_drained();
     assert!(
         extractor.is_running(),

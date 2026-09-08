@@ -26,7 +26,49 @@ use crossbeam_channel::Sender;
 
 use crate::TimeSource;
 use crate::index::{MAGIC, RecordingIndex, ScanProgress, ScanSeed, WindowPlan, op, scan_available};
-use crate::trigger::TriggerRecord;
+use crate::manifest::{CutRequest, Planned, Producer, WindowCoverage};
+use crate::trigger::{Stamp, Trigger, TriggerRecord};
+
+/// The producer a test's clips are stamped with: a mode name no real binary
+/// runs under, so a manifest written by a fixture is never mistaken for one a
+/// recorder wrote.
+pub const TEST_PRODUCER: Producer = Producer {
+    program: "clipper",
+    mode: "test",
+};
+
+/// The [`CutRequest`] a test cuts the window `[start_ns, end_ns]` on `source`
+/// with.
+///
+/// A request derives its window from the trigger that asked for it, so a test
+/// naming bounds directly gets a trigger built to resolve to exactly them: the
+/// anchor sits at the window end, with the whole width as preroll. Tests about
+/// the *trigger* build their own; this serves the many that only need some
+/// window.
+pub fn window_request(start_ns: u64, end_ns: u64, source: TimeSource) -> CutRequest {
+    CutRequest::new(
+        TEST_PRODUCER,
+        Trigger {
+            name: "test".to_string(),
+            description: String::new(),
+            trigger_time: Stamp { sec: 0, nanosec: 0 },
+            preroll: end_ns.saturating_sub(start_ns),
+            postroll: 0,
+        },
+        end_ns,
+        source,
+    )
+}
+
+/// The [`Planned`] facts of a window one recording covered end to end — what a
+/// test staging a single segment out of a finished fixture recording is looking
+/// at. Tests about the empty and short cases state their own.
+pub fn planned_one_file() -> Planned {
+    Planned {
+        files: 1,
+        coverage: WindowCoverage::Covered,
+    }
+}
 
 /// Read a finished clip back as its `(topic, log_time)` pairs. `MessageStream`
 /// insists on a complete summary/footer/magic, so this doubles as a validity
@@ -209,6 +251,27 @@ pub fn channel_body(id: u16, schema_id: u16, topic: &str, encoding: &str) -> Vec
     body.extend_from_slice(&(encoding.len() as u32).to_le_bytes());
     body.extend_from_slice(encoding.as_bytes());
     body.extend_from_slice(&0u32.to_le_bytes());
+    body
+}
+
+/// A `Metadata` record body (name, then the key/value map as a
+/// byte-length-prefixed run of length-prefixed strings) — the record shape a
+/// `ros2 bag record` MCAP carries its own `rosbag2` metadata in, and the one a
+/// clip's manifest is written as.
+pub fn metadata_body(name: &str, entries: &[(&str, &str)]) -> Vec<u8> {
+    fn put_str(out: &mut Vec<u8>, s: &str) {
+        out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+        out.extend_from_slice(s.as_bytes());
+    }
+    let mut map = Vec::new();
+    for (k, v) in entries {
+        put_str(&mut map, k);
+        put_str(&mut map, v);
+    }
+    let mut body = Vec::new();
+    put_str(&mut body, name);
+    body.extend_from_slice(&(map.len() as u32).to_le_bytes());
+    body.extend_from_slice(&map);
     body
 }
 
