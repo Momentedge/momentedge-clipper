@@ -67,14 +67,22 @@
 //! says so. A run's result is the output directory's contents when the process
 //! exits, and the exit status is the verdict.
 //!
-//! Configuration is parsed by clap into [`Config`]: each setting is a flag of
-//! `clipper tail` that falls back to a `MOMENTEDGE_<KEY>` environment variable,
-//! then to a built-in default — the CLI flag wins over the env var, which wins
-//! over the default. The `MOMENTEDGE_*` env names are derived from one prefix
-//! applied to every field of every mode ([`with_env_prefix`]). `--version`
-//! prints the version; [`Config`]'s field docs are the `clipper tail --help`
-//! text and the authoritative per-flag reference (the README configuration
-//! table is the user-facing copy of the same set).
+//! Configuration resolves through four layers over each setting's built-in
+//! default: the system configuration file, the per-run file ([`clip::config`]),
+//! the `MOMENTEDGE_<KEY>` environment variable, and the flag — strongest last.
+//! The files are read before the parser is built and become its defaults
+//! ([`with_file_defaults`]), which is what puts the four in that order; the
+//! `MOMENTEDGE_*` names are derived from one prefix applied to every field of
+//! every mode ([`with_env_prefix`]); and `--print-config` prints what they came
+//! to ([`effective_config`]), as the log does at startup. `--version` prints the
+//! version; [`Config`]'s field docs are the `clipper tail --help` text and the
+//! authoritative per-flag reference (the README configuration table is the
+//! user-facing copy of the same set).
+//!
+//! Which topics a clip is cut from is the one setting with no flag: the files'
+//! `[topics]` table becomes a [`clip::ChannelSelection`] that both modes hand to
+//! their staging pool, so the recorder and the one-shot cutter cut the same
+//! channel set out of one recording.
 //!
 //! Logging uses the `log` facade with a pretty_env_logger backend and goes to
 //! **stdout**; `RUST_LOG` controls verbosity. Under `--interface ros` the ROS
