@@ -486,6 +486,15 @@ the recorder a unit file names is `clipper tail`. The binary carries no bundled
 overlay and no baked rpath; it resolves its typesupport through the standard
 `/opt/ros/<distro>/setup.bash`, like every ROS executable.
 
-The dev-shell build (Nix, per-distro), the CI matrix, and the Debian packaging
-pipeline are documented in the repository's contributor skills — see
-[`CLAUDE.md`](CLAUDE.md).
+The ROS-free build ships differently, and elsewhere. With clipper's `ros` feature
+off the binary links no ROS at all — its only dynamic dependencies are libc and
+libgcc — so none of the reasoning above bears on it: there is no host ROS to stay
+ABI-compatible with, and no ROS closure a store path could bake in. It ships as
+the flake's one deployable package, `nix build .#clipper-ros-free`: a
+distro-independent store path carrying the same `clipper` executable, which runs
+on a host with no ROS 2 installation. It needs no Debian package, because the apt
+`Depends` list that earns one is entirely the device build's ROS dependencies.
+
+The dev-shell build (Nix, per-distro), the two nix packages, the CI matrix, and
+the Debian packaging pipeline are documented in the repository's contributor
+skills — see [`CLAUDE.md`](CLAUDE.md).
