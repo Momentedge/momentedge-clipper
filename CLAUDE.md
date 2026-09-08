@@ -71,8 +71,9 @@ package) and `sim/` (the sim camera's launch/config tree) are not Cargo members.
 `crates/clip` and `crates/tail` are the libraries under the recorder, and
 neither needs a ROS toolchain anywhere. `clip` is what every consumer of a
 recording shares — the MCAP format layer, the recording index, the cut path, the
-neutral trigger contract and segment publication — so cutting a window out of a
-recording nobody is writing links `clip` alone. `tail` is what a recording with
+neutral trigger contract, segment publication, and the manifest record every
+clip carries saying what it is — so cutting a window out of a recording nobody
+is writing links `clip` alone. `tail` is what a recording with
 no end yet costs on top: discovery, the recording collection and its lifecycle,
 coverage, retention, the scan-fault budget, and the waits a cut from a growing
 file does before the shared cut path runs. `clip`'s `ros` feature, off by
@@ -85,7 +86,7 @@ escapes the `ros` feature fails there rather than in a downstream ROS-free
 build.
 
 ```
-crates/clip/            # ROS-free library: format layer, index, cut, trigger contract
+crates/clip/            # ROS-free library: format layer, index, cut, manifest, trigger contract
 crates/tail/            # ROS-free library: following a recording still being written
 crates/clipper/         # the clipper binary (`clipper tail` is the recorder): interfaces, config, supervision
 momentedge_msgs/        # local ROS2 interface package (Trigger, Recorded)
