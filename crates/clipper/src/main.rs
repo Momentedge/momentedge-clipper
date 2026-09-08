@@ -56,6 +56,17 @@
 //! modes, `clipper tail --help` lists the recorder's own flags, and a flag
 //! offered to `clipper` itself is a parse error pointing at the subcommand.
 //!
+//! **The other mode is `clipper clip`** ([`clip_mode`]): one clip out of one
+//! finished recording, named by a trigger on the command line, then exit. It
+//! shares everything below the trigger — the window plan, the copy, the
+//! manifest, atomic publication — and differs in the two things a finished input
+//! makes meaningless. The recording is indexed from its own summary
+//! ([`clip::whole::WholeFileIndex`]) rather than by a scan that keeps resuming,
+//! and neither wait above runs: there is no later data to wait for, so a window
+//! reaching past the recording's end is simply short and the clip's manifest
+//! says so. A run's result is the output directory's contents when the process
+//! exits, and the exit status is the verdict.
+//!
 //! Configuration is parsed by clap into [`Config`]: each setting is a flag of
 //! `clipper tail` that falls back to a `MOMENTEDGE_<KEY>` environment variable,
 //! then to a built-in default — the CLI flag wins over the env var, which wins
@@ -244,8 +255,9 @@ impl std::fmt::Display for InterfaceKind {
     long_about = "Triggered MCAP clip recorder.\n\n\
                   One mode runs per invocation, and the mode is a subcommand: \
                   `clipper tail` follows a continuous recording and cuts a clip \
-                  per trigger. Every flag belongs to a mode, so `clipper tail \
-                  --help` is the recorder's own flag reference."
+                  per trigger, while `clipper clip` cuts one clip out of one \
+                  finished recording and exits. Every flag belongs to a mode, so \
+                  `clipper <mode> --help` is that mode's own flag reference."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -262,6 +274,15 @@ enum Mode {
     /// record` writes, and cuts the window each trigger asks for out of them.
     /// Runs until a shutdown signal.
     Tail(Config),
+    /// Cut one clip out of one finished recording and exit.
+    ///
+    /// Takes a recording nobody is writing any more and a trigger named on the
+    /// command line, and writes the window that trigger asks for. The recording
+    /// is indexed from its own summary rather than by walking it, and nothing
+    /// is waited for — the input has an end. The run's result is the contents
+    /// of the output directory when the process exits; the exit status is the
+    /// verdict.
+    Clip(ClipConfig),
 }
 
 /// The program name every clip's manifest carries under `producer.name`: this
@@ -277,6 +298,7 @@ impl Mode {
     fn producer(&self) -> Producer {
         let mode = match self {
             Mode::Tail(_) => "tail",
+            Mode::Clip(_) => "clip",
         };
         Producer {
             program: PROGRAM,
@@ -392,6 +414,56 @@ impl Config {
     }
 }
 
+/// Configuration for [`Mode::Clip`]: the recording to cut from, where the clip
+/// goes, and the trigger — spelled out as the five fields a
+/// `momentedge_msgs/Trigger` carries, so a clip cut here states the same trigger
+/// a clip cut from a live topic does. As with every mode, each field falls back
+/// to its `MOMENTEDGE_*` environment variable ([`load_cli`]) and the field doc
+/// comments are the `clipper clip --help` text.
+///
+/// There is no clock-domain flag. The window lives on `log_time` ([`CLIP_TIME_SOURCE`]),
+/// the clock a recording's summary states its message times on and the one a
+/// completeness claim can be made about; `--time-source` belongs to the tail,
+/// where coverage is something a caller waits for.
+#[derive(Debug, Args)]
+struct ClipConfig {
+    /// The finished MCAP recording to cut the clip out of.
+    recording: PathBuf,
+
+    /// Directory the finished clip is written to.
+    #[arg(long)]
+    out_dir: PathBuf,
+
+    /// The instant the clip window centres on, in nanoseconds since the epoch.
+    ///
+    /// The window is `[trigger-time - preroll, trigger-time + postroll]` on the
+    /// recording's `log_time`, and the instant also names the clip
+    /// (`<trigger-time>_<trigger-name>.mcap`). There is no default: the one
+    /// thing only the caller knows is which moment the clip is about.
+    #[arg(long)]
+    trigger_time: u64,
+
+    /// Nanoseconds before the trigger instant to include in the clip.
+    #[arg(long)]
+    preroll: u64,
+
+    /// Nanoseconds after the trigger instant to include in the clip.
+    #[arg(long)]
+    postroll: u64,
+
+    /// The trigger's name, which also names the clip file.
+    ///
+    /// Carried into the clip's manifest under `trigger.name` and embedded in the
+    /// output filename, so it is bounded and kept filename-safe the same way a
+    /// name arriving on a topic is.
+    #[arg(long, default_value = "clip")]
+    trigger_name: String,
+
+    /// The trigger's description, carried into the clip's manifest.
+    #[arg(long, default_value = "")]
+    trigger_description: String,
+}
+
 /// Prefix shared by every `MOMENTEDGE_*` environment variable.
 /// [`with_env_prefix`] applies it to every argument of every [`Mode`], so the
 /// env names track the field names (`grace_secs` → `MOMENTEDGE_GRACE_SECS`)
@@ -442,7 +514,8 @@ fn mode_hint(kind: clap::error::ErrorKind) -> Option<&'static str> {
     )
     .then_some(
         "clipper runs one mode per invocation, named as a subcommand. \
-         The recorder is `clipper tail` — try `clipper tail --help`.",
+         The recorder is `clipper tail` and the one-shot cutter is \
+         `clipper clip` — try `clipper tail --help`.",
     )
 }
 
@@ -559,6 +632,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let producer = mode.producer();
     match mode {
         Mode::Tail(cfg) => tail_mode(cfg, producer),
+        Mode::Clip(cfg) => clip_mode(cfg, producer).map_err(Into::into),
     }
 }
 
@@ -629,6 +703,119 @@ fn tail_mode(cfg: Config, producer: Producer) -> Result<(), Box<dyn std::error::
         }
     };
     result.map_err(Into::into)
+}
+
+/// The clock domain `clipper clip` cuts on.
+///
+/// Not a flag: a finished recording's summary states its message times on
+/// `log_time` alone, so that is the clock a window over one can be planned and a
+/// completeness claim made on. `--time-source` is the tail's, where the choice
+/// changes what a handler waits for.
+const CLIP_TIME_SOURCE: TimeSource = TimeSource::Log;
+
+/// The codec `clipper clip` writes its clip with — the recorder's default,
+/// spelled once here because this mode takes no compression flag.
+const CLIP_MODE_COMPRESSION: ClipCompression = ClipCompression::Zstd;
+
+/// `clipper clip`: cut one window out of one finished recording and exit.
+///
+/// The recording is indexed from its own summary ([`clip::whole::WholeFileIndex`])
+/// — a footer seek and one read, no chunk decompressed — and handed to the same
+/// [`clip::segment::cut_window`] the recorder drives, so the clip is byte-for-byte
+/// what the device would have cut from the same recording and window.
+///
+/// **The waits are what is absent.** `tail::handler` sleeps until the wall clock
+/// passes the window end, then blocks until the tail's coverage reaches it,
+/// because a window may reach past the last byte on disk. This input has an end:
+/// there is nothing to wait for, so a window reaching past it is simply short,
+/// and the manifest says so ([`clip::manifest::WindowCoverage`]).
+///
+/// Nothing is printed for a caller to parse. The result is the output
+/// directory's contents when the process exits, each clip carrying its own
+/// manifest; the exit status is the verdict.
+fn clip_mode(cfg: ClipConfig, producer: Producer) -> anyhow::Result<()> {
+    // A trigger name reaches the filesystem through the clip's pathname, so it
+    // passes the gate every trigger passes, whichever source it arrived from.
+    if let Err(why) = validate_name(&cfg.trigger_name) {
+        anyhow::bail!("--trigger-name {:?} {why}", cfg.trigger_name);
+    }
+
+    // Start from a clean capturing dir, which also creates out_dir: a clip is
+    // assembled there and hard-linked into place, so the output directory only
+    // ever holds complete clips.
+    clip::cut::reset_capturing_dir(&cfg.out_dir)?;
+
+    let index = clip::whole::WholeFileIndex::open(&cfg.recording)?;
+
+    let anchor_ns = cfg.trigger_time;
+    let trigger = Trigger {
+        name: cfg.trigger_name,
+        description: cfg.trigger_description,
+        trigger_time: clip::Stamp::from_ns(anchor_ns),
+        preroll: cfg.preroll,
+        postroll: cfg.postroll,
+    };
+    let request = Arc::new(clip::CutRequest::new(
+        producer,
+        trigger.clone(),
+        anchor_ns,
+        CLIP_TIME_SOURCE,
+    ));
+
+    // The one thing a finished clip cannot show from its own contents: whether
+    // the recording ever reached the window end, or simply stops inside it.
+    let coverage = if index
+        .log_end_ns()
+        .is_some_and(|end_ns| end_ns >= request.end_ns())
+    {
+        clip::WindowCoverage::Covered
+    } else {
+        warn!(
+            "{} ends before the window end {}; the clip stops where the \
+             recording does",
+            cfg.recording.display(),
+            request.end_ns(),
+        );
+        clip::WindowCoverage::Short
+    };
+
+    info!(
+        "cutting {} window=[{}, {}] source={CLIP_TIME_SOURCE} from {} into {}",
+        trigger.name,
+        request.start_ns(),
+        request.end_ns(),
+        cfg.recording.display(),
+        cfg.out_dir.display(),
+    );
+
+    // One window, one recording, one copy: the pool is sized to the work there
+    // is. It exists at all because staging is the pool's job either way.
+    let stage_tx = segment::spawn_stage_workers(1, CLIP_MODE_COMPRESSION.to_mcap());
+    let base_out_path = cfg.out_dir.join(format!(
+        "{anchor_ns}_{}.mcap",
+        segment::sanitize(&trigger.name)
+    ));
+    let segments = segment::cut_window(&index, &request, coverage, &base_out_path, &stage_tx)?;
+
+    for stats in &segments {
+        info!(
+            "clip {} written: {} msgs from {} extents, {:.1} MiB",
+            stats.out_path.display(),
+            stats.messages_copied,
+            stats.extents_read,
+            stats.bytes_copied as f64 / 1_048_576.0,
+        );
+        if stats.records_skipped > 0 || stats.chunks_dropped > 0 {
+            warn!(
+                "clip {} is missing data over damage in the recording: \
+                 {} records skipped, {} chunks dropped",
+                stats.out_path.display(),
+                stats.records_skipped,
+                stats.chunks_dropped,
+            );
+        }
+    }
+    Ok(())
 }
 
 /// The largest `preroll` or `postroll` a trigger may request, in nanoseconds
@@ -942,6 +1129,19 @@ mod tests {
     {
         cli_from(argv).map(|cli| match cli.mode {
             Mode::Tail(cfg) => cfg,
+            Mode::Clip(_) => panic!("this argv names the tail mode"),
+        })
+    }
+
+    /// The cutter's `ClipConfig` out of an argv naming the `clip` mode.
+    fn clip_from<I, T>(argv: I) -> Result<ClipConfig, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        cli_from(argv).map(|cli| match cli.mode {
+            Mode::Clip(cfg) => cfg,
+            Mode::Tail(_) => panic!("this argv names the clip mode"),
         })
     }
 
@@ -995,32 +1195,43 @@ mod tests {
     /// invariant generically: each one carries `MOMENTEDGE_<FIELD>`, and the
     /// auto-generated `--help`/`--version` carry none. Written over
     /// `get_arguments()` rather than a hand-listed set so a field added to
-    /// `Config` is covered the moment it exists — a per-field list would silently
-    /// leave the newest field, the one most likely to be mis-wired, untested.
+    /// a mode's config is covered the moment it exists — a per-field list would
+    /// silently leave the newest field, the one most likely to be mis-wired,
+    /// untested. Every mode is walked, since the binding is applied per
+    /// subcommand.
     #[test]
     fn env_prefix_binds_a_momentedge_name_to_every_field() {
         let cli = with_env_prefix(Cli::command());
-        let cmd = cli
-            .find_subcommand("tail")
-            .expect("the tail mode is a subcommand of clipper");
-        let mut bound = 0;
-        for arg in cmd.get_arguments() {
-            let id = arg.get_id().as_str();
-            let env = arg.get_env().map(|e| e.to_string_lossy().into_owned());
-            if matches!(id, "help" | "version") {
-                assert_eq!(env, None, "{id} must keep clap's own handling");
-                continue;
+        let bound = |mode: &str| -> usize {
+            let cmd = cli
+                .find_subcommand(mode)
+                .unwrap_or_else(|| panic!("{mode} is a subcommand of clipper"));
+            let mut bound = 0;
+            for arg in cmd.get_arguments() {
+                let id = arg.get_id().as_str();
+                let env = arg.get_env().map(|e| e.to_string_lossy().into_owned());
+                if matches!(id, "help" | "version") {
+                    assert_eq!(env, None, "{id} must keep clap's own handling");
+                    continue;
+                }
+                assert_eq!(
+                    env.as_deref(),
+                    Some(format!("MOMENTEDGE_{}", id.to_uppercase()).as_str()),
+                    "{mode}: {id} must fall back to its MOMENTEDGE_* env var",
+                );
+                bound += 1;
             }
-            assert_eq!(
-                env.as_deref(),
-                Some(format!("MOMENTEDGE_{}", id.to_uppercase()).as_str()),
-                "{id} must fall back to its MOMENTEDGE_* env var",
-            );
-            bound += 1;
-        }
+            bound
+        };
         assert_eq!(
-            bound, 9,
+            bound("tail"),
+            9,
             "every Config field is bound (update on a new field)"
+        );
+        assert_eq!(
+            bound("clip"),
+            7,
+            "every ClipConfig field is bound (update on a new field)"
         );
     }
 
@@ -1130,7 +1341,9 @@ mod tests {
         assert_eq!(mode_hint(err.kind()), None);
         let help = err.to_string();
         assert!(help.contains("Commands:"), "{help}");
-        assert!(help.contains("tail"), "{help}");
+        for mode in ["tail", "clip"] {
+            assert!(help.contains(mode), "the mode listing names {mode}: {help}");
+        }
     }
 
     /// `clipper tail --help` is the recorder's own surface: its flags, and no
@@ -1203,6 +1416,270 @@ mod tests {
         let err = cli_from(["clipper", "tail", "--time-source", "bogus"])
             .expect_err("an unknown --time-source value is rejected");
         assert_eq!(mode_hint(err.kind()), None);
+    }
+
+    // ── `clipper clip`: one clip out of one finished recording ─────────────
+
+    /// A full `clipper clip` command line populates every field of the cutter's
+    /// config.
+    #[test]
+    fn clip_cli_flags_populate_every_field() {
+        let cfg = clip_from([
+            "clipper",
+            "clip",
+            "/data/record/rosbag2_0.mcap",
+            "--out-dir",
+            "/data/clips",
+            "--trigger-time",
+            "1738000000000000000",
+            "--preroll",
+            "5000000000",
+            "--postroll",
+            "2000000000",
+            "--trigger-name",
+            "brake-event",
+            "--trigger-description",
+            "hard brake over 0.8 g",
+        ])
+        .unwrap();
+        assert_eq!(
+            cfg.recording,
+            PathBuf::from("/data/record/rosbag2_0.mcap"),
+            "the recording is the positional argument"
+        );
+        assert_eq!(cfg.out_dir, PathBuf::from("/data/clips"));
+        assert_eq!(cfg.trigger_time, 1_738_000_000_000_000_000);
+        assert_eq!(cfg.preroll, 5_000_000_000);
+        assert_eq!(cfg.postroll, 2_000_000_000);
+        assert_eq!(cfg.trigger_name, "brake-event");
+        assert_eq!(cfg.trigger_description, "hard brake over 0.8 g");
+    }
+
+    /// The window is what only the caller knows, so leaving out the instant it
+    /// centres on is refused by name rather than defaulted to something.
+    ///
+    /// The refusal is clap's, so it happens before `clip_mode` runs: no output
+    /// directory is created and no clip is written.
+    #[test]
+    fn clip_without_a_trigger_time_is_refused_by_name() {
+        let err = cli_from([
+            "clipper",
+            "clip",
+            "rec.mcap",
+            "--out-dir",
+            "/data/clips",
+            "--preroll",
+            "1000",
+            "--postroll",
+            "1000",
+        ])
+        .expect_err("a clip with no trigger time names no window");
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        assert_ne!(err.exit_code(), 0, "a rejected command line exits non-zero");
+        assert!(
+            err.to_string().contains("--trigger-time"),
+            "the refusal names the missing flag: {err}"
+        );
+    }
+
+    /// The cutter has no clock-domain flag: a window over a finished recording
+    /// lives on `log_time`, the clock its summary states message times on.
+    /// Passing `--time-source` is refused rather than quietly ignored.
+    #[test]
+    fn clip_offers_no_clock_domain_flag() {
+        assert!(
+            clip_from([
+                "clipper",
+                "clip",
+                "rec.mcap",
+                "--out-dir",
+                "/data/clips",
+                "--trigger-time",
+                "1000",
+                "--preroll",
+                "0",
+                "--postroll",
+                "0",
+                "--time-source",
+                "log",
+            ])
+            .is_err(),
+            "the cutter takes no --time-source"
+        );
+
+        let err =
+            cli_from(["clipper", "clip", "--help"]).expect_err("--help short-circuits the parse");
+        let help = err.to_string();
+        assert!(
+            !help.contains("--time-source"),
+            "clipper clip --help offers no clock domain: {help}"
+        );
+        for flag in [
+            "--out-dir",
+            "--trigger-time",
+            "--preroll",
+            "--postroll",
+            "--trigger-name",
+            "--trigger-description",
+        ] {
+            assert!(
+                help.contains(flag),
+                "clipper clip --help lists {flag}: {help}"
+            );
+        }
+    }
+
+    /// The end-to-end cut: a real chunked recording in, one clip out, stamped
+    /// with the mode that produced it.
+    ///
+    /// `producer.mode` is what tells a clip cut here from one the recorder cut,
+    /// and it is read off the parsed mode rather than spelled at the cut, so it
+    /// is taken through `Mode::producer` exactly as `main` takes it.
+    #[test]
+    fn clip_mode_cuts_the_window_and_stamps_the_clip_as_its_own() -> anyhow::Result<()> {
+        let root = clip::testing::test_dir("clip-mode")?;
+        let rec = root.join("rec.mcap");
+        clip::testing::write_recording(
+            &rec,
+            true,
+            &[("/t", 1_000), ("/t", 2_000), ("/t", 3_000), ("/t", 4_000)],
+        )?;
+        let out_dir = root.join("clipped");
+
+        let mode = Mode::Clip(ClipConfig {
+            recording: rec.clone(),
+            out_dir: out_dir.clone(),
+            trigger_time: 3_000,
+            preroll: 1_500,
+            postroll: 500,
+            trigger_name: "brake".to_string(),
+            trigger_description: "hard brake".to_string(),
+        });
+        let producer = mode.producer();
+        let Mode::Clip(cfg) = mode else {
+            unreachable!("the mode was just built as Clip")
+        };
+        clip_mode(cfg, producer)?;
+
+        let clip_path = out_dir.join("3000_brake.mcap");
+        assert_eq!(
+            clip::testing::read_clip(&clip_path)?,
+            vec![("/t".to_string(), 2_000), ("/t".to_string(), 3_000)],
+            "the window [1500, 3500] holds exactly these two messages"
+        );
+
+        let m = clip::manifest::read_manifest(&clip_path)?.expect("every clip carries a manifest");
+        assert_eq!(m["producer.name"], "clipper");
+        assert_eq!(
+            m["producer.mode"], "clip",
+            "a clip cut here is told from a recorder's without opening the recording"
+        );
+        assert_eq!(m["trigger.name"], "brake");
+        assert_eq!(m["trigger.description"], "hard brake");
+        assert_eq!(m["trigger.anchor_ns"], "3000");
+        assert_eq!(m["trigger.preroll_ns"], "1500");
+        assert_eq!(m["trigger.postroll_ns"], "500");
+        assert_eq!(m["window.time_source"], "log");
+        assert_eq!(m["window.start_ns"], "1500");
+        assert_eq!(m["window.end_ns"], "3500");
+        assert_eq!(m["source.path"], rec.display().to_string());
+        assert_eq!(m["source.files_planned"], "1");
+        assert_eq!(m["clip.messages"], "2");
+        assert_eq!(
+            m["clip.short"], "false",
+            "the recording runs past the window end"
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// The cut runs with both of the recorder's waits absent.
+    ///
+    /// The window ends a minute in the wall-clock future and a minute past the
+    /// last recorded message — the two things `tail::handler` sleeps for. The
+    /// recording is finished, so there is nothing to wait for: the clip is
+    /// written at once and says it stops short of what was asked for.
+    #[test]
+    fn clip_mode_over_a_finished_recording_does_not_wait() -> anyhow::Result<()> {
+        let root = clip::testing::test_dir("clip-nowait")?;
+        let rec = root.join("rec.mcap");
+        let base = clip::trigger::now_ns();
+        clip::testing::write_recording(&rec, true, &[("/t", base), ("/t", base + 1_000)])?;
+        let out_dir = root.join("clipped");
+
+        let postroll = 60_000_000_000;
+        let began = std::time::Instant::now();
+        clip_mode(
+            ClipConfig {
+                recording: rec,
+                out_dir: out_dir.clone(),
+                trigger_time: base,
+                preroll: 0,
+                postroll,
+                trigger_name: "late".to_string(),
+                trigger_description: String::new(),
+            },
+            Producer {
+                program: PROGRAM,
+                mode: "clip",
+            },
+        )?;
+        let elapsed = began.elapsed();
+
+        let clip_path = out_dir.join(format!("{base}_late.mcap"));
+        let m = clip::manifest::read_manifest(&clip_path)?.expect("every clip carries a manifest");
+        assert_eq!(m["clip.messages"], "2");
+        assert_eq!(
+            m["clip.short"], "true",
+            "the recording stops well inside the window, and the clip says so"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the cut must not sleep out the window's {postroll} ns of postroll: took {elapsed:?}"
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// A trigger name that cannot be safely embedded in the clip pathname is
+    /// refused here exactly as it is when it arrives on a topic, and nothing is
+    /// written.
+    #[test]
+    fn clip_mode_refuses_an_unsafe_trigger_name() -> anyhow::Result<()> {
+        let root = clip::testing::test_dir("clip-badname")?;
+        let rec = root.join("rec.mcap");
+        clip::testing::write_recording(&rec, true, &[("/t", 1_000)])?;
+        let out_dir = root.join("clipped");
+
+        let err = clip_mode(
+            ClipConfig {
+                recording: rec,
+                out_dir: out_dir.clone(),
+                trigger_time: 1_000,
+                preroll: 0,
+                postroll: 0,
+                trigger_name: "../escape".to_string(),
+                trigger_description: String::new(),
+            },
+            Producer {
+                program: PROGRAM,
+                mode: "clip",
+            },
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("--trigger-name"),
+            "the refusal names the flag: {err:#}"
+        );
+        assert!(
+            !out_dir.exists(),
+            "a refused command line writes nothing at all"
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
     }
 
     // ── supervise() tests ──────────────────────────────────────────────────

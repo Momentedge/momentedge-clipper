@@ -16,8 +16,11 @@ The system is **two cooperating processes that share only a file**:
 
 `clipper` is one binary and the mode is a subcommand, so a mode that reaches a
 recording some other way is a sibling of `tail` rather than a second
-executable to deploy. `tail` is the mode this document describes; the flags it
-takes are tabulated in the [README](README.md#configuration).
+executable to deploy. The other one is **`clipper clip`**: one clip out of one
+finished recording, named by a trigger on the command line, then exit — see
+[Cutting from a finished recording](#cutting-from-a-finished-recording). `tail`
+is the mode most of this document describes; the flags each takes are tabulated
+in the [README](README.md#configuration).
 
 The split is deliberate. Recording and deciding-what-matters are different jobs
 with different change rates: the recorder keeps its own config, lifecycle, and
@@ -67,6 +70,7 @@ e2e-tests the feature half.
 | `clip` module | Role |
 |---|---|
 | `src/index.rs` | The format layer: schema/channel definitions, extents carrying both time spans, the per-recording index, the incremental scan and its delta, the window plan and the `WindowPlanner` that serves one |
+| `src/whole.rs` | The same index for a recording that is already finished, taken from its own summary: one extent per chunk index, the registry and time bounds off the summary, served through the same `WindowPlanner` |
 | `src/cut.rs` | Window extraction: read planned extents, assemble and atomically publish a standalone MCAP clip |
 | `src/manifest.rs` | What a clip says about itself: the `momentedge.clip` metadata record, the `CutRequest` a caller names a window with, and the reader that pulls the record back out |
 | `src/segment.rs` | One window to durable clips: plan, stage a segment per source recording over a worker pool, drop the empties, publish |
@@ -84,7 +88,7 @@ e2e-tests the feature half.
 
 | `clipper` source file | Role |
 |---|---|
-| `src/main.rs` | Entry point, the subcommand surface (`clipper tail`) and its configuration (clap), admission gate, thread supervision |
+| `src/main.rs` | Entry point, the subcommand surface (`clipper tail`, `clipper clip`) and each mode's configuration (clap), admission gate, thread supervision |
 | `src/interface.rs` | `trait Interface`, the `Anchor` it resolves, and the `mcap` implementation with its no-op announcer |
 | `src/interface/ros.rs` | The `ros` implementation and its `Recorded` announcer, compiled in only under the crate's `ros` feature — the only source file in the workspace that names a ROS node |
 | `src/supervision.rs` | `spawn_supervised`/`harvest_panic`: pair each long-lived thread with a channel carrying its verdict |
@@ -295,6 +299,44 @@ the active `--time-source`:
 6. **Announce** one completion through the active interface — only after every
    segment is in `out_dir` and fsynced, so every announced path is crash-durable.
 
+## Cutting from a finished recording
+
+`clipper clip <recording.mcap> --out-dir <dir> --trigger-time <ns> --preroll
+<ns> --postroll <ns>` cuts one window out of a recording nobody is writing any
+more and exits. Steps 3–6 above are unchanged — it is `clip::segment::cut_window`
+either way, and the clip is what the device would have written from the same
+recording and window. Two things differ, and both follow from the input having
+an end.
+
+**The index comes from the summary.** A finalised MCAP carries a chunk index per
+chunk (its byte range and the `log_time` span of the messages inside it), the
+whole schema and channel registry, and the file's statistics — everything the
+incremental scan spends a pass over the data section rebuilding.
+`clip::whole::WholeFileIndex` reads the footer and the summary and nothing else,
+turns each chunk index into one `Extent` and the registry into the channel map,
+and hands the result to the same `WindowPlanner` seam the tail implements. So
+accepting a recording costs a seek and one read whatever its size, no chunk is
+decompressed until the copy asks for one, and the cut path cannot tell which kind
+of index it was given. The summary states message times on `log_time` alone, so
+an extent built this way carries the unbounded publish span: a window on
+`publish` selects every chunk rather than dropping one the summary cannot vouch
+for, and the copy's own per-message test still decides membership.
+
+**Neither wait runs.** There is no later data to wait for, so nothing sleeps out
+the postroll and nothing blocks on coverage. A window reaching past the end of
+the recording is short, and that is a fact the summary's own statistics answer:
+the cut compares the recording's highest `log_time` against the window end and
+carries the verdict into the manifest's `clip.short`, exactly as the coverage
+wait's verdict travels on the live path.
+
+The mode takes no `--time-source`: `log_time` is the clock a summary states and
+the only one a completeness claim over a finished recording can be made on, so
+passing the flag is a parse error. Everything else about the clip — the manifest,
+the `<anchor_ns>_<name>.mcap` name, the staged-then-linked publication — is the
+shared path, and `producer.mode` reads `clip` rather than `tail` so a reader
+tells the two apart without opening the recording. No ROS is involved, so the
+ROS-free build cuts these clips as well as the device build does.
+
 ## Clip assembly and atomic publication
 
 Extraction reads each planned extent with `read_at` and walks its records with
@@ -445,8 +487,8 @@ trigger arrived live over ROS or was decoded out of the tailed MCAP.
 
 ## Time source
 
-`--time-source` (`log` or `publish`, default `log`) selects the clock domain the
-whole window lives in: the anchor it centres on, which messages fall inside,
+`--time-source` is `clipper tail`'s (`log` or `publish`, default `log`) and
+selects the clock domain the whole window lives in: the anchor it centres on, which messages fall inside,
 which extents are read, and the coverage a cut waits for. It governs nothing
 else. Every MCAP message carries both stamps; the tail indexes both, and the
 window compares against whichever the flag selects. `log_time` is when the
@@ -458,6 +500,8 @@ coverage is a liveness signal only. Retention always ages a recording out on its
 `log_time`, independent of the window's source, so a producer cannot drive file
 deletion through `publish_time`. On ROS 2 Humble `publish_time = log_time`
 verbatim, so `publish` is a no-op there; it differs on Jazzy and newer.
+`clipper clip` has no such flag — see
+[Cutting from a finished recording](#cutting-from-a-finished-recording).
 
 ## Deployment
 

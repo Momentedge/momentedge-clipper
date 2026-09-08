@@ -34,7 +34,10 @@ Build, CI, packaging, and release mechanics live in **skills** (loaded on demand
 message index, and cuts clips out of a continuous on-disk `ros2 bag record` on
 trigger events, copying MCAP messages straight through (decoding only each
 message's log time). The example [`trigger-pub`](examples/trigger-pub/CLAUDE.md)
-is a periodic `Trigger` publisher that drives it during development. The full
+is a periodic `Trigger` publisher that drives it during development. The mode is
+a subcommand: `clipper tail` is that recorder, and `clipper clip` cuts one window
+out of one already-finished recording and exits — same window plan, same copy,
+same manifest, without the two waits a growing file costs. The full
 design is in [ARCHITECTURE.md](ARCHITECTURE.md) and
 [crates/clipper/CLAUDE.md](crates/clipper/CLAUDE.md).
 
@@ -70,7 +73,8 @@ package) and `sim/` (the sim camera's launch/config tree) are not Cargo members.
 
 `crates/clip` and `crates/tail` are the libraries under the recorder, and
 neither needs a ROS toolchain anywhere. `clip` is what every consumer of a
-recording shares — the MCAP format layer, the recording index, the cut path, the
+recording shares — the MCAP format layer, the recording index (including the
+whole-file one a finished recording's own summary yields), the cut path, the
 neutral trigger contract, segment publication, and the manifest record every
 clip carries saying what it is — so cutting a window out of a recording nobody
 is writing links `clip` alone. `tail` is what a recording with

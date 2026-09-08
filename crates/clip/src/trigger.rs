@@ -46,6 +46,26 @@ impl Stamp {
     pub fn ns(&self) -> u64 {
         (self.sec.max(0) as u64) * 1_000_000_000 + self.nanosec as u64
     }
+
+    /// The stamp naming `ns` nanoseconds since the epoch — what a trigger source
+    /// that states its instant as a plain nanosecond count (a command line, a
+    /// JSON field) fills the message's `builtin_interfaces/Time` from.
+    ///
+    /// Exact inverse of [`Self::ns`] for every instant the message can hold.
+    /// `sec` is an `i32`, so an instant past its range (some time in 2038)
+    /// saturates at the largest stamp there is rather than wrapping into the
+    /// past — a window is anchored on the nanosecond count itself, never on the
+    /// round trip through here.
+    pub fn from_ns(ns: u64) -> Self {
+        let nanosec = (ns % 1_000_000_000) as u32;
+        match i32::try_from(ns / 1_000_000_000) {
+            Ok(sec) => Stamp { sec, nanosec },
+            Err(_) => Stamp {
+                sec: i32::MAX,
+                nanosec: 999_999_999,
+            },
+        }
+    }
 }
 
 /// Nanoseconds since the Unix epoch on the system clock — the one time base the
@@ -160,5 +180,38 @@ mod tests {
             .ns(),
             250
         );
+    }
+
+    /// A nanosecond count becomes the stamp that names the same instant, and
+    /// comes back unchanged — the property a caller anchoring a window on one
+    /// and reporting the other depends on.
+    #[test]
+    fn from_ns_round_trips_every_representable_instant() {
+        for ns in [
+            0,
+            1,
+            999_999_999,
+            1_000_000_000,
+            1_738_000_000_123_456_789,
+            i32::MAX as u64 * 1_000_000_000 + 999_999_999,
+        ] {
+            assert_eq!(Stamp::from_ns(ns).ns(), ns, "{ns} must round-trip");
+        }
+    }
+
+    /// An instant past the `i32` seconds field saturates at the largest stamp
+    /// there is; it must never wrap into a negative second, which `ns()` would
+    /// then clamp to the epoch.
+    #[test]
+    fn from_ns_saturates_past_the_seconds_field() {
+        let stamp = Stamp::from_ns(u64::MAX);
+        assert_eq!(
+            stamp,
+            Stamp {
+                sec: i32::MAX,
+                nanosec: 999_999_999
+            }
+        );
+        assert!(stamp.ns() > 0, "saturation must not land back at the epoch");
     }
 }

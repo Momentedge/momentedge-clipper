@@ -199,15 +199,23 @@ code in both. To build the device half:
 
 ## Configuration
 
-clipper is one binary and the mode is a subcommand: `clipper tail` is the
-recorder, and `clipper --help` lists the modes. A recorder flag handed to the
-bare `clipper` is refused, with a message naming `clipper tail`.
+clipper is one binary and the mode is a subcommand, and `clipper --help` lists
+them:
 
-`clipper tail` is configured by CLI flags, each with a `MOMENTEDGE_*`
-environment fallback and a built-in default: a flag overrides the env var, which
-overrides the default. `clipper tail --help` lists them; `clipper --version`
-prints the version. Every flag is optional — `clipper tail` runs with no
-further arguments.
+- **`clipper tail`** — the recorder: follow a continuous recording and cut a clip
+  per trigger, until a shutdown signal.
+- **`clipper clip`** — cut one clip out of one finished recording and exit
+  ([below](#cutting-one-clip-clipper-clip)).
+
+A flag handed to the bare `clipper` is refused, with a message naming the mode
+that owns it. Every mode's flags carry a `MOMENTEDGE_*` environment fallback: a
+flag overrides the env var, which overrides the built-in default where there is
+one. `clipper <mode> --help` lists that mode's flags; `clipper --version` prints
+the version.
+
+### `clipper tail`
+
+Every flag is optional — `clipper tail` runs with no further arguments.
 
 | Flag | Env var | Default | Meaning |
 |---|---|---|---|
@@ -225,6 +233,56 @@ further arguments.
 unchunked `fastwrite` recording, roughly one chunk-fill for a chunked profile.
 The [`examples/continuous`](examples/continuous/README.md) guide explains the
 recorder's latency-vs-size knobs and how to size `--grace-secs` against them.
+
+### Cutting one clip: `clipper clip`
+
+`clipper tail` exists because the recording has no end yet: it follows the file
+and waits for each window to land on disk before cutting. A recording that is
+already finished needs no such wait — `clipper clip` takes one, cuts the window a
+trigger names out of it, and exits.
+
+```bash
+clipper clip ./record/rosbag2_0.mcap \
+  --out-dir ./clipped \
+  --trigger-time 1738000000000000000 \
+  --preroll 5000000000 --postroll 5000000000 \
+  --trigger-name brake-event --trigger-description "hard brake over 0.8 g"
+```
+
+| Argument | Env var | Default | Meaning |
+|---|---|---|---|
+| `<recording>` | `MOMENTEDGE_RECORDING` | — | the finished `.mcap` to cut from (positional) |
+| `--out-dir` | `MOMENTEDGE_OUT_DIR` | — | where the clip is written |
+| `--trigger-time` | `MOMENTEDGE_TRIGGER_TIME` | — | the instant the window centres on, in nanoseconds since the epoch |
+| `--preroll` | `MOMENTEDGE_PREROLL` | — | nanoseconds before that instant to include |
+| `--postroll` | `MOMENTEDGE_POSTROLL` | — | nanoseconds after it to include |
+| `--trigger-name` | `MOMENTEDGE_TRIGGER_NAME` | `clip` | the trigger's name, which also names the clip file |
+| `--trigger-description` | `MOMENTEDGE_TRIGGER_DESCRIPTION` | *(empty)* | the trigger's description, carried into the manifest |
+
+The clip lands at `<out-dir>/<trigger-time>_<trigger-name>.mcap` and is the same
+file the recorder would have written from the same recording and window — the
+window plan, the byte copy, the [manifest](#what-a-clip-carries) and the atomic
+publication are all the shared path. The five trigger arguments are the fields
+of a `momentedge_msgs/Trigger`, so the clip states the same trigger a clip cut
+from a live topic does; only `producer.mode` differs, reading `clip` rather than
+`tail`.
+
+Three things follow from the input being finished:
+
+- **Nothing waits.** No postroll sleep, no wait for coverage. A window reaching
+  past the end of the recording is simply short, and the clip's `clip.short` key
+  says so.
+- **There is no clock-domain flag.** A recording's summary states its message
+  times on `log_time` alone, so that is the clock the window lives on. Passing
+  `--time-source` is a parse error.
+- **Reading it is cheap.** The recording is indexed from its own summary — a
+  footer seek and one read, whatever the file's size — rather than by walking it,
+  so no chunk is decompressed until the copy asks for one.
+
+Nothing machine-readable is printed. The result is the output directory's
+contents when the process exits, each clip carrying its own manifest, and the
+exit status is the verdict. No ROS is involved, so the ROS-free build cuts these
+clips as well as the device build does.
 
 ## Time source: `log` or `publish`
 
@@ -382,7 +440,7 @@ The keys are flat and dotted, the values all strings:
 | Group | What it says |
 |---|---|
 | `manifest.version` | the record's own schema version; a reader checks it before trusting the rest |
-| `producer.*` | the binary, the subcommand that cut the clip, the cut path's crate version, the project URL |
+| `producer.*` | the binary, the subcommand that cut the clip (`tail` or `clip`), the cut path's crate version, the project URL |
 | `trigger.*` | the trigger that asked: name, description, the anchor it resolved to, preroll and postroll |
 | `window.*` | the clock the window lives on (`log`/`publish`) and its inclusive bounds |
 | `source.*` | the recording the bytes came from, how many recordings the window was planned over, and how much was read |
@@ -414,7 +472,7 @@ both carry a record under the same name — pass `--allow-duplicate-metadata`.
 - **Lifecycle.** Ctrl-C (SIGINT/SIGTERM) stops clipper cleanly with exit 0. Any
   internal fault — a dead tail thread, an unrecoverable scan fault — exits
   non-zero so a process supervisor (systemd, …) restarts it.
-- **Logs go to stdout.** `clipper tail` logs at `info` on stdout; `RUST_LOG`
+- **Logs go to stdout.** clipper logs at `info` on stdout; `RUST_LOG`
   raises or lowers that. A run publishes nothing machine-readable on stdout —
   its result is the clips in `--out-dir`, each carrying its own metadata — so
   the stream is free for the output an operator reads first, and discarding
