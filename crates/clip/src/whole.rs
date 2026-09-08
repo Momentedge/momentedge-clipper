@@ -156,7 +156,11 @@ impl WindowPlanner for WholeFileIndex {
 /// footer and reads the summary section back, so the bytes this touches are the
 /// tail of the file and nothing else. `Ok(None)` is a well-formed MCAP with no
 /// summary section.
-fn read_summary(mut file: &File) -> Result<Option<mcap::Summary>> {
+///
+/// Shared with [`crate::embedded`], which reads a finished recording's own
+/// triggers out of the same summary: the two ask it different questions, and
+/// neither should own a second copy of the read.
+pub(crate) fn read_summary(mut file: &File) -> Result<Option<mcap::Summary>> {
     let mut reader = SummaryReader::new();
     while let Some(event) = reader.next_event() {
         match event.context("parsing the summary section")? {

@@ -27,6 +27,9 @@
 //!   source targets.
 //! - [`decode`] — a trigger payload's bytes to a [`trigger::Trigger`], dispatched
 //!   on its MCAP `message_encoding`.
+//! - [`embedded`] — the triggers a finished recording carries on the trigger
+//!   topic, found through the summary's own chunk index so only the chunks
+//!   holding that channel are read.
 //! - [`segment`] — one window to durable clips: plan, stage a segment per source
 //!   recording, drop the empties, publish atomically.
 //! - `testing` (under the `test-support` feature) — the MCAP fixture writers the
@@ -38,6 +41,7 @@
 
 pub mod cut;
 pub mod decode;
+pub mod embedded;
 pub mod index;
 pub mod manifest;
 pub mod segment;
