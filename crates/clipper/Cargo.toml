@@ -81,6 +81,10 @@ rstest = "0.26"
 # sixteen handlers with. Cargo's v2+ resolver does not enable a dev-dependency's
 # features for a normal build, so a release binary compiles none of it.
 tail = { path = "../tail", features = ["test-support"] }
+# The MCAP fixture writers and clip readers the `clipper clip` tests cut real
+# recordings with — the same ones `clip`'s own tests use, so a fixture cannot
+# drift from what the index and the cut expect. Dev-only, like `tail`'s above.
+clip = { path = "../clip", features = ["clap", "test-support"] }
 # Reading back the JSON trigger payloads the e2e harness writes into a recording.
 serde_json = "1"
 

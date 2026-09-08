@@ -529,6 +529,14 @@ mod tests {
         )?;
         let gutted = clobber_data_section(&rec, &root.join("gutted.mcap"))?;
 
+        // The fixture is only worth anything if the data section really is
+        // destroyed: a scan of it recovers no channel and reaches no message.
+        let walked = scanned(&gutted)?;
+        assert!(
+            walked.0.channels.is_empty() && !walked.0.bounds.has_messages,
+            "the gutted data section must carry nothing a walk can recover"
+        );
+
         let intact = WholeFileIndex::open(&rec)?;
         let from_summary = WholeFileIndex::open(&gutted)?;
 
