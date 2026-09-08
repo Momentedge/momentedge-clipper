@@ -13,7 +13,7 @@ description: >
 # Build & dev environment
 
 The Nix flake is for **development** (the dev shell, and
-`nix build .#clipper-tailing` as a build check) and CI. Deployment is a native
+`nix build .#clipper` as a build check) and CI. Deployment is a native
 build on the target — see the `packaging` skill and
 [ARCHITECTURE.md § Deployment](ARCHITECTURE.md#deployment).
 
@@ -92,15 +92,13 @@ once per distro:
 ```bash
 nix develop            # jazzy (the default)
 nix develop .#humble   # or .#lyrical / .#rolling
-nix build .#clipper-tailing            # default distro
-nix build .#clipper-tailing-rolling    # per-distro; also .#rosEnv-humble, etc.
+nix build .#clipper            # default distro
+nix build .#clipper-rolling    # per-distro; also .#rosEnv-humble, etc.
 ```
 
-The flake outputs are named for the binary; cargo selects by package. The
-package is `clipper` and the binary it builds is `clipper-tailing`, so
-`cargo build -p clipper` produces `target/release/clipper-tailing`;
-`nix/binaries.nix` pairs the two (`pname = "clipper-tailing"`,
-`cargoPkg = "clipper"`).
+The flake outputs are named for the binary, which for the recorder is also the
+cargo package name: `cargo build -p clipper` produces `target/release/clipper`,
+whose modes are subcommands (`cargo run -p clipper -- tail`).
 
 The attrset is lazy: selecting one distro never forces the others. Adding a
 distro is one entry in `rosDistros`. The shellHook exports

@@ -33,9 +33,9 @@ ros2 bag record --all \
 ## Run clipper
 
 ```bash
-./scripts/run.sh                    # clipper-tailing --record-dir ./record …
+./scripts/run.sh                    # clipper tail --record-dir ./record …
 # or, in the dev shell without an install:
-cargo run -p clipper --bin clipper-tailing -- \
+cargo run -p clipper -- tail \
   --record-dir ./record --out-dir ./clipped --grace-secs 30
 ```
 
@@ -95,7 +95,7 @@ ros2 bag record --all \
   --max-cache-size 0 \
   --output ./record
 
-clipper-tailing --record-dir ./record --grace-secs 2
+clipper tail --record-dir ./record --grace-secs 2
 ```
 
 ## Retention

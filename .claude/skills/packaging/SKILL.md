@@ -18,7 +18,7 @@ a Cargo binary**. So:
 | Package | Source | Tool | Script | Installs to |
 |---|---|---|---|---|
 | `ros-<distro>-momentedge-msgs` | `momentedge_msgs/` (ament_cmake) | **bloom** | `scripts/package-msgs-deb.sh` | `/opt/ros/<distro>` |
-| `momentedge-clipper` | `crates/clipper` (Rust/r2r) | **cargo-deb** | `scripts/package-clipper-deb.sh` | `/opt/momentedge-clipper/bin` (as `clipper-tailing`) |
+| `momentedge-clipper` | `crates/clipper` (Rust/r2r) | **cargo-deb** | `scripts/package-clipper-deb.sh` | `/opt/momentedge-clipper/bin` (as `clipper`) |
 
 `momentedge-clipper` declares `Depends: ros-<distro>-momentedge-msgs,
 ros-<distro>-rmw-fastrtps-cpp, ros-<distro>-ros-base`. The msgs package is a
@@ -28,7 +28,7 @@ bundled overlay** — its message typesupport resolves through the distro's own
 
 ## Run model: no baked rpath, source setup.bash
 
-The recorder binary, `clipper-tailing`, is built **without `MOMENTEDGE_RPATH`** (the
+The recorder binary, `clipper`, is built **without `MOMENTEDGE_RPATH`** (the
 optional rpath knob in `ros-cargo.sh` stays unset), so it carries **no RUNPATH**.
 It resolves `rcl`/`rmw` and the `momentedge_msgs` typesupport — including the dlopen'd
 rmw-specific `libmomentedge_msgs__rosidl_typesupport_fastrtps_c.so` — through
@@ -39,13 +39,15 @@ The msgs package puts those `.so` files in `/opt/ros/<distro>/lib`, which the di
 ```bash
 sudo apt install ./ros-humble-momentedge-msgs_*.deb ./momentedge-clipper_*.deb
 source /opt/ros/humble/setup.bash
-/opt/momentedge-clipper/bin/clipper-tailing --help
+/opt/momentedge-clipper/bin/clipper --help
 ```
 
-A systemd unit does the same: source `/opt/ros/<distro>/setup.bash` in `ExecStart`,
-or set the equivalent `Environment=`/`LD_LIBRARY_PATH`. There is **no overlay
-`setup.bash` and no launcher wrapper** in the clipper package — the binary and the
-`clipper` compatibility symlink beside it (see the gotchas) are all of it.
+The mode is a subcommand, so what a unit file's `ExecStart` names is
+`/opt/momentedge-clipper/bin/clipper tail`; the bare binary with recorder flags
+is refused. A systemd unit sources `/opt/ros/<distro>/setup.bash` in `ExecStart`,
+or sets the equivalent `Environment=`/`LD_LIBRARY_PATH`. There is **no overlay
+`setup.bash` and no launcher wrapper** in the clipper package — the one
+executable is all of it.
 
 ## Build both debs
 
@@ -101,22 +103,21 @@ comes from the installed msgs package:
 sudo dpkg --purge momentedge-clipper ros-humble-momentedge-msgs   # clean slate
 sudo apt install ./dist/ros-humble-momentedge-msgs_*.deb ./dist/momentedge-clipper_*.deb
 bin=/opt/momentedge-clipper/bin
-dpkg -L momentedge-clipper                                  # both names in the file list
-test -L "$bin/clipper"                                      # the compatibility symlink
-readelf -d "$bin/clipper-tailing" | grep -i runpath         # expect: none
+dpkg -L momentedge-clipper                                  # one executable, no symlink
+readelf -d "$bin/clipper" | grep -i runpath                 # expect: none
 source /opt/ros/humble/setup.bash
-ldd "$bin/clipper-tailing" | grep momentedge                # => /opt/ros/humble/lib/...
-diff <("$bin/clipper-tailing" --version) <("$bin/clipper" --version)
-RUST_LOG=info MOMENTEDGE_RECORD_DIR=$(mktemp -d) timeout -s INT 6 "$bin/clipper"
+ldd "$bin/clipper" | grep momentedge                        # => /opt/ros/humble/lib/...
+"$bin/clipper" --help                                       # lists the modes
+"$bin/clipper" tail --help                                  # lists the recorder's flags
+RUST_LOG=info MOMENTEDGE_RECORD_DIR=$(mktemp -d) timeout -s INT 6 "$bin/clipper" tail
 ```
 
 Success: `ldd` resolves the typesupport from `/opt/ros/<distro>/lib` (the apt
-package, not the build overlay or a baked rpath), both names report the same
-`--version`, and the recorder logs `clipper-tailing up: ...`, idles, then
-`SIGINT received; shutting down`. `release.yml`'s smoke-test step asserts the same
-per distro (its shape is in the **`ci`** skill) — keep the two in step. `--help` is
-the one output that differs between the names, by its `Usage:` line alone: clap
-builds that from `argv[0]`, so it names whichever path you invoked.
+package, not the build overlay or a baked rpath), and the recorder logs
+`clipper tail up: ...`, idles, then `SIGINT received; shutting down`.
+`release.yml`'s smoke-test step asserts the same per distro, plus that a bare
+`clipper --record-dir …` is refused (its shape is in the **`ci`** skill) — keep
+the two in step.
 
 ## Gotchas (each cost real time)
 
@@ -136,28 +137,17 @@ builds that from `argv[0]`, so it names whichever path you invoked.
   repeats `name = "momentedge-clipper"` so cargo-deb does **not** append `-<distro>`
   to the package name (the distro lives in the `.deb` filename instead, via
   `--output`). Select with `cargo deb --variant <distro>`.
-- **The cargo package is `clipper`, its binary `clipper-tailing`.** `cargo deb -p
-  clipper` and `BUILD_PACKAGES=clipper` name the package; the artefact both scripts
-  hand each other is `target/release/clipper-tailing`, declared by `[[bin]]` in
-  `crates/clipper/Cargo.toml` and named literally in the assets below.
-- **The `clipper` symlink is a cargo-deb asset, not a postinst.** `assets` in
-  `[package.metadata.deb]` mixes the array form with a table entry:
+- **One package, one executable.** The cargo package, the `[[bin]]` target and
+  the installed file are all `clipper`; `cargo deb -p clipper` and
+  `BUILD_PACKAGES=clipper` name it, and the artefact both scripts hand each other
+  is `target/release/clipper`, named literally in `assets`:
 
   ```toml
-  assets = [
-      ["target/release/clipper-tailing", "opt/momentedge-clipper/bin/", "755"],
-      { dest = "opt/momentedge-clipper/bin/clipper", link_name = "/opt/momentedge-clipper/bin/clipper-tailing" },
-  ]
+  assets = [["target/release/clipper", "opt/momentedge-clipper/bin/", "755"]]
   ```
 
-  `dest` is where the link is created inside the package, `link_name` what it points
-  at; cargo-deb normalises an absolute `link_name` under the same top-level directory
-  into a sibling-relative link, per Debian policy. Declaring it as an asset puts it
-  in the archive itself, so `dpkg-deb -c` and `dpkg -L` list it and `dpkg --purge`
-  takes it away again — none of which holds for a link a postinst creates behind
-  dpkg's back. It is a compatibility measure kept **for one release**, so units and
-  scripts pointing at `/opt/momentedge-clipper/bin/clipper` keep working until every
-  device has been re-deployed; drop the entry after that.
+  A second mode is a subcommand of that binary, not a second asset — so adding
+  one changes no packaging at all.
 - **cargo-deb summary comes from `[package].description`.** Without it the deb
   Description is `[generated from Rust crate clipper]`; clipper sets `description`
   (and `license`) in its `[package]` so the control file reads properly.

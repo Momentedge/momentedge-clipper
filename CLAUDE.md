@@ -87,7 +87,7 @@ build.
 ```
 crates/clip/            # ROS-free library: format layer, index, cut, trigger contract
 crates/tail/            # ROS-free library: following a recording still being written
-crates/clipper/         # the recorder binary (clipper-tailing): interfaces, config, supervision
+crates/clipper/         # the clipper binary (`clipper tail` is the recorder): interfaces, config, supervision
 momentedge_msgs/        # local ROS2 interface package (Trigger, Recorded)
 examples/               # setup guides + trigger-pub + mcap-writer examples + cu-mcap-record (copper)
 sim/                    # synthetic gscam camera (sim/cam_sim.sh) — see sim/README.md
