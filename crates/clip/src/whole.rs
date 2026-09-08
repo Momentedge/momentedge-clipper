@@ -99,13 +99,17 @@ impl WholeFileIndex {
                 )
             })?;
 
-        let messages = summary.stats.as_ref().map(|s| s.message_count);
-        if summary.chunk_indexes.is_empty() && messages.is_some_and(|n| n > 0) {
+        if summary.chunk_indexes.is_empty()
+            && let Some(messages) = summary
+                .stats
+                .as_ref()
+                .map(|stats| stats.message_count)
+                .filter(|count| *count > 0)
+        {
             bail!(
-                "{} indexes no chunk but its summary reports {} messages; \
+                "{} indexes no chunk but its summary reports {messages} messages; \
                  nothing of it can be planned",
                 path.display(),
-                messages.unwrap_or(0),
             );
         }
 
@@ -133,11 +137,6 @@ impl WholeFileIndex {
             .bounds
             .has_messages
             .then_some(self.index.bounds.log.max)
-    }
-
-    /// The path the recording was opened at.
-    pub fn path(&self) -> &Path {
-        &self.index.path
     }
 }
 
