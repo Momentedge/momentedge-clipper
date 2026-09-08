@@ -1326,6 +1326,59 @@ mod tests {
         Ok(())
     }
 
+    /// Everything a clip carries per message is copied verbatim: the topic, both
+    /// stamps, the sequence number and the payload bytes. The copy decodes only
+    /// the one stamp the window lives on, so no other field is ever rebuilt —
+    /// this is what pins that, and what an mcap version change has to keep true.
+    #[test]
+    fn clip_copies_topic_both_stamps_sequence_and_payload_verbatim() -> Result<()> {
+        let root = test_dir("clip-verbatim")?;
+        let rec = root.join("rec.mcap");
+        // Two topics; sequence numbers that are neither zero nor the message's
+        // position; publish stamps that disagree with the log stamps; a
+        // different payload per message.
+        write_raw(
+            &rec,
+            &[
+                raw_record(op::CHANNEL, &channel_body(1, 0, "/a", "cdr")),
+                raw_record(op::CHANNEL, &channel_body(2, 0, "/b", "cdr")),
+                raw_record(op::MESSAGE, &message_body_pub(1, 7, 100, 250, b"alpha")),
+                raw_record(op::MESSAGE, &message_body_pub(2, 42, 200, 150, b"bravo")),
+                raw_record(op::MESSAGE, &message_body_pub(1, 9, 300, 350, b"charlie")),
+            ],
+        )?;
+        let index = index_whole(&rec)?;
+
+        let out = root.join("clip.mcap");
+        let plan = plan_one(&index, 0, 1000);
+        extract_clip(&plan, &out, 0, 1000, TEST_COMPRESSION)?;
+
+        let buf = std::fs::read(&out)?;
+        let copied: Vec<(String, u64, u64, u32, Vec<u8>)> = mcap::MessageStream::new(&buf)?
+            .map(|msg| {
+                let msg = msg?;
+                Ok((
+                    msg.channel.topic.clone(),
+                    msg.log_time,
+                    msg.publish_time,
+                    msg.sequence,
+                    msg.data.to_vec(),
+                ))
+            })
+            .collect::<Result<_>>()?;
+        assert_eq!(
+            copied,
+            vec![
+                ("/a".to_string(), 100, 250, 7, b"alpha".to_vec()),
+                ("/b".to_string(), 200, 150, 42, b"bravo".to_vec()),
+                ("/a".to_string(), 300, 350, 9, b"charlie".to_vec()),
+            ]
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
     #[test]
     fn highly_compressed_chunk_extracts_despite_small_extent() -> Result<()> {
         let root = test_dir("clip-ratio")?;
