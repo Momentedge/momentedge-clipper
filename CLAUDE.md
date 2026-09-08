@@ -79,10 +79,15 @@ file does before the shared cut path runs. `clip`'s `ros` feature, off by
 default, adds only the CDR trigger decoder and the two r2r message conversions;
 its `clap` feature makes `TimeSource` a `ValueEnum`; its `test-support` feature
 publishes the MCAP fixture writers a consumer's tests build recordings with, and
-`tail`'s publishes the watch setter a waiter test drives. The `libraries` CI job
-builds, lints and tests both on the plain toolchain, so an r2r dependency that
-escapes the `ros` feature fails there rather than in a downstream ROS-free
-build.
+`tail`'s publishes the watch setter a waiter test drives.
+
+The recorder carries a `ros` feature of its own, likewise off by default, adding
+the live trigger subscription, the `Recorded` publish, and `clip/ros` underneath.
+So `cargo build -p clipper` links no ROS and offers `--interface mcap` alone,
+while `--features ros` is the device build every packaging path selects. The
+`libraries` CI job builds, lints and tests all three crates with default features
+on the plain toolchain, so an r2r dependency that escapes a `ros` feature fails
+there rather than in a downstream ROS-free build.
 
 ```
 crates/clip/            # ROS-free library: format layer, index, cut, trigger contract

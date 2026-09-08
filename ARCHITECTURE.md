@@ -40,22 +40,29 @@ neutral trigger contract that names a window. [`crates/tail`](crates/tail) is
 what following a recording still being written adds on top — discovery, the
 recording collection and its lifecycle, coverage, retention, and the waiting a
 cut does when its window reaches past the last byte on disk.
-[`crates/clipper`](crates/clipper) is the device binary over both: a ROS
-interface, a CLI, and thread supervision. `momentedge_msgs` is the local ROS 2
+[`crates/clipper`](crates/clipper) is the binary over both: the outside-facing
+interfaces, a CLI, and thread supervision. `momentedge_msgs` is the local ROS 2
 interface package defining `Trigger`/`Recorded`.
 
-**Both libraries build with no ROS toolchain; only the binary needs one.** That
-is what decides the link: a consumer cutting from a finished recording takes
-`clip` alone, one following a live recording takes `clip` + `tail`, and neither
-needs r2r, a node, or a ROS installation — they run the same format layer and
-the same copy the device runs. The one ROS-shaped piece — the `cdr` trigger
-decoder and the two r2r message conversions — sits behind `clip`'s `ros` cargo
-feature, off by default, and the binary is what turns it on. The `libraries` CI
-job (`clip + tail (ROS-free)`) holds the property down: before compiling
-anything it asserts `cargo tree` names no r2r in either crate's default
-dependency tree, then clippies and tests both on a stock stable toolchain with
-no nix and no ROS on `PATH`, so a dependency that escapes the feature fails
-there rather than downstream.
+**Nothing links ROS unless a cargo feature asks for it.** A consumer cutting from
+a finished recording takes `clip` alone, one following a live recording takes
+`clip` + `tail`, and neither needs r2r, a node, or a ROS installation — they run
+the same format layer and the same copy the device runs. The ROS-shaped pieces
+sit behind features that are off by default: `clip`'s `ros` carries the `cdr`
+trigger decoder and the two r2r message conversions, and `clipper`'s `ros`
+carries the live trigger subscription, the `Recorded` publish, and `clip/ros`
+underneath. So the recorder has **two builds** — a default one that links no ROS
+and offers `--interface mcap` alone, and `--features ros`, the device build every
+release artefact is, which adds `--interface ros` and defaults to it. The tail,
+the window plan, the cut and every other flag are the same code in both.
+
+The `libraries` CI job (`clip + tail + clipper (ROS-free)`) holds that property
+down for all three crates: before compiling anything it asserts `cargo tree`
+names no r2r in any default dependency tree, then clippies and tests them on a
+stock stable toolchain with no nix and no ROS on `PATH`, so a dependency that
+escapes a feature fails there rather than in a downstream build that has no ROS
+toolchain at all. The per-distro `recorder` matrix builds, unit-tests and
+e2e-tests the feature half.
 
 | `clip` module | Role |
 |---|---|
@@ -77,7 +84,8 @@ there rather than downstream.
 | `clipper` source file | Role |
 |---|---|
 | `src/main.rs` | Entry point, the subcommand surface (`clipper tail`) and its configuration (clap), admission gate, thread supervision |
-| `src/interface.rs` | `trait Interface` + the `ros` and `mcap` implementations and their announcers |
+| `src/interface.rs` | `trait Interface`, the `Anchor` it resolves, and the `mcap` implementation with its no-op announcer |
+| `src/interface/ros.rs` | The `ros` implementation and its `Recorded` announcer, compiled in only under the crate's `ros` feature — the only source file in the workspace that names a ROS node |
 | `src/supervision.rs` | `spawn_supervised`/`harvest_panic`: pair each long-lived thread with a channel carrying its verdict |
 
 ## Data flow
@@ -327,9 +335,9 @@ segment from that file.
 ## The two interfaces
 
 The trigger input and the completion output are one unit — an **interface** —
-chosen by `--interface` (default `ros`). The recorder is decoupled around one
-neutral boundary so the clip-cutting half (`tail::handler` and the `clip` code
-under it) never learns of ROS or any wire encoding:
+chosen by `--interface`. The recorder is decoupled around one neutral boundary so
+the clip-cutting half (`tail::handler` and the `clip` code under it) never learns
+of ROS or any wire encoding:
 
 - **`clip::trigger`** is the neutral contract (`Trigger`, `Stamp`, `Completion`,
   the `Announce` trait), depending on neither `r2r` nor `mcap`.
@@ -338,9 +346,16 @@ under it) never learns of ROS or any wire encoding:
   library only, no ROS `Context`/`Node`, so it works ROS-free — and `json` via
   `serde_json`. Other encodings return an error the interface logs and skips.
 - **`clipper::interface`** holds `trait Interface` (statically dispatched) with
+  `McapInterface` (drains the trigger tap, announces via a no-op — the clip's
+  move into `out_dir` is the only signal) and, under the crate's `ros` feature,
   `RosInterface` (owns a node and its internal spin thread, announces by
-  publishing `Recorded`) and `McapInterface` (drains the trigger tap, announces
-  via a no-op — the clip's move into `out_dir` is the only signal).
+  publishing `Recorded`).
+
+Which interfaces exist is the build. `mcap` is in every one and is the default
+where it is alone; the `ros` feature adds `ros` and makes it the default. The
+variant set drives the CLI, so `clipper tail --help` lists exactly the values the
+binary in front of you accepts, and a ROS-free build refuses `--interface ros` as
+an unknown value rather than failing later at a node it cannot create.
 
 **The anchor seam.** An interface resolves each trigger's anchor — the instant
 its window centres on — and hands it to the handler alongside the neutral
@@ -369,7 +384,8 @@ unchanged.
 The binary's `main.rs` wires the selected interface to the tail and runs a
 generic `drive<I: Interface>`. The `ros` interface talks to the ROS graph
 (`/events/momentedge/trigger` in, `/events/momentedge/recorded` out); the `mcap`
-interface has no ROS surface at all.
+interface has no ROS surface at all, which is why a build without the `ros`
+feature still runs the whole recorder.
 
 ## Admission control
 
@@ -441,7 +457,9 @@ They are built **against the host's own ROS 2 libraries** for ABI compatibility:
 a nix-built binary would bake `/nix/store` RPATHs and load the nix closure rather
 than the host's ROS, breaking interop with the host's other nodes. So the build
 runs on the target (or an ABI-identical box of the same arch + distro) via
-[`scripts/build-on-target.sh`](scripts/build-on-target.sh). Running natively
+[`scripts/build-on-target.sh`](scripts/build-on-target.sh), which selects
+clipper's `ros` feature — a ROS deployment wants the ROS build, and the feature
+is off by default. Running natively
 (no container) means all ROS 2 processes share the host `/dev/shm`, so FastDDS
 shared-memory transport and direct DDS interop work.
 

@@ -1,6 +1,6 @@
 # clipper
 
-A *triggered* clip recorder over a **continuous `ros2 bag record`** output. It keeps the growing recording(s) open and **tails them**, so a clip can be cut as soon as the data is physically on disk: clip latency is bounded by the recorder's write-through latency. Built on [r2r](https://github.com/sequenceplanner/r2r) over plain OS threads — there is no async runtime.
+A *triggered* clip recorder over a **continuous `ros2 bag record`** output. It keeps the growing recording(s) open and **tails them**, so a clip can be cut as soon as the data is physically on disk: clip latency is bounded by the recorder's write-through latency. Plain OS threads throughout — there is no async runtime. ROS is the crate's `ros` cargo feature, off by default: with it the binary links [r2r](https://github.com/sequenceplanner/r2r) and offers the live trigger subscription, without it it links no ROS at all (see "Two builds" below).
 
 The recorder is three crates — [`clip`](../clip), [`tail`](../tail), and this
 binary — and this document is the internals of all three. The workspace
@@ -26,12 +26,13 @@ clipper ◀── trigger ── EITHER /events/momentedge/trigger (ros interfac
 ```
 
 The trigger and the completion are paired into one **interface**, selected by
-`--interface {ros|mcap}` (default `ros`); the two interfaces are mutually
-exclusive and clipper drives exactly one per run. The `ros` interface
-subscribes on a ROS node and publishes `Recorded`; the `mcap` interface reads
-triggers out of the recording clipper already tails and runs ROS-free, with the
-clip's move into `out_dir` as the only completion signal. See "The interface
-abstraction" below.
+`--interface`; the interfaces are mutually exclusive and clipper drives exactly
+one per run. The `ros` interface subscribes on a ROS node and publishes
+`Recorded`; the `mcap` interface reads triggers out of the recording clipper
+already tails and runs ROS-free, with the clip's move into `out_dir` as the only
+completion signal. Which of them the binary has is the build: `mcap` is in every
+one, `ros` needs the crate's `ros` feature, and the default is `ros` where it
+exists and `mcap` otherwise. See "The interface abstraction" below.
 
 `record.sh` is a standalone `ros2 bag record` — this binary never
 spawns it. The two communicate only through the files. Under the `mcap`
@@ -54,24 +55,45 @@ file must clear before the shared cut path runs. A consumer cutting from a
 recording nobody is writing links `clip` alone: no successor to find, no
 lifecycle to run, nothing to wait for.
 
-**What is left is the binary**, three files in this crate: the two interfaces and
-their announcers (`src/interface.rs`), and the clap `Config`, the admission gate
+**What is left is the binary**, four files in this crate: the interface seam and
+its MCAP implementation (`src/interface.rs`), the ROS implementation behind the
+`ros` feature (`src/interface/ros.rs`), and the clap `Config`, the admission gate
 and the thread supervision (`src/main.rs`, `src/supervision.rs`). Telling ROS
 from MCAP, taking configuration, and deciding what to do when a thread dies is
 the whole of what a device recorder adds over the two libraries. The per-module
 table is in [ARCHITECTURE.md](../../ARCHITECTURE.md#module-map).
 
-**Both libraries build with no ROS toolchain.** Neither default feature set
-pulls r2r, so a consumer cutting clips out of a recording on a plain Linux host
-runs the same format layer, the same copy, and — while the recording is still
-being written — the same tail the device runs. The `libraries` CI job
-(`clip + tail (ROS-free)`) holds that property down for both: it asserts
-`cargo tree` names no r2r in either crate's default tree *before* anything is
-compiled, then clippies and tests both with `-D warnings` on a stock stable
-toolchain with no nix and no ROS on `PATH` — so a dependency that escapes the
-feature gate turns that job red in seconds instead of surfacing as a missing rmw
-at link time in a downstream build that has no ROS at all. Only this crate needs
-r2r, and so only this crate needs the dev shell.
+### Two builds
+
+**Nothing here links ROS unless a feature asks for it — this crate included.**
+Neither library's default feature set pulls r2r, and neither does this crate's,
+so a consumer cutting clips out of a recording on a plain Linux host runs the
+same format layer, the same copy, and — while the recording is still being
+written — the same tail the device runs, and can run the whole recorder binary
+too:
+
+```bash
+cargo build -p clipper                                       # links no ROS
+nix develop --command cargo build -p clipper --features ros  # the device build
+```
+
+The feature buys the `ros` interface and nothing else: `dep:r2r`, the
+`dep:futures` its subscription stream is drained with, and `clip/ros`
+underneath. The tail, the window plan, the cut, the admission gate, the
+supervision and every other flag are the same code either way. What differs on
+the command line is one flag — `--interface` accepts `mcap` alone in the default
+build and takes it by default, and accepts `ros` and defaults to it under the
+feature — plus what a `cdr` trigger in the recording does: decoded with the
+feature, skipped with an error naming it without.
+
+The `libraries` CI job (`clip + tail + clipper (ROS-free)`) holds that down for
+all three crates: it asserts `cargo tree` names no r2r in any default tree
+*before* anything is compiled, then clippies and tests all three with
+`-D warnings` on a stock stable toolchain with no nix and no ROS on `PATH` — so a
+dependency that escapes a feature gate turns that job red in seconds instead of
+surfacing as a missing rmw at link time in a build that has no ROS at all. Only
+`--features ros` needs the dev shell. Every packaging path selects it, so a
+shipped binary is always the device build.
 
 `clip` carries three cargo features, all off by default:
 
@@ -97,8 +119,14 @@ r2r, and so only this crate needs the dev shell.
   test: the recorder's admission-gate test parks a full 16 handlers on a
   `Watch<bool>` and frees them all with one `send_replace`.
 
-The recorder enables clip's `ros` + `clap` normally, and both crates'
-`test-support` under `[dev-dependencies]`.
+This crate carries one:
+
+- **`ros`** — `dep:r2r`, `dep:futures`, and `clip/ros`, which together are the
+  `ros` interface (`src/interface/ros.rs`) and the `cdr` trigger decoder. It is
+  the whole of the difference between the two builds above.
+
+The recorder enables clip's `clap` normally and clip's `ros` through its own
+`ros`, plus both crates' `test-support` under `[dev-dependencies]`.
 
 **The window-plan seam** is what leaves the cut path indifferent to which side
 of the line it runs on. `clip::index::WindowPlanner` is one method —
@@ -502,7 +530,8 @@ one value to both the planner and every `StageJob` it queues.
 | **`--interface ros`**  | `now_ns()` at the subscription | the trigger's `trigger_time` |
 | **`--interface mcap`** | the record's `log_time`        | the record's `publish_time`  |
 
-`resolve_ros_anchor` and `resolve_mcap_anchor` (in `interface.rs`) do the
+`resolve_ros_anchor` (in `interface/ros.rs`) and `resolve_mcap_anchor` (in
+`interface.rs`) do the
 resolution; a live ROS trigger has no record stamp and r2r surfaces no wire
 timestamp, so ROS anchors on `now` or the publisher's `trigger_time`. The
 `Completion` echoes the trigger's `trigger_time` unchanged.
@@ -539,11 +568,21 @@ in `main.rs`; each value exactly at its bound is accepted:
 ## The two interfaces
 
 The trigger input and the completion output are one unit — an **interface** —
-chosen by `--interface {ros|mcap}` (default `ros`). The two are mutually
-exclusive; clipper drives exactly one per run. No `rosbag2_interfaces`
-subscription either way — coverage always comes from the file itself.
+chosen by `--interface`. They are mutually exclusive; clipper drives exactly one
+per run. No `rosbag2_interfaces` subscription either way — coverage always comes
+from the file itself.
 
-**`ros`** (the default, the deployed path) talks to the ROS graph:
+Which interfaces the binary offers is decided at compile time by the `ros`
+feature. `InterfaceKind::Ros` is a `#[cfg(feature = "ros")]` variant, so clap
+derives the accepted `--interface` values from what the build actually has: a
+ROS-free build refuses `--interface ros` as an unknown value at parse time rather
+than failing later on a node it cannot create, and `clipper tail --help` lists
+`mcap` alone (with a `long_help` saying which feature the missing one needs).
+`DEFAULT_INTERFACE` follows the same `#[cfg]` split, so an absent flag means
+`ros` where it exists and `mcap` where it does not.
+
+**`ros`** (the deployed path, and the default where the feature built it) talks
+to the ROS graph:
 
 | Direction | Topic | Type |
 |---|---|---|
@@ -599,11 +638,15 @@ no interface's:
   return an error the interface logs and skips — one undecodable trigger never
   stops the recorder.
 - **`src/interface.rs`** — the `trait Interface` (generic, dispatched statically,
-  no `Box<dyn>`), with `RosInterface` (owns the node and its own internal spin
-  thread) and `McapInterface` (drains the tail's trigger tap and decodes each
-  raw trigger), plus the two announcers: `RosAnnouncer` (publishes `Recorded`)
-  and `NullAnnouncer` (no-op). An interface produces decoded `Trigger`s and owns
-  the completion half through its `Announce`r.
+  no `Box<dyn>`) and the `Anchor` it resolves, with `McapInterface` (drains the
+  tail's trigger tap and decodes each raw trigger) and its no-op `NullAnnouncer`.
+  Nothing in this file names ROS. **`src/interface/ros.rs`** is the other
+  implementation — `RosInterface` (owns the node and its own internal spin
+  thread) and `RosAnnouncer` (publishes `Recorded`) — and the whole module is
+  `#[cfg(feature = "ros")]`, which is why the r2r, futures, `Pin` and
+  `spawn_supervised` imports it needs live there and not in the parent. An
+  interface produces decoded `Trigger`s and owns the completion half through its
+  `Announce`r.
 - **`tail::handler`** (`crates/tail/src/handler.rs`) — `handle_trigger`
   (generic over `Announce`) and `record_clip`: the ROS- and encoding-agnostic
   half, speaking only the `Trigger`/`Completion` contract. It waits, calls

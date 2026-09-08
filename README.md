@@ -126,8 +126,8 @@ ros2 bag record --all --storage mcap --output ./record
 
 # 2. clipper, tailing ./record, writing clips to ./clipped
 clipper tail --record-dir ./record --out-dir ./clipped --clip-compression zstd
-#    from a source checkout:
-#    cargo run -p clipper -- tail --record-dir ./record --out-dir ./clipped
+#    from a source checkout (--features ros for the live trigger topic below):
+#    cargo run -p clipper --features ros -- tail --record-dir ./record --out-dir ./clipped
 
 # 3. Fire a trigger: 5 s before and 5 s after the instant clipper receives it.
 #    Under the default --time-source log the window anchors on clipper's own
@@ -168,17 +168,34 @@ like every ROS executable — no bundled overlay, no baked rpath.
 
 ### From source
 
-clipper is a standard Rust workspace, but building the binary needs a ROS 2
-environment (for `rcl`/`rmw` and the message typesupport):
+clipper is a standard Rust workspace, and **ROS is a cargo feature** of it. The
+feature decides which of two builds you get:
+
+```bash
+cargo build -p clipper                                       # ROS-free
+nix develop --command cargo build -p clipper --features ros  # the device build
+```
+
+- **Default (no feature):** the binary links no ROS at all and builds and runs on
+  a host with no ROS installation. It offers `--interface mcap` — triggers read
+  out of the recording it tails — and nothing else. Plain `cargo build`, no ROS 2
+  environment, no dev shell.
+- **`--features ros`:** the device build, and what every release artefact is. It
+  links `rcl`/`rmw` and the `momentedge_msgs` typesupport, so it needs a ROS 2
+  environment to compile against, and it adds `--interface ros` (its default
+  there): the live trigger subscription and the `Recorded` publish.
+
+Everything else — the tail, the window, the cut, every other flag — is the same
+code in both. To build the device half:
 
 - **Development:** a [Nix](https://nixos.org/) dev shell provides ROS 2 —
-  `nix develop --command cargo build`. See [CLAUDE.md](CLAUDE.md) for the
-  dev-shell and per-distro build details.
+  `nix develop --command cargo build --features clipper/ros`. See
+  [CLAUDE.md](CLAUDE.md) for the dev-shell and per-distro build details.
 - **On a deployment target:** `./scripts/build-on-target.sh` compiles
-  `clipper` and `momentedge_msgs` natively against the host's apt ROS 2
-  install (the binaries are ABI-compatible with the rest of the host's ROS graph
-  by construction). See [ARCHITECTURE.md](ARCHITECTURE.md#deployment) for the
-  rationale.
+  `clipper` (with the feature) and `momentedge_msgs` natively against the host's
+  apt ROS 2 install (the binaries are ABI-compatible with the rest of the host's
+  ROS graph by construction). See
+  [ARCHITECTURE.md](ARCHITECTURE.md#deployment) for the rationale.
 
 ## Configuration
 
@@ -196,7 +213,7 @@ further arguments.
 |---|---|---|---|
 | `--record-dir` | `MOMENTEDGE_RECORD_DIR` | `./record` | bag directory of the continuous recording to tail |
 | `--out-dir` | `MOMENTEDGE_OUT_DIR` | `./clipped` | where finished clips are written |
-| `--interface` | `MOMENTEDGE_INTERFACE` | `ros` | how triggers arrive and completions are signalled: `ros` or `mcap` (see [below](#two-ways-in-ros-and-mcap)) |
+| `--interface` | `MOMENTEDGE_INTERFACE` | `ros` (`mcap` in a ROS-free build) | how triggers arrive and completions are signalled: `ros` or `mcap` (see [below](#two-ways-in-ros-and-mcap)) |
 | `--time-source` | `MOMENTEDGE_TIME_SOURCE` | `log` | clock domain the clip window lives in: `log` or `publish` (see [below](#time-source-log-or-publish)) |
 | `--grace-secs` | `MOMENTEDGE_GRACE_SECS` | `30` | how long past the window end to wait for the recording to cover it before cutting from what is on disk |
 | `--clip-compression` | `MOMENTEDGE_CLIP_COMPRESSION` | `zstd` | codec for written clips: `none`, `lz4`, or `zstd` (smallest) |
@@ -303,9 +320,9 @@ all listed in `filenames`.
 ### Two ways in: `ros` and `mcap`
 
 How a trigger reaches clipper and how completion is signalled is one choice, set
-by `--interface` (default `ros`). clipper runs exactly one interface per launch.
+by `--interface`. clipper runs exactly one interface per launch.
 
-- **`ros`** (the default, deployed path) subscribes to
+- **`ros`** (the deployed path, and the default where it exists) subscribes to
   `/events/momentedge/trigger` and publishes `momentedge_msgs/Recorded` on
   `/events/momentedge/recorded`.
 - **`mcap`** reads triggers straight out of the recording clipper already tails
@@ -314,6 +331,16 @@ by `--interface` (default `ros`). clipper runs exactly one interface per launch.
   signalled only by the file appearing in `--out-dir`.
 
 Both cut identical clips; only the trigger and completion edges differ.
+
+`ros` is the interface the `ros` cargo feature adds, so a
+[ROS-free build](#from-source) offers `mcap` alone and takes it by default, and
+`clipper tail --help` lists the values the binary in front of you accepts. The
+`mcap` interface decodes each trigger by its MCAP `message_encoding`: `json`
+decodes in every build, while `cdr` — what `ros2 bag record` writes — needs the
+rmw typesupport the same feature links, and a ROS-free build skips such a trigger
+with an error naming the feature. So a ROS-free deployment wants a producer that
+writes its triggers as `json` (see
+[`examples/custom-mcap-writer`](examples/custom-mcap-writer/README.md)).
 
 ## Operational notes
 

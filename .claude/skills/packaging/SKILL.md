@@ -137,6 +137,15 @@ the two in step.
   repeats `name = "momentedge-clipper"` so cargo-deb does **not** append `-<distro>`
   to the package name (the distro lives in the `.deb` filename instead, via
   `--output`). Select with `cargo deb --variant <distro>`.
+- **The packaged binary is the `ros` feature build.** ROS is a cargo feature of
+  `clipper`, off by default, so a plain `cargo build -p clipper` produces a
+  binary that links no ROS and offers no `--interface ros` — the wrong artefact
+  for a package whose whole `Depends` list is ROS. `build-on-target.sh` adds
+  `--features clipper/ros` whenever clipper is among its `BUILD_PACKAGES`, and
+  that is the only place the choice is made: cargo-deb runs `--no-build` and
+  packages whatever binary is at `target/release/clipper`. A build that skipped
+  the feature would install and start cleanly and then never see a trigger, so
+  the smoke-test's live run is worth keeping.
 - **One package, one executable.** The cargo package, the `[[bin]]` target and
   the installed file are all `clipper`; `cargo deb -p clipper` and
   `BUILD_PACKAGES=clipper` name it, and the artefact both scripts hand each other

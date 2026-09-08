@@ -145,16 +145,19 @@ jobs:
       # 2. Build the clipper binary natively against the host ROS2 (colcon overlay for
       #    r2r codegen + cargo). No MOMENTEDGE_RPATH: the deployed binary resolves its
       #    libraries through the sourced /opt/ros/<distro>/setup.bash, the standard ROS
-      #    way, rather than baked rpaths.
+      #    way, rather than baked rpaths. build-on-target.sh selects clipper's `ros`
+      #    feature, which is what makes the packaged binary the device build.
       - name: Build clipper
         run: ./scripts/build-on-target.sh
         env:
           BUILD_PACKAGES: clipper
 
       # clipper's inline unit suite — `--bins` excludes the live-ROS e2e tests
-      # (tests/e2e.rs). `--release` reuses the build step's artifacts.
+      # (tests/e2e.rs). `--release --features ros` matches the build step above,
+      # so these are the tests of the binary about to be packaged and cargo reuses
+      # its artifacts rather than compiling a second feature set.
       - name: Unit tests
-        run: ./scripts/ros-cargo.sh test --release -p clipper --bins
+        run: ./scripts/ros-cargo.sh test --release --features ros -p clipper --bins
 
       # 3. The Debian package: cargo-deb wraps the binary, Depends on the msgs deb.
       - name: Package clipper (cargo-deb)

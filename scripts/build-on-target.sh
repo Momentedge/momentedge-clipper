@@ -37,10 +37,24 @@ cd "$REPO_ROOT"
 #    just-built overlay and adds the r2r codegen env (IDL_PACKAGE_FILTER) and any
 #    MOMENTEDGE_RPATH. Both deployables by default; the .deb build sets
 #    BUILD_PACKAGES=clipper, the only one it packages.
+#
+#    --features clipper/ros is what makes clipper the device build. ROS is a
+#    cargo feature of the recorder and it is off by default, so without this flag
+#    the binary would link no ROS and offer no `--interface ros` — exactly the
+#    wrong artefact for a target set up with an apt ROS2 above. The flag is added
+#    only when clipper is selected: cargo rejects a `<pkg>/<feature>` naming a
+#    package no `-p` picked. trigger-pub has no such feature; it links r2r
+#    unconditionally.
 read -ra _build_pkgs <<< "${BUILD_PACKAGES:-clipper trigger-pub}"
 _pkg_flags=()
-for _p in "${_build_pkgs[@]}"; do _pkg_flags+=(-p "$_p"); done
-"$REPO_ROOT/scripts/ros-cargo.sh" build --release "${_pkg_flags[@]}"
+_feature_flags=()
+for _p in "${_build_pkgs[@]}"; do
+  _pkg_flags+=(-p "$_p")
+  if [[ "$_p" == clipper ]]; then
+    _feature_flags=(--features clipper/ros)
+  fi
+done
+"$REPO_ROOT/scripts/ros-cargo.sh" build --release "${_feature_flags[@]}" "${_pkg_flags[@]}"
 
 echo
 echo "built:"

@@ -25,12 +25,14 @@ if [[ -z "${ROS_DISTRO:-}" ]]; then
   exit 1
 fi
 
-# The installed binary (the momentedge-clipper deb, or `cargo install`). Without
-# an install, run the crate from the workspace instead:
-#   cargo run -p clipper -- tail --record-dir ./record
+# The installed binary (the momentedge-clipper deb, or `cargo install`), which is
+# built with clipper's `ros` feature and so offers the ROS trigger interface this
+# script relies on. Without an install, run the crate from the workspace with the
+# same feature — a default build links no ROS and has no `--interface ros`:
+#   cargo run -p clipper --features ros -- tail --record-dir ./record
 if ! command -v clipper >/dev/null 2>&1; then
   echo "clipper not on PATH — install the momentedge-clipper package, or run" >&2
-  echo "from the workspace: cargo run -p clipper -- tail --record-dir ./record" >&2
+  echo "from the workspace: cargo run -p clipper --features ros -- tail --record-dir ./record" >&2
   exit 1
 fi
 
