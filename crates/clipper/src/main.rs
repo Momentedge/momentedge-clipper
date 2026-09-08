@@ -255,8 +255,9 @@ impl std::fmt::Display for InterfaceKind {
     long_about = "Triggered MCAP clip recorder.\n\n\
                   One mode runs per invocation, and the mode is a subcommand: \
                   `clipper tail` follows a continuous recording and cuts a clip \
-                  per trigger. Every flag belongs to a mode, so `clipper tail \
-                  --help` is the recorder's own flag reference."
+                  per trigger, while `clipper clip` cuts one clip out of one \
+                  finished recording and exits. Every flag belongs to a mode, so \
+                  `clipper <mode> --help` is that mode's own flag reference."
 )]
 struct Cli {
     #[command(subcommand)]
