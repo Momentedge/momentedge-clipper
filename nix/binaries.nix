@@ -12,7 +12,7 @@
 { pkgs, rosEnv, idlPackageFilter, rosDistro, src, cargoLockFile }:
 
 let
-  mkBin = { pname, cargoPkg ? pname }: pkgs.rustPlatform.buildRustPackage {
+  mkBin = { pname, cargoPkg ? pname, cargoFeatures ? [ ] }: pkgs.rustPlatform.buildRustPackage {
     inherit pname src;
     version = "0.0.1";
     cargoLock = {
@@ -22,8 +22,10 @@ let
       # it needs its vendor hash here.
       outputHashes."r2r-0.9.6" = "sha256-1DQPrRQOYzxTckzyH0p6pnyEy1lOw/OmU0sDAMNzHpg=";
     };
-    # Build only the named crate (`-p` is independent of its directory).
-    cargoBuildFlags = [ "-p" cargoPkg ];
+    # Build only the named crate (`-p` is independent of its directory), with
+    # whatever cargo features that crate needs to be the ROS-linking build.
+    cargoBuildFlags = [ "-p" cargoPkg ]
+      ++ pkgs.lib.optionals (cargoFeatures != [ ]) [ "--features" (pkgs.lib.concatStringsSep "," cargoFeatures) ];
     doCheck = false;
     nativeBuildInputs = [ pkgs.clang pkgs.pkg-config rosEnv ];
     buildInputs = [ rosEnv ];
@@ -32,8 +34,11 @@ let
     ROS_DISTRO = rosDistro;
   };
 in {
-  # The recorder: cargo package and binary are both `clipper`.
-  clipper = mkBin { pname = "clipper"; };
+  # The recorder: cargo package and binary are both `clipper`. `ros` is what
+  # makes it the device build — the feature is off by default, and without it the
+  # binary would link none of the ROS closure this derivation exists to build
+  # against.
+  clipper = mkBin { pname = "clipper"; cargoFeatures = [ "ros" ]; };
   # The example trigger publisher (examples/trigger-pub), built here too as a check.
   trigger-pub = mkBin { pname = "trigger-pub"; };
 }
