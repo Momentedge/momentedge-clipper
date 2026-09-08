@@ -3,24 +3,22 @@
 # This is NOT the deployment artifact: the target builds these natively against
 # its own apt ROS2 (see README "Native build on the target"), since a nix-built
 # binary bakes /nix/store RPATHs and would drag the nix closure along instead of
-# using the host's ROS. Both are built: clipper (the deployable recorder, whose
-# modes are subcommands — `clipper tail`) and trigger-pub (the example trigger
-# publisher, examples/trigger-pub). r2r's build
+# using the host's ROS. The binary that *is* a shippable nix artefact is the
+# ROS-free one, which links none of this and is built once for no distro (see
+# ./clipper-ros-free.nix). Both packages here are built: clipper (the deployable
+# recorder, whose modes are subcommands — `clipper tail`) and trigger-pub (the
+# example trigger publisher, examples/trigger-pub). r2r's build
 # script (bindgen + rcl codegen) needs the same environment the dev shell's
 # shellHook sets: rosEnv's setup hook exports AMENT_PREFIX_PATH, and the explicit
 # knobs below match the shell.
-{ pkgs, rosEnv, idlPackageFilter, rosDistro, src, cargoLockFile }:
+{ pkgs, rosEnv, idlPackageFilter, rosDistro, src, cargoLockFile, version, cargoOutputHashes }:
 
 let
   mkBin = { pname, cargoPkg ? pname, cargoFeatures ? [ ] }: pkgs.rustPlatform.buildRustPackage {
-    inherit pname src;
-    version = "0.0.1";
+    inherit pname src version;
     cargoLock = {
       lockFile = cargoLockFile;
-      # r2r is a git-sourced workspace dependency pinned to its 0.9.6 git tag
-      # (for lyrical support — see Cargo.toml) until 0.9.6 reaches crates.io, so
-      # it needs its vendor hash here.
-      outputHashes."r2r-0.9.6" = "sha256-1DQPrRQOYzxTckzyH0p6pnyEy1lOw/OmU0sDAMNzHpg=";
+      outputHashes = cargoOutputHashes;
     };
     # Build only the named crate (`-p` is independent of its directory), with
     # whatever cargo features that crate needs to be the ROS-linking build.

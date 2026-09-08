@@ -45,6 +45,19 @@
       };
       lib = pkgs.lib;
 
+      # The workspace version, read from the one place it is set
+      # (`[workspace.package].version` in Cargo.toml), so every nix-built binary
+      # reports what a cargo-built one does instead of a hand-kept copy.
+      version = (lib.importTOML ./Cargo.toml).workspace.package.version;
+
+      # Vendor hashes for the lockfile's git sources, shared by every
+      # rustPlatform build below. r2r is pinned to its 0.9.6 git tag (for
+      # lyrical support — see Cargo.toml) until 0.9.6 reaches crates.io, and a
+      # git source has no registry checksum to vendor against.
+      cargoOutputHashes = {
+        "r2r-0.9.6" = "sha256-1DQPrRQOYzxTckzyH0p6pnyEy1lOw/OmU0sDAMNzHpg=";
+      };
+
       # The ROS2 distros this repo is built and tested against. nix-ros-overlay
       # packages each one as `pkgs.rosPackages.<distro>`; everything below
       # (dev shell, nix-built binaries, the recorder closure) is produced once
@@ -139,7 +152,7 @@
         };
         rosEnv = import ./nix/ros-env.nix {inherit ros momentedge-msgs lib withSim;};
         binaries = import ./nix/binaries.nix {
-          inherit pkgs rosEnv idlPackageFilter rosDistro;
+          inherit pkgs rosEnv idlPackageFilter rosDistro version cargoOutputHashes;
           src = ./.;
           cargoLockFile = ./Cargo.lock;
         };
