@@ -2404,6 +2404,63 @@ mod tests {
         )
     }
 
+    /// The two configuration files are found by a scan rather than a parse, so
+    /// the scan has to accept what clap accepts: either spelling, a path that is
+    /// not UTF-8, and nothing past `--`.
+    #[test]
+    fn the_config_scan_accepts_both_spellings_and_stops_at_the_separator() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let argv = |args: &[&str]| -> Vec<OsString> { args.iter().map(OsString::from).collect() };
+
+        assert_eq!(
+            scan_flag(
+                &argv(&["clipper", "tail", "--config", "/tmp/a.toml"]),
+                "--config"
+            ),
+            Some(PathBuf::from("/tmp/a.toml"))
+        );
+        assert_eq!(
+            scan_flag(
+                &argv(&["clipper", "tail", "--config=/tmp/a.toml"]),
+                "--config"
+            ),
+            Some(PathBuf::from("/tmp/a.toml"))
+        );
+        assert_eq!(
+            scan_flag(&argv(&["clipper", "tail"]), "--config"),
+            None,
+            "an absent flag names no file"
+        );
+        assert_eq!(
+            scan_flag(
+                &argv(&["clipper", "tail", "--", "--config", "/tmp/a.toml"]),
+                "--config"
+            ),
+            None,
+            "nothing past `--` is a flag"
+        );
+        assert_eq!(
+            scan_flag(
+                &argv(&["clipper", "tail", "--system-config", "/tmp/s.toml"]),
+                "--config"
+            ),
+            None,
+            "a longer flag that starts the same way is a different flag"
+        );
+
+        // A path that is not UTF-8 survives both spellings.
+        let raw = OsString::from_vec(b"/tmp/\xff.toml".to_vec());
+        let mut eq = OsString::from("--config=");
+        eq.push(&raw);
+        assert_eq!(
+            scan_flag(&[OsString::from("--config"), raw.clone()], "--config"),
+            Some(PathBuf::from(&raw))
+        );
+        assert_eq!(scan_flag(&[eq], "--config"), Some(PathBuf::from(&raw)));
+    }
+
     /// The `(value, origin)` a report line carries for `key`.
     fn reported(report: &str, key: &str) -> (String, String) {
         let line = report
@@ -2687,6 +2744,11 @@ mod tests {
             &run,
             "--grace-secs",
             "12",
+            // A key the per-run file also sets, so the report is caught out if
+            // it re-derives a value from the layers instead of reading the one
+            // the parse settled on.
+            "--out-dir",
+            "/tmp/from-the-flag",
         ])
         .map_err(|_| anyhow::anyhow!("this configuration must load"))?;
         let report = loaded.report.clone();
@@ -2698,7 +2760,7 @@ mod tests {
         // Every settings line against the field the run reads.
         for (key, used, layer) in [
             ("record_dir", cfg.record_dir.display().to_string(), "system"),
-            ("out_dir", cfg.out_dir.display().to_string(), "per-run"),
+            ("out_dir", cfg.out_dir.display().to_string(), "flag"),
             ("grace_secs", cfg.grace_secs.to_string(), "flag"),
             (
                 "extract_parallelism",
