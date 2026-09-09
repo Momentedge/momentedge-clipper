@@ -305,7 +305,11 @@ impl ClipManifest<'_> {
 }
 
 /// The manifest a written clip carries, read back through the summary's metadata
-/// index — a bounded seek and one record, never a walk of the message section.
+/// index: the record is addressed directly rather than found by walking the
+/// message section.
+///
+/// The file is read whole into memory first, so this is for a clip — a bounded
+/// window — and for tests and tooling, not for a recording of arbitrary size.
 ///
 /// `Ok(None)` means the file parses but carries no [`MANIFEST_NAME`] record: an
 /// MCAP from somewhere else, or one whose summary was lost. Errors are a file
@@ -325,8 +329,15 @@ pub fn read_manifest(path: &Path) -> Result<Option<BTreeMap<String, String>>> {
         return Ok(None);
     };
     // The index addresses the whole record; its body starts past the opcode and
-    // the u64 length prefix the framing puts in front of every record.
-    let start = index.offset as usize + 9;
+    // the u64 length prefix the framing puts in front of every record. Both
+    // numbers come out of the file, so the addition is checked rather than
+    // trusted to stay inside `usize`.
+    const FRAME_HEADER_LEN: u64 = 1 + size_of::<u64>() as u64;
+    let start = index
+        .offset
+        .checked_add(FRAME_HEADER_LEN)
+        .and_then(|start| usize::try_from(start).ok())
+        .with_context(|| format!("{} indexes its manifest out of bounds", path.display()))?;
     let end = index
         .offset
         .checked_add(index.length)
