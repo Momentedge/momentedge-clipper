@@ -561,7 +561,16 @@ impl Config {
 /// where coverage is something a caller waits for.
 #[derive(Debug, Args)]
 struct ClipConfig {
-    /// The finished MCAP recording to cut the clips out of.
+    /// The finished recording to cut the clips out of: one `.mcap` file, or a
+    /// bag directory whose splits are read as one time-ordered collection.
+    ///
+    /// A directory is ordered by the recorder's own `metadata.yaml` where it
+    /// wrote one, and by modification time where it did not — the
+    /// copied-mid-recording case, since the recorder writes that file at
+    /// shutdown. Every split is indexed on its own and has to satisfy the same
+    /// contract on its own, so a directory holding one that does not is refused
+    /// naming that recording. A window straddling a split is cut into one
+    /// segment per contributing recording.
     recording: PathBuf,
 
     /// Directory the finished clips are written to.
@@ -1287,7 +1296,9 @@ fn clip_triggers(cfg: &ClipConfig) -> anyhow::Result<Vec<AnchoredTrigger>> {
 /// The list exists before the first cut, because the input has an end: reading
 /// it is a summary read plus the chunks that summary names as holding the
 /// trigger channel ([`clip::embedded::read_triggers`]), and no other chunk is
-/// decompressed to find it.
+/// decompressed to find it. A bag directory is read split by split, in the same
+/// order its windows are planned in ([`clip::bag::splits`]), so the run's clips
+/// come out in the order the triggers were recorded.
 ///
 /// An undecodable trigger is logged and skipped rather than fatal, exactly as
 /// the recorder's `mcap` interface treats one: a single trigger nobody can read
@@ -1295,20 +1306,21 @@ fn clip_triggers(cfg: &ClipConfig) -> anyhow::Result<Vec<AnchoredTrigger>> {
 /// is undecodable in a build without the `ros` feature; `json` decodes in every
 /// build.
 fn embedded_triggers(recording: &std::path::Path) -> anyhow::Result<Vec<AnchoredTrigger>> {
-    let records = clip::embedded::read_triggers(recording, TRIGGER_TOPIC)?;
-    let mut triggers = Vec::with_capacity(records.len());
-    for record in records {
-        match clip::decode::decode_trigger(&record.message_encoding, &record.body) {
-            Ok(trigger) => triggers.push(AnchoredTrigger {
-                trigger,
-                anchor_ns: record.log_time,
-            }),
-            Err(e) => warn!(
-                "skipping the trigger at log_time {} in {} (encoding={}): {e:#}",
-                record.log_time,
-                recording.display(),
-                record.message_encoding,
-            ),
+    let mut triggers = Vec::new();
+    for split in clip::bag::splits(recording)? {
+        for record in clip::embedded::read_triggers(&split, TRIGGER_TOPIC)? {
+            match clip::decode::decode_trigger(&record.message_encoding, &record.body) {
+                Ok(trigger) => triggers.push(AnchoredTrigger {
+                    trigger,
+                    anchor_ns: record.log_time,
+                }),
+                Err(e) => warn!(
+                    "skipping the trigger at log_time {} in {} (encoding={}): {e:#}",
+                    record.log_time,
+                    split.display(),
+                    record.message_encoding,
+                ),
+            }
         }
     }
     Ok(triggers)
@@ -1322,6 +1334,13 @@ fn embedded_triggers(recording: &std::path::Path) -> anyhow::Result<Vec<Anchored
 /// [`clip::segment::cut_window`] the recorder drives, so each clip is
 /// byte-for-byte what the device would have cut from the same recording and
 /// window.
+///
+/// **The input is one recording or a bag directory of them.** A directory is
+/// read as one time-ordered collection ([`clip::bag`]), so a window straddling
+/// a split is cut into one segment per contributing recording — the same
+/// `<anchor>_<name>_NN.mcap` set the device writes when a window straddles a
+/// rollover — and a segment number is the position after the recordings that
+/// contributed nothing are dropped, not the split's place in the directory.
 ///
 /// **How many clips a run writes is the trigger source's answer**
 /// ([`clip_triggers`]). `--trigger-source param` names one trigger and writes
@@ -1339,8 +1358,10 @@ fn embedded_triggers(recording: &std::path::Path) -> anyhow::Result<Vec<Anchored
 /// and summary, before anything is created: [`clip::whole::IndexRefusal`] is
 /// the taxonomy, the message names the fault and the `mcap` command that
 /// repairs it, and the run exits non-zero having written nothing — not the
-/// output directory, not the staging directory inside it. clipper runs no
-/// repair itself; recovering and re-indexing a recording are the operator's.
+/// output directory, not the staging directory inside it. Every split of a bag
+/// directory faces that contract on its own, so a directory is refused naming
+/// the one recording in it that failed. clipper runs no repair itself;
+/// recovering and re-indexing a recording are the operator's.
 ///
 /// Nothing is printed for a caller to parse. The result is the output
 /// directory's contents when the process exits, each clip carrying its own
@@ -1385,10 +1406,10 @@ fn clip_mode(
         return Ok(());
     }
 
-    // Index the recording before anything is created: a recording clipper
-    // cannot index is refused by name (`clip::whole::IndexRefusal`), and a
-    // refusal writes nothing anywhere — not the output directory, not the
-    // staging directory inside it.
+    // Index the recording — every split of it, for a bag directory — before
+    // anything is created: a recording clipper cannot index is refused by name
+    // (`clip::whole::IndexRefusal`), and a refusal writes nothing anywhere —
+    // not the output directory, not the staging directory inside it.
     let index = clip::whole::WholeFileIndex::open(&cfg.recording)?;
 
     // Start from a clean capturing dir, which also creates out_dir: a clip is
@@ -1402,8 +1423,9 @@ fn clip_mode(
     let stage_tx = segment::spawn_stage_workers(1, CLIP_MODE_COMPRESSION.to_mcap(), selection);
 
     info!(
-        "cutting {} clip(s) from {} into {} (source={CLIP_TIME_SOURCE})",
+        "cutting {} clip(s) from {} recording(s) under {} into {} (source={CLIP_TIME_SOURCE})",
         cuts.len(),
+        index.splits().len(),
         cfg.recording.display(),
         cfg.out_dir.display(),
     );
@@ -2445,6 +2467,129 @@ mod tests {
         Ok(())
     }
 
+    /// A bag directory is cut as one collection: a window straddling a split
+    /// becomes one segment per contributing recording, and each segment states
+    /// which recording it came from.
+    ///
+    /// This is the whole of what the directory buys — the window is the same
+    /// window either way, and a clip that stopped at the split it started in
+    /// would be short two seconds of data nobody asked to lose.
+    #[test]
+    fn clip_mode_cuts_a_bag_directory_as_one_collection() -> anyhow::Result<()> {
+        let root = clip::testing::test_dir("clip-bag")?;
+        let bag = root.join("record");
+        std::fs::create_dir_all(&bag)?;
+        let first = bag.join("bag_0.mcap");
+        let second = bag.join("bag_1.mcap");
+        clip::testing::write_recording(&first, true, &[("/t", 1_000), ("/t", 2_000)])?;
+        clip::testing::write_recording(&second, true, &[("/t", 3_000), ("/t", 4_000)])?;
+        clip::testing::write_bag_metadata(&bag, &["bag_0.mcap", "bag_1.mcap"], &[("/t", 4)])?;
+        let out_dir = root.join("clipped");
+
+        clip_mode(
+            ClipConfig {
+                trigger_time: Some(3_000),
+                preroll: Some(1_500),
+                postroll: Some(500),
+                trigger_name: Some("brake".to_string()),
+                ..param_clip_cfg(&bag, &out_dir)
+            },
+            CLIP_PRODUCER,
+            clip::ChannelSelection::default(),
+        )?;
+
+        let mut written: Vec<String> = std::fs::read_dir(&out_dir)?
+            .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
+            .collect::<anyhow::Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|name| name.ends_with(".mcap"))
+            .collect();
+        written.sort();
+        assert_eq!(
+            written,
+            vec!["3000_brake_00.mcap", "3000_brake_01.mcap"],
+            "one segment per contributing recording, numbered in collection order"
+        );
+
+        // The window [1500, 3500] straddles the split; the segments together
+        // are the two messages inside it, in recording order.
+        assert_eq!(clip_data(&out_dir.join("3000_brake_00.mcap"))?, vec![2_000]);
+        assert_eq!(clip_data(&out_dir.join("3000_brake_01.mcap"))?, vec![3_000]);
+
+        let manifest = |name: &str| -> anyhow::Result<_> {
+            clip::manifest::read_manifest(&out_dir.join(name))?
+                .context("every clip carries a manifest")
+        };
+        assert_eq!(
+            manifest("3000_brake_00.mcap")?["source.path"],
+            first.display().to_string()
+        );
+        assert_eq!(
+            manifest("3000_brake_01.mcap")?["source.path"],
+            second.display().to_string()
+        );
+        assert_eq!(
+            manifest("3000_brake_00.mcap")?["source.files_planned"],
+            "2",
+            "the clip states how many recordings of the collection the window crossed"
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// A bag directory holding one recording that fails the index contract is
+    /// refused naming *that recording* — the file an operator repairs — and
+    /// writes nothing.
+    ///
+    /// The fixture is the case this exists for: a directory copied off a device
+    /// mid-recording, whose last split never got its footer. Its good splits
+    /// buy it nothing; a collection is only as plannable as the recordings in
+    /// it.
+    #[test]
+    fn clip_mode_refuses_a_collection_naming_the_recording_that_fails() -> anyhow::Result<()> {
+        let root = clip::testing::test_dir("clip-bag-refused")?;
+        let bag = root.join("record");
+        std::fs::create_dir_all(&bag)?;
+        clip::testing::write_recording(&bag.join("bag_0.mcap"), true, &[("/t", 1_000)])?;
+        let truncated = bag.join("bag_1.mcap");
+        clip::testing::write_unfinished_recording(&truncated, "/t", &[2_000, 3_000])?;
+        let out_dir = root.join("clipped");
+
+        let err = clip_mode(
+            ClipConfig {
+                trigger_time: Some(2_000),
+                preroll: Some(1_000),
+                postroll: Some(1_000),
+                ..param_clip_cfg(&bag, &out_dir)
+            },
+            CLIP_PRODUCER,
+            clip::ChannelSelection::default(),
+        )
+        .unwrap_err();
+
+        let text = format!("{err:#}");
+        assert!(
+            text.contains(&truncated.display().to_string()),
+            "the refusal names the recording that failed, not the directory: {text}"
+        );
+        assert!(
+            !text.contains("bag_0.mcap"),
+            "and says nothing about the recordings that passed: {text}"
+        );
+        assert!(
+            text.contains("does not end with the MCAP magic"),
+            "the refusal names the fault: {text}"
+        );
+        assert!(
+            !out_dir.exists(),
+            "a refusal writes nothing, not even the staging directory"
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
     // ── `clipper clip --trigger-source`: where the run's triggers come from ─
 
     /// The topic a fixture recording carries its triggers on: the recorder's
@@ -2737,6 +2882,69 @@ mod tests {
         assert_eq!(first["window.start_ns"], "1500");
         assert_eq!(first["window.end_ns"], "3000");
         assert_eq!(first["producer.mode"], "clip");
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// Over a bag directory, every split is read for triggers, in the order the
+    /// collection is planned in.
+    ///
+    /// A trigger sits in the recording that was being written when it fired, so
+    /// a reader that stopped at the first split would cut the clips of the
+    /// first few minutes and silently drop the rest of the run's.
+    #[test]
+    fn mcap_reads_every_recording_of_a_bag_directory_for_triggers() -> anyhow::Result<()> {
+        let root = clip::testing::test_dir("clip-embedded-bag")?;
+        let bag = root.join("record");
+        std::fs::create_dir_all(&bag)?;
+        clip::testing::write_recording_with_triggers(
+            &bag.join("bag_0.mcap"),
+            FIXTURE_TRIGGER_TOPIC,
+            &[
+                &[recorded(1_000), recorded(2_000), recorded(3_000)],
+                &[embedded(2_000, "first", 500, 500)],
+            ],
+        )?;
+        clip::testing::write_recording_with_triggers(
+            &bag.join("bag_1.mcap"),
+            FIXTURE_TRIGGER_TOPIC,
+            &[
+                &[recorded(5_000), recorded(6_000), recorded(7_000)],
+                &[embedded(6_000, "second", 500, 500)],
+            ],
+        )?;
+        clip::testing::write_bag_metadata(&bag, &["bag_0.mcap", "bag_1.mcap"], &[("/t", 6)])?;
+        let out_dir = root.join("clipped");
+
+        clip_mode(
+            ClipConfig {
+                trigger_source: TriggerSource::Mcap,
+                trigger_time: None,
+                preroll: None,
+                postroll: None,
+                ..param_clip_cfg(&bag, &out_dir)
+            },
+            CLIP_PRODUCER,
+            clip::ChannelSelection::default(),
+        )?;
+
+        let mut written: Vec<String> = std::fs::read_dir(&out_dir)?
+            .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
+            .collect::<anyhow::Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|name| name.ends_with(".mcap"))
+            .collect();
+        written.sort();
+        assert_eq!(
+            written,
+            vec!["2000_first.mcap", "6000_second.mcap"],
+            "one clip per trigger, whichever recording of the collection carried it"
+        );
+        // Each window sits inside the recording its trigger was written to, so
+        // each clip is one segment and holds that recording's messages.
+        assert_eq!(clip_data(&out_dir.join("2000_first.mcap"))?, vec![2_000]);
+        assert_eq!(clip_data(&out_dir.join("6000_second.mcap"))?, vec![6_000]);
 
         std::fs::remove_dir_all(root)?;
         Ok(())

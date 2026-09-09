@@ -40,16 +40,30 @@
 //! costs the same seek and read that accepting one does, whatever its size, and
 //! the input is opened read-only and left exactly as it was found: recovering
 //! and re-indexing are the operator's, never this crate's.
+//!
+//! **A bag directory is one collection.** A recorder that ran for hours left a
+//! directory of splits rather than a file, and [`WholeFileIndex::open`] takes
+//! either. Each split is indexed on its own and satisfies the contract on its
+//! own — a directory holding one that does not is refused naming *that
+//! recording*, not the directory — and the splits are then planned in the order
+//! [`crate::bag`] put them in, so a window straddling a rollover yields one
+//! plan per contributing split and the shared cut path publishes one segment
+//! each. The recorder's own per-topic counts, where its metadata file states
+//! them, are cross-checked against what the splits' summaries add up to
+//! ([`CountDisagreement`]): a collection short a split still cuts, and says
+//! how much of it is missing.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use log::warn;
 use mcap::sans_io::summary_reader::{SummaryReadEvent, SummaryReader, SummaryReaderOptions};
 
 use crate::TimeSource;
+use crate::bag::{BagError, METADATA_FILE};
 use crate::index::{
     ChannelDef, Extent, MAGIC, RecordingIndex, SchemaDef, Span, Stamps, TimeBounds, WindowPlan,
     WindowPlanner,
@@ -153,14 +167,19 @@ pub enum IndexRefusal {
     Unindexed { path: PathBuf, chunks: usize },
 }
 
-/// Everything [`WholeFileIndex::open`] can fail with: the file could not be
-/// read, its tail is not MCAP, or it is MCAP and clipper refuses to index it.
+/// Everything [`WholeFileIndex::open`] can fail with: the bag directory could
+/// not be listed, a file could not be read, its tail is not MCAP, or it is MCAP
+/// and clipper refuses to index it.
 ///
-/// The three are separated because they are three different things to do: fix
-/// the path or the permissions, treat the file as corrupt, or apply the repair
-/// the [`IndexRefusal`] names.
+/// The four are separated because they are four different things to do: point
+/// at the directory the splits are in, fix the path or the permissions, treat
+/// the file as corrupt, or apply the repair the [`IndexRefusal`] names.
 #[derive(Debug, thiserror::Error)]
 pub enum OpenError {
+    /// The input is a directory and is not a bag directory this can list.
+    /// Its own message says which of those it is.
+    #[error(transparent)]
+    Bag(#[from] BagError),
     /// The file could not be opened, stat'd, seeked or read.
     #[error("cannot read {}", path.display())]
     Unreadable {
@@ -190,28 +209,74 @@ fn unreadable(path: &Path) -> impl Fn(std::io::Error) -> OpenError {
     }
 }
 
-/// One finished recording, indexed from its own summary and ready to cut
-/// windows out of.
+/// One topic whose message count over a bag directory's splits disagrees with
+/// what the recorder's metadata file states for it.
+///
+/// Both numbers are counted rather than estimated — `stated` is the recorder's
+/// own `topics_with_message_count`, `indexed` the sum of the splits' summary
+/// statistics — so a disagreement means the collection is not the one the
+/// recorder wrote: a split is missing, an extra one was dropped in beside them,
+/// or one was rewritten. It is reported and not refused, because a collection
+/// short a split still cuts every window its splits do cover, and only the
+/// operator knows whether the missing part mattered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CountDisagreement {
+    /// The topic the two counts are about.
+    pub topic: String,
+    /// What the metadata file says the collection holds on it.
+    pub stated: u64,
+    /// What the splits actually present add up to.
+    pub indexed: u64,
+}
+
+impl std::fmt::Display for CountDisagreement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            topic,
+            stated,
+            indexed,
+        } = self;
+        write!(
+            f,
+            "{topic}: the recordings present hold {indexed} message(s), the \
+             {METADATA_FILE} states {stated}"
+        )
+    }
+}
+
+/// One finished recording — or one bag directory of them — indexed from the
+/// summaries and ready to cut windows out of.
 ///
 /// [`Self::open`] is the whole construction; from there it is a
 /// [`WindowPlanner`] like any other, so [`crate::segment::cut_window`] takes it
-/// exactly as it takes a live tail. Nothing here waits: the recording has an
+/// exactly as it takes a live tail. Nothing here waits: the recordings have an
 /// end, so a window that reaches past it is short and stays short however long
 /// a caller stands around.
+///
+/// The splits are held in recording order and planned in it, which is the order
+/// a straddling window's segments are numbered in — so the collection's order
+/// is a clip's segment order, and [`crate::bag`] owns the decision that sets it.
 #[derive(Debug)]
 pub struct WholeFileIndex {
-    index: RecordingIndex,
+    /// One index per recording, in the order [`crate::bag`] put them in. A
+    /// single-file input is a collection of one.
+    splits: Vec<RecordingIndex>,
+    /// What the collection and the recorder's metadata file disagree about, in
+    /// topic order; always empty for a single file and for a directory with no
+    /// metadata file.
+    disagreements: Vec<CountDisagreement>,
 }
 
 impl WholeFileIndex {
-    /// Index the finished recording at `path` from its summary.
+    /// Index what `path` names: one finished recording, or a bag directory read
+    /// as one time-ordered collection of splits.
     ///
-    /// Reads the footer and the summary section and nothing else — the data
-    /// section is not walked and no chunk is decompressed, so the cost is
-    /// independent of the recording's size and is not paid twice when the cut
-    /// then reads the extents it was given. The file is opened read-only and
-    /// never written to: a recording this refuses is left exactly as it was
-    /// found, and repairing it is the operator's.
+    /// Per recording this reads the footer and the summary section and nothing
+    /// else — the data section is not walked and no chunk is decompressed, so
+    /// the cost is independent of the recording's size and is not paid twice
+    /// when the cut then reads the extents it was given. Files are opened
+    /// read-only and never written to: a recording this refuses is left exactly
+    /// as it was found, and repairing it is the operator's.
     ///
     /// Every recording this cannot index is refused by name, from the same two
     /// reads: [`IndexRefusal`] is the taxonomy, and the checks run in the order
@@ -220,70 +285,216 @@ impl WholeFileIndex {
     /// a chunked recording that holds no message indexes no chunk either, and
     /// [`IndexRefusal::Empty`] is the honest name for it, not
     /// [`IndexRefusal::Unchunked`].
+    ///
+    /// **Each split of a directory has to satisfy that contract on its own.**
+    /// A collection is only as plannable as the recordings in it, and a window
+    /// is cut out of one of them at a time, so a directory holding one this
+    /// cannot index is refused naming that recording — the file an operator
+    /// repairs or removes — rather than the directory they typed. The usual
+    /// offender is the last split of a directory copied off a device while the
+    /// recording was still being written, which is also the directory with no
+    /// metadata file in it.
     pub fn open(path: &Path) -> Result<Self, OpenError> {
-        let file = File::open(path).map_err(unreadable(path))?;
-        let end_of_scan = file.metadata().map_err(unreadable(path))?.len();
-
-        if end_of_scan < MIN_MCAP_LEN {
-            return Err(IndexRefusal::NotMcap {
-                path: path.to_path_buf(),
-                len: end_of_scan,
-            }
-            .into());
+        if path.is_dir() {
+            Self::open_dir(path)
+        } else {
+            Ok(WholeFileIndex {
+                splits: vec![index_split(path)?.0],
+                disagreements: Vec::new(),
+            })
         }
-        // The closing magic is what separates a finalised recording from one
-        // still being written or truncated in transit, and it is eight bytes at
-        // a known offset — cheaper and more specific than letting the summary
-        // reader discover it as a parse failure.
-        if !ends_with_magic(&file, end_of_scan).map_err(unreadable(path))? {
-            return Err(IndexRefusal::Unfinalised {
-                path: path.to_path_buf(),
-            }
-            .into());
-        }
-        let Some(summary) = read_summary(&file, end_of_scan, path)? else {
-            return Err(IndexRefusal::NoSummary {
-                path: path.to_path_buf(),
-            }
-            .into());
-        };
-        refuse_unplannable(path, &summary)?;
-
-        let mut index = RecordingIndex::new(path.to_path_buf(), Arc::new(file));
-        // The magic is behind the summary this file just parsed, and there is
-        // nothing left to scan: the cursor sits at the end of the file.
-        index.magic_ok = true;
-        index.offset = end_of_scan;
-        index.schemas = schemas(&summary);
-        index.channels = channels(&summary);
-        index.extents = extents(&summary);
-        index.bounds = bounds(&summary);
-        Ok(WholeFileIndex { index })
     }
 
-    /// The highest `log_time` the recording holds, or `None` for one that holds
-    /// no message.
+    /// Index every split of the bag directory at `dir`, in recording order, and
+    /// cross-check the collection against the recorder's own account of it.
+    ///
+    /// The cross-check needs both sides whole: per-topic counts from the
+    /// metadata file, and a message count from every split. A summary is
+    /// allowed to carry no statistics record, and one split without it makes
+    /// the sum an undercount rather than a disagreement; a metadata file that
+    /// states no counts at all is no account rather than an account of zero. In
+    /// either case the check is skipped entirely rather than reporting a
+    /// shortfall that belongs to the format instead of to the collection.
+    fn open_dir(dir: &Path) -> Result<Self, OpenError> {
+        let bag = crate::bag::open(dir)?;
+        let mut splits = Vec::with_capacity(bag.splits.len());
+        let mut indexed: Option<BTreeMap<String, u64>> = Some(BTreeMap::new());
+        for path in &bag.splits {
+            let (index, counts) = index_split(path)?;
+            splits.push(index);
+            indexed = match (indexed, counts) {
+                (Some(mut total), Some(counts)) => {
+                    for (topic, count) in counts {
+                        *total.entry(topic).or_default() += count;
+                    }
+                    Some(total)
+                }
+                _ => None,
+            };
+        }
+
+        let disagreements = match (bag.metadata, indexed) {
+            (Some(metadata), Some(indexed)) if !metadata.topic_counts.is_empty() => {
+                cross_check(&metadata.topic_counts, &indexed)
+            }
+            _ => Vec::new(),
+        };
+        for disagreement in &disagreements {
+            warn!(
+                "{} does not hold what it says it does — {disagreement}",
+                dir.display()
+            );
+        }
+
+        Ok(WholeFileIndex {
+            splits,
+            disagreements,
+        })
+    }
+
+    /// The recordings a window is planned over, in the order their segments come
+    /// out — one path for a single file, one per split for a bag directory.
+    pub fn splits(&self) -> Vec<&Path> {
+        self.splits
+            .iter()
+            .map(|index| index.path.as_path())
+            .collect()
+    }
+
+    /// What the collection and the recorder's metadata file disagree about, in
+    /// topic order. Empty when they agree, when the directory carries no
+    /// metadata file, and for a single recording.
+    pub fn disagreements(&self) -> &[CountDisagreement] {
+        &self.disagreements
+    }
+
+    /// The highest `log_time` the collection holds, or `None` when no recording
+    /// in it holds a message.
     ///
     /// This is what says whether a window's end was ever reached: a finished
     /// recording that stops inside a window cuts a clip that is
     /// [`Short`](crate::manifest::WindowCoverage::Short), and only the recording
-    /// itself can say so — the clip cannot show it from its own contents.
+    /// itself can say so — the clip cannot show it from its own contents. Over a
+    /// bag directory it is the last split's end, so a window reaching past the
+    /// whole collection is what makes a clip short, not one reaching past the
+    /// split it started in.
     pub fn log_end_ns(&self) -> Option<u64> {
-        self.index
-            .bounds
-            .has_messages
-            .then_some(self.index.bounds.log.max)
+        self.splits
+            .iter()
+            .filter(|index| index.bounds.has_messages)
+            .map(|index| index.bounds.log.max)
+            .max()
     }
 }
 
+/// The per-topic message counts one recording's summary states, or `None` for a
+/// summary carrying no statistics record.
+///
+/// The statistics count every message in the file, chunked or not, per channel;
+/// two channels sharing a topic — a schema that changed mid-recording — add up
+/// under the one topic, which is how the recorder counted them too. A count
+/// against a channel the summary's own registry does not carry leaves the
+/// account short by that channel's messages, and an account that cannot be
+/// completed is no account: `None` again, rather than a total that would
+/// disagree with the recorder for a reason that is the file's.
+fn topic_counts(summary: &mcap::Summary) -> Option<BTreeMap<String, u64>> {
+    let stats = summary.stats.as_ref()?;
+    let mut counts = BTreeMap::new();
+    for (id, count) in &stats.channel_message_counts {
+        *counts
+            .entry(summary.channels.get(id)?.topic.clone())
+            .or_default() += count;
+    }
+    Some(counts)
+}
+
+/// Every topic the two accounts of a collection disagree about, in topic order.
+///
+/// A topic only one side names is a disagreement too, counted as zero on the
+/// side that does not name it: a topic the recorder counted messages on and the
+/// recordings present hold none of is exactly the shape of a missing split.
+fn cross_check(
+    stated: &BTreeMap<String, u64>,
+    indexed: &BTreeMap<String, u64>,
+) -> Vec<CountDisagreement> {
+    stated
+        .keys()
+        .chain(indexed.keys())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .filter_map(|topic| {
+            let stated = stated.get(topic).copied().unwrap_or(0);
+            let indexed = indexed.get(topic).copied().unwrap_or(0);
+            (stated != indexed).then(|| CountDisagreement {
+                topic: topic.clone(),
+                stated,
+                indexed,
+            })
+        })
+        .collect()
+}
+
+/// Index one recording from its summary: the [`RecordingIndex`] a window is
+/// planned over, and the per-topic counts that cross-check a collection.
+///
+/// The whole of what opening a recording costs, and the only place a refusal is
+/// decided — a single file and one split of a directory go through exactly this,
+/// so the contract is one contract and a refusal names the recording that
+/// failed it either way.
+fn index_split(path: &Path) -> Result<(RecordingIndex, Option<BTreeMap<String, u64>>), OpenError> {
+    let file = File::open(path).map_err(unreadable(path))?;
+    let end_of_scan = file.metadata().map_err(unreadable(path))?.len();
+
+    if end_of_scan < MIN_MCAP_LEN {
+        return Err(IndexRefusal::NotMcap {
+            path: path.to_path_buf(),
+            len: end_of_scan,
+        }
+        .into());
+    }
+    // The closing magic is what separates a finalised recording from one
+    // still being written or truncated in transit, and it is eight bytes at
+    // a known offset — cheaper and more specific than letting the summary
+    // reader discover it as a parse failure.
+    if !ends_with_magic(&file, end_of_scan).map_err(unreadable(path))? {
+        return Err(IndexRefusal::Unfinalised {
+            path: path.to_path_buf(),
+        }
+        .into());
+    }
+    let Some(summary) = read_summary(&file, end_of_scan, path)? else {
+        return Err(IndexRefusal::NoSummary {
+            path: path.to_path_buf(),
+        }
+        .into());
+    };
+    refuse_unplannable(path, &summary)?;
+
+    let counts = topic_counts(&summary);
+    let mut index = RecordingIndex::new(path.to_path_buf(), Arc::new(file));
+    // The magic is behind the summary this file just parsed, and there is
+    // nothing left to scan: the cursor sits at the end of the file.
+    index.magic_ok = true;
+    index.offset = end_of_scan;
+    index.schemas = schemas(&summary);
+    index.channels = channels(&summary);
+    index.extents = extents(&summary);
+    index.bounds = bounds(&summary);
+    Ok((index, counts))
+}
+
 impl WindowPlanner for WholeFileIndex {
-    /// The single plan over this recording, or none at all when no chunk's span
-    /// overlaps the window. One file means at most one plan — the multi-plan
-    /// shape of the seam belongs to a caller holding several recordings.
+    /// One plan per recording whose chunks overlap the window, in recording
+    /// order; none at all when no chunk of any of them does.
+    ///
+    /// A single file therefore yields at most one plan, and a bag directory one
+    /// per contributing split — the same shape the live tail serves out of its
+    /// own collection, which is why the cut path needs to know neither which of
+    /// the two it was handed nor how many recordings are behind it.
     fn plan_window(&self, start_ns: u64, end_ns: u64, source: TimeSource) -> Vec<WindowPlan> {
-        self.index
-            .plan(start_ns, end_ns, source)
-            .into_iter()
+        self.splits
+            .iter()
+            .filter_map(|index| index.plan(start_ns, end_ns, source))
             .collect()
     }
 }
@@ -488,19 +699,33 @@ fn log_span(summary: &mcap::Summary) -> Option<Span> {
 }
 
 #[cfg(test)]
+impl WholeFileIndex {
+    /// The one index behind a single-file input, for a test asserting on what
+    /// the summary put in it. A collection has no "the" split, so this panics
+    /// on one — the tests that hold a directory read [`Self::splits`] instead.
+    fn only_split(&self) -> &RecordingIndex {
+        match self.splits.as_slice() {
+            [index] => index,
+            splits => panic!("{} recordings, not one", splits.len()),
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
     use std::io::BufWriter;
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
-    use anyhow::Result;
+    use anyhow::{Context, Result};
 
     use super::*;
-    use crate::manifest::WindowCoverage;
+    use crate::cut;
+    use crate::manifest::{WindowCoverage, read_manifest};
     use crate::segment::{cut_window, spawn_stage_workers};
     use crate::select::{ChannelSelection, Spec};
-    use crate::testing::{index_file, scan_to_end, test_dir, window_request};
+    use crate::testing::{index_file, scan_to_end, test_dir, window_request, write_bag_metadata};
     use crate::trigger::now_ns;
 
     /// The clip compression the recorder defaults to, so these cuts write the
@@ -866,7 +1091,7 @@ mod tests {
 
         let topics = |idx: &WholeFileIndex| {
             let mut t: Vec<String> = idx
-                .index
+                .only_split()
                 .channels
                 .values()
                 .map(|c| c.topic.clone())
@@ -881,7 +1106,7 @@ mod tests {
         assert_eq!(topics(&from_summary), topics(&intact));
         assert!(
             from_summary
-                .index
+                .only_split()
                 .channels
                 .values()
                 .all(|c| c.schema.is_some()),
@@ -889,7 +1114,7 @@ mod tests {
         );
 
         let ranges = |idx: &WholeFileIndex| -> Vec<(u64, u64)> {
-            idx.index
+            idx.only_split()
                 .extents
                 .iter()
                 .map(|e| (e.offset, e.len))
@@ -1162,8 +1387,12 @@ mod tests {
         );
     }
 
-    /// The two failures that are not refusals say their own layer and let the
+    /// The failures that carry a low-level cause say their own layer and let the
     /// cause say the rest, rather than printing the cause twice.
+    ///
+    /// `Refused` and `Bag` are transparent instead: their own message already
+    /// names the input and the fault, so a layer above it would only repeat the
+    /// path.
     #[test]
     fn a_failure_that_is_not_a_refusal_states_its_own_layer() {
         let source = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
@@ -1551,7 +1780,7 @@ mod tests {
         assert_eq!(plans.len(), 1);
         assert_eq!(
             plans[0].extents.len(),
-            index.index.extents.len(),
+            index.only_split().extents.len(),
             "every chunk is planned on a clock the summary does not bound"
         );
 
@@ -1567,6 +1796,416 @@ mod tests {
             read_messages(&stats[0].out_path)?,
             vec![("/a".to_string(), 100, 5_000, 0, 64)],
             "only the message published inside the window is copied"
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    // ── a bag directory: one time-ordered collection ───────────────────────
+
+    /// One message on `topic` at `log_time`, with every other field derived
+    /// from it: a fixture that is about *when* a message is names only that.
+    fn at(topic: &'static str, log_time: u64) -> Msg {
+        Msg {
+            topic,
+            log_time,
+            publish_time: log_time,
+            sequence: (log_time / 100) as u32,
+            payload_len: 40,
+        }
+    }
+
+    /// One recording of a bag directory, written after a pause long enough that
+    /// each call lands a strictly newer modification time — so a fixture that
+    /// writes the splits out of order makes the filesystem's order disagree
+    /// with the recorder's, which is the only way to see which one was used.
+    fn write_split(dir: &Path, name: &str, msgs: &[Msg]) -> Result<PathBuf> {
+        std::thread::sleep(Duration::from_millis(10));
+        let path = dir.join(name);
+        write_chunked(&path, msgs)?;
+        Ok(path)
+    }
+
+    /// A fresh bag directory under `root`.
+    fn bag_dir(root: &Path) -> Result<PathBuf> {
+        let dir = root.join("bag");
+        std::fs::create_dir_all(&dir)?;
+        Ok(dir)
+    }
+
+    /// A published clip's manifest.
+    fn manifest_of(clip: &Path) -> Result<BTreeMap<String, String>> {
+        read_manifest(clip)?.context("every published clip carries a manifest")
+    }
+
+    /// The recording a published segment says its bytes came from.
+    fn source_of(clip: &Path) -> Result<PathBuf> {
+        Ok(PathBuf::from(
+            manifest_of(clip)?
+                .get("source.path")
+                .context("a segment cut from a recording names it")?,
+        ))
+    }
+
+    /// The published segments' filenames, in the order they were cut.
+    fn segment_names(segments: &[cut::ClipStats]) -> Vec<String> {
+        segments
+            .iter()
+            .map(|stats| {
+                stats
+                    .out_path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect()
+    }
+
+    /// A window straddling a split is cut into one segment per contributing
+    /// recording, and the segments together are the window.
+    ///
+    /// The claim is that a collection is not a different clip from the
+    /// recording it was split out of: the same window over a single recording
+    /// holding all six messages holds the same messages, field for field, and
+    /// arrives in one file instead of two.
+    #[test]
+    fn a_window_straddling_a_split_is_one_segment_per_contributing_recording() -> Result<()> {
+        let root = test_dir("whole-straddle")?;
+        let bag = bag_dir(&root)?;
+        let first = write_split(
+            &bag,
+            "bag_0.mcap",
+            &[at("/a", 100), at("/a", 200), at("/a", 300)],
+        )?;
+        let second = write_split(
+            &bag,
+            "bag_1.mcap",
+            &[at("/a", 400), at("/a", 500), at("/a", 600)],
+        )?;
+        write_bag_metadata(&bag, &["bag_0.mcap", "bag_1.mcap"], &[("/a", 6)])?;
+
+        let index = WholeFileIndex::open(&bag)?;
+        assert_eq!(
+            index.splits(),
+            vec![first.as_path(), second.as_path()],
+            "both recordings, in the order the recorder wrote them"
+        );
+        assert_eq!(
+            index.log_end_ns(),
+            Some(600),
+            "the collection ends where its last recording does"
+        );
+
+        let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
+        let request = Arc::new(window_request(250, 450, TimeSource::Log));
+        let segments = cut_window(
+            &index,
+            &request,
+            WindowCoverage::Covered,
+            &root.join("clip.mcap"),
+            &stage_tx,
+        )?;
+
+        assert_eq!(
+            segment_names(&segments),
+            vec!["clip_00.mcap", "clip_01.mcap"],
+            "one segment per contributing recording, numbered in collection order"
+        );
+        assert_eq!(source_of(&segments[0].out_path)?, first);
+        assert_eq!(source_of(&segments[1].out_path)?, second);
+
+        let mut copied = Vec::new();
+        for stats in &segments {
+            copied.extend(read_messages(&stats.out_path)?);
+        }
+        assert_eq!(
+            copied,
+            vec![
+                ("/a".to_string(), 300, 300, 3, 40),
+                ("/a".to_string(), 400, 400, 4, 40),
+            ],
+            "every message in the window and no other, across the rollover"
+        );
+
+        // The same window out of one recording holding all six messages: the
+        // collection is cut into the same clip, only in two files.
+        let single_rec = root.join("single.mcap");
+        write_chunked(
+            &single_rec,
+            &[
+                at("/a", 100),
+                at("/a", 200),
+                at("/a", 300),
+                at("/a", 400),
+                at("/a", 500),
+                at("/a", 600),
+            ],
+        )?;
+        let single = cut_window(
+            &WholeFileIndex::open(&single_rec)?,
+            &request,
+            WindowCoverage::Covered,
+            &root.join("unsplit.mcap"),
+            &stage_tx,
+        )?;
+        assert_eq!(single.len(), 1, "one recording, one segment");
+        assert_eq!(
+            copied,
+            read_messages(&single[0].out_path)?,
+            "the segments concatenated are the clip the unsplit recording cuts"
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// A recording that contributes nothing to a window is dropped, and the
+    /// segments left are numbered by where they land — not by which split they
+    /// came from.
+    ///
+    /// The middle recording covers a camera outage: it holds messages, and the
+    /// window selects its chunks, but none of what it holds is in the channel
+    /// set this clip is cut from. So the collection plans three recordings and
+    /// publishes two, and `_01` is the third recording rather than the second.
+    #[test]
+    fn a_recording_contributing_nothing_is_dropped_and_the_rest_renumber() -> Result<()> {
+        let root = test_dir("whole-empty-middle")?;
+        let bag = bag_dir(&root)?;
+        let first = write_split(
+            &bag,
+            "bag_0.mcap",
+            &[at("/camera/image", 100), at("/camera/image", 200)],
+        )?;
+        write_split(
+            &bag,
+            "bag_1.mcap",
+            &[at("/diagnostics", 300), at("/diagnostics", 400)],
+        )?;
+        let third = write_split(
+            &bag,
+            "bag_2.mcap",
+            &[at("/camera/image", 500), at("/camera/image", 600)],
+        )?;
+        write_bag_metadata(
+            &bag,
+            &["bag_0.mcap", "bag_1.mcap", "bag_2.mcap"],
+            &[("/camera/image", 4), ("/diagnostics", 2)],
+        )?;
+
+        let selection = ChannelSelection::try_from(Spec {
+            include_regex: Some("^/camera/".to_string()),
+            ..Spec::default()
+        })?;
+        let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION, selection);
+        let segments = cut_window(
+            &WholeFileIndex::open(&bag)?,
+            &Arc::new(window_request(0, 1_000, TimeSource::Log)),
+            WindowCoverage::Covered,
+            &root.join("clip.mcap"),
+            &stage_tx,
+        )?;
+
+        assert_eq!(
+            segment_names(&segments),
+            vec!["clip_00.mcap", "clip_01.mcap"],
+            "two segments out of three recordings, numbered from zero"
+        );
+        assert_eq!(
+            source_of(&segments[0].out_path)?,
+            first,
+            "_00 is the first recording"
+        );
+        assert_eq!(
+            source_of(&segments[1].out_path)?,
+            third,
+            "_01 is the third recording, not the second"
+        );
+        assert_eq!(
+            manifest_of(&segments[0].out_path)?["source.files_planned"],
+            "3",
+            "the clip still states how many recordings the window was planned over"
+        );
+        assert_eq!(
+            read_messages(&segments[0].out_path)?,
+            vec![
+                ("/camera/image".to_string(), 100, 100, 1, 40),
+                ("/camera/image".to_string(), 200, 200, 2, 40),
+            ],
+        );
+        assert_eq!(
+            read_messages(&segments[1].out_path)?,
+            vec![
+                ("/camera/image".to_string(), 500, 500, 5, 40),
+                ("/camera/image".to_string(), 600, 600, 6, 40),
+            ],
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// The recorder's metadata file states the collection's order; a directory
+    /// without one is ordered by modification time.
+    ///
+    /// One fixture proves both, because its two recordings are written
+    /// newest-first: the filesystem's order is the reverse of the recorder's,
+    /// so the segments come out in one order with the metadata file present and
+    /// the other with it gone.
+    #[test]
+    fn the_metadata_file_orders_a_collection_and_modification_time_orders_one_without_it()
+    -> Result<()> {
+        let root = test_dir("whole-order")?;
+        let bag = bag_dir(&root)?;
+        let second = write_split(&bag, "bag_1.mcap", &[at("/a", 400), at("/a", 500)])?;
+        let first = write_split(&bag, "bag_0.mcap", &[at("/a", 100), at("/a", 200)])?;
+        let metadata = write_bag_metadata(&bag, &["bag_0.mcap", "bag_1.mcap"], &[("/a", 4)])?;
+
+        let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
+        let request = Arc::new(window_request(0, 1_000, TimeSource::Log));
+
+        let stated = cut_window(
+            &WholeFileIndex::open(&bag)?,
+            &request,
+            WindowCoverage::Covered,
+            &root.join("stated.mcap"),
+            &stage_tx,
+        )?;
+        assert_eq!(
+            [
+                source_of(&stated[0].out_path)?,
+                source_of(&stated[1].out_path)?
+            ],
+            [first.clone(), second.clone()],
+            "the order the metadata file states, against the modification times"
+        );
+
+        std::fs::remove_file(&metadata)?;
+        let by_mtime = cut_window(
+            &WholeFileIndex::open(&bag)?,
+            &request,
+            WindowCoverage::Covered,
+            &root.join("mtime.mcap"),
+            &stage_tx,
+        )?;
+        assert_eq!(
+            [
+                source_of(&by_mtime[0].out_path)?,
+                source_of(&by_mtime[1].out_path)?
+            ],
+            [second, first],
+            "with no metadata file, oldest first — the same two recordings, the \
+             other way round"
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// The metadata file's per-topic counts are checked against what the
+    /// recordings present actually hold, and every topic they disagree about is
+    /// reported.
+    ///
+    /// The recorder counted two messages on `/b`; the directory holds one, which
+    /// is what a collection short a split looks like from the inside. It is
+    /// reported and not refused: the windows the recordings present do cover
+    /// still cut.
+    #[test]
+    fn a_collections_topic_counts_are_cross_checked_against_the_metadata_file() -> Result<()> {
+        let root = test_dir("whole-counts")?;
+        let bag = bag_dir(&root)?;
+        write_split(&bag, "bag_0.mcap", &[at("/a", 100), at("/b", 150)])?;
+        write_split(&bag, "bag_1.mcap", &[at("/a", 200)])?;
+
+        write_bag_metadata(&bag, &["bag_0.mcap", "bag_1.mcap"], &[("/a", 2), ("/b", 2)])?;
+        let short = WholeFileIndex::open(&bag)?;
+        assert_eq!(
+            short.disagreements().to_vec(),
+            vec![CountDisagreement {
+                topic: "/b".to_string(),
+                stated: 2,
+                indexed: 1,
+            }],
+            "the one topic the two accounts differ on, and only it"
+        );
+        let reported = short.disagreements()[0].to_string();
+        for phrase in ["/b", "1 message(s)", "states 2", METADATA_FILE] {
+            assert!(
+                reported.contains(phrase),
+                "the report names {phrase}: {reported}"
+            );
+        }
+
+        write_bag_metadata(&bag, &["bag_0.mcap", "bag_1.mcap"], &[("/a", 2), ("/b", 1)])?;
+        assert!(
+            WholeFileIndex::open(&bag)?.disagreements().is_empty(),
+            "an account that adds up says nothing"
+        );
+
+        write_bag_metadata(&bag, &["bag_0.mcap", "bag_1.mcap"], &[])?;
+        assert!(
+            WholeFileIndex::open(&bag)?.disagreements().is_empty(),
+            "a metadata file stating no counts is no account, not an account of zero"
+        );
+
+        std::fs::remove_file(bag.join(METADATA_FILE))?;
+        assert!(
+            WholeFileIndex::open(&bag)?.disagreements().is_empty(),
+            "a directory with no metadata file has no account to disagree with"
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// Every recording of a collection satisfies the index contract on its own,
+    /// and a directory holding one that does not is refused naming *that
+    /// recording* — with nothing written anywhere.
+    ///
+    /// The fixture is the case this exists for: a bag directory copied off a
+    /// device while it was still recording. The last split never got its
+    /// footer, and the recorder never got as far as writing the metadata file,
+    /// so its absence and the truncation arrive together.
+    #[test]
+    fn a_collection_holding_one_unindexable_recording_is_refused_naming_it() -> Result<()> {
+        let root = test_dir("whole-bad-split")?;
+        let bag = bag_dir(&root)?;
+        let good = write_split(&bag, "bag_0.mcap", &one_message())?;
+        std::thread::sleep(Duration::from_millis(10));
+        let truncated = bag.join("bag_1.mcap");
+        crate::testing::write_unfinished_recording(&truncated, "/a", &[200, 300])?;
+
+        // The fixture is only worth anything if the other recording is fine:
+        // the directory is refused for the one that is not.
+        WholeFileIndex::open(&good)?;
+
+        let listing = |dir: &Path| -> Result<Vec<PathBuf>> {
+            let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)?
+                .map(|entry| Ok(entry?.path()))
+                .collect::<Result<Vec<_>>>()?;
+            paths.sort();
+            Ok(paths)
+        };
+        let before = listing(&bag)?;
+
+        let refused = refusal(&bag);
+        let IndexRefusal::Unfinalised { path } = &refused else {
+            panic!("a truncated split is refused as unfinalised, not: {refused}")
+        };
+        assert_eq!(
+            path, &truncated,
+            "the refusal names the recording that failed the contract"
+        );
+        let text = refused.to_string();
+        assert!(
+            text.contains("bag_1.mcap") && !text.contains("bag_0.mcap"),
+            "the operator is told which file to repair: {text}"
+        );
+        assert_eq!(
+            listing(&bag)?,
+            before,
+            "a refusal writes nothing, not even beside the recordings"
         );
 
         std::fs::remove_dir_all(root)?;

@@ -278,13 +278,13 @@ clipper clip ./record/rosbag2_0.mcap \
   --preroll 5000000000 --postroll 5000000000 \
   --trigger-name brake-event --trigger-description "hard brake over 0.8 g"
 
-# one clip per trigger the recording itself carries
-clipper clip ./record/rosbag2_0.mcap --out-dir ./clipped --trigger-source mcap
+# the whole bag directory, read as one time-ordered collection
+clipper clip ./record --out-dir ./clipped --trigger-source mcap
 ```
 
 | Argument | Env var | Type | Default | Per-run | Meaning |
 |---|---|---|---|---|---|
-| `<recording>` | `MOMENTEDGE_RECORDING` | path | — | yes | the finished `.mcap` to cut from (positional) |
+| `<recording>` | `MOMENTEDGE_RECORDING` | path | — | yes | the finished recording to cut from (positional): one `.mcap`, or a bag directory of splits |
 | `--out-dir` | `MOMENTEDGE_OUT_DIR` | path | — | yes | where the clips are written |
 | `--trigger-source` | `MOMENTEDGE_TRIGGER_SOURCE` | `param` \| `mcap` | `param` | yes | where this run's triggers come from (see [below](#where-a-clip-runs-triggers-come-from-param-and-mcap)) |
 | `--trigger-time` | `MOMENTEDGE_TRIGGER_TIME` | integer, ns | — | yes | the instant the window centres on, in nanoseconds since the epoch (`param` only, required) |
@@ -311,17 +311,47 @@ Four things follow from the input being finished:
   `--time-source` is a parse error.
 - **Reading it is cheap.** The recording is indexed from its own summary — a
   footer seek and one read, whatever the file's size — rather than by walking it,
-  so no chunk is decompressed until the copy asks for one. Reading the
-  recording's own triggers costs the same summary plus the chunks that summary
-  names as holding the trigger channel, and nothing else.
+  so no chunk is decompressed until the copy asks for one. A bag directory costs
+  that per split. Reading the recording's own triggers costs the same summary
+  plus the chunks that summary names as holding the trigger channel, and nothing
+  else.
 - **A recording it cannot index is refused by name**, from that same footer and
   summary, before anything is written — see below.
+
+#### A bag directory is one collection
+
+A recorder that ran for hours left a directory of splits, and `<recording>` takes
+that directory as readily as it takes one file. The splits are read as one
+time-ordered collection, so a window straddling a split is cut whole: it yields
+one segment per *contributing* recording, named `<anchor-ns>_<name>_00.mcap`,
+`_01.mcap` and so on — the same set the recorder writes when a window straddles a
+rollover. A segment's number is its position among the segments that hold data,
+so a window over three splits whose middle recording contributes nothing yields
+`_00` and `_01`, where `_01` holds the third recording's data.
+
+The order is the recorder's own where it stated one:
+
+- **With `metadata.yaml`** — the sidecar `ros2 bag record` writes when it stops —
+  the ordered `relative_file_paths` it states is the split order, and its
+  collection-wide per-topic message counts are cross-checked against what the
+  recordings present add up to. Every topic the two disagree about is reported;
+  it is not fatal, since a collection short a split still cuts every window its
+  splits do cover.
+- **Without it** the recordings are ordered oldest-first by modification time.
+  That is the directory copied off a device while it was still recording: the
+  file is written at shutdown, so its absence is the signal.
+
+Every split is indexed on its own and has to satisfy the same contract on its
+own, so a directory holding one that does not is
+[refused naming that recording](#when-a-recording-is-refused) — the last split of
+a directory copied mid-recording is the usual offender.
 
 #### When a recording is refused
 
 Not every `.mcap` carries a summary worth planning a window from. `clipper clip`
 decides that from the footer and the summary alone, names the fault, exits
-non-zero, and writes nothing at all — no output directory, no staged file.
+non-zero, and writes nothing at all — no output directory, no staged file. Over a
+bag directory the message names the split that failed, not the directory.
 
 | The message says | The recording is |
 |---|---|
@@ -331,6 +361,12 @@ non-zero, and writes nothing at all — no output directory, no staged file.
 | *holds no message* | empty — its statistics report a message count of zero |
 | *summary indexes no chunk* | written with an unchunked profile |
 | *no … chunk index carries a message index* | written by a writer with message indexing disabled |
+
+A directory is refused too when it holds no `*.mcap` at all — usually the
+directory *above* the one the splits are in — or when its `metadata.yaml` is
+there and does not parse. The metadata file is the split order, so a file that
+cannot be read is not quietly replaced by the modification times: repair it, or
+delete it to fall back to those.
 
 Every one of them but the empty recording is repaired by rewriting the file,
 which clipper never does itself — it opens an input read-only and leaves it

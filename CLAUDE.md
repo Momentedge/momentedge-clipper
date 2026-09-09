@@ -76,7 +76,8 @@ package) and `sim/` (the sim camera's launch/config tree) are not Cargo members.
 `crates/clip` and `crates/tail` are the libraries under the recorder, and
 neither needs a ROS toolchain anywhere. `clip` is what every consumer of a
 recording shares — the MCAP format layer, the recording index (including the
-whole-file one a finished recording's own summary yields), the cut path, the
+whole-file one a finished recording's own summary yields, over one file or a bag
+directory's splits read as one time-ordered collection), the cut path, the
 neutral trigger contract, segment publication, and the manifest record every
 clip carries saying what it is — so cutting a window out of a recording nobody
 is writing links `clip` alone. `tail` is what a recording with

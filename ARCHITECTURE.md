@@ -70,7 +70,8 @@ e2e-tests the feature half.
 | `clip` module | Role |
 |---|---|
 | `src/index.rs` | The format layer: schema/channel definitions, extents carrying both time spans, the per-recording index, the incremental scan and its delta, the window plan and the `WindowPlanner` that serves one |
-| `src/whole.rs` | The same index for a recording that is already finished, taken from its own summary: one extent per chunk index, the registry and time bounds off the summary, served through the same `WindowPlanner` |
+| `src/bag.rs` | What the operator pointed at: one recording, or a bag directory's splits in recording order — the recorder's `metadata.yaml` where it wrote one, modification time where it did not — plus the per-topic counts that cross-check the collection |
+| `src/whole.rs` | The same index for a recording that is already finished, taken from its own summary: one extent per chunk index, the registry and time bounds off the summary, served through the same `WindowPlanner`. A bag directory is indexed split by split and planned as one collection |
 | `src/cut.rs` | Window extraction: read planned extents, assemble and atomically publish a standalone MCAP clip |
 | `src/manifest.rs` | What a clip says about itself: the `momentedge.clip` metadata record, the `CutRequest` a caller names a window with, and the reader that pulls the record back out |
 | `src/segment.rs` | One window to durable clips: plan, stage a segment per source recording over a worker pool, drop the empties, publish |
@@ -304,7 +305,7 @@ the active `--time-source`:
 
 ## Cutting from a finished recording
 
-`clipper clip <recording.mcap> --out-dir <dir> --trigger-time <ns> --preroll
+`clipper clip <recording> --out-dir <dir> --trigger-time <ns> --preroll
 <ns> --postroll <ns>` cuts a window out of a recording nobody is writing any more
 and exits. Steps 3–6 above are unchanged — it is `clip::segment::cut_window`
 either way, and each clip is what the device would have written from the same
@@ -325,6 +326,21 @@ an extent built this way carries the unbounded publish span: a window on
 `publish` selects every chunk rather than dropping one the summary cannot vouch
 for, and the copy's own per-message test still decides membership.
 
+**A bag directory is one time-ordered collection.** `<recording>` is one
+`.mcap` file or the directory a recording run left behind, and `clip::bag`
+answers which recordings that is and in what order: the ordered
+`relative_file_paths` of the recorder's own `metadata.yaml` where it wrote one,
+and modification time where it did not — the copied-mid-recording case, since
+that file is written at shutdown. Each split is indexed on its own, so the
+collection is planned as one time-ordered `WindowPlanner` and a window
+straddling a split yields one plan per contributing recording, which step 5
+publishes as one `_NN` segment each; a segment's number is its position after
+the recordings that contributed nothing are dropped, not the split's place in
+the directory. The metadata file's collection-wide per-topic counts are
+cross-checked against what the splits' summaries add up to, and every topic they
+disagree about is reported — a collection short a split still cuts every window
+its splits do cover.
+
 **A recording it cannot index is refused by name.** The same footer and summary
 decide that too, so a refusal costs the same seek and read an acceptance does and
 no chunk is decompressed to reach one. `clip::whole::IndexRefusal` is the whole
@@ -334,6 +350,10 @@ and chunk indexes that index no message — and each variant's message names the
 fault and the `mcap recover` / `mcap compress` / `mcap list chunks` commands an
 operator repairs it with. The empty and unchunked cases are told apart by the
 statistics record, since a recording holding no message indexes no chunk either.
+Every split of a bag directory faces that contract on its own, so a directory
+holding one that fails it is refused naming *that recording* — the file an
+operator repairs or removes — rather than the directory they typed; the last
+split of a directory copied off a device mid-recording is the usual offender.
 The run exits non-zero having written nothing, and the input is left byte for
 byte as it was found: clipper never rewrites, recovers or re-indexes a recording.
 
@@ -353,7 +373,10 @@ message with, which is the stamp the recorder's `mcap` interface anchors on too,
 so the two agree on where the window sits. The trigger list exists before the
 first cut: `clip::embedded::read_triggers` reads the same summary the index came
 from, and then only the chunks whose message indexes name the trigger channel —
-a recording that never carried the topic is answered from the summary alone. Each
+a recording that never carried the topic is answered from the summary alone. A
+bag directory is read split by split, in the order the collection is planned in,
+so a trigger reaches its clip whichever recording of the run was being written
+when it fired. Each
 record is decoded by its `message_encoding` through the same `clip::decode` the
 live interface uses, and a trigger the run cannot use (an undecodable payload, a
 name that cannot be embedded in a clip pathname) costs that trigger its clip and

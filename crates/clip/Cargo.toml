@@ -49,6 +49,9 @@ crossbeam-channel.workspace = true
 # `derive` feature.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The rosbag2 `metadata.yaml` a bag directory carries (`clip::bag`): the split
+# order it states, and the per-topic counts that cross-check the collection.
+serde_norway.workspace = true
 # The configuration file's format (`clip::config`). TOML rather than JSON so an
 # operator's file may carry comments, and rather than YAML so the parser is one
 # a Rust workspace already builds.
