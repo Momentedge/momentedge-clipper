@@ -37,7 +37,9 @@
 //!   topic, found through the summary's own chunk index so only the chunks
 //!   holding that channel are read.
 //! - [`segment`] — one window to durable clips: plan, stage a segment per source
-//!   recording, drop the empties, publish atomically.
+//!   recording, drop the empties, publish atomically — under the caller's
+//!   [`segment::Publication`] verdict on a name the output directory already
+//!   holds.
 //! - [`select`] — which of a recording's topics a clip is cut from, the decision
 //!   [`cut`] applies at the two places it can matter: where a channel is
 //!   registered in the output, and where a message is copied.

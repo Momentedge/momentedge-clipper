@@ -723,7 +723,7 @@ mod tests {
     use super::*;
     use crate::cut;
     use crate::manifest::{WindowCoverage, read_manifest};
-    use crate::segment::{cut_window, spawn_stage_workers};
+    use crate::segment::{Publication, cut_window, spawn_stage_workers};
     use crate::select::{ChannelSelection, Spec};
     use crate::testing::{index_file, scan_to_end, test_dir, window_request, write_bag_metadata};
     use crate::trigger::now_ns;
@@ -917,6 +917,7 @@ mod tests {
             &request,
             WindowCoverage::Covered,
             &root.join("summary.mcap"),
+            Publication::Suffix,
             &stage_tx,
         )?;
         let from_scan = cut_window(
@@ -924,6 +925,7 @@ mod tests {
             &request,
             WindowCoverage::Covered,
             &root.join("scan.mcap"),
+            Publication::Suffix,
             &stage_tx,
         )?;
 
@@ -1006,6 +1008,7 @@ mod tests {
             &request,
             WindowCoverage::Covered,
             &root.join("summary.mcap"),
+            Publication::Suffix,
             &stage_tx,
         )?;
         let from_scan = cut_window(
@@ -1013,6 +1016,7 @@ mod tests {
             &request,
             WindowCoverage::Covered,
             &root.join("scan.mcap"),
+            Publication::Suffix,
             &stage_tx,
         )?;
 
@@ -1162,6 +1166,7 @@ mod tests {
             &Arc::new(window_request(0, 1_000, TimeSource::Log)),
             WindowCoverage::Covered,
             &out_dir.join("clip.mcap"),
+            Publication::Suffix,
             &stage_tx,
         )
         .unwrap_err();
@@ -1237,6 +1242,7 @@ mod tests {
             &request,
             WindowCoverage::Short,
             &root.join("clip.mcap"),
+            Publication::Suffix,
             &stage_tx,
         )?;
         let elapsed = began.elapsed();
@@ -1790,6 +1796,7 @@ mod tests {
             &Arc::new(window_request(4_500, 5_500, TimeSource::Publish)),
             WindowCoverage::Covered,
             &root.join("clip.mcap"),
+            Publication::Suffix,
             &stage_tx,
         )?;
         assert_eq!(
@@ -1905,6 +1912,7 @@ mod tests {
             &request,
             WindowCoverage::Covered,
             &root.join("clip.mcap"),
+            Publication::Suffix,
             &stage_tx,
         )?;
 
@@ -1948,6 +1956,7 @@ mod tests {
             &request,
             WindowCoverage::Covered,
             &root.join("unsplit.mcap"),
+            Publication::Suffix,
             &stage_tx,
         )?;
         assert_eq!(single.len(), 1, "one recording, one segment");
@@ -2004,6 +2013,7 @@ mod tests {
             &Arc::new(window_request(0, 1_000, TimeSource::Log)),
             WindowCoverage::Covered,
             &root.join("clip.mcap"),
+            Publication::Suffix,
             &stage_tx,
         )?;
 
@@ -2070,6 +2080,7 @@ mod tests {
             &request,
             WindowCoverage::Covered,
             &root.join("stated.mcap"),
+            Publication::Suffix,
             &stage_tx,
         )?;
         assert_eq!(
@@ -2087,6 +2098,7 @@ mod tests {
             &request,
             WindowCoverage::Covered,
             &root.join("mtime.mcap"),
+            Publication::Suffix,
             &stage_tx,
         )?;
         assert_eq!(

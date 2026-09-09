@@ -193,7 +193,17 @@ fn record_clip(
     // planner — it serves plans out of its live collection, each pinning its own
     // recording's `Arc<File>` so a prune or rollover after this cannot pull the
     // bytes out from under the copy.
-    segment::cut_window(tailer.as_ref(), request, covered, base_out_path, extract_tx)
+    segment::cut_window(
+        tailer.as_ref(),
+        request,
+        covered,
+        base_out_path,
+        // A colliding name on a vehicle is a second trigger, and its clip is
+        // data no re-run can produce again: it is published beside the first,
+        // never dropped.
+        segment::Publication::Suffix,
+        extract_tx,
+    )
 }
 
 #[cfg(test)]
@@ -243,6 +253,50 @@ mod tests {
         assert_eq!(stats.len(), 1, "no recording yields a single empty segment");
         assert_eq!(stats[0].messages_copied, 0);
         assert!(read_clip(&stats[0].out_path)?.is_empty());
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// A second trigger naming the same instant and name as one already cut
+    /// publishes beside the first rather than being refused.
+    ///
+    /// On a vehicle a colliding clip name is a *second* trigger, and its clip is
+    /// data no re-run can produce again, so the live path takes the `_<n>`
+    /// sibling. Cutting the same window out of a recording nobody is writing is
+    /// replayable and refuses instead; the two policies are
+    /// [`clip::segment::Publication`], and this pins the one the recorder picks.
+    #[test]
+    fn record_clip_publishes_a_duplicate_trigger_beside_the_first() -> anyhow::Result<()> {
+        let root = test_dir("dup-trigger")?;
+        let rec = root.join("rec.mcap");
+        write_recording(&rec, false, &[("/t", 100), ("/t", 900)])?;
+
+        let (tailer, coverage) = Tailer::new();
+        let file = Arc::new(std::fs::File::open(&rec)?);
+        tailer.attach(file.clone());
+        scan_to_end(&tailer, &file, 8)?;
+
+        let extract_tx =
+            segment::spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
+        let base = root.join("clip.mcap");
+        let cut = || {
+            record_clip(
+                &tailer,
+                &window((100, 900), TimeSource::Log),
+                &base,
+                &coverage,
+                Duration::from_secs(10),
+                &extract_tx,
+            )
+        };
+
+        assert_eq!(cut()?[0].out_path, base, "the first trigger takes the name");
+        assert_eq!(
+            cut()?[0].out_path,
+            root.join("clip_1.mcap"),
+            "the second trigger's clip lands beside the first, never dropped"
+        );
 
         std::fs::remove_dir_all(root)?;
         Ok(())
