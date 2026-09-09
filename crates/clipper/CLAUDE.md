@@ -148,7 +148,8 @@ of the line it runs on. `clip::index::WindowPlanner` is one method —
 `clip::segment::cut_window` takes a `&dyn WindowPlanner` and never learns which
 it holds. `tail::Tailer` implements it over its live collection, so a window
 straddling a rollover yields one plan per source recording; a whole-file index
-over one finished recording implements it too, yielding at most one.
+implements it too, over one finished recording (yielding at most one plan) or
+over a bag directory's splits read as one time-ordered collection.
 
 **The line falls where lifecycle begins.** `clip::index::RecordingIndex` is the
 pure per-recording index — path, file, scan offset, magic check, extents,
@@ -427,7 +428,7 @@ ignored: no handler runs, no clip is extracted, and no completion is announced.
 
 ## `clipper clip`: one window, one finished recording
 
-`clipper clip <recording.mcap> --out-dir <dir> --trigger-time <ns> --preroll
+`clipper clip <recording> --out-dir <dir> --trigger-time <ns> --preroll
 <ns> --postroll <ns>` (plus optional `--trigger-name`/`--trigger-description`)
 is `clip_mode` in `src/main.rs`. It builds the same `CutRequest` the handler
 builds — the trigger's five values are spelled as flags, and `--trigger-time` is
@@ -456,7 +457,10 @@ what a *recorded* trigger may be encoded as.
   turns each into a `Trigger`, and the window anchors on the record's own
   `log_time` — the stamp `resolve_mcap_anchor` picks under `--time-source log`,
   so a clip cut here and the one the device cut from that trigger centre on the
-  same instant. One run, one clip per trigger, cut in trigger order.
+  same instant. One run, one clip per trigger, cut in trigger order. Over a bag
+  directory every split is read, in the order the collection is planned in, so a
+  trigger reaches its clip whichever recording of the run was being written when
+  it fired.
 
 **Reading the trigger list costs the summary and the chunks it names.** A
 finalised MCAP's chunk index carries, per chunk, the offset of a message index
@@ -496,7 +500,34 @@ a real decision rather than an assumption — `WholeFileIndex::log_end_ns()`
 against `request.end_ns()` — and it travels into the cut as the same
 `WindowCoverage`, so `clip.short` means what it means everywhere else.
 
-**The index is the summary** (`clip::whole::WholeFileIndex`). A finalised MCAP
+**A bag directory is one time-ordered collection** (`clip::bag`). `<recording>`
+is one `.mcap` or the directory a recording run left behind, and `bag::open`
+answers which recordings that is and in what order — the one decision, made in
+one place, that `whole.rs` and `embedded_triggers` both read. The recorder's
+`metadata.yaml` states it where the recorder wrote one: its ordered
+`relative_file_paths` is authoritative, since the order is a clip's *segment*
+order and getting it wrong reorders a clip rather than merely renaming it.
+Without that file the order is modification time, oldest first — and its absence
+is itself the signal, the file being written at shutdown: a directory without it
+was copied off a device while the recording was still growing. What the file
+states is checked rather than trusted: a recording it names that is missing and
+one present it never named are both logged, neither is fatal, and the
+collection-wide `topics_with_message_count` is cross-checked against what the
+splits' summaries add up to (`whole::CountDisagreement`, one per topic the two
+differ on, reported and not refused).
+
+Two things follow at the cut. **Each split satisfies the index contract on its
+own**, so a directory holding one that does not is refused naming *that
+recording* — the file an operator repairs or removes — and the last split of a
+directory copied mid-recording is the usual offender. And the collection is one
+`WindowPlanner`: `plan_window` returns one plan per contributing split, in
+recording order, so `cut_window` publishes one `_NN` segment each. The number is
+the position **after** the segments that copied nothing are dropped, not the
+split's place in the directory — a window over three splits whose middle
+recording contributes nothing yields `_00` and `_01`, where `_01` holds the third
+recording's data.
+
+**The index is the summary** (`clip::whole::WholeFileIndex`), per recording. A finalised MCAP
 already carries a chunk index per chunk (byte range plus the `log_time` span
 inside it), the resolved schema/channel registry, and the file's statistics —
 everything the incremental scan rebuilds by walking the data section. `open`
@@ -546,10 +577,13 @@ column is what `Unindexed` reads). `clip_mode` opens the index *before*
 directory inside it, and the input is opened read-only and left byte for byte and
 mtime for mtime as it was found. clipper runs no repair; `mcap` does.
 
-`OpenError`'s other two arms are not refusals: `Unreadable` (the file could not be
-opened, stat'd, seeked or read) and `Unparsable` (a footer that is not a footer
-record, or a summary section that does not parse). They are separate because they
-are separate things to do — fix the path, treat the file as corrupt, or run the
+`OpenError`'s other three arms are not refusals: `Unreadable` (the file could not
+be opened, stat'd, seeked or read), `Unparsable` (a footer that is not a footer
+record, or a summary section that does not parse), and `Bag` (a `bag::BagError`:
+a directory that cannot be listed, one holding no `*.mcap` at all — usually the
+directory *above* the splits — or a `metadata.yaml` that is there and does not
+parse). They are separate because they are separate things to do — point at the
+directory the splits are in, fix the path, treat the file as corrupt, or run the
 repair the refusal names.
 
 Nothing machine-readable is printed: the run's result is `out_dir`'s contents
