@@ -77,15 +77,22 @@ pub struct ClipStats {
     pub chunks_dropped: u64,
 }
 
-/// The uncompressed size a clip's chunks are cut at: 1 MiB.
+/// The uncompressed size a clip's chunks are cut at: 768 KiB.
 ///
 /// The mcap writer closes a chunk on the first message that carries it past
-/// this target, so a chunk holds a little over 1 MiB of pre-compression bytes
+/// this target, so a chunk holds a little over 768 KiB of pre-compression bytes
 /// and the clip's seek granularity — and the memory a reader spends
 /// decompressing one chunk — follow from it. It is set on every clip's
 /// [`mcap::WriteOptions`] rather than inherited, so the layout a clip is
 /// written in is this crate's decision and moves only when this line does.
-pub const CLIP_CHUNK_SIZE: u64 = 1 << 20;
+///
+/// It differs from [`mcap::WriteOptions::DEFAULT_CHUNK_SIZE`] on purpose, and
+/// `clip_chunk_size_is_the_size_the_cut_path_names` holds the two apart. A
+/// value equal to the crate's own default would write the same bytes whether
+/// the cut path set it or not, so nothing would notice the setting being
+/// dropped — and the next bump of that default would move every clip's layout,
+/// which is the whole thing naming the size exists to prevent.
+pub const CLIP_CHUNK_SIZE: u64 = 1024 * 768;
 
 /// The name of the capturing subdirectory under the final output directory.
 /// A clip is assembled here and moved out only once complete; observers of the
@@ -1628,6 +1635,16 @@ mod tests {
     /// clipper-z8r.
     #[test]
     fn clip_chunk_size_is_the_size_the_cut_path_names() -> Result<()> {
+        // The named size and the crate default must differ, or this test cannot
+        // tell a cut path that sets the size from one that inherits it: both
+        // would write identical bytes and deleting the setting would stay green.
+        assert_ne!(
+            CLIP_CHUNK_SIZE,
+            mcap::WriteOptions::DEFAULT_CHUNK_SIZE,
+            "the named chunk size must not be the crate's own default, or \
+             nothing here can observe the cut path naming it"
+        );
+
         let root = test_dir("clip-chunksize")?;
         let rec = root.join("rec.mcap");
 
