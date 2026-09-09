@@ -301,7 +301,7 @@ fields of a `momentedge_msgs/Trigger`, so the clip states the same trigger a cli
 cut from a live topic does; only `producer.mode` differs, reading `clip` rather
 than `tail`.
 
-Four things follow from the input being finished:
+Five things follow from the input being finished:
 
 - **Nothing waits.** No postroll sleep, no wait for coverage. A window reaching
   past the end of the recording is simply short, and the clip's `clip.short` key
@@ -316,6 +316,10 @@ Four things follow from the input being finished:
   names as holding the trigger channel, and nothing else.
 - **A recording it cannot index is refused by name**, from that same footer and
   summary, before anything is written — see below.
+- **A clip that is already there is refused too.** The same recording and the
+  same trigger describe the same window, so a re-run would write the clip that is
+  already in `--out-dir`. It names that clip and exits non-zero instead — see
+  [below](#when-a-clip-is-already-there).
 
 #### When a recording is refused
 
@@ -344,6 +348,37 @@ mcap list chunks ./record/fixed.mcap                           # check the resul
 
 `mcap list chunks` prints a `message index length` per chunk; that column is the
 field the last refusal above reads, and a repaired recording has it non-zero.
+
+#### When a clip is already there
+
+A finished recording and a trigger describe one window and one copy of its bytes,
+so running the same cut twice would write the clip that is already in
+`--out-dir`. The second run names that clip, exits non-zero, and writes nothing —
+no clip, no suffixed sibling, nothing left in the staging directory:
+
+```console
+$ clipper clip ./record/rosbag2_0.mcap --out-dir ./clipped \
+    --trigger-time 1738000000000000000 --preroll 5000000000 --postroll 5000000000
+Error: ./clipped/1738000000000000000_clip.mcap already exists: this window has been
+cut into this output directory before, and cutting it again writes a second copy of
+the same clip rather than new data. Move or delete it, or cut into a different
+output directory, to cut this window again
+```
+
+The check is one read of the output directory, made before the window is planned,
+so a window that would have been written as several segments (`_00`, `_01`, …) is
+refused whole rather than half-written. It asks whether the clip's own name **or any
+`_NN` segment beside it** is taken, because how many segments a window becomes is
+settled only while it is being cut — so a clip already there under either shape
+refuses the run. There is no flag to override it: to cut the window again, move
+or delete the clip, or point `--out-dir` somewhere else.
+
+This is where `clipper clip` and `clipper tail` differ on purpose. On the vehicle
+a clip name that is already taken means a *second* trigger asked for the same
+instant and name, and that clip is data no re-run can produce again, so the
+recorder publishes it beside the first as `<name>_1.mcap`. A cut from a finished
+recording is replayable, so the same name means the same bytes, and a second file
+would be a duplicate.
 
 Nothing machine-readable is printed. The result is the output directory's
 contents when the process exits, each clip carrying its own manifest, and the

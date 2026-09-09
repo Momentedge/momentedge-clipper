@@ -308,8 +308,7 @@ the active `--time-source`:
 <ns> --postroll <ns>` cuts a window out of a recording nobody is writing any more
 and exits. Steps 3–6 above are unchanged — it is `clip::segment::cut_window`
 either way, and each clip is what the device would have written from the same
-recording and window. Three things differ, and all of them follow from the input
-having an end.
+recording and window. What differs all follows from the input having an end.
 
 **The index comes from the summary.** A finalised MCAP carries a chunk index per
 chunk (its byte range and the `log_time` span of the messages inside it), the
@@ -336,6 +335,22 @@ operator repairs it with. The empty and unchunked cases are told apart by the
 statistics record, since a recording holding no message indexes no chunk either.
 The run exits non-zero having written nothing, and the input is left byte for
 byte as it was found: clipper never rewrites, recovers or re-indexes a recording.
+
+**A clip that is already there is refused too.** A finished recording and a
+trigger describe one window and one copy of its bytes, so a second run over both
+would write the clip that is already in the output directory. It names that clip
+and exits non-zero instead — `clip::segment::Publication::Refuse`, checked before
+the window is planned, so the refused run stages nothing and publishes nothing.
+The recorder takes the other half of the same policy (`Publication::Suffix`), and
+the two differ because their inputs do: on a vehicle a taken name means a
+*second* trigger, whose clip is data no re-run can produce again, so it is
+published beside the first. The check asks whether the window's base name or any
+`<base>_NN.mcap` beside it exists, because a window's segment count is settled
+only once staging has run — a slightly broader refusal than strictly necessary,
+which is the trade the right way round: a false refusal costs a rename and a
+re-run, an unrefused duplicate is two files claiming to be one clip. A
+multi-segment window is refused whole, and there is no flag to override it; an
+operator who wants the clip again removes it or names another `--out-dir`.
 
 **Neither wait runs.** There is no later data to wait for, so nothing sleeps out
 the postroll and nothing blocks on coverage. A window reaching past the end of
@@ -409,6 +424,11 @@ Publication is **two-staged** so `out_dir` only ever holds finished clips:
    duplicate trigger races for the same name — resolved by an `_<n>` suffix
    retry. A `StagedClip` is `#[must_use]` and unlinks the staged file on drop, so
    an early return or panic between the stages strands nothing.
+
+Whether a name the output directory already holds is worth a `_<n>` sibling at
+all is the caller's, stated as a `clip::segment::Publication` at each cut: the
+recorder suffixes, and a cut from a finished recording refuses the window before
+staging (see [Cutting from a finished recording](#cutting-from-a-finished-recording)).
 
 `.capturing/` is a *subdirectory* of `out_dir` so the two always share a
 filesystem and the move is a true atomic link. `reset_capturing_dir()`, called

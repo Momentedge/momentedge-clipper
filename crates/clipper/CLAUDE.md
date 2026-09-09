@@ -415,7 +415,12 @@ ignored: no handler runs, no clip is extracted, and no completion is announced.
    determines naming, which is why the workers stage but never publish: a
    single segment keeps the bare `<anchor_ns>_<name>.mcap`; multiple segments
    get `<base>_00.mcap`, `<base>_01.mcap`, … Each is atomically published into
-   `out_dir` via `hard_link` + unlink.
+   `out_dir` via `hard_link` + unlink. The recorder cuts under
+   `clip::segment::Publication::Suffix`: a name an earlier clip already holds
+   means a *second* trigger asked for it, so its clip lands beside the first as
+   `<name>_1.mcap` rather than being dropped. (`clipper clip` passes `Refuse`
+   instead — see
+   [`clipper clip`](#clipper-clip-one-window-one-finished-recording).)
 6. **Announce** (`handle_trigger`) a single `Completion` (the trigger echo plus
    all segment paths) through the active interface's announcer — only after
    every segment is in `out_dir` and fsynced, so every announced path is already
@@ -552,6 +557,24 @@ record, or a summary section that does not parse). They are separate because the
 are separate things to do — fix the path, treat the file as corrupt, or run the
 repair the refusal names.
 
+**A clip already in `out_dir` is the other refusal** (`clip::segment::ClipExists`).
+`clip_mode` cuts under `Publication::Refuse`, the recorder under
+`Publication::Suffix`, and the two halves of that policy are the same collision
+answered for different inputs: a live trigger colliding with an earlier clip's
+name is a *second* trigger whose data no re-run can produce again, while a cut
+from a finished recording is replayable, so the same name means the same bytes
+and a second file is a duplicate. `cut_window` applies the policy as its first
+step — before `plan_window`, before a `StageJob` is queued — so a refused window
+publishes nothing, stages nothing, and is refused whole even where only one of
+its segments' names is taken. What it checks is the base name **or any
+`<stem>_<digits><ext>` beside it** (`existing_clip`), the one shape both a
+segment name and a suffix-retry sibling take, because a window's segment count is
+settled only once staging has run; the resulting over-refusal — a stray
+`<stem>_00.mcap` blocks a single-segment window — is the cheap direction of that
+trade. The lowest-sorting collision is the one named, so the message is the same
+on every run. There is no override flag: an operator removes the clip or names
+another `--out-dir`.
+
 Nothing machine-readable is printed: the run's result is `out_dir`'s contents
 when the process exits, each clip carrying its own manifest, and the exit status
 is the verdict. No ROS is involved anywhere on this path, so a default (ROS-free)
@@ -645,7 +668,9 @@ unlinks an unpublished staged file, so an early return or panic between the
 stages — or a failed publish — strands nothing in `.capturing` and never
 reaches `out_dir`. The capturing-dir name may carry its own `_<n>` suffix to
 avoid colliding with a concurrent stage, independent of the final name a
-duplicate trigger resolves to at publish. The one leftover `Drop` cannot
+duplicate trigger resolves to at publish — and whether the final name is allowed
+to take a suffix at all is the cut's `clip::segment::Publication`, the recorder's
+`Suffix` against `clipper clip`'s `Refuse`. The one leftover `Drop` cannot
 reclaim is a crash *between* the publish link and the staged-file unlink, which
 strands a stale link in `.capturing` (harmless — only `out_dir` is observed);
 `clip::cut::reset_capturing_dir`, called once from `main` at startup, deletes
