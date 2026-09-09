@@ -11,6 +11,9 @@
 //!
 //! ## The modules
 //!
+//! - [`bag`] — what the operator points at: one recording, or a bag directory
+//!   read as one time-ordered collection of splits, ordered by the recorder's
+//!   own metadata file where it left one.
 //! - [`index`] — the format layer: schema and channel definitions, extents with
 //!   their `log_time`/`publish_time` spans, the per-recording index, the
 //!   incremental scan and its delta, the window plan and the [`index::WindowPlanner`]
@@ -18,7 +21,9 @@
 //! - [`whole`] — the same index for a recording that is already finished, taken
 //!   from its summary rather than by walking it: a footer seek and one read,
 //!   whatever the recording's size, and a named refusal for every recording it
-//!   cannot index that way.
+//!   cannot index that way. A bag directory is indexed split by split and
+//!   planned as one collection, so a window straddling a rollover is cut into
+//!   one segment per contributing split.
 //! - [`cut`] — the copy: raw message bytes out of the planned extents into a new
 //!   MCAP, finished with a manifest record, a summary and a footer.
 //! - [`manifest`] — what a clip says about itself: the metadata record every cut
@@ -46,6 +51,7 @@
 //! [`TimeSource`], and the same choice selects the extents read, the messages
 //! that fall inside, and the coverage a caller waits on.
 
+pub mod bag;
 pub mod config;
 pub mod cut;
 pub mod decode;
@@ -69,7 +75,7 @@ pub use index::{
 pub use manifest::{CutRequest, Producer, WindowCoverage};
 pub use select::ChannelSelection;
 pub use trigger::{Announce, Completion, Stamp, Trigger, TriggerRecord};
-pub use whole::{IndexRefusal, OpenError, WholeFileIndex};
+pub use whole::{CountDisagreement, IndexRefusal, OpenError, WholeFileIndex};
 
 /// The clock domain a clip's whole window lives in.
 ///

@@ -265,6 +265,68 @@ fn trigger_json(trigger: &Trigger) -> Vec<u8> {
     .into_bytes()
 }
 
+/// A rosbag2 `metadata.yaml`: the sidecar a bag directory carries, naming
+/// `files` in the order the recorder wrote them and stating the collection-wide
+/// message count per topic.
+///
+/// The keys [`crate::bag`] does not read — the storage identifier, the
+/// durations, the per-file starting times, the QoS profiles offered per topic —
+/// are written on purpose: the reader has to walk past them, and a fixture
+/// carrying only the two fields it wants would never show that it does.
+pub fn bag_metadata(files: &[&str], topic_counts: &[(&str, u64)]) -> String {
+    let mut yaml = String::from(
+        "rosbag2_bagfile_information:\n  \
+         version: 9\n  \
+         storage_identifier: mcap\n  \
+         duration:\n    nanoseconds: 4000\n  \
+         starting_time:\n    nanoseconds_since_epoch: 1000\n  \
+         message_count: 6\n  \
+         topics_with_message_count:\n",
+    );
+    for (topic, count) in topic_counts {
+        yaml.push_str(&format!(
+            "    - topic_metadata:\n        \
+                 name: {topic}\n        \
+                 type: std_msgs/msg/String\n        \
+                 serialization_format: cdr\n        \
+                 offered_qos_profiles:\n          \
+                   - history: 3\n            \
+                     depth: 0\n            \
+                     deadline:\n              sec: 9223372036\n              nsec: 854775807\n        \
+                 type_description_hash: RIHS01_00000000\n      \
+               message_count: {count}\n"
+        ));
+    }
+    yaml.push_str("  compression_format: \"\"\n  compression_mode: \"\"\n  relative_file_paths:\n");
+    for file in files {
+        yaml.push_str(&format!("    - {file}\n"));
+    }
+    yaml.push_str("  files:\n");
+    for file in files {
+        yaml.push_str(&format!(
+            "    - path: {file}\n      \
+               starting_time:\n        nanoseconds_since_epoch: 1000\n      \
+               duration:\n        nanoseconds: 2000\n      \
+               message_count: 3\n"
+        ));
+    }
+    yaml.push_str("  ros_distro: jazzy\n");
+    yaml
+}
+
+/// Write [`bag_metadata`] into `dir` under the name the recorder gives it, and
+/// return the path — the file whose presence makes a bag directory's split order
+/// the recorder's rather than the filesystem's.
+pub fn write_bag_metadata(
+    dir: &Path,
+    files: &[&str],
+    topic_counts: &[(&str, u64)],
+) -> Result<PathBuf> {
+    let path = dir.join(crate::bag::METADATA_FILE);
+    std::fs::write(&path, bag_metadata(files, topic_counts))?;
+    Ok(path)
+}
+
 /// A fresh scratch directory under the system temp dir, named for the test and
 /// made unique by pid and nanosecond, so tests that run concurrently (and reruns
 /// of a test that left its directory behind on failure) never collide.
