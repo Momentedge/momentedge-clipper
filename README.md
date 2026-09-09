@@ -301,6 +301,23 @@ fields of a `momentedge_msgs/Trigger`, so the clip states the same trigger a cli
 cut from a live topic does; only `producer.mode` differs, reading `clip` rather
 than `tail`.
 
+Four things follow from the input being finished:
+
+- **Nothing waits.** No postroll sleep, no wait for coverage. A window reaching
+  past the end of the recording is simply short, and the clip's `clip.short` key
+  says so.
+- **There is no clock-domain flag.** A recording's summary states its message
+  times on `log_time` alone, so that is the clock the window lives on. Passing
+  `--time-source` is a parse error.
+- **Reading it is cheap.** The recording is indexed from its own summary — a
+  footer seek and one read, whatever the file's size — rather than by walking it,
+  so no chunk is decompressed until the copy asks for one. A bag directory costs
+  that per split. Reading the recording's own triggers costs the same summary
+  plus the chunks that summary names as holding the trigger channel, and nothing
+  else.
+- **A recording it cannot index is refused by name**, from that same footer and
+  summary, before anything is written — see below.
+
 #### A bag directory is one collection
 
 A recorder that ran for hours left a directory of splits, and `<recording>` takes
@@ -328,23 +345,6 @@ Every split is indexed on its own and has to satisfy the same contract on its
 own, so a directory holding one that does not is
 [refused naming that recording](#when-a-recording-is-refused) — the last split of
 a directory copied mid-recording is the usual offender.
-
-Four things follow from the input being finished:
-
-- **Nothing waits.** No postroll sleep, no wait for coverage. A window reaching
-  past the end of the recording is simply short, and the clip's `clip.short` key
-  says so.
-- **There is no clock-domain flag.** A recording's summary states its message
-  times on `log_time` alone, so that is the clock the window lives on. Passing
-  `--time-source` is a parse error.
-- **Reading it is cheap.** The recording is indexed from its own summary — a
-  footer seek and one read, whatever the file's size — rather than by walking it,
-  so no chunk is decompressed until the copy asks for one. A bag directory costs
-  that per split. Reading the recording's own triggers costs the same summary
-  plus the chunks that summary names as holding the trigger channel, and nothing
-  else.
-- **A recording it cannot index is refused by name**, from that same footer and
-  summary, before anything is written — see below.
 
 #### When a recording is refused
 
