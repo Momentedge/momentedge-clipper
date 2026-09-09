@@ -1342,6 +1342,15 @@ fn embedded_triggers(recording: &std::path::Path) -> anyhow::Result<Vec<Anchored
 /// output directory, not the staging directory inside it. clipper runs no
 /// repair itself; recovering and re-indexing a recording are the operator's.
 ///
+/// **A clip that is already there is refused too**
+/// ([`clip::segment::Publication::Refuse`]). A finished recording and a trigger
+/// describe one window and one copy of its bytes, so a re-run over both writes
+/// the clip that is already in the output directory: the run names it, exits
+/// non-zero, and stages nothing, rather than publishing a second copy beside it
+/// the way the recorder does for a second live trigger. There is no flag to
+/// override it — an operator who wants the clip again removes it or names
+/// another `--out-dir`.
+///
 /// Nothing is printed for a caller to parse. The result is the output
 /// directory's contents when the process exits, each clip carrying its own
 /// manifest; the exit status is the verdict.
@@ -1445,7 +1454,14 @@ fn clip_mode(
             "{anchor_ns}_{}.mcap",
             segment::sanitize(&trigger.name)
         ));
-        let segments = segment::cut_window(&index, &request, coverage, &base_out_path, &stage_tx)?;
+        let segments = segment::cut_window(
+            &index,
+            &request,
+            coverage,
+            &base_out_path,
+            segment::Publication::Refuse,
+            &stage_tx,
+        )?;
 
         for stats in &segments {
             info!(
@@ -2438,6 +2454,87 @@ mod tests {
         let printed = format!("{boxed:?}");
         assert!(
             printed.contains("indexes no chunk") && printed.contains("mcap recover"),
+            "the refusal survives the boxing `main` does: {printed}"
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// Cutting the same window out of the same recording twice writes the clip
+    /// once: the second run names the clip that is already there, exits
+    /// non-zero, and leaves the output directory exactly as the first left it.
+    ///
+    /// This is what separates a cut from a finished recording from the
+    /// recorder's cut on a vehicle. There a colliding name is a *second*
+    /// trigger, whose clip is data no re-run can produce again, so it is
+    /// published beside the first. Here both runs describe one window over one
+    /// finished file and copy the same bytes, so a second file would be a
+    /// duplicate — and there is no flag that turns the refusal off.
+    #[test]
+    fn clip_mode_refuses_a_re_run_rather_than_duplicating() -> anyhow::Result<()> {
+        let root = clip::testing::test_dir("clip-rerun")?;
+        let rec = root.join("rec.mcap");
+        clip::testing::write_recording(&rec, true, &[("/t", 1_000), ("/t", 2_000)])?;
+        let out_dir = root.join("clipped");
+        let cut_it = || {
+            clip_mode(
+                ClipConfig {
+                    trigger_time: Some(1_500),
+                    preroll: Some(1_000),
+                    postroll: Some(1_000),
+                    trigger_name: Some("brake".to_string()),
+                    ..param_clip_cfg(&rec, &out_dir)
+                },
+                CLIP_PRODUCER,
+                clip::ChannelSelection::default(),
+            )
+        };
+
+        cut_it()?;
+        let clip_path = out_dir.join("1500_brake.mcap");
+        assert_eq!(
+            clip::testing::read_clip(&clip_path)?,
+            vec![("/t".to_string(), 1_000), ("/t".to_string(), 2_000)],
+            "the first run writes the clip"
+        );
+
+        let err = cut_it().unwrap_err();
+        let text = format!("{err:#}");
+        assert!(
+            text.contains(&clip_path.display().to_string()),
+            "the refusal names the clip that is already there: {text}"
+        );
+        assert!(
+            err.downcast_ref::<clip::segment::ClipExists>().is_some(),
+            "the refusal keeps its type all the way out: {text}"
+        );
+
+        // Nothing else reached the output directory: no second copy under a
+        // suffixed name, and nothing stranded in the staging area.
+        let mut published: Vec<String> = std::fs::read_dir(&out_dir)?
+            .map(|e| Ok::<_, anyhow::Error>(e?.file_name().to_string_lossy().into_owned()))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        published.sort();
+        assert_eq!(
+            published,
+            vec![".capturing".to_string(), "1500_brake.mcap".to_string()],
+            "the refused run publishes nothing, least of all a suffixed sibling"
+        );
+        assert_eq!(
+            std::fs::read_dir(out_dir.join(".capturing"))?.count(),
+            0,
+            "the refusal happens before staging, so the staging area stays empty"
+        );
+
+        // What the operator actually sees: `main` boxes the error and returns
+        // it, and the runtime renders that box's `Debug` before exiting
+        // non-zero. A refusal that does not name the clip on the way out is one
+        // nobody can act on.
+        let boxed: Box<dyn std::error::Error> = err.into();
+        let printed = format!("{boxed:?}");
+        assert!(
+            printed.contains(&clip_path.display().to_string()),
             "the refusal survives the boxing `main` does: {printed}"
         );
 
