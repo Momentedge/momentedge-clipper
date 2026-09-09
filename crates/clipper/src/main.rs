@@ -1814,7 +1814,7 @@ mod tests {
         I: IntoIterator<Item = T>,
         T: Into<std::ffi::OsString> + Clone,
     {
-        let argv: Vec<std::ffi::OsString> = argv.into_iter().map(Into::into).collect();
+        let argv = without_a_system_file(argv.into_iter().map(Into::into).collect());
         let _env = env_lock();
         match parse_cli(&argv) {
             Ok(loaded) => Ok(loaded.cli),
@@ -1823,6 +1823,29 @@ mod tests {
             // built-in defaults and this arm is unreachable in practice.
             Err(StartupError::Config(err)) => panic!("no configuration file is named: {err}"),
         }
+    }
+
+    /// A path no system configuration file is at, named so a parse under test
+    /// resolves against the built-in defaults.
+    ///
+    /// [`clip::config::SYSTEM_CONFIG_PATH`] is a real path on a machine with
+    /// the package installed — a deployment target, and any CI runner that
+    /// installs the deb — and a file there would decide the defaults every one
+    /// of these tests reads. A missing system file is legal, so naming one that
+    /// cannot exist is the same run with none, deterministically.
+    const NO_SYSTEM_FILE: &str = "/nonexistent/momentedge/clipper.toml";
+
+    /// `argv` with [`NO_SYSTEM_FILE`] appended, unless it names its own system
+    /// file — the tests that are *about* the system layer pass their own.
+    fn without_a_system_file(mut argv: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
+        let names_one = argv.iter().any(|arg| {
+            arg == "--system-config" || arg.to_string_lossy().starts_with("--system-config=")
+        });
+        if !names_one {
+            argv.push("--system-config".into());
+            argv.push(NO_SYSTEM_FILE.into());
+        }
+        argv
     }
 
     /// A `clipper clip` argv over `rec.mcap` into `/data/clips`, with `extra`
@@ -3713,12 +3736,9 @@ mod tests {
     /// the exit-on-failure.
     fn loaded_from(argv: &[&str]) -> Result<Loaded, StartupError> {
         let _env = env_lock();
-        parse_cli(
-            &argv
-                .iter()
-                .map(std::ffi::OsString::from)
-                .collect::<Vec<_>>(),
-        )
+        parse_cli(&without_a_system_file(
+            argv.iter().map(std::ffi::OsString::from).collect(),
+        ))
     }
 
     /// The two configuration files are found by a scan rather than a parse, so
