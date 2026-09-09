@@ -33,6 +33,12 @@
 //!   holding that channel are read.
 //! - [`segment`] — one window to durable clips: plan, stage a segment per source
 //!   recording, drop the empties, publish atomically.
+//! - [`select`] — which of a recording's topics a clip is cut from, the decision
+//!   [`cut`] applies at the two places it can matter: where a channel is
+//!   registered in the output, and where a message is copied.
+//! - [`config`] — the layered configuration file every setting and that
+//!   selection are read from: a system file under a per-run file, both under
+//!   the environment and the command line.
 //! - `testing` (under the `test-support` feature) — the MCAP fixture writers the
 //!   modules above are tested against, for a downstream crate's tests.
 //!
@@ -40,12 +46,14 @@
 //! [`TimeSource`], and the same choice selects the extents read, the messages
 //! that fall inside, and the coverage a caller waits on.
 
+pub mod config;
 pub mod cut;
 pub mod decode;
 pub mod embedded;
 pub mod index;
 pub mod manifest;
 pub mod segment;
+pub mod select;
 /// The MCAP fixtures this crate's tests are written against, published for a
 /// downstream crate's tests under the `test-support` feature.
 #[cfg(any(test, feature = "test-support"))]
@@ -53,11 +61,13 @@ pub mod testing;
 pub mod trigger;
 pub mod whole;
 
+pub use config::Layered;
 pub use index::{
     ChannelDef, Extent, PlanSource, RecordingIndex, ScanDelta, ScanProgress, ScanSeed, SchemaDef,
     Span, Stamps, TimeBounds, WindowPlan, WindowPlanner,
 };
 pub use manifest::{CutRequest, Producer, WindowCoverage};
+pub use select::ChannelSelection;
 pub use trigger::{Announce, Completion, Stamp, Trigger, TriggerRecord};
 pub use whole::{IndexRefusal, OpenError, WholeFileIndex};
 

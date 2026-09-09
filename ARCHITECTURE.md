@@ -74,6 +74,8 @@ e2e-tests the feature half.
 | `src/cut.rs` | Window extraction: read planned extents, assemble and atomically publish a standalone MCAP clip |
 | `src/manifest.rs` | What a clip says about itself: the `momentedge.clip` metadata record, the `CutRequest` a caller names a window with, and the reader that pulls the record back out |
 | `src/segment.rs` | One window to durable clips: plan, stage a segment per source recording over a worker pool, drop the empties, publish |
+| `src/select.rs` | Which of a recording's topics a clip is cut from: the include and exclude lists, their two regular-expression forms, and the two rules no configuration reaches |
+| `src/config.rs` | The layered configuration file: a system TOML file under a per-run one, merged per key into the defaults the CLI parser takes, plus the topic selection they describe |
 | `src/trigger.rs` | The neutral contract: `Trigger`, `Stamp`, `TriggerRecord`, `Completion`, the `Announce` trait, `now_ns` — plus the `Completion` → `Recorded` conversion under `ros` |
 | `src/decode.rs` | `decode_trigger`: decode a trigger payload by its MCAP `message_encoding` (`json` always, `cdr` under `ros`) |
 | `src/embedded.rs` | `read_triggers`: the triggers a finished recording carries on the trigger topic, found through the summary's own chunk index so only the chunks holding that channel are decompressed |
@@ -374,8 +376,16 @@ ROS-free build cuts these clips as well as the device build does.
 Extraction reads each planned extent with `read_at` and walks its records with
 its own opcode + length framing — the same walk the tail performed, so the
 extent boundaries are known to tile. Messages whose stamp on the window's time
-source falls in the inclusive window are written through with their raw
-serialized bytes; CDR bodies are never decoded. The clip writer is built from
+source falls in the inclusive window **and whose topic the channel selection
+keeps** are written through with their raw serialized bytes; CDR bodies are never
+decoded. The two conditions are asked at the two places they can be: the window
+on every message, the selection once per channel — in the same step that
+registers a channel in the output, so an excluded topic contributes to a clip
+neither a channel, nor a schema, nor a message, nor a manifest key. The selection
+comes from the configuration file's `[topics]` table
+([README](README.md#which-topics-a-clip-contains)) and rides in the staging
+worker pool beside the compression codec, so one configuration cuts the same
+channel set on the device and out of the finished recording afterwards. The clip writer is built from
 explicit `mcap::WriteOptions` with both knobs that decide a clip's layout set
 deliberately — the codec (`--clip-compression`) and the 1 MiB chunk size
 (`clip::cut::CLIP_CHUNK_SIZE`) — and finished with `Writer::finish()` (summary +

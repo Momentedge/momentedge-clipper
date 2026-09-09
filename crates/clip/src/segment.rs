@@ -23,6 +23,7 @@ use crossbeam_channel::{Sender, bounded, unbounded};
 
 use crate::index::{WindowPlan, WindowPlanner};
 use crate::manifest::{CutRequest, Planned, WindowCoverage};
+use crate::select::ChannelSelection;
 use crate::{cut, panic_text};
 
 /// One queued clip-segment staging: the window-plan snapshot [`cut_window`] took
@@ -62,18 +63,23 @@ pub struct StageJob {
 /// inside it, so a worker holds everything it needs and never reaches back into
 /// whoever planned the window; a retention prune or a rollover between queueing
 /// and copying cannot pull the bytes out from under it. The clip compression
-/// codec is the one setting fixed for the pool's lifetime and captured here —
-/// it is a property of the output, not of any one window, and no window can
-/// disagree with it. The window's clock domain travels in the job instead (see
+/// codec and the [`ChannelSelection`] are the two settings fixed for the pool's
+/// lifetime and captured here — both are properties of the output, not of any
+/// one window, and no window may disagree with either. The selection travelling
+/// with the pool rather than with a window is what makes one configuration cut
+/// the same channel set on the device and out of the finished recording
+/// afterwards. The window's clock domain travels in the job instead (see
 /// [`StageJob`]). A panicking stage is caught and replied as an error — per-job
 /// isolation, the pool outlives it.
 pub fn spawn_stage_workers(
     parallelism: usize,
     compression: Option<mcap::Compression>,
+    selection: ChannelSelection,
 ) -> Sender<StageJob> {
     let (tx, rx) = unbounded::<StageJob>();
     for i in 0..parallelism.max(1) {
         let rx = rx.clone();
+        let selection = selection.clone();
         thread::Builder::new()
             .name(format!("stage-{i}"))
             .spawn(move || {
@@ -85,6 +91,7 @@ pub fn spawn_stage_workers(
                             &job.request,
                             job.planned,
                             compression,
+                            &selection,
                         )
                     }))
                     .unwrap_or_else(|payload| {
@@ -330,7 +337,7 @@ mod tests {
         // staging worker: the copies serialize FIFO, the second writer lands on
         // a `_1` sibling at publish, and both clips come out complete. Neither
         // window straddles a rollover, so each is a single segment.
-        let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION);
+        let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
         let out = root.join("clip.mcap");
         let cut = |start_ns: u64, end_ns: u64| {
             let planner = planner.clone();
@@ -392,7 +399,7 @@ mod tests {
 
         let planner = indexed(&[&rec])?;
 
-        let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION);
+        let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
         let out = root.join("clip.mcap");
         let plan = || {
             planner
@@ -445,7 +452,7 @@ mod tests {
 
         let planner = indexed(&[&split0, &split1])?;
 
-        let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION);
+        let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
         let base = root.join("clip.mcap");
         let stats = cut_window(
             &planner,
@@ -491,7 +498,7 @@ mod tests {
 
         let planner = indexed(&[&split0, &split1])?;
 
-        let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION);
+        let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
         let base = root.join("clip.mcap");
         let stats = cut_window(
             &planner,
@@ -528,7 +535,7 @@ mod tests {
 
         let planner = indexed(&[&split0, &split1])?;
 
-        let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION);
+        let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
         let base = root.join("clip.mcap");
         let stats = cut_window(
             &planner,
@@ -606,7 +613,7 @@ mod tests {
         let rec = root.join("rec.mcap");
         write_recording(&rec, false, &[("/t", 100), ("/t", 200)])?;
 
-        let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION);
+        let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
 
         let doomed = Unreadable(PlanSource {
             path: junk.clone(),
@@ -702,7 +709,7 @@ mod tests {
         let rec = root.join("rec.mcap");
         write_recording(&rec, false, &[("/t", 100), ("/t", 200)])?;
 
-        let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION);
+        let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
 
         let doomed = Unallocatable(PlanSource {
             path: src.clone(),
@@ -773,7 +780,7 @@ mod tests {
             ],
         )?;
         let planner = indexed(&[&rec])?;
-        let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION);
+        let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
 
         // A second recording whose log span [100, 200] and publish span
         // [1_000, 2_000] do not overlap: the window [900, 1_500] falls inside
@@ -878,7 +885,7 @@ mod tests {
     #[test]
     fn an_empty_clip_says_which_kind_of_empty_it_is() -> anyhow::Result<()> {
         let root = test_dir("empty-kinds")?;
-        let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION);
+        let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
 
         // 1. Nothing covered the window: no recording exists, and the wait for
         //    coverage timed out — the recorder never got there.
@@ -969,7 +976,7 @@ mod tests {
         write_recording(&split1, false, &[("/t", 5_000), ("/t", 6_000)])?;
 
         let planner = indexed(&[&split0, &split1])?;
-        let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION);
+        let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
         let stats = cut_window(
             &planner,
             &log_request(1_500, 5_500, TimeSource::Log),

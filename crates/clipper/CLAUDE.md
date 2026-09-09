@@ -47,8 +47,10 @@ format layer and its recording index (`clip::index`, and `clip::whole` for a
 recording that is already finished), the copy that cuts a window out of one
 (`clip::cut`), the neutral trigger and completion contract (`clip::trigger`,
 `clip::decode`), the segment assembly that turns one window into published clips
-(`clip::segment`), and the record each of those clips carries saying what it is
-(`clip::manifest`).
+(`clip::segment`), the record each of those clips carries saying what it is
+(`clip::manifest`), which of the recording's topics a clip is cut from
+(`clip::select`), and the layered configuration file that decides those topics
+and every other setting (`clip::config`).
 
 **What following a recording still being written adds** is [`tail`](../tail):
 discovery, the recording collection and its lifecycle, coverage, retention, the
@@ -599,6 +601,27 @@ with `Writer::finish()`, which writes the summary section, footer and closing
 magic — every clip is a complete, standalone MCAP file
 (`mcap::MessageStream` over a clip is the validity check the
 unit tests use).
+
+**Which topics a clip is cut from** is the other condition beside the window, and
+`ClipWriter::route` is where it is asked — once per recording channel ID, in the
+same step that registers the channel. That placement is the whole design: a topic
+`clip::select::ChannelSelection` refuses is never registered, so the clip carries
+no `Channel` record for it, no `Schema` record that only it referenced, no
+message (a copy needs a registration), and no `channel.<id>.*` manifest keys (the
+tally is filled by the step that writes a message through). `Route` keeps the two
+ways out apart: `Excluded` is this clip's scope and costs nothing, `Unregistered`
+is a recording that declares no channel for an ID and is counted with the rest of
+the damage. The selection travels in the staging worker pool beside the
+compression codec — both are properties of the output rather than of any one
+window — which is why one configuration cuts the same channel set whether the
+window was found by a scan (`clipper tail`) or by a finished recording's summary
+(`clipper clip`); `whole.rs`'s
+`one_selection_cuts_one_channel_set_from_either_index` pins that. Two rules are
+not the configuration's to make: the announcement topic
+(`clip::trigger::ANNOUNCE_TOPIC`) is refused unconditionally, and the trigger
+topic is kept unless `exclude_trigger_topic` drops it. The keys and their
+`ros2 bag record` counterparts are in the
+[README](../../README.md#which-topics-a-clip-contains).
 
 **Two-staged atomic publication.** The cut is two separate calls so the output
 directory only ever holds finished clips, and so a window that straddled a
@@ -1152,8 +1175,9 @@ hint, because the caller already said which mode they wanted. `main.rs`'s
 
 `Config` is the recorder mode's `derive(Args)` and `ClipConfig` the cutter's:
 every field is a CLI flag (or, for the cutter's recording, the positional) with a
-`MOMENTEDGE_*` environment fallback, so precedence is CLI flag > env var >
-default where there is one. `Config`'s fields all have defaults, so
+`MOMENTEDGE_*` environment fallback and a `[settings]` key in the configuration
+file, so precedence is CLI flag > env var > per-run file > system file > default
+where there is one ([the four layers](#the-four-configuration-layers) below). `Config`'s fields all have defaults, so
 `clipper tail` runs bare; `ClipConfig`'s window arguments deliberately do not —
 which moment a clip is about is the one thing only the caller knows, so omitting
 `--trigger-time` is a parse error naming the flag rather than a clip about some
@@ -1173,3 +1197,51 @@ the [README](../../README.md#configuration).
 The interface seam is one such flag: `--interface {ros|mcap}` (env
 `MOMENTEDGE_INTERFACE`, default `ros`), a clap `ValueEnum` over `InterfaceKind`
 that picks the active [interface](#the-two-interfaces) at startup.
+
+### The four configuration layers
+
+A setting resolves through four layers over its built-in default: the **system**
+configuration file (`/etc/momentedge/clipper.toml`), the **per-run** file, the
+`MOMENTEDGE_*` **environment** variable, and the **flag**. `clip::config` owns
+the bottom two and `clap` the top two, and the join between them is one line in
+`with_file_defaults`: what the files resolved for a key becomes that argument's
+`default_value`. clap already resolves a flag over an environment variable over a
+default, so handing it the files' value *as* the default puts all four in order
+with no per-key wiring — and makes a file's value pass exactly the value parser a
+flag's value passes, so a file cannot smuggle in a value the command line would
+have refused. `required` is cleared with the same stroke, since clap's required
+check does not count a default as an answer: a configuration file that names
+`recording`, `--out-dir` and the window is a complete `clipper clip` invocation.
+
+The files have to be read *before* the parser exists, so `config_paths` scans
+argv for `--config` and `--system-config` (either spelling, on bytes, stopping at
+`--`) and falls back to the environment variable clap would have read for the
+same flag. Those two flags and `--print-config` are also declared as real
+arguments, injected onto every subcommand by `with_config_args` rather than
+declared as fields of `Config`/`ClipConfig` — so `--help` lists them, an unknown
+spelling is refused the ordinary way, and neither mode's struct grows a field it
+never reads. None of the three is a `[settings]` key, so no file can name another
+file.
+
+`clip::config::SETTINGS` is the key table, and it carries the one thing no
+argument definition can: whether a **per-run** file may set the key at all. A key
+naming the machine or the resources it may spend there is the system file's
+alone, and a per-run file setting one is reported by name with the system value
+left standing (`Layered::refusals`). `main.rs`'s
+`every_mode_argument_is_a_settings_key_and_back` is what keeps that table and the
+modes' arguments from drifting apart in either direction.
+
+`--print-config` prints `effective_config` and exits; the same text goes to the
+log at startup, so a run's log states the configuration it ran with. It is built
+from the **parsed** `ArgMatches` — the same matches the mode's struct is built
+from — so it cannot report a value the run does not use; clap's `ValueSource`
+separates the flag and environment layers, and everything it calls a default is a
+file's value where `Layered` says a file named the key. The keys come off the
+`Command` rather than out of `ArgMatches::ids`, which also yields the argument
+group clap's derive names after the config struct.
+
+The `[topics]` half of the same files becomes the `clip::select::ChannelSelection`
+both modes hand to their staging pool — see
+[the copy](#the-copy-is-direct-clipcut). The schema, the layering rule and the
+per-key scope are documented in the
+[README](../../README.md#the-configuration-file).
