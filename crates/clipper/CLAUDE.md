@@ -775,10 +775,11 @@ does not know who asked or what the planner offered. So:
 immediately after `write_to_known_channel` and does both the whole-clip counters
 and the `BTreeMap<u16, ChannelTally>` the manifest's `channel.<id>.*` keys come
 from, keyed by the **output** channel id so a reader can join the keys to the
-clip's own `Channel` records. One call site is the point: whatever decides which
-messages are copied — the window test today, a channel selection beside it
-tomorrow — cannot leave the accounting behind, and a channel nothing was copied
-from simply never gets an entry, so it has no keys rather than a row of zeroes.
+clip's own `Channel` records. One call site is the point: everything that
+decides which messages are copied — the window test and the channel selection
+beside it — sits in front of that one call, so nothing can leave the accounting
+behind, and a channel nothing was copied from simply never gets an entry, so it
+has no keys rather than a row of zeroes.
 
 **An empty clip says which kind of empty it is.** `source.files_planned`,
 `clip.messages` and `clip.short` are what separate "nothing covered the window"
@@ -1019,8 +1020,9 @@ consumer.
 **Staging worker pool.** `clip::segment::spawn_stage_workers` starts
 `extract_parallelism` threads (at least one) sharing one unbounded FIFO channel,
 started once in `main` and handed to every handler. `cut_window` enqueues one
-`StageJob` per `WindowPlan` — the plan snapshot, the window bounds, the window's
-`time_source`, the base output path, and a bounded(1) reply channel — and blocks
+`StageJob` per `WindowPlan` — the plan snapshot, the `CutRequest` the window was
+cut from, the `Planned` facts of that window, the base output path, and a
+bounded(1) reply channel — and blocks
 on each reply. The worker dequeues FIFO, runs `clip::cut::stage_clip` into
 `.capturing/`, and replies a `StagedClip`. `cut_window` — not the worker —
 publishes the staged segments once the window's segment count is known, so
@@ -1031,8 +1033,9 @@ pool thread survives and continues processing. With the default
 and coverage waiting are always concurrent.
 
 **What the pool captures and what the job carries** is the one distinction worth
-holding onto. The compression codec is captured for the pool's lifetime: it is a
-property of the output, process-global, and no window may disagree with it. The
+holding onto. The compression codec and the `ChannelSelection` are captured for
+the pool's lifetime: both are properties of the output, process-global, and no
+window may disagree with either. The
 `time_source` rides in each job, because it is a property of the *window* — the
 same value has to choose the extents the planner returns *and* the stamp each
 message's membership is tested on. A pool-level `time_source` would let those two
