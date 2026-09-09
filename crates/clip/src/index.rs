@@ -238,6 +238,7 @@ impl WindowPlan {
     /// (magic + manifest + summary + footer) for a window no recording covers.
     /// The empty path needs no [`PlanSource`], so it serves the "no recording
     /// exists yet" case too.
+    #[must_use]
     pub fn empty() -> Self {
         WindowPlan {
             source: None,
@@ -330,6 +331,7 @@ pub struct RecordingIndex {
 impl RecordingIndex {
     /// A freshly discovered recording, indexed but not yet scanned: nothing
     /// consumed (`offset` 0, magic unverified), no extents, an empty registry.
+    #[must_use]
     pub fn new(path: PathBuf, file: Arc<File>) -> Self {
         RecordingIndex {
             path,
@@ -406,6 +408,7 @@ impl RecordingIndex {
 
     /// A single-file [`WindowPlan`] over this recording's extents overlapping
     /// `[start_ns, end_ns]` on `source`, or `None` if none do.
+    #[must_use]
     pub fn plan(&self, start_ns: u64, end_ns: u64, source: TimeSource) -> Option<WindowPlan> {
         let extents: Vec<Extent> = self
             .extents
@@ -536,7 +539,7 @@ impl ScanDelta {
             }
             None => Stamps::point(log_time, publish_time),
         });
-        let gap = log_time as i128 - publish_time as i128;
+        let gap = i128::from(log_time) - i128::from(publish_time);
         self.skew = Some(match self.skew {
             Some(mut sk) => {
                 sk.observe(gap);
@@ -748,6 +751,14 @@ impl ScanDelta {
 /// faulted record), never earlier. Re-scanning an already-applied region makes
 /// the open extent's extension compute `record_end - open.offset` across bytes
 /// the open extent already spans and underflow.
+#[must_use]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one record-framing walk. The fault/resync invariant — `offset` left \
+              unadvanced at the faulted record, the partial delta returned anyway — \
+              holds across the whole loop, so splitting the opcode arms out would \
+              scatter the one thing this function guarantees"
+)]
 pub fn scan_available(
     file: &File,
     mut offset: u64,
@@ -783,6 +794,11 @@ pub fn scan_available(
             break;
         }
         let opcode = hdr[0];
+        #[expect(
+            clippy::unwrap_used,
+            reason = "`hdr` is `[u8; 9]`, so `[1..9]` is exactly the 8 bytes \
+                      `try_into` needs — the conversion cannot fail"
+        )]
         let len = u64::from_le_bytes(hdr[1..9].try_into().unwrap());
         if len > MAX_RECORD_LEN {
             // u64::MAX is the placeholder a seek-back (chunked) writer leaves
@@ -833,6 +849,14 @@ pub fn scan_available(
                 // LE). A message on a trigger channel also has its payload
                 // (past those 22 fixed fields) lifted out; every other body
                 // stays untouched until extraction.
+                #[expect(
+                    clippy::unwrap_used,
+                    clippy::cast_possible_truncation,
+                    reason = "`header` is `[u8; 22]`, so every fixed-field slice \
+                              below is exactly the width `try_into` needs; and \
+                              `len` was bounded by `MAX_RECORD_LEN` (2^31) above, \
+                              so the payload length is inside `usize`"
+                )]
                 if len >= 22 {
                     let mut header = [0u8; 22];
                     if let Err(e) = file.read_exact_at(&mut header, offset + 9) {
@@ -934,6 +958,11 @@ pub fn scan_available(
 }
 
 fn read_body(file: &File, offset: u64, len: u64) -> Result<Vec<u8>> {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "callers reject a `len` past `MAX_RECORD_LEN` (2^31) as a framing \
+                  fault before reaching here, so the length is inside `usize`"
+    )]
     let mut body = vec![0u8; len as usize];
     file.read_exact_at(&mut body, offset)
         .with_context(|| format!("reading {len} B record body at {offset}"))?;
@@ -942,6 +971,13 @@ fn read_body(file: &File, offset: u64, len: u64) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        reason = "a failed unwrap or a panicking index is a failing test"
+    )]
+
     use super::*;
     use crate::testing::{
         channel_body, chunk_body, index_file, message_body, message_body_pub, plan_one, raw_record,

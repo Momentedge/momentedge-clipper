@@ -20,3 +20,7 @@ serde.workspace = true
 serde_json.workspace = true
 # Finalise the file cleanly on Ctrl+C (already a workspace dependency).
 signal-hook.workspace = true
+
+# The workspace lint policy (root `Cargo.toml`), inherited whole.
+[lints]
+workspace = true

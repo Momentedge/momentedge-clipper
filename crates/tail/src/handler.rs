@@ -52,12 +52,20 @@ use crate::watch::Watch;
 /// coverage the wait blocks on. `producer` is the binary and mode each clip's
 /// manifest names as having cut it; the driver supplies it because only the
 /// binary knows which of its subcommands is running.
-// The arguments are the recorder's cohesive per-trigger inputs — the resolved
-// anchor, the neutral trigger, the shared tail/coverage/staging handles, the
-// announcer, and the settings the seam unpacks. Bundling them into a struct
-// purely to satisfy the argument-count heuristic would add indirection without
-// making the seam clearer.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the arguments are the recorder's cohesive per-trigger inputs — the \
+              resolved anchor, the neutral trigger, the shared tail/coverage/staging \
+              handles, the announcer, and the settings the seam unpacks. Bundling \
+              them into a struct purely to satisfy the argument-count heuristic \
+              would add indirection without making the seam clearer"
+)]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "each caller runs this on its own per-trigger thread and hands over \
+              the clones it made for it; borrowing would push the lifetime problem \
+              back onto every caller for no saved allocation"
+)]
 pub fn handle_trigger<A: Announce>(
     trig: Trigger,
     anchor_ns: u64,
@@ -102,6 +110,10 @@ pub fn handle_trigger<A: Announce>(
     )?;
 
     let mut filenames = Vec::with_capacity(segments.len());
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a log line's MiB figure; the loss starts past 8 PiB in one clip"
+    )]
     for stats in &segments {
         info!(
             "clip {} written: {} msgs from {} extents, {:.1} MiB",
@@ -208,6 +220,16 @@ fn record_clip(
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::assert_is_empty,
+        reason = "a failed unwrap or a panicking index is a failing test, and \
+                  `assert!(x.is_empty())` names the claim better than the \
+                  empty-array `assert_eq!` the lint asks for"
+    )]
+
     use clip::ChannelSelection;
     use clip::index::op;
     use clip::manifest::read_manifest;

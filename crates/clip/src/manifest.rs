@@ -123,6 +123,7 @@ pub struct CutRequest {
 impl CutRequest {
     /// The window `[anchor - preroll, anchor + postroll]` on `time_source`, as
     /// `trigger` asked for it and `producer` is about to cut it.
+    #[must_use]
     pub fn new(
         producer: Producer,
         trigger: Trigger,
@@ -142,26 +143,31 @@ impl CutRequest {
     }
 
     /// The inclusive window start.
+    #[must_use]
     pub fn start_ns(&self) -> u64 {
         self.start_ns
     }
 
     /// The inclusive window end.
+    #[must_use]
     pub fn end_ns(&self) -> u64 {
         self.end_ns
     }
 
     /// The clock domain the whole window lives in.
+    #[must_use]
     pub fn time_source(&self) -> TimeSource {
         self.time_source
     }
 
     /// The instant the window centres on.
+    #[must_use]
     pub fn anchor_ns(&self) -> u64 {
         self.anchor_ns
     }
 
     /// The trigger that named the window.
+    #[must_use]
     pub fn trigger(&self) -> &Trigger {
         &self.trigger
     }
@@ -197,6 +203,7 @@ pub struct ChannelTally {
 
 impl ChannelTally {
     /// The tally a channel's first copied message opens.
+    #[must_use]
     pub fn opened(stamp_ns: u64) -> Self {
         ChannelTally {
             messages: 1,
@@ -241,6 +248,7 @@ pub struct ClipManifest<'a> {
 
 impl ClipManifest<'_> {
     /// Render as the MCAP metadata record a clip's writer emits.
+    #[must_use]
     pub fn record(&self) -> mcap::records::Metadata {
         mcap::records::Metadata {
             name: MANIFEST_NAME.to_string(),
@@ -315,6 +323,10 @@ impl ClipManifest<'_> {
 /// MCAP from somewhere else, or one whose summary was lost. Errors are a file
 /// that will not parse at all.
 pub fn read_manifest(path: &Path) -> Result<Option<BTreeMap<String, String>>> {
+    /// The opcode and the u64 length prefix the framing puts in front of every
+    /// record, which a metadata index's offset addresses the front of.
+    const FRAME_HEADER_LEN: u64 = 1 + size_of::<u64>() as u64;
+
     let buf = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let Some(summary) = mcap::Summary::read(&buf)
         .with_context(|| format!("reading the summary of {}", path.display()))?
@@ -328,11 +340,8 @@ pub fn read_manifest(path: &Path) -> Result<Option<BTreeMap<String, String>>> {
     else {
         return Ok(None);
     };
-    // The index addresses the whole record; its body starts past the opcode and
-    // the u64 length prefix the framing puts in front of every record. Both
-    // numbers come out of the file, so the addition is checked rather than
-    // trusted to stay inside `usize`.
-    const FRAME_HEADER_LEN: u64 = 1 + size_of::<u64>() as u64;
+    // Both numbers come out of the file, so both the addition and the narrowing
+    // to `usize` are checked rather than trusted.
     let start = index
         .offset
         .checked_add(FRAME_HEADER_LEN)
@@ -341,10 +350,16 @@ pub fn read_manifest(path: &Path) -> Result<Option<BTreeMap<String, String>>> {
     let end = index
         .offset
         .checked_add(index.length)
-        .map(|end| end as usize)
+        .and_then(|end| usize::try_from(end).ok())
         .filter(|end| *end <= buf.len() && *end >= start)
         .with_context(|| format!("{} indexes its manifest out of bounds", path.display()))?;
-    let record = mcap::parse_record(op::METADATA, &buf[start..end])
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "the `filter` above rejects any `end` past the buffer or behind \
+                  `start`, so the range is in bounds by the time it is taken"
+    )]
+    let body = &buf[start..end];
+    let record = mcap::parse_record(op::METADATA, body)
         .with_context(|| format!("parsing the manifest of {}", path.display()))?;
     #[expect(
         clippy::wildcard_enum_match_arm,
@@ -358,6 +373,13 @@ pub fn read_manifest(path: &Path) -> Result<Option<BTreeMap<String, String>>> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        reason = "a failed unwrap or a panicking index is a failing test"
+    )]
+
     use super::*;
     use crate::trigger::Stamp;
 

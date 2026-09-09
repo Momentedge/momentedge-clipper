@@ -160,6 +160,7 @@ impl StagedClip {
     /// Whether this staged segment copied no in-window messages — a rollover
     /// whose new file held nothing inside the window stages such an empty
     /// trailing segment, which the caller drops when other segments carry data.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.stats.messages_copied == 0
     }
@@ -238,8 +239,7 @@ pub fn stage_clip(
 ) -> Result<StagedClip> {
     let out_dir = out_path
         .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
     let desired_name = out_path
         .file_name()
         .context("clip path has no file name")?
@@ -347,6 +347,11 @@ fn copy_window(
         for extent in &plan.extents {
             clip.stats.extents_read += 1;
             clip.stats.bytes_read += extent.len;
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "an extent closes at EXTENT_CAP_BYTES (4 MiB), so its \
+                          length is inside `usize` on every target this builds for"
+            )]
             let mut buf = vec![0u8; extent.len as usize];
             source
                 .file
@@ -388,6 +393,11 @@ fn create_new_file(desired: &Path) -> Result<(File, PathBuf)> {
             .open(candidate)
             .map(|f| file = Some(f))
     })?;
+    #[expect(
+        clippy::expect_used,
+        reason = "`with_suffix_retry` returns Ok only once the closure did, and \
+                  the closure's only Ok path is the one that fills `file`"
+    )]
     Ok((file.expect("a successful create yields the file"), path))
 }
 
@@ -484,6 +494,16 @@ impl ClipWriter<'_> {
     /// longer matches the tail's scan (an oversized length, a record running
     /// past or short of the extent) means the bytes changed since the scan,
     /// and that aborts the clip.
+    #[expect(
+        clippy::indexing_slicing,
+        clippy::unwrap_used,
+        clippy::cast_possible_truncation,
+        reason = "the framing walk is the design here: the loop guard proves the \
+                  9-byte header is present, the `bail!` below proves the body is, \
+                  and `MAX_RECORD_LEN` (2^31) keeps every length inside `usize`. \
+                  Replacing the indexing with `get()` would add error plumbing no \
+                  input can reach"
+    )]
     fn copy_extent(&mut self, buf: &[u8]) -> Result<()> {
         let mut offset = 0usize;
         while offset + 9 <= buf.len() {
@@ -706,6 +726,18 @@ enum Route {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::assert_is_empty,
+        clippy::items_after_statements,
+        clippy::cast_possible_truncation,
+        reason = "a failed unwrap or a panicking index is a failing test, and \
+                  `assert!(x.is_empty())` names the claim better than the \
+                  empty-array `assert_eq!` the lint asks for"
+    )]
+
     use std::collections::BTreeMap;
     use std::sync::Arc;
 

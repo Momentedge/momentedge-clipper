@@ -16,6 +16,19 @@
 //! corruption) drive the recorder's start/kill/damage themselves — the
 //! lifecycle is exactly what they exercise.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::assert_is_empty,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    reason = "a failed unwrap, a panicking index or a wrapped cast is a failing \
+              test, and `assert!(x.is_empty())` names the claim better than the \
+              empty-array `assert_eq!` the lint asks for"
+)]
+
 mod harness;
 
 use std::path::Path;

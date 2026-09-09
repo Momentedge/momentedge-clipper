@@ -165,6 +165,10 @@ impl StampMsg {
     /// Split an absolute Unix-epoch-nanosecond anchor into `{sec, nanosec}`.
     /// `sec` is `i32` (matching `builtin_interfaces/Time`, so it inherits that
     /// message's year-2038 rollover) — safe for any anchor before then.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the documented year-2038 rollover this message type already has"
+    )]
     fn from_ns(ns: u64) -> Self {
         StampMsg {
             sec: (ns / 1_000_000_000) as i32,
@@ -213,6 +217,12 @@ fn channels() -> Vec<Channel> {
             schema_name: "Pose",
             schema_encoding: "jsonschema",
             schema: POSE_SCHEMA,
+            #[expect(
+                clippy::cast_precision_loss,
+                clippy::expect_used,
+                reason = "a synthetic angle from a counter no run reaches 2^53 of, \
+                          and a struct of three finite `f64`s `to_vec` cannot fail on"
+            )]
             source: Box::new((0u64..).map(|i| {
                 let a = i as f64 * 0.05;
                 serde_json::to_vec(&Pose {
@@ -229,6 +239,10 @@ fn channels() -> Vec<Channel> {
             schema_name: "",
             schema_encoding: "",
             schema: b"", // schemaless — the most basic payload there is
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "a synthetic angle from a counter no run reaches 2^53 of"
+            )]
             source: Box::new((0u64..).map(|i| {
                 let size = 1.0 + (i as f64 * 0.05).sin().abs();
                 format!("{{\"size\": {size}}}").into_bytes()
@@ -315,6 +329,11 @@ fn write_trigger<W: std::io::Write + std::io::Seek>(
         preroll: TRIGGER_PREROLL_NS,
         postroll: TRIGGER_POSTROLL_NS,
     };
+    #[expect(
+        clippy::expect_used,
+        reason = "a struct of owned strings and integers; `to_vec` has no failing \
+                  path for it"
+    )]
     let payload = serde_json::to_vec(&trigger).expect("TriggerMsg serializes");
     writer.write_to_known_channel(
         &mcap::records::MessageHeader {
@@ -331,6 +350,10 @@ fn write_trigger<W: std::io::Write + std::io::Seek>(
     Ok(())
 }
 
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "u64 nanoseconds since the epoch runs to the year 2554"
+)]
 fn now_ns() -> Result<u64> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() as u64)
 }
@@ -387,6 +410,10 @@ fn main() -> Result<()> {
         )?;
         seq += 1;
 
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "u64 milliseconds of uptime runs to half a billion years"
+        )]
         if !trigger_emitted
             && cfg
                 .trigger_after_ms
@@ -417,6 +444,17 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::cast_possible_truncation,
+        clippy::wildcard_enum_match_arm,
+        reason = "a failed unwrap or a panicking index is a failing test, and a \
+                  catch-all over the foreign `mcap::records::Record` is the only \
+                  arm upstream lets this assertion have"
+    )]
+
     use std::io::Cursor;
 
     use super::*;
@@ -457,7 +495,7 @@ mod tests {
                 &mut chans,
                 &ids,
                 seq,
-                EPOCH_FLOOR_NS + seq as u64 * 20_000_000,
+                EPOCH_FLOOR_NS + u64::from(seq) * 20_000_000,
                 0,
             )?;
         }
@@ -510,7 +548,7 @@ mod tests {
         let trigger_channel_id = writer.add_channel(0, TRIGGER_TOPIC, "json", &BTreeMap::new())?;
 
         for seq in 0..5u32 {
-            let log_time = base + seq as u64 * 20_000_000;
+            let log_time = base + u64::from(seq) * 20_000_000;
             write_tick(&mut writer, &mut chans, &ids, seq, log_time, offset_ns)?;
         }
         let trigger_log_time = base + 2 * 20_000_000;
@@ -587,7 +625,7 @@ mod tests {
                 &mut chans,
                 &ids,
                 seq,
-                EPOCH_FLOOR_NS + seq as u64 * 20_000_000,
+                EPOCH_FLOOR_NS + u64::from(seq) * 20_000_000,
                 0,
             )?;
         }

@@ -84,3 +84,53 @@ serde_json = "1"
 # rather than scanned by hand. `serde_norway` is the maintained continuation of
 # the deprecated `serde_yaml`.
 serde_norway = "0.9"
+
+# One lint policy for every member, inherited with `[lints] workspace = true`.
+# Cargo cannot override a workspace lint per member, so anything a member keeps
+# against the policy is an `#[expect(lint, reason = "…")]` at the narrowest scope
+# in the source — which reports itself the day the lint stops firing.
+[workspace.lints.rust]
+# `deny`, not `forbid`: `forbid` cannot be lifted anywhere in the package, tests
+# included, so the env-var guards the recorder's config tests need and the
+# `kill(2)` the e2e harness signals a process group with would both become
+# impossible.
+unsafe_code = "deny"
+unreachable_pub = "warn"
+# A public type a downstream crate holds in a struct or logs on an error path
+# needs `Debug`, and the omission only shows up in the consumer's build.
+missing_debug_implementations = "warn"
+# Deliberately no `missing_docs`: measured on this workspace, nearly every hit is
+# a struct field on a type whose own docs already say what it carries, so the
+# lint buys restated field names rather than contracts. The discipline is the
+# `//!` module header instead.
+
+[workspace.lints.rustdoc]
+# Rot-detection for the links the docs do carry — these crates cross-reference
+# heavily between `clip`, `tail` and the recorder.
+broken_intra_doc_links = "warn"
+bare_urls = "warn"
+
+[workspace.lints.clippy]
+# `priority = -1` so the single-lint entries below override it.
+pedantic = { level = "warn", priority = -1 }
+missing_errors_doc = "allow"                  # what it forces is usually the variant list
+missing_panics_doc = "allow"                  # public-item-only; misses the panics we have
+doc_markdown = "allow"                        # a hand-maintained proper-noun allowlist
+# Every arm of a match over one of *our* enums is a decision; a catch-all hides
+# the site a new variant has to be handled at. It is blind to matches over a
+# tuple, and cannot be satisfied on a foreign `#[non_exhaustive]` enum
+# (`mcap::records::Record`, `io::ErrorKind`) — those carry an `#[expect]`.
+wildcard_enum_match_arm = "warn"
+unwrap_used = "warn"
+expect_used = "warn"                          # the half that catches an invariant nothing checks
+indexing_slicing = "warn"                     # carved out per accessor in the index/arena code
+string_slice = "warn"                         # `indexing_slicing` does not cover `&s[a..b]` on a str
+allow_attributes_without_reason = "warn"
+undocumented_unsafe_blocks = "warn"           # meaningful because `unsafe_code` is `deny`, not `forbid`
+await_holding_lock = "deny"                   # nothing here is async; the entry is the ratchet
+
+# Deliberately not enabled, having been measured rather than assumed:
+#   clippy::arithmetic_side_effects — ~50 hits across `clip` and `tail`, all
+#     offset and length arithmetic in the scan and the cut, every one already
+#     bounded by an explicit `MAX_RECORD_LEN` or file-length check before it
+#     runs. Suppressing every site would bury the two that matter.

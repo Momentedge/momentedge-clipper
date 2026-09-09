@@ -102,6 +102,13 @@ impl From<r2r::momentedge_msgs::msg::Trigger> for Trigger {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        reason = "a failed unwrap or a panicking index is a failing test"
+    )]
+
     use super::*;
     use crate::trigger::Stamp;
 

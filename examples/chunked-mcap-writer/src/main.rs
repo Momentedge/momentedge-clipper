@@ -157,7 +157,12 @@ fn write_pose<W: Write + Seek>(
     seq: u32,
     now_ns: u64,
 ) -> Result<()> {
-    let a = seq as f64 * 0.05;
+    let a = f64::from(seq) * 0.05;
+    #[expect(
+        clippy::expect_used,
+        reason = "a struct of three finite `f64`s and no map keys; `to_vec` has no \
+                  failing path for it"
+    )]
     let payload = serde_json::to_vec(&Pose {
         x: a.cos(),
         y: a.sin(),
@@ -191,6 +196,11 @@ fn write_trigger<W: Write + Seek>(
         preroll: TRIGGER_PREROLL_NS,
         postroll: TRIGGER_POSTROLL_NS,
     };
+    #[expect(
+        clippy::expect_used,
+        reason = "a struct of owned strings and integers; `to_vec` has no failing \
+                  path for it"
+    )]
     let payload = serde_json::to_vec(&trigger).expect("TriggerMsg serializes");
     writer.write_to_known_channel(
         &mcap::records::MessageHeader {
@@ -207,6 +217,10 @@ fn write_trigger<W: Write + Seek>(
     Ok(())
 }
 
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "u64 nanoseconds since the epoch runs to the year 2554"
+)]
 fn now_ns() -> Result<u64> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() as u64)
 }
@@ -266,6 +280,16 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::cast_possible_truncation,
+        reason = "a failed unwrap or a panicking index is a failing test, and a \
+                  catch-all over the foreign `mcap::records::Record` is the only \
+                  arm upstream lets this assertion have"
+    )]
+
     use super::*;
 
     /// Synthetic stamps for the sample recording: an arbitrary absolute base
@@ -307,9 +331,9 @@ mod tests {
         fn seek(&mut self, from: std::io::SeekFrom) -> std::io::Result<u64> {
             use std::io::SeekFrom;
             let new = match from {
-                SeekFrom::Start(p) => p as i128,
-                SeekFrom::End(off) => self.buf.len() as i128 + off as i128,
-                SeekFrom::Current(off) => self.pos as i128 + off as i128,
+                SeekFrom::Start(p) => i128::from(p),
+                SeekFrom::End(off) => self.buf.len() as i128 + i128::from(off),
+                SeekFrom::Current(off) => i128::from(self.pos) + i128::from(off),
             };
             self.pos = u64::try_from(new).expect("seek before start of file");
             Ok(self.pos)
@@ -329,7 +353,13 @@ mod tests {
         let mut writer = chunked_writer(sink).expect("writer");
         let (pose_id, trigger_id) = register(&mut writer).expect("register");
         for seq in 0..n_pose {
-            write_pose(&mut writer, pose_id, seq, BASE_NS + seq as u64 * STEP_NS).expect("pose");
+            write_pose(
+                &mut writer,
+                pose_id,
+                seq,
+                BASE_NS + u64::from(seq) * STEP_NS,
+            )
+            .expect("pose");
         }
         write_trigger(&mut writer, trigger_id, trigger_ns(n_pose)).expect("trigger");
         writer.finish().expect("finish");
@@ -339,7 +369,7 @@ mod tests {
     /// The stamp [`sample_recording`] puts on its trigger: one step past the
     /// last `/pose` message.
     fn trigger_ns(n_pose: u32) -> u64 {
-        BASE_NS + n_pose as u64 * STEP_NS
+        BASE_NS + u64::from(n_pose) * STEP_NS
     }
 
     /// Walk the top-level record framing by hand, exactly the way clipper's
@@ -486,7 +516,7 @@ mod tests {
                 pose_idx += 1;
             }
         }
-        assert_eq!(pose_idx, n as u64, "every /pose message decodes");
+        assert_eq!(pose_idx, u64::from(n), "every /pose message decodes");
         assert!(saw_trigger, "the trigger record must be present");
     }
 

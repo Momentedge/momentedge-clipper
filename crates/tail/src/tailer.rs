@@ -128,6 +128,7 @@ pub struct Coverage {
 impl Coverage {
     /// The high-water for the windowing `source`: `log`'s completeness
     /// high-water, or `publish`'s liveness high-water.
+    #[must_use]
     pub fn for_source(&self, source: TimeSource) -> u64 {
         match source {
             TimeSource::Log => self.high_water_ns,
@@ -326,6 +327,7 @@ impl Tailer {
     /// A fresh tailer (no trigger tap) plus the coverage watch trigger handlers
     /// wait on. The scan reads only message timestamps; triggers arrive through
     /// the ROS interface, not the file.
+    #[must_use]
     pub fn new() -> (Arc<Self>, Arc<Watch<Coverage>>) {
         Self::build(None)
     }
@@ -382,7 +384,11 @@ impl Tailer {
     /// record directory is not a fault — discovery idles until the recorder
     /// creates the bag dir, the documented startup state.
     pub fn run(&self, record_dir: &Path, watch: Duration, delete_old_files: bool) -> Result<()> {
-        let watch_ns = watch.as_nanos().min(u64::MAX as u128) as u64;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the `min` above saturates the duration at u64::MAX nanoseconds"
+        )]
+        let watch_ns = watch.as_nanos().min(u128::from(u64::MAX)) as u64;
 
         // Startup seed: adopt the newest existing recording directly, and seed
         // the iterator past every file present now so the backlog behind it is
@@ -407,6 +413,10 @@ impl Tailer {
             // 2. Prune aged-out recordings (every poll, not only at rollover) —
             //    bounds open fds and index memory even when the recorder idles.
             let floor = now_ns().saturating_sub(watch_ns);
+            #[expect(
+                clippy::unwrap_used,
+                reason = "a poisoned state lock means the tail thread panicked mid-update, so the recording collection is torn; propagating is the policy"
+            )]
             for path in self.state.lock().unwrap().prune(floor) {
                 info!("retention: forgetting {}", path.display());
                 if delete_old_files {
@@ -447,6 +457,10 @@ impl Tailer {
     }
 
     /// The id of the recording currently being tailed, if any.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "a poisoned state lock means the tail thread panicked mid-update, so the recording collection is torn; propagating is the policy"
+    )]
     fn current_id(&self) -> Option<RecordingId> {
         self.state.lock().unwrap().current
     }
@@ -458,6 +472,10 @@ impl Tailer {
     pub(crate) fn index_recording(&self, path: &Path) {
         match File::open(path) {
             Ok(f) => {
+                #[expect(
+                    clippy::unwrap_used,
+                    reason = "a poisoned state lock means the tail thread panicked mid-update, so the recording collection is torn; propagating is the policy"
+                )]
                 let id = self
                     .state
                     .lock()
@@ -472,6 +490,10 @@ impl Tailer {
 
     /// Retire the finished `current` recording and advance to the next.
     fn end_current(&self, id: RecordingId) {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "a poisoned state lock means the tail thread panicked mid-update, so the recording collection is torn; propagating is the policy"
+        )]
         self.state.lock().unwrap().mark_ended_and_advance(id);
     }
 
@@ -480,7 +502,19 @@ impl Tailer {
     /// index and refreshing coverage), then decide whether it has finished.
     fn poll_current(&self, id: RecordingId) -> Result<PollOutcome> {
         let (path, file, mut offset, magic_ok) = {
+            #[expect(
+                clippy::unwrap_used,
+                reason = "a poisoned state lock means the tail thread panicked mid-update, so the recording collection is torn; propagating is the policy"
+            )]
             let st = self.state.lock().unwrap();
+            #[expect(
+                clippy::expect_used,
+                reason = "`id` came from `current_id()` on this same thread, and the \
+                          tail thread is the only writer of the collection — \
+                          `prune` refuses to drop the `current` recording, and \
+                          `mark_ended_and_advance` only ever moves `current` onto \
+                          another indexed one"
+            )]
             let r = st.recording(id).expect("current id is in the collection");
             (
                 r.index.path.clone(),
@@ -507,6 +541,10 @@ impl Tailer {
                 bail!("{} is not an MCAP file", path.display());
             }
             offset = MAGIC.len() as u64;
+            #[expect(
+                clippy::unwrap_used,
+                reason = "a poisoned state lock means the tail thread panicked mid-update, so the recording collection is torn; propagating is the policy"
+            )]
             let mut st = self.state.lock().unwrap();
             if let Some(r) = st.recording_mut(id) {
                 r.index.offset = offset;
@@ -539,6 +577,10 @@ impl Tailer {
         // Finished on any of three signals; the scan above already drained every
         // complete record to EOF, so nothing trailing is lost.
         let inode_dead = inode_changed(&path, &file)?;
+        #[expect(
+            clippy::unwrap_used,
+            reason = "a poisoned state lock means the tail thread panicked mid-update, so the recording collection is torn; propagating is the policy"
+        )]
         let has_successor = self.state.lock().unwrap().has_successor(id);
         if progress.ended || inode_dead || (has_successor && !made_progress) {
             let why = if progress.ended {
@@ -565,6 +607,10 @@ impl Tailer {
     /// runs through [`Self::run`]'s iterator instead of this.
     #[cfg(test)]
     pub(crate) fn attach(&self, file: Arc<File>) {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "a poisoned state lock means the tail thread panicked mid-update, so the recording collection is torn; propagating is the policy"
+        )]
         let mut st = self.state.lock().unwrap();
         let id = st.insert_new_recording(PathBuf::new(), file);
         if let Some(r) = st.recording_mut(id) {
@@ -588,6 +634,10 @@ impl Tailer {
         // coverage advances only here — so the cut never races ahead of the
         // index it reads.
         let (hw, phw) = {
+            #[expect(
+                clippy::unwrap_used,
+                reason = "a poisoned state lock means the tail thread panicked mid-update, so the recording collection is torn; propagating is the policy"
+            )]
             let mut st = self.state.lock().unwrap();
             if let Some(id) = st.current
                 && let Some(r) = st.recording_mut(id)
@@ -645,6 +695,10 @@ impl Tailer {
         // Take the seed under the lock, then release it: the scan's file IO must
         // not run with the state lock held.
         let seed = {
+            #[expect(
+                clippy::unwrap_used,
+                reason = "a poisoned state lock means the tail thread panicked mid-update, so the recording collection is torn; propagating is the policy"
+            )]
             let st = self.state.lock().unwrap();
             let current = st.current.and_then(|id| st.recording(id));
             ScanSeed {
@@ -673,6 +727,10 @@ impl WindowPlanner for Tailer {
     /// `[start_ns, end_ns]` on `source`, oldest first. A window inside one
     /// recording yields one plan; one straddling a rollover yields one per source
     /// file. Empty when no indexed recording covers the window.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "a poisoned state lock means the tail thread panicked mid-update, so the recording collection is torn; propagating is the policy"
+    )]
     fn plan_window(&self, start_ns: u64, end_ns: u64, source: TimeSource) -> Vec<WindowPlan> {
         self.state
             .lock()
@@ -719,9 +777,7 @@ fn newest_mcap(dir: &Path) -> Option<PathBuf> {
         .filter_map(|e| Some(e.ok()?.path()))
         .filter(|p| p.extension().is_some_and(|e| e == "mcap"))
         .max_by_key(|p| {
-            std::fs::metadata(p)
-                .map(|m| (m.mtime(), m.mtime_nsec()))
-                .unwrap_or((i64::MIN, i64::MIN))
+            std::fs::metadata(p).map_or((i64::MIN, i64::MIN), |m| (m.mtime(), m.mtime_nsec()))
         })
 }
 
@@ -747,6 +803,13 @@ fn file_len(file: &File) -> Result<u64> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        reason = "a failed unwrap or a panicking index is a failing test"
+    )]
+
     use std::time::SystemTime;
 
     use clip::index::{MAX_RECORD_LEN, op};

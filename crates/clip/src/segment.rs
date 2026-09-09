@@ -78,6 +78,12 @@ pub struct StageJob {
 /// afterwards. The window's clock domain travels in the job instead (see
 /// [`StageJob`]). A panicking stage is caught and replied as an error — per-job
 /// isolation, the pool outlives it.
+#[must_use]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "the pool owns its selection for the process lifetime and hands each \
+              worker a clone; borrowing here would only move that clone to the caller"
+)]
 pub fn spawn_stage_workers(
     parallelism: usize,
     compression: Option<mcap::Compression>,
@@ -87,10 +93,16 @@ pub fn spawn_stage_workers(
     for i in 0..parallelism.max(1) {
         let rx = rx.clone();
         let selection = selection.clone();
+        #[expect(
+            clippy::expect_used,
+            reason = "the pool is built once at startup; a recorder that cannot \
+                      spawn its staging workers can cut no clip at all, so failing \
+                      loudly here beats starting a recorder that silently never cuts"
+        )]
         thread::Builder::new()
             .name(format!("stage-{i}"))
             .spawn(move || {
-                for job in rx.iter() {
+                for job in &rx {
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         cut::stage_clip(
                             &job.plan,
@@ -190,6 +202,12 @@ pub struct ClipExists {
 /// `publication` is what a name the output directory already holds costs: a
 /// `_<n>` sibling beside the earlier clip, or a refusal of the whole window
 /// before anything is staged ([`Publication`]).
+#[expect(
+    clippy::similar_names,
+    reason = "`plans` and `planned` are the domain's own two words: the per-file \
+              window plans, and the window-level facts every segment's manifest \
+              repeats. Renaming either would cost more than the similarity does"
+)]
 pub fn cut_window(
     planner: &dyn WindowPlanner,
     request: &Arc<CutRequest>,
@@ -381,6 +399,7 @@ fn is_numbered_sibling(name: &str, prefix: &str, ext: &str) -> bool {
 
 /// Make a trigger name safe to embed in a filename: keep alphanumerics, `-`,
 /// `_` and `.`; everything else (notably `/`) becomes `_`.
+#[must_use]
 pub fn sanitize(name: &str) -> String {
     let s: String = name
         .chars()
@@ -401,6 +420,16 @@ pub fn sanitize(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::assert_is_empty,
+        reason = "a failed unwrap or a panicking index is a failing test, and \
+                  `assert!(x.is_empty())` names the claim better than the \
+                  empty-array `assert_eq!` the lint asks for"
+    )]
+
     use std::collections::HashMap;
     use std::fs::File;
     use std::sync::Arc;

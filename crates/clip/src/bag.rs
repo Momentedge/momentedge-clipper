@@ -297,6 +297,16 @@ fn recording_order(dir: &Path, named: Option<&[PathBuf]>, mut present: Vec<Split
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::assert_is_empty,
+        reason = "a failed unwrap or a panicking index is a failing test, and \
+                  `assert!(x.is_empty())` names the claim better than the \
+                  empty-array `assert_eq!` the lint asks for"
+    )]
+
     use std::fs::File;
     use std::io::Write;
     use std::time::Duration;

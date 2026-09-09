@@ -38,6 +38,12 @@ pub(crate) fn spawn_supervised<T: Send + 'static>(
     f: impl FnOnce() -> T + Send + 'static,
 ) -> Supervised<T> {
     let (tx, rx) = bounded(1);
+    #[expect(
+        clippy::expect_used,
+        reason = "the supervised threads are spawned once at startup; a recorder \
+                  that cannot start its tail or its interface has nothing to do, so \
+                  failing loudly beats a process that runs and records nothing"
+    )]
     let handle = thread::Builder::new()
         .name(name.to_string())
         .spawn(move || {

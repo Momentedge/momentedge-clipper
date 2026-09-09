@@ -36,21 +36,9 @@ clip = { path = "../clip", features = ["test-support"] }
 # The clip compression codec the handler tests drive the staging pool through.
 mcap.workspace = true
 
-[lints.rust]
-# A public type a downstream crate holds in a struct or logs on an error path
-# needs `Debug`, and the omission only shows up in the consumer's build.
-missing_debug_implementations = "warn"
-unreachable_pub = "warn"
-
-[lints.clippy]
-# The recording lifecycle is an enum whose arms are decisions — a `New` recording
-# waits, a `Tailing` one is scanned, an `Ended` one is prunable — so a catch-all
-# is a state nobody decided about.
-wildcard_enum_match_arm = "warn"
-
-# Deliberately not enabled, having been measured rather than assumed:
-#   missing_docs — 60 hits, nearly all struct fields on types whose own docs
-#     already say what they carry, so the lint buys restated field names.
-#   clippy::arithmetic_side_effects — 24 hits, all file offsets and durations
-#     already bounded by the checks around them; suppressing every site would
-#     bury the ones that matter.
+# The workspace lint policy (root `Cargo.toml`), inherited whole. The recording
+# lifecycle is an enum whose arms are decisions — a `New` recording waits, a
+# `Tailing` one is scanned, an `Ended` one is prunable — so
+# `wildcard_enum_match_arm` earns its place here rather than being suppressed.
+[lints]
+workspace = true

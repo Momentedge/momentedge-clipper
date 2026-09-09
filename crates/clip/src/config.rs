@@ -115,6 +115,7 @@ const SETTINGS: &[(&str, Scope)] = &[
 ];
 
 /// Who may set `key`, or `None` for a key no mode has an argument for.
+#[must_use]
 pub fn scope_of(key: &str) -> Option<Scope> {
     SETTINGS
         .iter()
@@ -149,11 +150,13 @@ pub struct Setting {
 
 impl Setting {
     /// The value as the CLI parser takes it.
+    #[must_use]
     pub fn value(&self) -> &str {
         &self.value
     }
 
     /// The layer that decided it.
+    #[must_use]
     pub fn layer(&self) -> Layer {
         self.layer
     }
@@ -245,6 +248,7 @@ impl Layered {
 
     /// The default the CLI parser should give `key`, or `None` where no file
     /// named it and the parser's own default stands.
+    #[must_use]
     pub fn setting(&self, key: &str) -> Option<&Setting> {
         self.settings.get(key)
     }
@@ -263,11 +267,13 @@ impl Layered {
     }
 
     /// Which topics a clip is cut from.
+    #[must_use]
     pub fn selection(&self) -> &ChannelSelection {
         &self.selection
     }
 
     /// Take the selection out, for handing to the cut path.
+    #[must_use]
     pub fn into_selection(self) -> ChannelSelection {
         self.selection
     }
@@ -276,12 +282,14 @@ impl Layered {
     /// each, already logged. A report repeats them so the run's configuration
     /// and the reason it is not what the per-run file asked for are read
     /// together.
+    #[must_use]
     pub fn refusals(&self) -> &[String] {
         &self.refusals
     }
 
     /// How a report names `layer` — with the file's path for the two file
     /// layers, since "system file" alone does not say which file was read.
+    #[must_use]
     pub fn origin(&self, layer: Layer) -> String {
         match layer {
             Layer::Builtin => "built-in default".to_string(),
@@ -403,7 +411,7 @@ fn render(key: &str, value: &toml::Value) -> Result<String> {
 fn merge_topics(system: &TopicsFile, run: &TopicsFile) -> (Spec, Vec<(&'static str, Setting)>) {
     /// The value and the layer for one key: the per-run file's if it set one,
     /// else the system file's, else nothing at the built-in layer.
-    fn pick<T: Clone>(system: &Option<T>, run: &Option<T>) -> (Option<T>, Layer) {
+    fn pick<T: Clone>(system: Option<&T>, run: Option<&T>) -> (Option<T>, Layer) {
         match (system, run) {
             (_, Some(v)) => (Some(v.clone()), Layer::Run),
             (Some(v), None) => (Some(v.clone()), Layer::System),
@@ -411,13 +419,17 @@ fn merge_topics(system: &TopicsFile, run: &TopicsFile) -> (Spec, Vec<(&'static s
         }
     }
 
-    let (all, all_layer) = pick(&system.all, &run.all);
-    let (include, include_layer) = pick(&system.include, &run.include);
-    let (include_regex, include_regex_layer) = pick(&system.include_regex, &run.include_regex);
-    let (exclude, exclude_layer) = pick(&system.exclude, &run.exclude);
-    let (exclude_regex, exclude_regex_layer) = pick(&system.exclude_regex, &run.exclude_regex);
-    let (exclude_trigger, exclude_trigger_layer) =
-        pick(&system.exclude_trigger_topic, &run.exclude_trigger_topic);
+    let (all, all_layer) = pick(system.all.as_ref(), run.all.as_ref());
+    let (include, include_layer) = pick(system.include.as_ref(), run.include.as_ref());
+    let (include_regex, include_regex_layer) =
+        pick(system.include_regex.as_ref(), run.include_regex.as_ref());
+    let (exclude, exclude_layer) = pick(system.exclude.as_ref(), run.exclude.as_ref());
+    let (exclude_regex, exclude_regex_layer) =
+        pick(system.exclude_regex.as_ref(), run.exclude_regex.as_ref());
+    let (exclude_trigger, exclude_trigger_layer) = pick(
+        system.exclude_trigger_topic.as_ref(),
+        run.exclude_trigger_topic.as_ref(),
+    );
 
     let spec = Spec {
         all,
@@ -440,7 +452,10 @@ fn merge_topics(system: &TopicsFile, run: &TopicsFile) -> (Spec, Vec<(&'static s
         ),
         (
             "include_regex",
-            Setting::new(&render_pattern(&spec.include_regex), include_regex_layer),
+            Setting::new(
+                &render_pattern(spec.include_regex.as_ref()),
+                include_regex_layer,
+            ),
         ),
         (
             "exclude",
@@ -448,7 +463,10 @@ fn merge_topics(system: &TopicsFile, run: &TopicsFile) -> (Spec, Vec<(&'static s
         ),
         (
             "exclude_regex",
-            Setting::new(&render_pattern(&spec.exclude_regex), exclude_regex_layer),
+            Setting::new(
+                &render_pattern(spec.exclude_regex.as_ref()),
+                exclude_regex_layer,
+            ),
         ),
         (
             "exclude_trigger_topic",
@@ -474,8 +492,8 @@ fn render_list(topics: &[String]) -> String {
 
 /// A pattern as a report prints it, or `(unset)` where there is none — an empty
 /// pattern matches everything, so it cannot stand in for absence.
-fn render_pattern(pattern: &Option<String>) -> String {
-    pattern.clone().unwrap_or_else(|| "(unset)".to_string())
+fn render_pattern(pattern: Option<&String>) -> String {
+    pattern.cloned().unwrap_or_else(|| "(unset)".to_string())
 }
 
 #[cfg(test)]
@@ -484,7 +502,10 @@ mod tests {
         clippy::unwrap_used,
         clippy::expect_used,
         clippy::indexing_slicing,
-        reason = "a failed unwrap or a panicking index is a failing test"
+        clippy::assert_is_empty,
+        reason = "a failed unwrap or a panicking index is a failing test, and \
+                  `assert!(x.is_empty())` names the claim better than the \
+                  empty-array `assert_eq!` the lint asks for"
     )]
 
     use super::*;

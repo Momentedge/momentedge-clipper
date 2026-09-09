@@ -373,6 +373,7 @@ impl WholeFileIndex {
 
     /// The recordings a window is planned over, in the order their segments come
     /// out — one path for a single file, one per split for a bag directory.
+    #[must_use]
     pub fn splits(&self) -> Vec<&Path> {
         self.splits
             .iter()
@@ -383,6 +384,7 @@ impl WholeFileIndex {
     /// What the collection and the recorder's metadata file disagree about, in
     /// topic order. Empty when they agree, when the directory carries no
     /// metadata file, and for a single recording.
+    #[must_use]
     pub fn disagreements(&self) -> &[CountDisagreement] {
         &self.disagreements
     }
@@ -397,6 +399,7 @@ impl WholeFileIndex {
     /// bag directory it is the last split's end, so a window reaching past the
     /// whole collection is what makes a clip short, not one reaching past the
     /// split it started in.
+    #[must_use]
     pub fn log_end_ns(&self) -> Option<u64> {
         self.splits
             .iter()
@@ -755,6 +758,15 @@ impl WholeFileIndex {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::single_match_else,
+        clippy::cast_possible_truncation,
+        reason = "a failed unwrap or a panicking index is a failing test"
+    )]
+
     use std::collections::BTreeMap;
     use std::io::BufWriter;
     use std::path::PathBuf;

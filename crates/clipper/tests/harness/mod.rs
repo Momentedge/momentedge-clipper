@@ -26,14 +26,14 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-pub const TRIGGER_TOPIC: &str = "/events/momentedge/trigger";
-pub const RECORDED_TOPIC: &str = "/events/momentedge/recorded";
+pub(crate) const TRIGGER_TOPIC: &str = "/events/momentedge/trigger";
+pub(crate) const RECORDED_TOPIC: &str = "/events/momentedge/recorded";
 
 /// Gate for the whole suite. Unset `CLIPPER_E2E` means skip-and-pass, so
 /// plain `cargo test` / `cargo llvm-cov` stay green without ROS. Set, a
 /// missing prerequisite is a loud panic — a misconfigured "enabled" run must
 /// fail, never silently skip.
-pub fn require_e2e() -> bool {
+pub(crate) fn require_e2e() -> bool {
     if std::env::var_os("CLIPPER_E2E").is_none() {
         eprintln!(
             "skipping: CLIPPER_E2E is unset \
@@ -59,7 +59,7 @@ pub fn require_e2e() -> bool {
 /// locally, so the full suite — including the live-corruption race
 /// `corrupt_tail_health_live` — runs. A skipped test returns early and so
 /// reports as passed, the same skip-and-pass convention as [`require_e2e`].
-pub fn skip_flaky() -> bool {
+pub(crate) fn skip_flaky() -> bool {
     if std::env::var_os("CLIPPER_E2E_SKIP_FLAKY").is_some() {
         eprintln!("skipping: flaky-under-CI test (CLIPPER_E2E_SKIP_FLAKY is set)");
         return true;
@@ -88,7 +88,7 @@ fn wait_for_file_contains(path: &Path, needle: &str, timeout: Duration) -> bool 
 
 /// Nanoseconds since the Unix epoch on the system clock — the time base the
 /// recorder, the trigger stamp, and MCAP `log_time` all share.
-pub fn now_ns() -> u64 {
+pub(crate) fn now_ns() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock before the epoch")
@@ -104,7 +104,7 @@ pub fn now_ns() -> u64 {
 /// on demand into that same directory. The example carries no r2r/ROS
 /// dependency, so the build is a quick final link over the workspace's
 /// already-compiled crates.
-pub fn writer_bin() -> PathBuf {
+pub(crate) fn writer_bin() -> PathBuf {
     let bin_dir = Path::new(env!("CARGO_BIN_EXE_clipper"))
         .parent()
         .expect("the clipper binary has a parent directory");
@@ -151,7 +151,7 @@ pub fn writer_bin() -> PathBuf {
 /// build takes minutes; the `e2e` profile grants this test a longer
 /// terminate-after for that (`.config/nextest.toml`), and CI prebuilds it in the
 /// matrix `Build` step so the on-demand build is normally an up-to-date no-op.
-pub fn cu_mcap_record_bin() -> PathBuf {
+pub(crate) fn cu_mcap_record_bin() -> PathBuf {
     if let Some(path) = std::env::var_os("CU_MCAP_RECORD_BIN") {
         let path = PathBuf::from(path);
         assert!(
@@ -202,7 +202,7 @@ fn unique_domain() -> u32 {
 
 /// One test's isolated world: a unique DDS domain and a temp tree holding the
 /// recording, the clips, and the child logs.
-pub struct TestEnv {
+pub(crate) struct TestEnv {
     pub domain: u32,
     root: tempfile::TempDir,
     /// Whether the running recorder subscribes to the trigger topic (it does
@@ -213,7 +213,7 @@ pub struct TestEnv {
 }
 
 impl TestEnv {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let root = tempfile::Builder::new()
             .prefix("clipper-e2e-")
             .tempdir()
@@ -232,11 +232,11 @@ impl TestEnv {
         env
     }
 
-    pub fn record_dir(&self) -> PathBuf {
+    pub(crate) fn record_dir(&self) -> PathBuf {
         self.root.path().join("record")
     }
 
-    pub fn out_dir(&self) -> PathBuf {
+    pub(crate) fn out_dir(&self) -> PathBuf {
         self.root.path().join("triggered")
     }
 
@@ -276,7 +276,7 @@ impl TestEnv {
 
     /// The production recording the extractor tails: a continuous `ros2 bag
     /// record --all` writing one growing MCAP file into this test's `record/`.
-    pub fn start_recorder(&self, preset: &str, cache: u64) -> Proc {
+    pub(crate) fn start_recorder(&self, preset: &str, cache: u64) -> Proc {
         // `--all` records every live topic, so the recorder also subscribes to
         // the trigger topic; `fire_trigger` then waits for two matched
         // subscribers (the extractor and the recorder).
@@ -285,7 +285,7 @@ impl TestEnv {
 
     /// [`Self::start_recorder`] restricted to exactly `topics`, for tests that
     /// must keep ambient topics (`/rosout`, the trigger) out of the recording.
-    pub fn start_recorder_topics(&self, topics: &[&str], preset: &str, cache: u64) -> Proc {
+    pub(crate) fn start_recorder_topics(&self, topics: &[&str], preset: &str, cache: u64) -> Proc {
         // `ros2 bag record`'s topic-list spelling differs across distros: humble
         // takes the topics positionally and has no `--topics` flag, while lyrical
         // dropped the positional form and requires `--topics`; jazzy accepts both
@@ -305,7 +305,7 @@ impl TestEnv {
     /// `max_bag_duration_secs` (`--max-bag-duration`), keeping every split on
     /// disk — the rosbag2 split recording a clip window can straddle, which the
     /// collection tailer recovers across.
-    pub fn start_recorder_split(
+    pub(crate) fn start_recorder_split(
         &self,
         preset: &str,
         cache: u64,
@@ -349,7 +349,7 @@ impl TestEnv {
     }
 
     /// Block until the recorder has created its MCAP file; returns its path.
-    pub fn wait_for_recording(&self, timeout: Duration) -> PathBuf {
+    pub(crate) fn wait_for_recording(&self, timeout: Duration) -> PathBuf {
         let deadline = Instant::now() + timeout;
         loop {
             if let Some(p) = self.newest_recording() {
@@ -367,7 +367,7 @@ impl TestEnv {
     /// Delete the recording file out from under the live recorder — the
     /// external-cleanup fault the deletion tests inject. The recorder keeps
     /// appending to the unlinked inode; the tail sees the path vanish.
-    pub fn delete_recording(&self) {
+    pub(crate) fn delete_recording(&self) {
         std::fs::remove_file(self.newest_recording().expect("the recording exists"))
             .expect("deleting the recording");
     }
@@ -378,7 +378,7 @@ impl TestEnv {
     /// disk. Returns the new recorder and the instant between the two
     /// recorders' lifetimes — every message in the new recording is stamped
     /// at receive and therefore at/after it.
-    pub fn restart_recorder(
+    pub(crate) fn restart_recorder(
         &self,
         recorder: &mut Proc,
         extractor: &Proc,
@@ -399,7 +399,7 @@ impl TestEnv {
 
     /// Newest `*.mcap` under `record/` by mtime — the same startup-adoption rule
     /// the extractor's tail uses to pick the live recording.
-    pub fn newest_recording(&self) -> Option<PathBuf> {
+    pub(crate) fn newest_recording(&self) -> Option<PathBuf> {
         let entries = std::fs::read_dir(self.record_dir()).ok()?;
         entries
             .flatten()
@@ -407,14 +407,13 @@ impl TestEnv {
             .filter(|p| p.extension().is_some_and(|x| x == "mcap"))
             .max_by_key(|p| {
                 p.metadata()
-                    .map(|m| (m.mtime(), m.mtime_nsec()))
-                    .unwrap_or((i64::MIN, i64::MIN))
+                    .map_or((i64::MIN, i64::MIN), |m| (m.mtime(), m.mtime_nsec()))
             })
     }
 
     /// A steady message stream so the bag has content and the tail's coverage
     /// high-water advances. Runs until dropped.
-    pub fn start_source(&self, topic: &str, rate: u32) -> Proc {
+    pub(crate) fn start_source(&self, topic: &str, rate: u32) -> Proc {
         let payload = "clipper-e2e-payload ".repeat(10);
         let mut cmd = self.command("ros2");
         cmd.args([
@@ -432,13 +431,13 @@ impl TestEnv {
     /// The binary under test in its `tail` mode, configured purely via
     /// `MOMENTEDGE_*` env onto this test's temp tree — the mode is the one
     /// argument on the command line. Blocks until its "up" line is logged.
-    pub fn start_extractor(&self, grace_secs: u64) -> Proc {
+    pub(crate) fn start_extractor(&self, grace_secs: u64) -> Proc {
         self.start_extractor_src(grace_secs, "log")
     }
 
     /// [`Self::start_extractor`] (the ROS interface, the default) on an explicit
     /// `--time-source` (`MOMENTEDGE_TIME_SOURCE`) — `log` or `publish`.
-    pub fn start_extractor_src(&self, grace_secs: u64, time_source: &str) -> Proc {
+    pub(crate) fn start_extractor_src(&self, grace_secs: u64, time_source: &str) -> Proc {
         let mut cmd = self.command(env!("CARGO_BIN_EXE_clipper"));
         cmd.arg("tail")
             .env("MOMENTEDGE_RECORD_DIR", self.record_dir())
@@ -454,14 +453,14 @@ impl TestEnv {
     /// tailed recording (decoding each by its `message_encoding`) and runs
     /// ROS-free — no trigger subscription, no `Recorded` publish. Same temp-tree
     /// wiring as [`Self::start_extractor`], plus `MOMENTEDGE_INTERFACE=mcap`.
-    pub fn start_extractor_mcap(&self, grace_secs: u64) -> Proc {
+    pub(crate) fn start_extractor_mcap(&self, grace_secs: u64) -> Proc {
         self.start_extractor_mcap_src(grace_secs, "log")
     }
 
     /// [`Self::start_extractor_mcap`] on an explicit `--time-source`
     /// (`MOMENTEDGE_TIME_SOURCE`) — `log` or `publish` — for the domain-selection
     /// e2e.
-    pub fn start_extractor_mcap_src(&self, grace_secs: u64, time_source: &str) -> Proc {
+    pub(crate) fn start_extractor_mcap_src(&self, grace_secs: u64, time_source: &str) -> Proc {
         let mut cmd = self.command(env!("CARGO_BIN_EXE_clipper"));
         cmd.arg("tail")
             .env("MOMENTEDGE_RECORD_DIR", self.record_dir())
@@ -484,7 +483,7 @@ impl TestEnv {
     /// publish_offset_ms`); its window is the writer's fixed ±2 s preroll and
     /// postroll. The process runs until its duration elapses — clipper tails the
     /// growing file the whole time — and is torn down with the [`Proc`] on drop.
-    pub fn start_writer(
+    pub(crate) fn start_writer(
         &self,
         file_name: &str,
         duration_secs: f64,
@@ -510,7 +509,7 @@ impl TestEnv {
     /// torn down — SIGINT-finalised by an explicit [`Proc::stop`], or SIGTERM'd
     /// by the [`Proc`] guard on drop (clipper has already cut the clip from the
     /// growing file by then, so finalisation is not needed for the cut).
-    pub fn start_cu_recorder(&self) -> Proc {
+    pub(crate) fn start_cu_recorder(&self) -> Proc {
         let mut cmd = Command::new(cu_mcap_record_bin());
         cmd.arg("--out").arg(self.record_dir());
         self.spawn("cu-recorder", cmd)
@@ -520,7 +519,7 @@ impl TestEnv {
     /// into its log. Started (and given a discovery head start) BEFORE the
     /// trigger fires, so the announcement publisher is already matched by the
     /// time it publishes.
-    pub fn start_recorded_listener(&self, tag: &str) -> Proc {
+    pub(crate) fn start_recorded_listener(&self, tag: &str) -> Proc {
         let mut cmd = self.command("ros2");
         cmd.args([
             "topic",
@@ -545,7 +544,7 @@ impl TestEnv {
     /// receipt instant sends zero. For a `--time-source publish` run — the one
     /// cell that reads `trigger_time` as the anchor — use
     /// [`Self::fire_trigger_stamped`].
-    pub fn fire_trigger(&self, name: &str, preroll_ns: u64, postroll_ns: u64) {
+    pub(crate) fn fire_trigger(&self, name: &str, preroll_ns: u64, postroll_ns: u64) {
         self.fire_trigger_stamped(name, 0, preroll_ns, postroll_ns);
     }
 
@@ -571,7 +570,7 @@ impl TestEnv {
     /// republish; re-firing is idempotent, since only a trigger the extractor
     /// receives cuts a clip. The wait is bounded by `wait_exit` rather than
     /// `--max-wait-time-secs`, Jazzy+ syntax Humble's `ros2 topic pub` rejects.
-    pub fn fire_trigger_stamped(
+    pub(crate) fn fire_trigger_stamped(
         &self,
         name: &str,
         trigger_time_ns: u64,
@@ -628,7 +627,7 @@ impl TestEnv {
 
     /// `out_dir/.capturing` must exist (the extractor ran) and hold nothing
     /// (no finished clip ever lingers there).
-    pub fn assert_capturing_drained(&self) {
+    pub(crate) fn assert_capturing_drained(&self) {
         let capturing = self.out_dir().join(".capturing");
         assert!(
             capturing.is_dir(),
@@ -653,7 +652,7 @@ impl TestEnv {
     /// it off the file. Publishes exactly once — a republish would write a second
     /// trigger record into the bag and cut a duplicate clip — then confirms
     /// clipper logged receipt after decoding it out of the MCAP.
-    pub fn fire_trigger_into_bag(&self, name: &str, preroll_ns: u64, postroll_ns: u64) {
+    pub(crate) fn fire_trigger_into_bag(&self, name: &str, preroll_ns: u64, postroll_ns: u64) {
         self.publish_trigger_into_bag(name, preroll_ns, postroll_ns);
 
         // clipper logs `trigger name="<name>"` the moment it decodes the trigger
@@ -678,7 +677,7 @@ impl TestEnv {
     /// recorder subscriber); a republish would write a second trigger record and
     /// cut a duplicate clip. `trigger_time` is zero: the MCAP interface anchors on
     /// the trigger record's own stamp and rejects a non-zero `trigger_time`.
-    pub fn publish_trigger_into_bag(&self, name: &str, preroll_ns: u64, postroll_ns: u64) {
+    pub(crate) fn publish_trigger_into_bag(&self, name: &str, preroll_ns: u64, postroll_ns: u64) {
         let yaml = format!(
             "{{name: {name}, description: e2e, \
              trigger_time: {{sec: 0, nanosec: 0}}, \
@@ -709,7 +708,7 @@ impl TestEnv {
     /// own stamp under `--interface mcap`, not the publisher's `trigger_time`. A
     /// test that does not know the exact anchor locates the clip by its
     /// `_<name>.mcap` suffix.
-    pub fn wait_for_clip_matching(&self, suffix: &str, timeout: Duration) -> PathBuf {
+    pub(crate) fn wait_for_clip_matching(&self, suffix: &str, timeout: Duration) -> PathBuf {
         let deadline = Instant::now() + timeout;
         loop {
             if let Ok(entries) = std::fs::read_dir(self.out_dir()) {
@@ -724,9 +723,10 @@ impl TestEnv {
                     }
                 }
             }
-            if Instant::now() >= deadline {
-                panic!("no clip ending in {suffix:?} appeared in out_dir within {timeout:?}");
-            }
+            assert!(
+                Instant::now() < deadline,
+                "no clip ending in {suffix:?} appeared in out_dir within {timeout:?}"
+            );
             std::thread::sleep(Duration::from_millis(100));
         }
     }
@@ -736,7 +736,7 @@ impl TestEnv {
 /// The window a clip was cut with is `[anchor - preroll, anchor + postroll]`, so
 /// a test that located the clip by name recovers the anchor to assert its
 /// window.
-pub fn anchor_from_clip(path: &Path) -> u64 {
+pub(crate) fn anchor_from_clip(path: &Path) -> u64 {
     path.file_name()
         .and_then(|n| n.to_str())
         .and_then(|n| n.split('_').next())
@@ -750,7 +750,11 @@ pub fn anchor_from_clip(path: &Path) -> u64 {
 /// pre-publish `now()`, which the `ros2 topic pub` startup precedes by around a
 /// second — so window assertions recover the anchor from the announced clip
 /// rather than a captured timestamp.
-pub fn announced_window(recorded: &Recorded, preroll_ns: u64, postroll_ns: u64) -> (u64, u64) {
+pub(crate) fn announced_window(
+    recorded: &Recorded,
+    preroll_ns: u64,
+    postroll_ns: u64,
+) -> (u64, u64) {
     let anchor = anchor_from_clip(Path::new(&recorded.filenames[0]));
     (anchor - preroll_ns, anchor + postroll_ns)
 }
@@ -766,10 +770,12 @@ pub fn announced_window(recorded: &Recorded, preroll_ns: u64, postroll_ns: u64) 
 /// interface anchors the window on one of them per `--time-source`). The JSON
 /// `trigger_time` is left zero — the MCAP interface reads the record stamp, not
 /// the payload field.
-// A test fixture builder: each argument shapes a distinct part of the synthetic
-// recording, so a struct would only add ceremony.
-#[allow(clippy::too_many_arguments)]
-pub fn write_time_source_recording(
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a test fixture builder: each argument shapes a distinct part of the \
+              synthetic recording, so a struct would only add ceremony"
+)]
+pub(crate) fn write_time_source_recording(
     path: &Path,
     src_topic: &str,
     src_msgs: &[(u64, u64)],
@@ -834,18 +840,18 @@ pub fn write_time_source_recording(
 }
 
 /// A child process in its own process group, killed group-wide on drop.
-pub struct Proc {
+pub(crate) struct Proc {
     name: String,
     child: Child,
     log: PathBuf,
 }
 
 impl Proc {
-    pub fn log_text(&self) -> String {
+    pub(crate) fn log_text(&self) -> String {
         std::fs::read_to_string(&self.log).unwrap_or_default()
     }
 
-    pub fn dump_log(&self) {
+    pub(crate) fn dump_log(&self) {
         eprintln!(
             "--- {} log ({}) ---\n{}\n--- end {} log ---",
             self.name,
@@ -855,12 +861,17 @@ impl Proc {
         );
     }
 
-    pub fn is_running(&mut self) -> bool {
+    pub(crate) fn is_running(&mut self) -> bool {
         self.child.try_wait().expect("try_wait").is_none()
     }
 
     /// Signal the child's whole process group.
-    pub fn signal_group(&self, signal: libc::c_int) {
+    #[expect(
+        unsafe_code,
+        reason = "the harness tears down a child's whole process group; `kill(2)` \
+                  through libc is the only way to reach a negative pid"
+    )]
+    pub(crate) fn signal_group(&self, signal: libc::c_int) {
         // Safety: plain kill(2); the group exists for the child's lifetime.
         unsafe {
             libc::kill(-(self.child.id() as i32), signal);
@@ -868,7 +879,7 @@ impl Proc {
     }
 
     /// Poll for exit up to `timeout`; `None` means still running.
-    pub fn wait_exit(&mut self, timeout: Duration) -> Option<ExitStatus> {
+    pub(crate) fn wait_exit(&mut self, timeout: Duration) -> Option<ExitStatus> {
         let deadline = Instant::now() + timeout;
         loop {
             if let Some(status) = self.child.try_wait().expect("try_wait") {
@@ -882,7 +893,7 @@ impl Proc {
     }
 
     /// Signal the group and require the child to exit within `timeout`.
-    pub fn stop(&mut self, signal: libc::c_int, timeout: Duration) -> ExitStatus {
+    pub(crate) fn stop(&mut self, signal: libc::c_int, timeout: Duration) -> ExitStatus {
         self.signal_group(signal);
         self.wait_exit(timeout).unwrap_or_else(|| {
             self.dump_log();
@@ -894,7 +905,7 @@ impl Proc {
     }
 
     /// Poll the child's log until `needle` appears.
-    pub fn wait_for_log(&self, needle: &str, timeout: Duration) -> bool {
+    pub(crate) fn wait_for_log(&self, needle: &str, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         loop {
             if self.log_text().contains(needle) {
@@ -909,7 +920,7 @@ impl Proc {
 
     /// [`Self::wait_for_log`], but a missing line is a failure with the full
     /// log dumped for post-mortem.
-    pub fn expect_log(&self, needle: &str, timeout: Duration) {
+    pub(crate) fn expect_log(&self, needle: &str, timeout: Duration) {
         if !self.wait_for_log(needle, timeout) {
             self.dump_log();
             panic!("{}: {needle:?} not logged within {timeout:?}", self.name);
@@ -923,7 +934,7 @@ impl Proc {
     /// cannot). The needle must be specific enough that no other line
     /// contributes a substring match toward the count — qualify it with the
     /// full path rather than a bare prefix another log line shares.
-    pub fn expect_log_count(&self, needle: &str, count: usize, timeout: Duration) {
+    pub(crate) fn expect_log_count(&self, needle: &str, count: usize, timeout: Duration) {
         let deadline = Instant::now() + timeout;
         while self.log_text().matches(needle).count() < count {
             if Instant::now() >= deadline {
@@ -955,7 +966,7 @@ impl Drop for Proc {
 /// lists every segment the window produced — one for a window that stayed in a
 /// single recording, several when it straddled a rollover.
 #[derive(Debug)]
-pub struct Recorded {
+pub(crate) struct Recorded {
     pub name: String,
     pub filenames: Vec<String>,
 }
@@ -963,7 +974,7 @@ pub struct Recorded {
 impl Recorded {
     /// The sole clip path, for the common case of a window that stayed in one
     /// recording. Panics if the window produced several segments.
-    pub fn only(&self) -> &str {
+    pub(crate) fn only(&self) -> &str {
         assert_eq!(
             self.filenames.len(),
             1,
@@ -1031,7 +1042,7 @@ fn parse_recorded(yaml: &str) -> Option<Recorded> {
 
 /// Wait for the listener to have echoed one complete announcement (echo
 /// terminates each message with a `---` line) and parse it.
-pub fn wait_for_recorded(listener: &mut Proc, timeout: Duration) -> Recorded {
+pub(crate) fn wait_for_recorded(listener: &mut Proc, timeout: Duration) -> Recorded {
     try_wait_for_recorded(listener, timeout).unwrap_or_else(|| {
         listener.dump_log();
         panic!("no Recorded announcement within {timeout:?}");
@@ -1039,7 +1050,7 @@ pub fn wait_for_recorded(listener: &mut Proc, timeout: Duration) -> Recorded {
 }
 
 /// [`wait_for_recorded`] for tests where no announcement is a legal outcome.
-pub fn try_wait_for_recorded(listener: &mut Proc, timeout: Duration) -> Option<Recorded> {
+pub(crate) fn try_wait_for_recorded(listener: &mut Proc, timeout: Duration) -> Option<Recorded> {
     if !listener.wait_for_log("---", timeout) {
         return None;
     }
@@ -1049,7 +1060,7 @@ pub fn try_wait_for_recorded(listener: &mut Proc, timeout: Duration) -> Option<R
 /// Read a finished clip back as `(topic, log_time)` pairs. `MessageStream`
 /// insists on a complete summary/footer/magic, so this doubles as the
 /// completeness check on every announced file.
-pub fn read_clip(path: &Path) -> Vec<(String, u64)> {
+pub(crate) fn read_clip(path: &Path) -> Vec<(String, u64)> {
     let buf = std::fs::read(path)
         .unwrap_or_else(|e| panic!("reading announced clip {}: {e}", path.display()));
     mcap::MessageStream::new(&buf)
@@ -1073,7 +1084,7 @@ pub fn read_clip(path: &Path) -> Vec<(String, u64)> {
 /// discriminator is which stamp `--time-source` applied the window to. Like
 /// [`read_clip`], `MessageStream` insists on a complete summary/footer/magic, so
 /// this doubles as the completeness check on the clip.
-pub fn read_clip_stamps(path: &Path) -> Vec<(String, u64, u64)> {
+pub(crate) fn read_clip_stamps(path: &Path) -> Vec<(String, u64, u64)> {
     let buf = std::fs::read(path)
         .unwrap_or_else(|e| panic!("reading announced clip {}: {e}", path.display()));
     mcap::MessageStream::new(&buf)
@@ -1099,7 +1110,7 @@ pub fn read_clip_stamps(path: &Path) -> Vec<(String, u64, u64)> {
 /// inside its own window and is copied into the clip; `None` if it is not there
 /// (or the payload lacks the fields). Lets a window assertion tether to the
 /// Producer's real bounds instead of a hardcoded copy.
-pub fn clip_trigger_window(path: &Path) -> Option<(u64, u64)> {
+pub(crate) fn clip_trigger_window(path: &Path) -> Option<(u64, u64)> {
     let buf =
         std::fs::read(path).unwrap_or_else(|e| panic!("reading clip {}: {e}", path.display()));
     for msg in mcap::MessageStream::new(&buf).expect("clip is a complete MCAP") {
@@ -1124,7 +1135,7 @@ pub fn clip_trigger_window(path: &Path) -> Option<(u64, u64)> {
 /// filename's anchor implies. Both interfaces go through the same cut, so
 /// calling this from a `ros` test and an `mcap` test covers every clip the
 /// recorder writes.
-pub fn assert_clip_manifest(path: &Path, preroll_ns: u64, postroll_ns: u64) {
+pub(crate) fn assert_clip_manifest(path: &Path, preroll_ns: u64, postroll_ns: u64) {
     let manifest = clip::manifest::read_manifest(path)
         .unwrap_or_else(|e| panic!("reading the manifest of {}: {e}", path.display()))
         .unwrap_or_else(|| panic!("clip {} carries no manifest", path.display()));
@@ -1156,7 +1167,7 @@ pub fn assert_clip_manifest(path: &Path, preroll_ns: u64, postroll_ns: u64) {
     );
 }
 
-pub fn assert_clip_within_window(msgs: &[(String, u64)], start_ns: u64, end_ns: u64) {
+pub(crate) fn assert_clip_within_window(msgs: &[(String, u64)], start_ns: u64, end_ns: u64) {
     for (topic, log_time) in msgs {
         assert!(
             (start_ns..=end_ns).contains(log_time),
@@ -1171,7 +1182,7 @@ pub fn assert_clip_within_window(msgs: &[(String, u64)], start_ns: u64, end_ns: 
 /// so this works on a live-copied file [`read_clip`] would reject. A torn final
 /// record ends the walk. Top-level only: messages inside `Chunk` records are
 /// not seen, which suffices for the suite's unchunked fastwrite recordings.
-pub fn partial_recording_stamps(path: &Path) -> Vec<u64> {
+pub(crate) fn partial_recording_stamps(path: &Path) -> Vec<u64> {
     let buf = std::fs::read(path).expect("reading recording");
     let mut stamps = Vec::new();
     let mut off = 8usize; // past the opening magic
@@ -1196,7 +1207,7 @@ pub fn partial_recording_stamps(path: &Path) -> Vec<u64> {
 /// Walk the top-level record framing (1-byte opcode + u64le length) and
 /// return every record boundary offset, magic excluded — the same framing the
 /// tail scans, used to place deterministic damage at a known record edge.
-pub fn record_boundaries(path: &Path) -> Vec<u64> {
+pub(crate) fn record_boundaries(path: &Path) -> Vec<u64> {
     let buf = std::fs::read(path).expect("reading recording");
     let mut boundaries = Vec::new();
     let mut off = 8u64; // past the opening magic
@@ -1211,7 +1222,7 @@ pub fn record_boundaries(path: &Path) -> Vec<u64> {
 /// Truncate `path` at a mid-file record boundary and append a record header
 /// whose declared length exceeds any plausible record: a framing fault with
 /// no resync point, exactly where the scan will arrive.
-pub fn inject_framing_fault(path: &Path) {
+pub(crate) fn inject_framing_fault(path: &Path) {
     use std::io::{Seek, SeekFrom, Write};
     let boundaries = record_boundaries(path);
     assert!(
@@ -1236,7 +1247,7 @@ pub fn inject_framing_fault(path: &Path) {
 
 /// Overwrite `len` bytes at `offset` with 0xFF — localized in-place damage in
 /// a region the tail has typically already consumed, surfacing at extraction.
-pub fn overwrite_bytes(path: &Path, offset: u64, len: usize) {
+pub(crate) fn overwrite_bytes(path: &Path, offset: u64, len: usize) {
     use std::os::unix::fs::FileExt;
     let file = std::fs::OpenOptions::new()
         .write(true)

@@ -162,6 +162,11 @@ impl std::fmt::Display for ClipCompression {
     /// Render as the clap value name (`none`/`zstd`/`lz4`) so the `--help`
     /// default rendered by `default_value_t` and the accepted flag values share
     /// one source — the `ValueEnum` possible-value names.
+    #[expect(
+        clippy::expect_used,
+        reason = "`to_possible_value` is `None` only for a `#[clap(skip)]` variant, \
+                  and this enum has none — a skipped one would also break `--help`"
+    )]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.to_possible_value()
             .expect("no ClipCompression variant is skipped")
@@ -230,6 +235,11 @@ feature, and this build was made without it.";
 impl std::fmt::Display for InterfaceKind {
     /// Render as the clap value name (`ros`/`mcap`) so the `--help` default and
     /// the accepted flag values share the `ValueEnum` possible-value names.
+    #[expect(
+        clippy::expect_used,
+        reason = "`to_possible_value` is `None` only for a `#[clap(skip)]` variant, \
+                  and this enum has none — a skipped one would also break `--help`"
+    )]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.to_possible_value()
             .expect("no InterfaceKind variant is skipped")
@@ -298,6 +308,11 @@ one source is active per run.";
 impl std::fmt::Display for TriggerSource {
     /// Render as the clap value name (`param`/`mcap`) so the `--help` default
     /// and the accepted flag values share the `ValueEnum` possible-value names.
+    #[expect(
+        clippy::expect_used,
+        reason = "`to_possible_value` is `None` only for a `#[clap(skip)]` variant, \
+                  and this enum has none — a skipped one would also break `--help`"
+    )]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.to_possible_value()
             .expect("no TriggerSource variant is skipped")
@@ -840,6 +855,11 @@ fn with_config_args(cmd: clap::Command) -> clap::Command {
 /// is still reported the ordinary way. The scan stops at `--`, past which
 /// nothing is a flag, and works on bytes so a path that is not UTF-8 is found in
 /// both spellings.
+#[expect(
+    clippy::similar_names,
+    reason = "`argv` is the whole command line and `args` the cursor walking it; \
+              both names are the ones the scan is about"
+)]
 fn scan_flag(argv: &[std::ffi::OsString], flag: &str) -> Option<PathBuf> {
     use std::os::unix::ffi::OsStrExt;
 
@@ -972,6 +992,11 @@ fn effective_config(
     }
     if !layered.refusals().is_empty() {
         out.push_str("  refused\n");
+        #[expect(
+            clippy::format_push_string,
+            reason = "a startup report built once; `write!` into a String would \
+                      trade a clear line for a discarded `Result` that cannot fail"
+        )]
         for refusal in layered.refusals() {
             out.push_str(&format!("    {refusal}\n"));
         }
@@ -1007,6 +1032,11 @@ enum StartupError {
 /// first, since what they say becomes the parser's defaults; clap then resolves
 /// the flag and the environment on top of them, so a setting present in all four
 /// layers comes out of the strongest that named it.
+#[expect(
+    clippy::similar_names,
+    reason = "`argv` is the command line and `args` the parsed mode's argument \
+              definition; both names are the ones this function is about"
+)]
 fn parse_cli(argv: &[std::ffi::OsString]) -> Result<Loaded, StartupError> {
     let (system, run) = config_paths(argv);
     let layered = Layered::load(system.as_deref(), run.as_deref()).map_err(StartupError::Config)?;
@@ -1015,9 +1045,18 @@ fn parse_cli(argv: &[std::ffi::OsString]) -> Result<Loaded, StartupError> {
     // the mode's arguments rather than guess at them from the matches.
     let definition = cmd.clone();
     let matches = cmd.try_get_matches_from(argv).map_err(StartupError::Cli)?;
+    #[expect(
+        clippy::expect_used,
+        reason = "`Cli` has `subcommand_required`, so a successful parse named a \
+                  mode, and that mode is by construction one the definition carries"
+    )]
     let (mode, sub) = matches
         .subcommand()
         .expect("a parsed Cli names one of its modes");
+    #[expect(
+        clippy::expect_used,
+        reason = "as above — `mode` came out of the same command definition"
+    )]
     let args = definition
         .find_subcommand(mode)
         .expect("the parsed mode is one of the command's subcommands");
@@ -1035,6 +1074,11 @@ fn parse_cli(argv: &[std::ffi::OsString]) -> Result<Loaded, StartupError> {
     {
         // Raised against `clipper clip` so the usage line clap prints under
         // the message is the mode's own flag list, not the mode listing.
+        #[expect(
+            clippy::expect_used,
+            reason = "reached only from the `Mode::Clip` arm above, so the parse \
+                      already resolved `CLIP_MODE` against this same definition"
+        )]
         let mut clip = definition
             .find_subcommand(CLIP_MODE)
             .expect("clip is a mode of clipper")
@@ -1377,6 +1421,11 @@ fn embedded_triggers(recording: &std::path::Path) -> anyhow::Result<Vec<Anchored
 /// Nothing is printed for a caller to parse. The result is the output
 /// directory's contents when the process exits, each clip carrying its own
 /// manifest; the exit status is the verdict.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "the mode owns the config clap parsed for it; `main` hands it over and \
+              keeps nothing"
+)]
 fn clip_mode(
     cfg: ClipConfig,
     producer: Producer,
@@ -1490,6 +1539,10 @@ fn clip_mode(
             &stage_tx,
         )?;
 
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "a log line's MiB figure; the loss starts past 8 PiB in one clip"
+        )]
         for stats in &segments {
             info!(
                 "clip {} written: {} msgs from {} extents, {:.1} MiB",
@@ -1634,6 +1687,12 @@ fn validate_name(name: &str) -> Result<(), &'static str> {
 /// that cuts the clip and announces through the interface's announcer; per-trigger
 /// errors are isolated (logged, the permit returned on drop). The ROS interface
 /// owns its own node spin internally, so supervision is uniform in either mode.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "`drive` owns the recorder's shared handles for the process's lifetime \
+              and moves its own clones of them into the `'static` interface \
+              callback; borrowing would push that lifetime back onto `main`"
+)]
 fn drive<I: Interface>(
     iface: I,
     cfg: Arc<Config>,
@@ -1764,6 +1823,11 @@ fn drive<I: Interface>(
 /// degrades every clip to a grace-timeout cut); the **interface** thread drains
 /// the trigger source and, for the ROS interface, owns the node spin (a dead
 /// interface silently stops acting on triggers).
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "supervision owns the signal receiver: dropping it here is what \
+              releases the handler's channel when the process winds down"
+)]
 fn supervise(
     tail: Supervised<anyhow::Result<()>>,
     interface: Supervised<anyhow::Result<()>>,
@@ -1802,6 +1866,18 @@ fn supervise(
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::cast_possible_truncation,
+        clippy::format_push_string,
+        clippy::case_sensitive_file_extension_comparisons,
+        reason = "a failed unwrap, a panicking index or a truncated stamp is a \
+                  failing test, and a fixture that writes `.mcap` in one case reads \
+                  it back in the same one"
+    )]
+
     use std::path::Path;
 
     use super::*;
@@ -3852,7 +3928,7 @@ mod tests {
         let held = (depth == 0).then(|| {
             ENV_LOCK
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
         });
         ENV_DEPTH.with(|d| d.set(depth + 1));
         EnvGuard { _held: held }
@@ -3872,9 +3948,16 @@ mod tests {
     impl EnvVar {
         fn set(name: &'static str, value: &str) -> Self {
             let guard = env_lock();
+            #[expect(
+                unsafe_code,
+                reason = "`set_var` is unsafe since edition 2024; the type's own \
+                          note above states the lock discipline that makes it sound"
+            )]
             // SAFETY: see the type's note — the lock keeps every other reader
             // out for as long as this is set, and it is removed on drop.
-            unsafe { std::env::set_var(name, value) };
+            unsafe {
+                std::env::set_var(name, value);
+            };
             EnvVar {
                 name,
                 _guard: guard,
@@ -3884,8 +3967,14 @@ mod tests {
 
     impl Drop for EnvVar {
         fn drop(&mut self) {
+            #[expect(
+                unsafe_code,
+                reason = "as above — the guard still holds the env lock here"
+            )]
             // SAFETY: as above.
-            unsafe { std::env::remove_var(self.name) };
+            unsafe {
+                std::env::remove_var(self.name);
+            };
         }
     }
 

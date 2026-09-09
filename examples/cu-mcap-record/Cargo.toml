@@ -29,3 +29,7 @@ serde_json.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 signal-hook.workspace = true
+
+# The workspace lint policy (root `Cargo.toml`), inherited whole.
+[lints]
+workspace = true

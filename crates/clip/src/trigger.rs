@@ -58,8 +58,14 @@ impl Stamp {
     /// `use_sim_time`); negative seconds clamp to 0. The same arithmetic the
     /// ROS path applies to a `builtin_interfaces/Time`, so a CDR-decoded trigger
     /// and a live ROS trigger anchor their windows identically.
+    #[must_use]
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "`.max(0)` is the documented pre-epoch clamp, so the value cast is \
+                  never negative"
+    )]
     pub fn ns(&self) -> u64 {
-        (self.sec.max(0) as u64) * 1_000_000_000 + self.nanosec as u64
+        (self.sec.max(0) as u64) * 1_000_000_000 + u64::from(self.nanosec)
     }
 
     /// The stamp naming `ns` nanoseconds since the epoch — what a trigger source
@@ -71,6 +77,7 @@ impl Stamp {
     /// saturates at the largest stamp there is rather than wrapping into the
     /// past — a window is anchored on the nanosecond count itself, never on the
     /// round trip through here.
+    #[must_use]
     pub fn from_ns(ns: u64) -> Self {
         let nanosec = (ns % 1_000_000_000) as u32;
         match i32::try_from(ns / 1_000_000_000) {
@@ -89,11 +96,15 @@ impl Stamp {
 /// (`tail`) compare against recorded times without conversion. Saturates at
 /// `u64::MAX` and reports 0 for a pre-epoch clock, so neither can wrap into a
 /// small value that would silently misplace a window.
+#[must_use]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the `min` below is the documented saturation at u64::MAX"
+)]
 pub fn now_ns() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos().min(u64::MAX as u128) as u64)
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_nanos().min(u128::from(u64::MAX)) as u64)
 }
 
 /// A decoded trigger: the clip-window request the handler acts on, independent
@@ -174,6 +185,13 @@ impl From<&Completion> for r2r::momentedge_msgs::msg::Recorded {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        reason = "a failed unwrap or a panicking index is a failing test"
+    )]
+
     use super::*;
 
     #[test]

@@ -108,6 +108,7 @@ impl ChannelSelection {
     /// own exclusions, so an operator can name a wide include and carve one
     /// topic back out of it. The two fixed rules are tested first: they are not
     /// exclusions an include can outrank.
+    #[must_use]
     pub fn selects(&self, topic: &str) -> bool {
         if topic == ANNOUNCE_TOPIC {
             return false;
@@ -138,6 +139,7 @@ impl ChannelSelection {
     ///
     /// The cut path logs what it dropped; a run that configured nothing has
     /// nothing to say about it.
+    #[must_use]
     pub fn is_narrowing(&self) -> bool {
         !self.all
             || self.exclude_trigger_topic
@@ -151,7 +153,8 @@ mod tests {
     #![allow(
         clippy::unwrap_used,
         clippy::expect_used,
-        reason = "a failed unwrap is a failing test"
+        clippy::indexing_slicing,
+        reason = "a failed unwrap or a panicking index is a failing test"
     )]
 
     use super::*;

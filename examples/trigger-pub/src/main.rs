@@ -67,6 +67,11 @@ impl Default for Args {
     }
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "an example's argv parsing: a bad flag ends the run before anything \
+              is published, which is the whole contract this parser has"
+)]
 fn parse_args() -> Args {
     let mut args = Args::default();
     let mut it = std::env::args().skip(1);
@@ -74,7 +79,7 @@ fn parse_args() -> Args {
         let mut value = || it.next().expect("flag needs a value");
         match flag.as_str() {
             "--period" => {
-                args.period = Duration::from_secs_f64(value().parse().expect("--period: number"))
+                args.period = Duration::from_secs_f64(value().parse().expect("--period: number"));
             }
             "--preroll" => args.preroll = Some(value().parse().expect("--preroll: u64 ns")),
             "--postroll" => args.postroll = Some(value().parse().expect("--postroll: u64 ns")),

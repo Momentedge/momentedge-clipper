@@ -30,6 +30,10 @@ impl<T: Clone> Watch<T> {
     /// The current value, by clone. Production readers wait on a predicate
     /// via [`Self::wait_timeout_for`]; a test observes state through this.
     #[cfg(any(test, feature = "test-support"))]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "a poisoned watch lock means a writer panicked mid-update, so the shared value is torn; propagating is the policy"
+    )]
     pub fn get(&self) -> T {
         self.value.lock().unwrap().clone()
     }
@@ -38,6 +42,10 @@ impl<T: Clone> Watch<T> {
     /// [`Self::send_if_modified`]; this unconditional setter serves a test that
     /// drives waiters directly.
     #[cfg(any(test, feature = "test-support"))]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "a poisoned watch lock means a writer panicked mid-update, so the shared value is torn; propagating is the policy"
+    )]
     pub fn send_replace(&self, value: T) {
         *self.value.lock().unwrap() = value;
         self.changed.notify_all();
@@ -46,6 +54,10 @@ impl<T: Clone> Watch<T> {
     /// Mutate the value in place. `modify` returns whether it changed the
     /// value; waiters are woken only then.
     pub fn send_if_modified(&self, modify: impl FnOnce(&mut T) -> bool) {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "a poisoned watch lock means a writer panicked mid-update, so the shared value is torn; propagating is the policy"
+        )]
         let mut value = self.value.lock().unwrap();
         if modify(&mut value) {
             self.changed.notify_all();
@@ -56,7 +68,15 @@ impl<T: Clone> Watch<T> {
     /// whether the predicate was satisfied (`false` = timed out). A predicate
     /// that already holds returns immediately.
     pub fn wait_timeout_for(&self, timeout: Duration, mut pred: impl FnMut(&T) -> bool) -> bool {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "a poisoned watch lock means a writer panicked mid-update, so the shared value is torn; propagating is the policy"
+        )]
         let guard = self.value.lock().unwrap();
+        #[expect(
+            clippy::unwrap_used,
+            reason = "a poisoned watch lock means a writer panicked mid-update, so the shared value is torn; propagating is the policy, and `wait_timeout_while` only errors on that same poison"
+        )]
         let (_guard, res) = self
             .changed
             .wait_timeout_while(guard, timeout, |v| !pred(v))
@@ -67,6 +87,13 @@ impl<T: Clone> Watch<T> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        reason = "a failed unwrap or a panicking index is a failing test"
+    )]
+
     use std::sync::Arc;
     use std::time::Instant;
 

@@ -118,7 +118,15 @@ impl Iterator for NewFileWatchIterator {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        reason = "a failed unwrap or a panicking index is a failing test"
+    )]
+
     use std::fs::File;
+    use std::io::Write;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use anyhow::Result;
@@ -253,7 +261,6 @@ mod tests {
         // Append to `a`, bumping its mtime well past when it was yielded.
         for _ in 0..3 {
             std::thread::sleep(Duration::from_millis(10));
-            use std::io::Write;
             let mut f = File::options().append(true).open(&a)?;
             f.write_all(b"more bytes")?;
             f.sync_all()?;

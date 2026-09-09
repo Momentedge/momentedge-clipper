@@ -177,6 +177,15 @@ impl Announce for RosAnnouncer {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::cast_possible_truncation,
+        reason = "a failed unwrap, a panicking index or a truncated fixture stamp \
+                  is a failing test"
+    )]
+
     use clip::trigger::Stamp;
 
     use super::*;

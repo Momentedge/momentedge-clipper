@@ -139,7 +139,7 @@ impl Interface for McapInterface {
     where
         F: Fn(Trigger, Anchor) + Send + 'static,
     {
-        for raw in self.triggers.iter() {
+        for raw in &self.triggers {
             match decode_trigger(&raw.message_encoding, &raw.body) {
                 Ok(trigger) => {
                     // The window anchors on the trigger record's own stamp — its
@@ -181,6 +181,13 @@ impl Announce for NullAnnouncer {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        reason = "a failed unwrap or a panicking index is a failing test"
+    )]
+
     use std::sync::{Arc, Mutex};
 
     use crossbeam_channel::unbounded;

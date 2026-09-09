@@ -14,6 +14,16 @@
 //! the `test-support` feature. See that feature's note in `Cargo.toml`: it is a
 //! dev-only opt-in, and a release build of a consumer compiles none of this.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::indexing_slicing,
+    clippy::format_push_string,
+    reason = "this module is fixture code — compiled only under `cfg(test)` or the \
+              `test-support` feature — where a panicking index or a truncated \
+              length is a failing test, and a `format!` per line of hand-built \
+              YAML reads better than the `write!` the lint asks for"
+)]
+
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::BufWriter;
@@ -45,6 +55,7 @@ pub const TEST_PRODUCER: Producer = Producer {
 /// anchor sits at the window end, with the whole width as preroll. Tests about
 /// the *trigger* build their own; this serves the many that only need some
 /// window.
+#[must_use]
 pub fn window_request(start_ns: u64, end_ns: u64, source: TimeSource) -> CutRequest {
     CutRequest::new(
         TEST_PRODUCER,
@@ -63,6 +74,7 @@ pub fn window_request(start_ns: u64, end_ns: u64, source: TimeSource) -> CutRequ
 /// The [`Planned`] facts of a window one recording covered end to end — what a
 /// test staging a single segment out of a finished fixture recording is looking
 /// at. Tests about the empty and short cases state their own.
+#[must_use]
 pub fn planned_one_file() -> Planned {
     Planned {
         files: 1,
@@ -111,14 +123,13 @@ pub fn write_recording_opts(
     let mut writer = opts.create(BufWriter::new(File::create(path)?))?;
     let mut ids: HashMap<&str, u16> = HashMap::new();
     for (seq, (topic, log_time)) in stamps.iter().enumerate() {
-        let id = match ids.get(topic) {
-            Some(id) => *id,
-            None => {
-                let schema = writer.add_schema("std_msgs/msg/String", "ros2msg", b"string data")?;
-                let id = writer.add_channel(schema, topic, "cdr", &BTreeMap::new())?;
-                ids.insert(topic, id);
-                id
-            }
+        let id = if let Some(id) = ids.get(topic) {
+            *id
+        } else {
+            let schema = writer.add_schema("std_msgs/msg/String", "ros2msg", b"string data")?;
+            let id = writer.add_channel(schema, topic, "cdr", &BTreeMap::new())?;
+            ids.insert(topic, id);
+            id
         };
         writer.write_to_known_channel(
             &mcap::records::MessageHeader {
@@ -180,7 +191,7 @@ pub fn write_recording_with_triggers(
     let mut ids: HashMap<String, u16> = HashMap::new();
     let mut sequence: u32 = 0;
     for group in chunks {
-        for msg in group.iter() {
+        for msg in *group {
             let (topic, encoding, log_time, payload) = match msg {
                 FixtureMsg::Data { topic, log_time } => {
                     ((*topic).to_string(), "cdr", *log_time, b"payload".to_vec())
@@ -192,15 +203,13 @@ pub fn write_recording_with_triggers(
                     trigger_json(trigger),
                 ),
             };
-            let id = match ids.get(&topic) {
-                Some(id) => *id,
-                None => {
-                    let schema =
-                        writer.add_schema("std_msgs/msg/String", "ros2msg", b"string data")?;
-                    let id = writer.add_channel(schema, &topic, encoding, &BTreeMap::new())?;
-                    ids.insert(topic, id);
-                    id
-                }
+            let id = if let Some(id) = ids.get(&topic) {
+                *id
+            } else {
+                let schema = writer.add_schema("std_msgs/msg/String", "ros2msg", b"string data")?;
+                let id = writer.add_channel(schema, &topic, encoding, &BTreeMap::new())?;
+                ids.insert(topic, id);
+                id
             };
             writer.write_to_known_channel(
                 &mcap::records::MessageHeader {
@@ -273,6 +282,7 @@ fn trigger_json(trigger: &Trigger) -> Vec<u8> {
 /// durations, the per-file starting times, the QoS profiles offered per topic —
 /// are written on purpose: the reader has to walk past them, and a fixture
 /// carrying only the two fields it wants would never show that it does.
+#[must_use]
 pub fn bag_metadata(files: &[&str], topic_counts: &[(&str, u64)]) -> String {
     let mut yaml = String::from(
         "rosbag2_bagfile_information:\n  \
@@ -354,6 +364,7 @@ pub fn index_file(path: &Path) -> Result<(RecordingIndex, Arc<File>)> {
 /// most tests drive, `Some((topic, tx))` for the trigger-tap ones. Public for
 /// the tests that call [`scan_available`] a pass at a time rather than through
 /// [`scan_passes`].
+#[must_use]
 pub fn seed_with(index: &RecordingIndex, tap: Option<(&str, &Sender<TriggerRecord>)>) -> ScanSeed {
     ScanSeed {
         open: index.open,
@@ -402,6 +413,7 @@ pub fn plan_one(index: &RecordingIndex, start_ns: u64, end_ns: u64) -> WindowPla
 }
 
 /// A length-prefixed top-level record as the writer lays it down.
+#[must_use]
 pub fn raw_record(opcode: u8, body: &[u8]) -> Vec<u8> {
     let mut rec = vec![opcode];
     rec.extend_from_slice(&(body.len() as u64).to_le_bytes());
@@ -412,12 +424,14 @@ pub fn raw_record(opcode: u8, body: &[u8]) -> Vec<u8> {
 /// A conformant `Message` record body (22 fixed bytes + payload) whose
 /// `publish_time` equals its `log_time` — the common case for tests that do
 /// not exercise the log/publish split.
+#[must_use]
 pub fn message_body(channel_id: u16, sequence: u32, log_time: u64, payload: &[u8]) -> Vec<u8> {
     message_body_pub(channel_id, sequence, log_time, log_time, payload)
 }
 
 /// A conformant `Message` record body with an independent `publish_time`,
 /// for tests asserting the tail carries both stamps.
+#[must_use]
 pub fn message_body_pub(
     channel_id: u16,
     sequence: u32,
@@ -435,6 +449,7 @@ pub fn message_body_pub(
 }
 
 /// A `Channel` record body (id, schema_id, topic, encoding, empty metadata).
+#[must_use]
 pub fn channel_body(id: u16, schema_id: u16, topic: &str, encoding: &str) -> Vec<u8> {
     let mut body = Vec::new();
     body.extend_from_slice(&id.to_le_bytes());
@@ -451,6 +466,7 @@ pub fn channel_body(id: u16, schema_id: u16, topic: &str, encoding: &str) -> Vec
 /// byte-length-prefixed run of length-prefixed strings) — the record shape a
 /// `ros2 bag record` MCAP carries its own `rosbag2` metadata in, and the one a
 /// clip's manifest is written as.
+#[must_use]
 pub fn metadata_body(name: &str, entries: &[(&str, &str)]) -> Vec<u8> {
     fn put_str(out: &mut Vec<u8>, s: &str) {
         out.extend_from_slice(&(s.len() as u32).to_le_bytes());
@@ -469,6 +485,7 @@ pub fn metadata_body(name: &str, entries: &[(&str, &str)]) -> Vec<u8> {
 }
 
 /// A `Schema` record body (id, name, encoding, length-prefixed data).
+#[must_use]
 pub fn schema_body(id: u16, name: &str, encoding: &str, data: &[u8]) -> Vec<u8> {
     let mut body = Vec::new();
     body.extend_from_slice(&id.to_le_bytes());
@@ -488,6 +505,7 @@ pub fn schema_body(id: u16, name: &str, encoding: &str, data: &[u8]) -> Vec<u8> 
 /// so a deliberately wrong CRC lets a test absorb the messages and then
 /// fail. `compression` is the chunk's algorithm string (empty for none);
 /// an unknown string fails `ChunkReader` construction outright.
+#[must_use]
 pub fn chunk_body(compression: &str, uncompressed_crc: u32, records: &[Vec<u8>]) -> Vec<u8> {
     let interior: Vec<u8> = records.concat();
     let mut body = Vec::new();

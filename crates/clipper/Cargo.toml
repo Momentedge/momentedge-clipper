@@ -128,3 +128,7 @@ depends = "ros-humble-ros-base, ros-humble-rmw-fastrtps-cpp, ros-humble-momented
 [package.metadata.deb.variants.jazzy]
 name = "momentedge-clipper"
 depends = "ros-jazzy-ros-base, ros-jazzy-rmw-fastrtps-cpp, ros-jazzy-momentedge-msgs"
+
+# The workspace lint policy (root `Cargo.toml`), inherited whole.
+[lints]
+workspace = true

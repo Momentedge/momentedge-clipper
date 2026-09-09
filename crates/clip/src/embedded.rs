@@ -150,6 +150,13 @@ pub fn read_triggers(path: &Path, topic: &str) -> Result<Vec<TriggerRecord>> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        reason = "a failed unwrap or a panicking index is a failing test"
+    )]
+
     use super::*;
     use crate::decode::decode_trigger;
     use crate::testing::{FixtureMsg, clobber_chunks, test_dir, write_recording_with_triggers};
