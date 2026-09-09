@@ -165,6 +165,25 @@ pub enum IndexRefusal {
         path.display()
     )]
     Unindexed { path: PathBuf, chunks: usize },
+    /// A chunk index addressing bytes the file does not have, or declaring a
+    /// record longer than [`crate::index::MAX_RECORD_LEN`].
+    ///
+    /// The length is a number the *recording* states, so it is bounded before
+    /// the cut allocates a buffer from it: an unbounded one turns a corrupt
+    /// summary into an allocation failure, which aborts the process instead of
+    /// refusing the file.
+    #[error(
+        "{}'s summary indexes a chunk at offset {offset} of {len} bytes, which \
+         the {file_len}-byte recording cannot hold: its summary does not \
+         describe its own bytes. {REPAIR}",
+        path.display()
+    )]
+    ChunkOutOfRange {
+        path: PathBuf,
+        offset: u64,
+        len: u64,
+        file_len: u64,
+    },
 }
 
 /// Everything [`WholeFileIndex::open`] can fail with: the bag directory could
@@ -468,7 +487,7 @@ fn index_split(path: &Path) -> Result<(RecordingIndex, Option<BTreeMap<String, u
         }
         .into());
     };
-    refuse_unplannable(path, &summary)?;
+    refuse_unplannable(path, &summary, end_of_scan)?;
 
     let counts = topic_counts(&summary);
     let mut index = RecordingIndex::new(path.to_path_buf(), Arc::new(file));
@@ -557,7 +576,11 @@ pub(crate) fn read_summary(
 /// the record being optional — does an absent chunk index mean an unchunked
 /// writer, and only then does an indexed chunk that indexes no message mean a
 /// writer with message indexing turned off.
-fn refuse_unplannable(path: &Path, summary: &mcap::Summary) -> Result<(), IndexRefusal> {
+fn refuse_unplannable(
+    path: &Path,
+    summary: &mcap::Summary,
+    file_len: u64,
+) -> Result<(), IndexRefusal> {
     if summary
         .stats
         .as_ref()
@@ -584,6 +607,25 @@ fn refuse_unplannable(path: &Path, summary: &mcap::Summary) -> Result<(), IndexR
             path: path.to_path_buf(),
             chunks: summary.chunk_indexes.len(),
         });
+    }
+    // Every extent's length reaches `vec![0u8; len]` in the cut, and both it
+    // and the offset are numbers the recording states about itself. The scan
+    // path bounds the same length as it walks (`index::MAX_RECORD_LEN`); this
+    // is where the summary-built path bounds it, before anything allocates.
+    for chunk in &summary.chunk_indexes {
+        let out_of_range = chunk.chunk_length > crate::index::MAX_RECORD_LEN
+            || chunk
+                .chunk_start_offset
+                .checked_add(chunk.chunk_length)
+                .is_none_or(|end| end > file_len);
+        if out_of_range {
+            return Err(IndexRefusal::ChunkOutOfRange {
+                path: path.to_path_buf(),
+                offset: chunk.chunk_start_offset,
+                len: chunk.chunk_length,
+                file_len,
+            });
+        }
     }
     Ok(())
 }
@@ -1321,6 +1363,12 @@ mod tests {
                 path: at(),
                 chunks: 4,
             },
+            IndexRefusal::ChunkOutOfRange {
+                path: at(),
+                offset: 41,
+                len: 1 << 40,
+                file_len: 4_096,
+            },
         ]
         .into_iter()
         .map(|refusal| {
@@ -1331,6 +1379,7 @@ mod tests {
                 IndexRefusal::Empty { .. } => "holds no message",
                 IndexRefusal::Unchunked { .. } => "indexes no chunk",
                 IndexRefusal::Unindexed { .. } => "carries a message index",
+                IndexRefusal::ChunkOutOfRange { .. } => "cannot hold",
             };
             (refusal, phrase)
         })
@@ -1613,6 +1662,70 @@ mod tests {
         }
     }
 
+    /// A chunk index the file cannot back is refused rather than allocated
+    /// from.
+    ///
+    /// `chunk_length` is a number the recording states about itself and the cut
+    /// allocates a buffer of exactly that size, so an unbounded one turns a
+    /// corrupt summary into an allocation failure — which aborts the process,
+    /// and an abort is not a refusal anyone can act on. Both halves of the
+    /// bound are checked: a length past `MAX_RECORD_LEN`, and one that fits the
+    /// bound but not the file.
+    #[test]
+    fn a_chunk_index_the_file_cannot_back_is_refused() {
+        let path = Path::new("/data/rec.mcap");
+        let indexed = |offset: u64, len: u64| mcap::records::ChunkIndex {
+            chunk_start_offset: offset,
+            chunk_length: len,
+            ..chunk_index(47)
+        };
+
+        let huge = mcap::Summary {
+            chunk_indexes: vec![indexed(41, crate::index::MAX_RECORD_LEN + 1)],
+            ..mcap::Summary::default()
+        };
+        assert!(
+            matches!(
+                refuse_unplannable(path, &huge, u64::MAX),
+                Err(IndexRefusal::ChunkOutOfRange { .. })
+            ),
+            "a chunk longer than MAX_RECORD_LEN is refused even in a huge file"
+        );
+
+        let past_the_end = mcap::Summary {
+            chunk_indexes: vec![indexed(41, 170)],
+            ..mcap::Summary::default()
+        };
+        assert!(
+            matches!(
+                refuse_unplannable(path, &past_the_end, 200),
+                Err(IndexRefusal::ChunkOutOfRange {
+                    offset: 41,
+                    len: 170,
+                    file_len: 200,
+                    ..
+                })
+            ),
+            "a chunk running past the end of the file is refused"
+        );
+        assert!(
+            refuse_unplannable(path, &past_the_end, 211).is_ok(),
+            "the same chunk in a file that holds it is plannable"
+        );
+
+        let overflowing = mcap::Summary {
+            chunk_indexes: vec![indexed(u64::MAX, 1)],
+            ..mcap::Summary::default()
+        };
+        assert!(
+            matches!(
+                refuse_unplannable(path, &overflowing, u64::MAX),
+                Err(IndexRefusal::ChunkOutOfRange { .. })
+            ),
+            "an offset+length that overflows is refused, not wrapped"
+        );
+    }
+
     /// A recording where one chunk indexes no message is not a recording whose
     /// writer had message indexing disabled.
     ///
@@ -1628,7 +1741,7 @@ mod tests {
             ..mcap::Summary::default()
         };
         assert!(
-            refuse_unplannable(path, &mixed).is_ok(),
+            refuse_unplannable(path, &mixed, 4_096).is_ok(),
             "one unindexed chunk beside an indexed one is plannable"
         );
 
@@ -1638,7 +1751,7 @@ mod tests {
         };
         assert!(
             matches!(
-                refuse_unplannable(path, &none),
+                refuse_unplannable(path, &none, 4_096),
                 Err(IndexRefusal::Unindexed { chunks: 2, .. })
             ),
             "a summary where no chunk indexes a message is refused"

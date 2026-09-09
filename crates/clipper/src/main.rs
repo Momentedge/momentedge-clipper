@@ -471,8 +471,10 @@ struct Config {
     /// `zstd` (the default) writes the smallest clips; `lz4` trades size for
     /// lower CPU; `none` skips recompression entirely. The codec is set
     /// explicitly on the clip writer rather than inherited from the mcap crate
-    /// default. Only the codec is configurable here — chunk size and chunking
-    /// stay at the mcap default.
+    /// default. Only the codec is configurable here: chunking stays on, and the
+    /// chunk size is the one the cut path names
+    /// (`clip::cut::CLIP_CHUNK_SIZE`), also set explicitly rather than
+    /// inherited.
     #[arg(long, value_enum, default_value_t = ClipCompression::Zstd)]
     clip_compression: ClipCompression,
 
@@ -1380,6 +1382,15 @@ fn clip_mode(
     producer: Producer,
     selection: clip::ChannelSelection,
 ) -> anyhow::Result<()> {
+    // Index the recording — every split of it, for a bag directory — before
+    // anything else touches it, including before its own triggers are read: a
+    // recording clipper cannot index is refused by name
+    // (`clip::whole::IndexRefusal`) from the footer and summary alone, so the
+    // refusal is the same whichever source the run's triggers come from and no
+    // chunk is decompressed to reach it. Reading triggers first would let an
+    // `mcap` run walk an input the contract refuses.
+    let index = clip::whole::WholeFileIndex::open(&cfg.recording)?;
+
     let triggers = clip_triggers(&cfg)?;
 
     // A trigger name reaches the filesystem through the clip's pathname, so it
@@ -1414,12 +1425,6 @@ fn clip_mode(
         );
         return Ok(());
     }
-
-    // Index the recording — every split of it, for a bag directory — before
-    // anything is created: a recording clipper cannot index is refused by name
-    // (`clip::whole::IndexRefusal`), and a refusal writes nothing anywhere —
-    // not the output directory, not the staging directory inside it.
-    let index = clip::whole::WholeFileIndex::open(&cfg.recording)?;
 
     // Start from a clean capturing dir, which also creates out_dir: a clip is
     // assembled there and hard-linked into place, so the output directory only
@@ -2477,6 +2482,53 @@ mod tests {
         assert!(
             printed.contains("indexes no chunk") && printed.contains("mcap recover"),
             "the refusal survives the boxing `main` does: {printed}"
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// The input contract guards `mcap` runs too: a recording clipper cannot
+    /// index is refused by name before its own triggers are read.
+    ///
+    /// Reading the triggers first would walk an input the contract refuses —
+    /// and, because a recording with no readable trigger cuts nothing and exits
+    /// zero, would answer an unindexable recording with silence instead of the
+    /// fault and its repair. The unchunked fixture is the sharp case: it is a
+    /// perfectly valid MCAP carrying no chunk index, so a trigger read over it
+    /// succeeds and finds nothing, while the contract refuses it outright.
+    #[test]
+    fn clip_mode_refuses_an_unindexable_recording_under_the_mcap_source() -> anyhow::Result<()> {
+        let root = clip::testing::test_dir("clip-unindexable-mcap")?;
+        let rec = root.join("rec.mcap");
+        clip::testing::write_recording(&rec, false, &[("/t", 1_000), ("/t", 2_000)])?;
+        let out_dir = root.join("clipped");
+
+        let err = clip_mode(
+            ClipConfig {
+                trigger_source: TriggerSource::Mcap,
+                trigger_time: None,
+                preroll: None,
+                postroll: None,
+                ..param_clip_cfg(&rec, &out_dir)
+            },
+            CLIP_PRODUCER,
+            clip::ChannelSelection::default(),
+        )
+        .unwrap_err();
+
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("indexes no chunk") && text.contains("mcap recover"),
+            "an `mcap` run gets the same refusal a `param` run gets: {text}"
+        );
+        assert!(
+            err.downcast_ref::<clip::OpenError>().is_some(),
+            "the refusal keeps its type all the way out: {text}"
+        );
+        assert!(
+            !out_dir.exists(),
+            "a refusal writes nothing, not even the staging directory"
         );
 
         std::fs::remove_dir_all(root)?;
@@ -3740,12 +3792,6 @@ mod tests {
         (value.trim().to_string(), origin.trim().to_string())
     }
 
-    /// A `MOMENTEDGE_*` variable set for one test and removed again.
-    ///
-    /// The environment is process-wide, so the variable is chosen to be one no
-    /// other test in this binary can read: every test that parses a `clipper
-    /// clip` command line passes `--trigger-description` explicitly, and a flag
-    /// outranks the environment.
     /// Serialises a test that sets a `MOMENTEDGE_*` variable against every test
     /// that parses a command line.
     ///
@@ -3792,6 +3838,12 @@ mod tests {
         EnvGuard { _held: held }
     }
 
+    /// A `MOMENTEDGE_*` variable set for one test and removed again.
+    ///
+    /// The guard holds [`ENV_LOCK`] for as long as the variable is set, so no
+    /// parse runs beside it and reads a value its own argv never named. The
+    /// variable is removed before the lock is released: `EnvVar`'s own `Drop`
+    /// runs before its fields do, and `_guard` releases the lock only then.
     struct EnvVar {
         name: &'static str,
         _guard: EnvGuard,
