@@ -510,6 +510,7 @@ dependencies = [
  "clap",
  "cu-bincode",
  "cu29",
+ "cu29-build",
  "mcap",
  "serde",
  "serde_json",

@@ -25,10 +25,10 @@ members = [
     # `disable_seeking(true)`): the second compliant producer path.
     "examples/chunked-mcap-writer",
     # Copper (cu29) CuSinkTask producer example — appends a tailable MCAP
-    # Recording clipper cuts clips from, ROS-free. Its copper deps (cu29 and the
-    # cu-bincode fork) stay declared in the crate's own Cargo.toml by decision —
-    # do NOT hoist them into [workspace.dependencies]; keeping them crate-local
-    # keeps the cu29 tree scoped to this one member.
+    # Recording clipper cuts clips from, ROS-free. Every copper dependency it
+    # takes stays declared in the crate's own Cargo.toml by decision — do NOT
+    # hoist one into [workspace.dependencies]; keeping them crate-local keeps
+    # the cu29 tree scoped to this one member.
     "examples/cu-mcap-record",
 ]
 
