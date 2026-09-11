@@ -294,12 +294,15 @@ Each test runs in its own `ROS_DOMAIN_ID` (band 80–101) with its own temp dirs
 so a recorder already on domain 0 is unaffected. Expect a few minutes of wall
 clock (the tests sleep out real trigger windows). Run across the working distros
 with a per-distro target dir (the r2r artifacts link that distro's `rcl`/`rmw`
-and must not collide):
+and must not collide), from the repo root and spelled absolute — nextest runs
+each test with its cwd at `crates/clipper/`, so a relative `CARGO_TARGET_DIR`
+names one directory to the build and a different one to every process the tests
+spawn:
 
 ```bash
 for d in humble jazzy lyrical; do
   nix develop ".#$d" --command bash -c \
-    "CARGO_TARGET_DIR=target/e2e-$d CLIPPER_E2E=1 \
+    "CARGO_TARGET_DIR=$PWD/target/e2e-$d CLIPPER_E2E=1 \
      cargo nextest run -p clipper --features ros --profile e2e -E 'binary(e2e)'"
 done
 ```

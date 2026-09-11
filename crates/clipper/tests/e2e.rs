@@ -474,13 +474,13 @@ fn live_writer_capture_time_windowing(#[case] time_source: &str) {
 /// drives the plain-Rust `custom-mcap-writer`): it proves a copper-rs robot with
 /// no ROS surface reaches clipper through the Recording alone.
 ///
-/// The binary is provisioned by [`cu_mcap_record_bin`] (its own excluded
-/// lockfile/target, prebuilt in CI). Anchored on the Trigger record's own
-/// `log_time` (default `--time-source`), the window closes ~3 s after the app
-/// starts, which the app's continuous ~50 Hz `/sensor` stream covers naturally,
-/// well inside the wait; grace is only a backstop. Assertions stay robust to
-/// scheduling — a parseable clip, in-window stamps, `/sensor` present, non-empty
-/// — with no exact counts or tight latency bounds.
+/// The binary is provisioned by [`cu_mcap_record_bin`] (a workspace member built
+/// beside the recorder under test, prebuilt in CI). Anchored on the Trigger
+/// record's own `log_time` (default `--time-source`), the window closes ~3 s
+/// after the app starts, which the app's continuous ~50 Hz `/sensor` stream
+/// covers naturally, well inside the wait; grace is only a backstop.
+/// Assertions stay robust to scheduling — a parseable clip, in-window stamps,
+/// `/sensor` present, non-empty — with no exact counts or tight latency bounds.
 #[rstest]
 fn copper_sink_recording_produces_clip() {
     if !require_e2e() {

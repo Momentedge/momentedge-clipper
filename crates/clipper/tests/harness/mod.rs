@@ -95,15 +95,33 @@ pub(crate) fn now_ns() -> u64 {
         .as_nanos() as u64
 }
 
+/// The cargo target directory the binaries under test live in: the parent of
+/// the `debug/`/`release/` directory `CARGO_BIN_EXE_clipper` sits in, and so an
+/// absolute path fixed when the test binary was compiled.
+///
+/// Every on-demand build below pins its output there with `--target-dir`, which
+/// is load-bearing rather than decorative. nextest runs a test with its cwd at
+/// the *package* root (`crates/clipper/`), not the workspace root, so a child
+/// cargo inheriting a relative `CARGO_TARGET_DIR` resolves it afresh against
+/// that cwd and writes the example into `crates/clipper/<that path>/` — a
+/// successful build the harness then cannot find. Passing the directory
+/// explicitly overrides the inherited variable and leaves the example nowhere
+/// but beside the recorder it has to run against.
+fn target_dir(bin_dir: &Path) -> &Path {
+    bin_dir
+        .parent()
+        .expect("the profile directory sits inside the cargo target directory")
+}
+
 /// Absolute path to the built `custom-mcap-writer` example binary (the
 /// momentedge writer the live capture-time e2e drives). Every workspace binary
 /// lands in the same `target/<profile>/` directory as the recorder under test,
 /// so it is resolved beside `CARGO_BIN_EXE_clipper` rather than through
 /// a `CARGO_BIN_EXE_*` cargo sets only for the crate under test. If it is not
 /// there — the e2e run builds only `-p clipper`, not the example — it is built
-/// on demand into that same directory. The example carries no r2r/ROS
-/// dependency, so the build is a quick final link over the workspace's
-/// already-compiled crates.
+/// on demand into that same directory (see [`target_dir`]). The example carries
+/// no r2r/ROS dependency, so the build is a quick final link over the
+/// workspace's already-compiled crates.
 pub(crate) fn writer_bin() -> PathBuf {
     let bin_dir = Path::new(env!("CARGO_BIN_EXE_clipper"))
         .parent()
@@ -120,7 +138,9 @@ pub(crate) fn writer_bin() -> PathBuf {
     build
         .args(["build", "-p", "custom-mcap-writer"])
         .arg("--manifest-path")
-        .arg(&manifest);
+        .arg(&manifest)
+        .arg("--target-dir")
+        .arg(target_dir(bin_dir));
     // Match the profile the test itself was built under, read off the binary
     // dir name, so a `--release` e2e run finds the writer beside clipper.
     if bin_dir.file_name().is_some_and(|n| n == "release") {
@@ -146,11 +166,12 @@ pub(crate) fn writer_bin() -> PathBuf {
 /// lands in the same `target/<profile>/` directory as the recorder under test,
 /// so it is resolved beside `CARGO_BIN_EXE_clipper`. If it is not there —
 /// the e2e run builds only `-p clipper`, not the example — it is built on demand
-/// with `-p cu-mcap-record`. `CU_MCAP_RECORD_BIN` overrides the path. Unlike
-/// `custom-mcap-writer`, this build compiles the cu29 tree, so a cold on-demand
-/// build takes minutes; the `e2e` profile grants this test a longer
-/// terminate-after for that (`.config/nextest.toml`), and CI prebuilds it in the
-/// matrix `Build` step so the on-demand build is normally an up-to-date no-op.
+/// with `-p cu-mcap-record` into that directory (see [`target_dir`]).
+/// `CU_MCAP_RECORD_BIN` overrides the path. Unlike `custom-mcap-writer`, this
+/// build compiles the cu29 tree, so a cold on-demand build takes minutes; the
+/// `e2e` profile grants this test a longer terminate-after for that
+/// (`.config/nextest.toml`), and CI prebuilds it in the matrix `Build` step so
+/// the on-demand build is normally an up-to-date no-op.
 pub(crate) fn cu_mcap_record_bin() -> PathBuf {
     if let Some(path) = std::env::var_os("CU_MCAP_RECORD_BIN") {
         let path = PathBuf::from(path);
@@ -168,11 +189,14 @@ pub(crate) fn cu_mcap_record_bin() -> PathBuf {
     if bin.is_file() {
         return bin;
     }
-    // Build the member into the shared target dir. `-p` reaches it now that it
-    // is a workspace member, so no manifest-path or target-dir juggling.
+    // Build the member into the shared target dir. It is a workspace member, so
+    // `-p` reaches it from this crate's cwd without a manifest path.
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let mut build = Command::new(cargo);
-    build.args(["build", "--locked", "-p", "cu-mcap-record"]);
+    build
+        .args(["build", "--locked", "-p", "cu-mcap-record"])
+        .arg("--target-dir")
+        .arg(target_dir(bin_dir));
     // Match the profile the test itself was built under, read off the binary
     // dir name, so a `--release` e2e run finds the example beside clipper.
     if bin_dir.file_name().is_some_and(|n| n == "release") {
