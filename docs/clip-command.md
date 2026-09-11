@@ -152,10 +152,11 @@ clips as well as the device build does.
 
 ## Where a `clip` run's triggers come from: `param` and `mcap`
 
-`clipper clip` faces the same question from the other side: a finished recording
-holds no live topic to subscribe to, so the triggers come either from the command
-line or from the recording itself. `--trigger-source` picks one, and exactly one
-is active per run.
+Both subcommands answer this with the same key, `--trigger-source`, and the
+values differ only where the recording's end makes them. A finished recording
+holds no live topic to subscribe to, so a `clip` run's triggers come either from
+the command line or from the recording itself. Exactly one source is active per
+run.
 
 - **`param`** (the default) cuts the single trigger the `--trigger-*` flags name.
   It needs `--trigger-time`, `--preroll` and `--postroll`; `--trigger-name` and
@@ -168,15 +169,29 @@ is active per run.
   chunks that summary names as holding the trigger channel; no other chunk is
   decompressed.
 
-This is the same recorded trigger the `mcap` *interface* reads while tailing, and
-the same decoder: `json` decodes in every build, `cdr` needs the `ros` cargo
-feature. A trigger this run cannot use — an undecodable payload, or a name that
-cannot be embedded in a clip pathname — costs that trigger its clip and no more;
-the run logs it and cuts the rest.
+`mcap` reads the same recorded trigger
+[`clipper tail --trigger-source mcap`](triggers-and-time.md#two-ways-in-ros-and-mcap)
+reads out of the recording it is still following, with the same decoder: `json`
+decodes in every build, `cdr` needs the `ros` cargo feature. That is what one key
+across both subcommands buys — the trigger stream that cut clips on the vehicle
+cuts the same clips from the bag afterwards. A trigger this run cannot use — an
+undecodable payload, or a name that cannot be embedded in a clip pathname — costs
+that trigger its clip and no more; the run logs it and cuts the rest.
 
 Both ways of stating the trigger wrongly are refused while the command line is
 being read, with the flag at fault named and nothing written: `param` without one
 of the three flags it needs, and `mcap` alongside any `--trigger-*` flag. A
 recording holding no trigger at all, read under `mcap`, cuts nothing and says so
 — a normal, zero-status run that leaves the output directory untouched.
+
+**`ros` is not offered here.** It is a live subscription on a ROS node, and a
+recording nobody is writing has no live topic to carry a trigger and nothing
+waiting on a `Recorded` publish. Asking for it is refused the same way, naming
+the value and listing what this subcommand does take:
+
+```console
+$ clipper clip ./record --out-dir ./clipped --trigger-source ros
+error: invalid value 'ros' for '--trigger-source <TRIGGER_SOURCE>'
+  [possible values: mcap, param]
+```
 

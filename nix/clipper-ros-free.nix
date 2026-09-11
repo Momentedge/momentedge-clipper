@@ -56,20 +56,20 @@ pkgs.rustPlatform.buildRustPackage {
 
     $out/bin/clipper --version
     $out/bin/clipper --help
-    $out/bin/clipper tail --interface mcap --help > /dev/null
+    $out/bin/clipper tail --trigger-source mcap --help > /dev/null
 
     # `ros` is not a value this build rejects at runtime — it is a clap variant
     # the feature never compiled, so the parse fails. Asserting that parse error
     # rather than merely a non-zero exit is what makes the check bite: a build
     # that leaked the feature would accept the flag and start a recorder, and a
     # started recorder's own exit status — whatever the timeout below makes of
-    # it — says nothing about which interfaces the binary offers.
-    if refusal=$(timeout 60 $out/bin/clipper tail --interface ros 2>&1 </dev/null); then
-      echo "clipper-ros-free accepted --interface ros: the ros feature leaked into this package" >&2
+    # it — says nothing about which trigger sources the binary offers.
+    if refusal=$(timeout 60 $out/bin/clipper tail --trigger-source ros 2>&1 </dev/null); then
+      echo "clipper-ros-free accepted --trigger-source ros: the ros feature leaked into this package" >&2
       exit 1
     fi
     if ! grep -qF "invalid value 'ros'" <<< "$refusal"; then
-      echo "clipper-ros-free did not refuse --interface ros at parse time; it said:" >&2
+      echo "clipper-ros-free did not refuse --trigger-source ros at parse time; it said:" >&2
       echo "$refusal" >&2
       exit 1
     fi

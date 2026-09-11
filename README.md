@@ -151,6 +151,14 @@ source /opt/ros/humble/setup.bash
 /opt/momentedge-clipper/bin/clipper --help
 ```
 
+**Upgrading a device already running clipper.** Where a run's triggers come from
+is `--trigger-source`, or `MOMENTEDGE_TRIGGER_SOURCE` in the environment — no
+configuration file may set it. A configuration file or unit
+file carrying an earlier release's `interface` spelling stops the run at
+startup — see
+[the upgrade note](docs/configuration.md#upgrading-a-deployment-configured-for-an-earlier-release)
+for what to edit, before the new package lands.
+
 **From source** — ROS is a cargo feature, and it decides which of two builds you
 get:
 
@@ -215,7 +223,7 @@ clipper clip ./record --out-dir ./clipped --trigger-source mcap
 | Page | What it answers |
 |---|---|
 | [Configuration](docs/configuration.md) | every flag, environment variable and TOML key, and which layer wins |
-| [Triggers and time](docs/triggers-and-time.md) | the `Trigger` message, the two interfaces, and which clock a window lives on |
+| [Triggers and time](docs/triggers-and-time.md) | the `Trigger` message, the two places a trigger comes from, and which clock a window lives on |
 | [`clipper clip`](docs/clip-command.md) | cutting from a finished recording: bag directories, refusals, re-runs |
 | [What a clip carries](docs/clip-manifest.md) | the `momentedge.clip` manifest inside every clip |
 | [Operating clipper](docs/operating.md) | shutdown, logs, retention, overload, and tuning under load |

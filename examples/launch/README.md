@@ -63,7 +63,7 @@ def generate_launch_description():
 |----------|---------|---------|
 | `record_dir` | `./record` | recording to tail (match `record.launch.py`) |
 | `clipped_dir` | `./clipped` | where clips are written |
-| `clipper_bin` | `clipper` | clipper executable, run as `<clipper_bin> tail`; set to `./target/release/clipper` for a dev build (build it with `--features ros`, or it has no ROS trigger interface — see the [README](../../README.md#install)) |
+| `clipper_bin` | `clipper` | clipper executable, run as `<clipper_bin> tail`; set to `./target/release/clipper` for a dev build (build it with `--features ros`, or it has no `ros` trigger source — see the [README](../../README.md#install)) |
 | `grace_secs` | `30` | clipper's coverage grace (size to the storage flush latency) |
 
 Ctrl-C stops a launch. `clipper tail` runs with `respawn=True` so it restarts

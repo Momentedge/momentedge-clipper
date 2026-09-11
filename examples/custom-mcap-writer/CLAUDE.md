@@ -28,5 +28,6 @@ rename of the binary breaks the test, not just the build.
 
 **Deliberately absent:** CDR encoding, file rotation, and `--compression` (which
 is meaningless unchunked). The payload's `trigger_time` is `{0,0}` unless
-`--stamp-payload-trigger-time` opts in, because the mcap interface cells *reject*
-a non-zero payload stamp — the record's own stamp is the anchor there.
+`--stamp-payload-trigger-time` opts in, because the `mcap` trigger source's
+cells *reject* a non-zero payload stamp — the record's own stamp is the anchor
+there.

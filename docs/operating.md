@@ -13,7 +13,7 @@ overload. For the flags behind any of it, see
   raises or lowers that. A run publishes nothing machine-readable on stdout —
   its result is the clips in `--out-dir`, each carrying its own metadata — so
   the stream is free for the output an operator reads first, and discarding
-  stderr keeps the logs. Under `--interface ros` the ROS layer's own
+  stderr keeps the logs. Under `--trigger-source ros` the ROS layer's own
   diagnostics are a separate stream: rcutils writes them to stderr unless
   `RCUTILS_LOGGING_USE_STDOUT=1`. Under systemd both streams land in the
   journal; under `ros2 launch` see [`examples/launch`](../examples/launch/README.md).

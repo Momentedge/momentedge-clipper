@@ -18,8 +18,8 @@ sees varied clip lengths; pass either flag to pin that side to a fixed nanosecon
 value.
 
 `trigger_time` is zero by default because clipper reads it only under
-`--interface ros --time-source publish`; every other cell anchors the window on
-the recorder's own receipt instant and rejects a trigger that sets
+`--trigger-source ros --time-source publish`; every other cell anchors the
+window on the recorder's own receipt instant and rejects a trigger that sets
 `trigger_time`. Pass `--stamp-trigger-time` to stamp it with the current RosTime
 at publish — the publish-domain anchor for a `--time-source publish` clipper.
 

@@ -332,7 +332,7 @@ jobs:
       # CLIPPER_E2E_SKIP_FLAKY=1 makes the in-test skip_flaky() gate skip the
       # flaky live-corruption race (see the matrix comment above). `--features
       # ros` builds the binary under test as the device build — the suite drives
-      # it on `--interface ros`, which only that build offers.
+      # it on `--trigger-source ros`, which only that build offers.
       - name: E2E tests
         run: |
           nix develop ".#${{ matrix.distro }}" --command \

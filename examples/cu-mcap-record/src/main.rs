@@ -1,5 +1,5 @@
 //! A copper (cu29) `CuSinkTask` that appends routed task outputs to an MCAP
-//! Recording `clipper tail --interface mcap` can follow live — the copper producer
+//! Recording `clipper tail --trigger-source mcap` can follow live — the copper producer
 //! path beside the two plain-`mcap`-crate writer examples
 //! (`examples/custom-mcap-writer`, `examples/chunked-mcap-writer`). No ROS
 //! stack is involved anywhere: the Trigger travels in-band, written into the
@@ -170,7 +170,7 @@ struct TriggerStampWire {
 /// The wire JSON for the trigger channel: the momentedge `Trigger`, written
 /// **unwrapped** (not in the copper envelope) because clipper's decoder reads
 /// these fields at the top level. This is the one channel with no exporter
-/// parity. `trigger_time` is the constant zero: under `--interface mcap`
+/// parity. `trigger_time` is the constant zero: under `--trigger-source mcap`
 /// clipper anchors on the trigger record's own MCAP stamp, and its admission
 /// gate rejects a non-zero payload `trigger_time`.
 #[derive(Serialize)]

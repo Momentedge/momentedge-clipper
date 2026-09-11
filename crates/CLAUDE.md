@@ -77,10 +77,10 @@ The feature buys the `ros` interface and nothing else: `dep:r2r`, the
 `dep:futures` its subscription stream is drained with, and `clip/ros`
 underneath. The tail, the window plan, the cut, the admission gate, the
 supervision and every other flag are the same code either way. What differs on
-the command line is one flag — `--interface` accepts `mcap` alone in the default
-build and takes it by default, and accepts `ros` and defaults to it under the
-feature — plus what a `cdr` trigger in the recording does: decoded with the
-feature, skipped with an error naming it without.
+the command line is one flag — `clipper tail --trigger-source` accepts `mcap`
+alone in the default build and takes it by default, and accepts `ros` and defaults
+to it under the feature — plus what a `cdr` trigger in the recording does: decoded
+with the feature, skipped with an error naming it without.
 
 The `libraries` CI job (`clip + tail + clipper (ROS-free)`) holds that down for
 all three crates: it asserts `cargo tree` names no r2r in any default tree

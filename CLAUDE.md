@@ -124,11 +124,11 @@ publishes the MCAP fixture writers a consumer's tests build recordings with, and
 
 The recorder carries a `ros` feature of its own, likewise off by default, adding
 the live trigger subscription, the `Recorded` publish, and `clip/ros` underneath.
-So `cargo build -p clipper` links no ROS and offers `--interface mcap` alone,
-while `--features ros` is the device build every packaging path selects. The
-`libraries` CI job builds, lints and tests all three crates with default features
-on the plain toolchain, so an r2r dependency that escapes a `ros` feature fails
-there rather than in a downstream ROS-free build.
+So `cargo build -p clipper` links no ROS and its `clipper tail --trigger-source`
+offers `mcap` alone, while `--features ros` is the device build every packaging
+path selects. The `libraries` CI job builds, lints and tests all three crates with
+default features on the plain toolchain, so an r2r dependency that escapes a `ros`
+feature fails there rather than in a downstream ROS-free build.
 
 ```
 crates/clip/            # ROS-free library: format layer, index, cut, manifest, trigger contract

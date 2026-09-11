@@ -5,7 +5,7 @@
 //! development.
 //!
 //! `trigger_time` is left zero by default. clipper reads `trigger_time` only
-//! under `--interface ros --time-source publish`; every other cell (including the
+//! under `--trigger-source ros --time-source publish`; every other cell (including the
 //! default `--time-source log`) anchors the window on the recorder's own receipt
 //! instant and *rejects* a trigger that sets `trigger_time`, so the default dev
 //! loop must send zero. Pass `--stamp-trigger-time` to stamp it with the current
@@ -49,8 +49,8 @@ struct Args {
     name: String,
     description: String,
     /// Stamp `trigger_time` with RosTime at publish. Off by default: only
-    /// `--interface ros --time-source publish` reads `trigger_time`; the other
-    /// cells reject a non-zero one, so the default sends zero.
+    /// `--trigger-source ros --time-source publish` reads `trigger_time`; the
+    /// other cells reject a non-zero one, so the default sends zero.
     stamp_trigger_time: bool,
 }
 
@@ -136,9 +136,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut counter: u64 = 0;
     loop {
-        // Zero unless --stamp-trigger-time: clipper reads trigger_time only under
-        // --interface ros --time-source publish and rejects a non-zero one in
-        // every other cell.
+        // Zero unless --stamp-trigger-time: clipper reads trigger_time only
+        // under --trigger-source ros --time-source publish and rejects a
+        // non-zero one in every other cell.
         let trigger_time = if args.stamp_trigger_time {
             r2r::Clock::to_builtin_time(&clock.get_now()?)
         } else {

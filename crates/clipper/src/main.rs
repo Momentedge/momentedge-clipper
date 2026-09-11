@@ -18,11 +18,12 @@
 //! assembled in a capturing dir and moved atomically into place so observers
 //! never see a footer-less file).
 //!
-//! Where triggers come from and how completion is signalled is the [`interface`],
-//! one active per run (`--interface`). The `mcap` interface reads triggers out
-//! of the tailed recording itself — decoding each by its MCAP `message_encoding`
+//! Where triggers come from is `--trigger-source`, and how completion is
+//! signalled follows from it: the two are one seam, the [`interface`], with one
+//! form active per run. The `mcap` source reads triggers out of the tailed
+//! recording itself — decoding each by its MCAP `message_encoding`
 //! ([`decode`]) — and runs ROS-free, the clip's atomic move into the output
-//! directory standing in for a completion announcement. The `ros` interface
+//! directory standing in for a completion announcement. The `ros` source
 //! subscribes to `/events/momentedge/trigger` (`momentedge_msgs/Trigger`) on a
 //! ROS node and publishes `/events/momentedge/recorded`
 //! (`momentedge_msgs/Recorded`) naming every durable segment. The handler
@@ -31,10 +32,11 @@
 //!
 //! **Two builds.** The `ros` cargo feature is what links the ROS client and
 //! compiles the `ros` interface in. With it — the device build, which every
-//! packaging path selects — `--interface` takes `ros` (the default there) or
-//! `mcap`. Without it the binary links no ROS, builds and runs on a host with no
-//! ROS installation, and offers `mcap` alone. Nothing else differs: the tail, the
-//! window plan, the cut, and every other flag are the same code either way.
+//! packaging path selects — `clipper tail --trigger-source` takes `ros` (the
+//! default there) or `mcap`. Without it the binary links no ROS, builds and runs
+//! on a host with no ROS installation, and offers `mcap` alone. Nothing else
+//! differs: the tail, the window plan, the cut, and every other flag are the
+//! same code either way.
 //!
 //! Time base: MCAP `log_time`, the trigger stamp, and the wait clock are all
 //! treated as nanoseconds on the system (ROS) clock — this assumes the default
@@ -85,8 +87,8 @@
 //! channel set out of one recording.
 //!
 //! Logging uses the `log` facade with a pretty_env_logger backend and goes to
-//! **stdout**; `RUST_LOG` controls verbosity. Under `--interface ros` the ROS
-//! layer's own diagnostics are a separate stream — rcutils writes them to
+//! **stdout**; `RUST_LOG` controls verbosity. Under `--trigger-source ros` the
+//! ROS layer's own diagnostics are a separate stream — rcutils writes them to
 //! stderr unless `RCUTILS_LOGGING_USE_STDOUT=1`.
 
 mod interface;
@@ -99,8 +101,9 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::Context;
+use clap::builder::TypedValueParser as _;
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
-use clip::config::{Layer, Layered};
+use clip::config::{self, Layer, Layered};
 use clip::manifest::Producer;
 #[cfg(feature = "ros")]
 use clip::trigger::ANNOUNCE_TOPIC;
@@ -175,107 +178,139 @@ impl std::fmt::Display for ClipCompression {
     }
 }
 
-/// Where clipper takes triggers from and where it announces completions — one
-/// interface to the outside world, chosen by `--interface`. The variants are
-/// mutually exclusive; clipper drives exactly one per run.
+/// Where a run's triggers come from — one value set, named `--trigger-source`
+/// under both subcommands, and the seam each variant drives underneath it.
 ///
-/// The variant set is the build: `Ros` exists only under the `ros` feature, so a
-/// ROS-free build's `--interface` accepts (and its `--help` lists) `mcap` alone.
-/// [`DEFAULT_INTERFACE`] is the one clipper takes when the flag is absent.
+/// The variants are mutually exclusive: a run drives exactly one. `mcap` means
+/// the same thing under both subcommands — the triggers the recording itself
+/// carries on the trigger topic, decoded by each message's MCAP
+/// `message_encoding` ([`clip::decode`]) — and only the mechanism differs, since
+/// `clipper tail` taps them out of a file as it is written while `clipper clip`
+/// reads them out of one that is finished. That shared meaning is why one enum
+/// serves both.
+///
+/// **Each subcommand takes a subset**, and [`TriggerSource::modes`] is where a
+/// variant says which subcommands take it. The two arguments narrow to that
+/// subset ([`trigger_source_parser`]) rather than restating it, so a source a
+/// subcommand does not take is refused by name while the command line is being
+/// read and never appears in that subcommand's `--help`.
+///
+/// The variant set is also the build's: `Ros` exists only under the `ros` cargo
+/// feature, so a ROS-free build refuses `--trigger-source ros` as an unknown
+/// value wherever the flag is offered. [`TAIL_DEFAULT_TRIGGER_SOURCE`] and
+/// [`CLIP_DEFAULT_TRIGGER_SOURCE`] are what each subcommand takes when the flag
+/// is absent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum InterfaceKind {
-    /// Subscribe to the trigger topic on a ROS node and publish `Recorded` on
-    /// completion. The deployed, ROS-native path, and the default where it
-    /// exists.
+enum TriggerSource {
+    /// Subscribe to the trigger topic on a ROS node and answer each clip with a
+    /// `Recorded` publish. The deployed, ROS-native path, and the recorder's
+    /// default where the feature built it.
     #[cfg(feature = "ros")]
     Ros,
-    /// Read triggers out of the tailed MCAP (decoding each by its
-    /// `message_encoding`) and signal completion by the clip's move into
-    /// `out_dir`. Runs ROS-free: no node, executor, subscription, or publish.
+    /// Take the triggers the recording carries on the trigger topic, each clip
+    /// anchored on the stamp the recording gave its trigger message. Runs
+    /// ROS-free: no node, executor, subscription, or publish.
     Mcap,
+    /// Cut the one trigger the `--trigger-*` flags name. One run, one clip.
+    Param,
 }
 
-/// The interface clipper drives when `--interface` is not given: the ROS one
-/// where the feature built it, and otherwise the only one there is.
-#[cfg(feature = "ros")]
-const DEFAULT_INTERFACE: InterfaceKind = InterfaceKind::Ros;
-#[cfg(not(feature = "ros"))]
-const DEFAULT_INTERFACE: InterfaceKind = InterfaceKind::Mcap;
+impl TriggerSource {
+    /// The subcommands that take this source.
+    ///
+    /// The subsets live here, on the type, rather than as two literals at the
+    /// two argument definitions: the match is exhaustive with no catch-all, so
+    /// adding a variant is a compile error until it says who takes it, and
+    /// [`trigger_source_parser`] derives both `--trigger-source` surfaces from
+    /// this one answer.
+    fn modes(self) -> &'static [config::Mode] {
+        match self {
+            // A live subscription needs a topic somebody is still publishing on,
+            // which is the recorder's situation and not the cutter's: a finished
+            // recording has no live topic.
+            #[cfg(feature = "ros")]
+            TriggerSource::Ros => &[config::Mode::Tail],
+            // The one source both subcommands share, and the reason they share a
+            // key at all.
+            TriggerSource::Mcap => &[config::Mode::Tail, config::Mode::Clip],
+            // `param` is the cutter's alone, and deliberately not the recorder's:
+            // `clipper tail` runs until a shutdown signal, so after the single
+            // cut a `param` run would have a loop with nothing left to do.
+            // "Follow a growing recording, wait for one window, cut it, exit" is
+            // an exit condition rather than a trigger source, and it is not a
+            // mode clipper has.
+            TriggerSource::Param => &[config::Mode::Clip],
+        }
+    }
 
-/// The `--interface` short help. It names the values this build actually
-/// accepts, which is the feature's one visible difference on the command line.
-#[cfg(feature = "ros")]
-const INTERFACE_HELP: &str = "Where triggers come from and completions go: `ros` or `mcap`";
-#[cfg(not(feature = "ros"))]
-const INTERFACE_HELP: &str = "Where triggers come from and completions go: `mcap`";
+    /// Whether the `--trigger-*` flags state this source's trigger.
+    ///
+    /// Only `param` does. Every other source has a trigger of its own — off a
+    /// live topic, or out of the recording, each stating its own name,
+    /// description, preroll and postroll — so the flags have nothing left to say
+    /// and a command line giving one anyway is refused
+    /// ([`ClipConfig::trigger_argument_fault`]).
+    fn reads_the_trigger_flags(self) -> bool {
+        match self {
+            #[cfg(feature = "ros")]
+            TriggerSource::Ros => false,
+            TriggerSource::Mcap => false,
+            TriggerSource::Param => true,
+        }
+    }
 
-/// The `--interface` long help (`--help`, not `-h`), likewise per build: the ROS
-/// arm is described only where it can be selected, and the ROS-free build says
-/// outright that it was built without it.
-#[cfg(feature = "ros")]
-const INTERFACE_LONG_HELP: &str = "\
-Where triggers come from and completions go: `ros` or `mcap`.
-
-`ros` (the default) subscribes to the trigger topic on a ROS node and publishes \
-`Recorded` on completion. `mcap` reads triggers out of the tailed recording \
-(decoding each by its `message_encoding`) and signals completion by moving the \
-clip into `out_dir` — it runs ROS-free, with no node, subscription, or publish. \
-Exactly one interface is active per run.";
-#[cfg(not(feature = "ros"))]
-const INTERFACE_LONG_HELP: &str = "\
-Where triggers come from and completions go: `mcap`.
-
-`mcap` reads triggers out of the tailed recording (decoding each by its \
-`message_encoding`) and signals completion by moving the clip into `out_dir` — \
-it runs ROS-free, with no node, subscription, or publish. It is the only \
-interface this binary has: the `ros` interface, which subscribes to the trigger \
-topic on a ROS node and publishes `Recorded`, is compiled in by the `ros` cargo \
-feature, and this build was made without it.";
-
-impl std::fmt::Display for InterfaceKind {
-    /// Render as the clap value name (`ros`/`mcap`) so the `--help` default and
-    /// the accepted flag values share the `ValueEnum` possible-value names.
-    #[expect(
-        clippy::expect_used,
-        reason = "`to_possible_value` is `None` only for a `#[clap(skip)]` variant, \
-                  and this enum has none — a skipped one would also break `--help`"
-    )]
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.to_possible_value()
-            .expect("no InterfaceKind variant is skipped")
-            .get_name()
-            .fmt(f)
+    /// The sources `mode` takes, in this enum's own variant order — which is the
+    /// order its `--help` lists them in.
+    fn accepted_by(mode: config::Mode) -> impl Iterator<Item = TriggerSource> {
+        TriggerSource::value_variants()
+            .iter()
+            .copied()
+            .filter(move |source| source.modes().contains(&mode))
     }
 }
 
-/// Where `clipper clip` takes the triggers it cuts from — one source per run,
-/// chosen by `--trigger-source`.
+/// The `--trigger-source` value parser for `mode`: the sources
+/// [`TriggerSource::accepted_by`] lists for that subcommand, and nothing else.
 ///
-/// The variants are mutually exclusive, and which one is active is what the
-/// `--trigger-*` flags mean: under [`Param`](TriggerSource::Param) they *are*
-/// the trigger, and under [`Mcap`](TriggerSource::Mcap) the recording states
-/// every trigger and they have nothing left to say — so a command line naming
-/// both is refused rather than silently preferring one
-/// ([`ClipConfig::trigger_argument_fault`]). [`DEFAULT_TRIGGER_SOURCE`] is the
-/// one a run takes when the flag is absent.
+/// Narrowing at the argument is what makes the refusal clap's own, raised while
+/// the command line is being read: `clipper clip --trigger-source ros` is an
+/// invalid value that names the value and the ones that *are* accepted, and
+/// `clipper <mode> --help` lists that subset with each variant's own help line.
+/// Every spelling comes from [`ValueEnum`], so the accepted values, the `--help`
+/// listing and the [`Display`](std::fmt::Display) a default is rendered through
+/// stay one fact.
 ///
-/// Unlike [`InterfaceKind`] the variant set is not the build's: both sources
-/// exist in every build. The `ros` feature is visible here only in what a
-/// recorded trigger may be encoded as — `json` decodes anywhere, `cdr` needs the
-/// typesupport that feature links ([`clip::decode`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum TriggerSource {
-    /// Cut the one trigger the `--trigger-*` flags name. One run, one clip.
-    Param,
-    /// Cut every trigger the recording itself carries on the trigger topic, each
-    /// clip anchored on its own trigger. One run, one clip per trigger.
-    Mcap,
+/// The map back cannot fail — the value was just checked against the subset —
+/// but it is a `try_map` rather than an unwrap, so a variant that ever stopped
+/// round-tripping would report itself as a value error instead of a panic.
+#[expect(
+    clippy::expect_used,
+    reason = "`to_possible_value` is `None` only for a `#[clap(skip)]` variant, \
+              and this enum has none — a skipped one would also break `--help`"
+)]
+fn trigger_source_parser(
+    mode: config::Mode,
+) -> impl clap::builder::TypedValueParser<Value = TriggerSource> {
+    clap::builder::PossibleValuesParser::new(TriggerSource::accepted_by(mode).map(|source| {
+        source
+            .to_possible_value()
+            .expect("no TriggerSource variant is skipped")
+    }))
+    .try_map(|name: String| <TriggerSource as ValueEnum>::from_str(&name, false))
 }
 
-/// The trigger source `clipper clip` takes when `--trigger-source` is absent:
-/// the command line, the source that needs nothing of the recording but its
+/// The source `clipper tail` takes when `--trigger-source` is absent: the live
+/// subscription where the `ros` feature built it, and otherwise the only source
+/// the recorder has.
+#[cfg(feature = "ros")]
+const TAIL_DEFAULT_TRIGGER_SOURCE: TriggerSource = TriggerSource::Ros;
+#[cfg(not(feature = "ros"))]
+const TAIL_DEFAULT_TRIGGER_SOURCE: TriggerSource = TriggerSource::Mcap;
+
+/// The source `clipper clip` takes when `--trigger-source` is absent: the
+/// command line, the source that needs nothing of the recording but its
 /// messages.
-const DEFAULT_TRIGGER_SOURCE: TriggerSource = TriggerSource::Param;
+const CLIP_DEFAULT_TRIGGER_SOURCE: TriggerSource = TriggerSource::Param;
 
 /// The trigger name a `param` run takes when `--trigger-name` is absent. A name
 /// is not optional — it goes in the clip's filename and its manifest — so the
@@ -285,13 +320,46 @@ const DEFAULT_TRIGGER_SOURCE: TriggerSource = TriggerSource::Param;
 /// on exactly that distinction).
 const DEFAULT_TRIGGER_NAME: &str = "clip";
 
-/// The `--trigger-source` short help.
-const TRIGGER_SOURCE_HELP: &str = "Where this run's triggers come from: `param` or `mcap`";
+/// `clipper tail`'s `--trigger-source` short help. It names the values this
+/// build actually accepts, which is the `ros` feature's one visible difference
+/// on the command line.
+#[cfg(feature = "ros")]
+const TAIL_TRIGGER_SOURCE_HELP: &str =
+    "Where triggers come from and completions go: `ros` or `mcap`";
+#[cfg(not(feature = "ros"))]
+const TAIL_TRIGGER_SOURCE_HELP: &str = "Where triggers come from and completions go: `mcap`";
 
-/// The `--trigger-source` long help (`--help`, not `-h`): what each source cuts,
-/// which flags it takes, and the one thing an operator has to get right about a
-/// recorded trigger's encoding.
-const TRIGGER_SOURCE_LONG_HELP: &str = "\
+/// `clipper tail`'s `--trigger-source` long help (`--help`, not `-h`), likewise
+/// per build: the ROS arm is described only where it can be selected, and the
+/// ROS-free build says outright that it was built without it.
+#[cfg(feature = "ros")]
+const TAIL_TRIGGER_SOURCE_LONG_HELP: &str = "\
+Where triggers come from and completions go: `ros` or `mcap`.
+
+`ros` (the default) subscribes to the trigger topic on a ROS node and publishes \
+`Recorded` on completion. `mcap` takes the triggers the recording itself carries \
+(decoding each by its `message_encoding`) and signals completion by moving the \
+clip into `out_dir` — it runs ROS-free, with no node, subscription, or publish. \
+The source is also the completion half: exactly one of the two is active per \
+run, and there is no third combination to select.";
+#[cfg(not(feature = "ros"))]
+const TAIL_TRIGGER_SOURCE_LONG_HELP: &str = "\
+Where triggers come from and completions go: `mcap`.
+
+`mcap` takes the triggers the recording itself carries (decoding each by its \
+`message_encoding`) and signals completion by moving the clip into `out_dir` — \
+it runs ROS-free, with no node, subscription, or publish. It is the only source \
+this binary has: `ros`, which subscribes to the trigger topic on a ROS node and \
+publishes `Recorded`, is compiled in by the `ros` cargo feature, and this build \
+was made without it.";
+
+/// `clipper clip`'s `--trigger-source` short help.
+const CLIP_TRIGGER_SOURCE_HELP: &str = "Where this run's triggers come from: `param` or `mcap`";
+
+/// `clipper clip`'s `--trigger-source` long help (`--help`, not `-h`): what each
+/// source cuts, which flags it takes, and the one thing an operator has to get
+/// right about a recorded trigger's encoding.
+const CLIP_TRIGGER_SOURCE_LONG_HELP: &str = "\
 Where this run's triggers come from: `param` or `mcap`.
 
 `param` (the default) cuts the single trigger the `--trigger-*` flags name, and \
@@ -303,11 +371,13 @@ name, description, preroll and postroll. A recording holding no trigger cuts \
 nothing and says so. A recorded trigger encoded as `json` is decoded by every \
 build; `cdr` needs the rmw typesupport the `ros` cargo feature links, and a \
 build without it skips such a trigger with an error naming the feature. Exactly \
-one source is active per run.";
+one source is active per run. `ros` is a live subscription and a finished \
+recording has no live topic, so this subcommand does not offer it.";
 
 impl std::fmt::Display for TriggerSource {
-    /// Render as the clap value name (`param`/`mcap`) so the `--help` default
-    /// and the accepted flag values share the `ValueEnum` possible-value names.
+    /// Render as the clap value name (`ros`/`mcap`/`param`) so the `--help`
+    /// default and the accepted flag values share the `ValueEnum`
+    /// possible-value names.
     #[expect(
         clippy::expect_used,
         reason = "`to_possible_value` is `None` only for a `#[clap(skip)]` variant, \
@@ -319,6 +389,17 @@ impl std::fmt::Display for TriggerSource {
             .get_name()
             .fmt(f)
     }
+}
+
+/// The error a subcommand raises when it is handed a trigger source it does not
+/// take.
+///
+/// [`trigger_source_parser`] refuses such a value while the command line is
+/// being read, so neither dispatch can reach this in a run clap accepted. It
+/// exists so each dispatch stays one decision per variant rather than a
+/// catch-all that would silently swallow a source added later.
+fn unaccepted_source(mode: &str, source: TriggerSource) -> anyhow::Error {
+    anyhow::anyhow!("`clipper {mode}` takes no `{source}` trigger source")
 }
 
 /// The one way a `clipper clip` command line can state its trigger wrongly:
@@ -425,11 +506,28 @@ enum Mode {
 /// binary, as an operator invokes it.
 const PROGRAM: &str = "clipper";
 
-/// clap's name for [`Mode::Clip`] — the word an operator types after `clipper`,
-/// derived by the derive from the variant name. Spelled here so [`parse_cli`]
-/// can raise a trigger-argument fault against that subcommand and get its usage
-/// line; a test pins it to the command clap actually built.
+/// clap's names for [`Mode::Tail`] and [`Mode::Clip`] — the word an operator
+/// types after `clipper`, derived by the derive from each variant name. Spelled
+/// here so [`scan_mode`] can find the mode in argv before clap parses it and
+/// [`parse_cli`] can raise a trigger-argument fault against `clip` and get its
+/// usage line; a test pins both to the commands clap actually built.
+const TAIL_MODE: &str = "tail";
 const CLIP_MODE: &str = "clip";
+
+/// Each mode as the command line spells it, paired with the [`config::Mode`]
+/// whose `[settings]` rows that subcommand reads.
+///
+/// The two enums name the same pair of subcommands from opposite sides: clap's
+/// [`Mode`] carries a mode's fully parsed configuration and so exists only after
+/// argv is parsed, while [`config::Mode`] is the bare name and so can be known
+/// before it — which is what the configuration files need, since their key set
+/// is the mode's. This table is where the two are tied together, and
+/// `every_mode_argument_is_a_settings_key_and_back` is what keeps the tie
+/// honest.
+const MODES: [(&str, config::Mode); 2] = [
+    (TAIL_MODE, config::Mode::Tail),
+    (CLIP_MODE, config::Mode::Clip),
+];
 
 impl Mode {
     /// What this mode's clips record as having cut them. The subcommand name is
@@ -493,18 +591,25 @@ struct Config {
     /// Where triggers come from and completions go.
     ///
     /// The one flag whose surface the `ros` cargo feature changes, so its help
-    /// text is per build ([`INTERFACE_HELP`] / [`INTERFACE_LONG_HELP`]) rather
-    /// than this doc comment, and its default is [`DEFAULT_INTERFACE`]. clap
-    /// derives the accepted values from [`InterfaceKind`]'s variants, so
-    /// `--help` lists exactly what this build can select.
+    /// text is per build ([`TAIL_TRIGGER_SOURCE_HELP`] /
+    /// [`TAIL_TRIGGER_SOURCE_LONG_HELP`]) rather than this doc comment, and its
+    /// default is [`TAIL_DEFAULT_TRIGGER_SOURCE`]. The accepted values are the
+    /// recorder's subset of [`TriggerSource`] ([`trigger_source_parser`]), so
+    /// `--help` lists exactly what this build of this subcommand can select and
+    /// nothing else — `param` belongs to `clipper clip` and is refused here.
+    ///
+    /// The source is the completion half too: `ros` drives the live
+    /// subscription and the `Recorded` publish that answers it, `mcap` the
+    /// in-recording triggers and the clip's move into `out_dir`
+    /// ([`crate::interface`]).
     #[arg(
         long,
-        value_enum,
-        default_value_t = DEFAULT_INTERFACE,
-        help = INTERFACE_HELP,
-        long_help = INTERFACE_LONG_HELP,
+        value_parser = trigger_source_parser(config::Mode::Tail),
+        default_value_t = TAIL_DEFAULT_TRIGGER_SOURCE,
+        help = TAIL_TRIGGER_SOURCE_HELP,
+        long_help = TAIL_TRIGGER_SOURCE_LONG_HELP,
     )]
-    interface: InterfaceKind,
+    trigger_source: TriggerSource,
 
     /// Clock domain the clip window lives in: `log` or `publish`.
     ///
@@ -593,18 +698,19 @@ struct ClipConfig {
 
     /// Where this run's triggers come from.
     ///
-    /// Its help text is spelled out ([`TRIGGER_SOURCE_HELP`] /
-    /// [`TRIGGER_SOURCE_LONG_HELP`]) rather than taken from this doc comment,
-    /// because it has to say which flags each source reads; its default is
-    /// [`DEFAULT_TRIGGER_SOURCE`]. clap derives the accepted values from
-    /// [`TriggerSource`]'s variants, so `--help` lists exactly what can be
-    /// selected.
+    /// Its help text is spelled out ([`CLIP_TRIGGER_SOURCE_HELP`] /
+    /// [`CLIP_TRIGGER_SOURCE_LONG_HELP`]) rather than taken from this doc
+    /// comment, because it has to say which flags each source reads; its default
+    /// is [`CLIP_DEFAULT_TRIGGER_SOURCE`]. The accepted values are the cutter's
+    /// subset of [`TriggerSource`] ([`trigger_source_parser`]), so `--help`
+    /// lists exactly what can be selected — `ros` is a live subscription and a
+    /// finished recording has no live topic, so it is refused here.
     #[arg(
         long,
-        value_enum,
-        default_value_t = DEFAULT_TRIGGER_SOURCE,
-        help = TRIGGER_SOURCE_HELP,
-        long_help = TRIGGER_SOURCE_LONG_HELP,
+        value_parser = trigger_source_parser(config::Mode::Clip),
+        default_value_t = CLIP_DEFAULT_TRIGGER_SOURCE,
+        help = CLIP_TRIGGER_SOURCE_HELP,
+        long_help = CLIP_TRIGGER_SOURCE_LONG_HELP,
     )]
     trigger_source: TriggerSource,
 
@@ -651,8 +757,8 @@ struct ClipConfig {
 /// sources resolve it differently: `--trigger-time` names it outright, while a
 /// trigger the recording carries is anchored on the `log_time` the recording
 /// stamped its trigger message with — the same stamp the recorder's `mcap`
-/// interface anchors on, so a clip cut here and the one the device cut from that
-/// trigger centre on the same instant.
+/// `mcap` source anchors on, so a clip cut here and the one the device cut from
+/// that trigger centre on the same instant.
 #[derive(Debug, Clone)]
 struct AnchoredTrigger {
     trigger: Trigger,
@@ -716,14 +822,13 @@ impl ClipConfig {
     /// requirement keyed on the flag being given would miss the default run
     /// entirely.
     fn trigger_argument_fault(&self) -> Option<TriggerArgFault> {
-        match self.trigger_source {
-            TriggerSource::Param => self.param_trigger().err(),
-            TriggerSource::Mcap => self
-                .trigger_params()
-                .into_iter()
-                .find(|(_, given)| *given)
-                .map(|(flag, _)| TriggerArgFault::Conflicting(flag)),
+        if self.trigger_source.reads_the_trigger_flags() {
+            return self.param_trigger().err();
         }
+        self.trigger_params()
+            .into_iter()
+            .find(|(_, given)| *given)
+            .map(|(flag, _)| TriggerArgFault::Conflicting(flag))
     }
 }
 
@@ -877,6 +982,31 @@ fn scan_flag(argv: &[std::ffi::OsString], flag: &str) -> Option<PathBuf> {
     None
 }
 
+/// The mode `argv` names, or `None` where it names none.
+///
+/// Which keys the configuration files may carry is the mode's
+/// ([`config::Mode`]), so the mode has to be known before [`Layered::load`]
+/// runs — which is before clap has parsed anything. Like [`scan_flag`], this is
+/// therefore a scan and not a parse.
+///
+/// The scan reads one word, `argv[1]`, and that is sound because nothing can
+/// stand between `clipper` and its subcommand: [`Cli`] declares no argument of
+/// its own, so the only flags `clipper` itself takes are clap's generated
+/// `--help` and `--version`, neither of which takes a value and both of which
+/// end the run; and the three configuration flags are injected onto the
+/// subcommands by [`with_config_args`], not onto the root. A command line whose
+/// second word is not a mode is one clap is about to reject.
+///
+/// `None` is "this command line names no mode" — a bare `clipper`, `clipper
+/// --help`, a misspelt subcommand. There is no key set to read a file against,
+/// so no file is read and clap reports the command line the way it always does.
+fn scan_mode(argv: &[std::ffi::OsString]) -> Option<config::Mode> {
+    let word = argv.get(1)?;
+    MODES
+        .iter()
+        .find_map(|(name, mode)| (word == name).then_some(*mode))
+}
+
 /// Where the two configuration files are for this run: the command line first,
 /// then the environment variable clap would have read for the same flag, then
 /// nothing (the system file falls back to its built-in location inside
@@ -1025,23 +1155,46 @@ enum StartupError {
 
 /// Parse `argv` into a fully-resolved [`Loaded`], four layers deep.
 ///
-/// The two configuration files are located in `argv` (and the environment)
-/// first, since what they say becomes the parser's defaults; clap then resolves
-/// the flag and the environment on top of them, so a setting present in all four
-/// layers comes out of the strongest that named it.
+/// The mode and then the two configuration files are located in `argv` (and the
+/// environment) first, since the mode decides which keys the files may carry and
+/// what they say becomes the parser's defaults; clap then resolves the flag and
+/// the environment on top of them, so a setting present in all four layers comes
+/// out of the strongest that named it.
 #[expect(
     clippy::similar_names,
     reason = "`argv` is the command line and `args` the parsed mode's argument \
               definition; both names are the ones this function is about"
 )]
 fn parse_cli(argv: &[std::ffi::OsString]) -> Result<Loaded, StartupError> {
-    let (system, run) = config_paths(argv);
-    let layered = Layered::load(system.as_deref(), run.as_deref()).map_err(StartupError::Config)?;
-    let cmd = with_file_defaults(with_env_prefix(with_config_args(Cli::command())), &layered);
+    // A command line that names no mode names no key set either, so there is
+    // nothing to read a file against: the parser is built on its own defaults
+    // and clap answers the missing or misspelt mode itself.
+    let layered = match scan_mode(argv) {
+        Some(mode) => {
+            let (system, run) = config_paths(argv);
+            Some(
+                Layered::load(mode, system.as_deref(), run.as_deref())
+                    .map_err(StartupError::Config)?,
+            )
+        }
+        None => None,
+    };
+    let cmd = with_env_prefix(with_config_args(Cli::command()));
+    let cmd = match &layered {
+        Some(layered) => with_file_defaults(cmd, layered),
+        None => cmd,
+    };
     // The command is cloned before parsing consumes it, so the report can list
     // the mode's arguments rather than guess at them from the matches.
     let definition = cmd.clone();
     let matches = cmd.try_get_matches_from(argv).map_err(StartupError::Cli)?;
+    #[expect(
+        clippy::expect_used,
+        reason = "`Cli` requires the subcommand and takes no argument of its own, \
+                  so a parse that succeeded named a mode as the word `scan_mode` \
+                  read — which means the files were read for it"
+    )]
+    let layered = layered.expect("a parsed Cli named the mode the scan found");
     #[expect(
         clippy::expect_used,
         reason = "`Cli` has `subcommand_required`, so a successful parse named a \
@@ -1275,25 +1428,32 @@ fn tail_mode(
         );
     }
 
-    // Build the tailer and the selected interface together, then drive the
-    // recorder with them. Exactly one interface is active; `drive` is generic
-    // over it (static dispatch, no `Box<dyn>`). The MCAP interface drives off a
-    // decode-free trigger tap — the tail lifts trigger-topic messages out of the
-    // recording — so its arm wires the tap channel and hands the receiver to the
-    // interface; the ROS interface reads triggers from a live subscription and
-    // needs no tap, so its tailer is built without one. The ROS arm exists only
-    // where the `ros` feature compiled that interface in — without it the
-    // variant does not exist and this match has the one arm.
-    let result = match cfg.interface {
+    // Build the tailer and the interface the trigger source selects together,
+    // then drive the recorder with them. This match is the pairing: the source
+    // names both halves of the seam, so `ros` takes the live subscription and
+    // the `Recorded` publish that answers it, and `mcap` takes the in-recording
+    // triggers and the clip's move into `out_dir` as its only completion signal
+    // (`Interface::SOURCE` on each is the same fact, stated on the type).
+    // Exactly one is active; `drive` is generic over it (static dispatch, no
+    // `Box<dyn>`).
+    //
+    // The MCAP interface drives off a decode-free trigger tap — the tail lifts
+    // trigger-topic messages out of the recording — so its arm wires the tap
+    // channel and hands the receiver to the interface; the ROS interface reads
+    // triggers from a live subscription and needs no tap, so its tailer is built
+    // without one. The ROS arm exists only where the `ros` feature compiled that
+    // interface in — without it the variant does not exist and this match has
+    // two arms.
+    let result = match cfg.trigger_source {
         #[cfg(feature = "ros")]
-        InterfaceKind::Ros => {
+        TriggerSource::Ros => {
             let (tailer, coverage) = Tailer::new();
             let iface = RosInterface::new(TRIGGER_TOPIC, ANNOUNCE_TOPIC, cfg.time_source)?;
             drive(
                 iface, cfg, tailer, coverage, extract_tx, admission, producer,
             )
         }
-        InterfaceKind::Mcap => {
+        TriggerSource::Mcap => {
             let (tx, rx) = unbounded();
             let (tailer, coverage) = Tailer::with_trigger_tap(TRIGGER_TOPIC, tx);
             let iface = McapInterface::new(TRIGGER_TOPIC, rx, cfg.time_source);
@@ -1301,6 +1461,7 @@ fn tail_mode(
                 iface, cfg, tailer, coverage, extract_tx, admission, producer,
             )
         }
+        TriggerSource::Param => Err(unaccepted_source(TAIL_MODE, TriggerSource::Param)),
     };
     result.map_err(Into::into)
 }
@@ -1330,6 +1491,8 @@ fn clip_triggers(cfg: &ClipConfig) -> anyhow::Result<Vec<AnchoredTrigger>> {
             .map(|trigger| vec![trigger])
             .map_err(|fault| anyhow::anyhow!("{}", fault.message())),
         TriggerSource::Mcap => embedded_triggers(&cfg.recording),
+        #[cfg(feature = "ros")]
+        TriggerSource::Ros => Err(unaccepted_source(CLIP_MODE, TriggerSource::Ros)),
     }
 }
 
@@ -1344,7 +1507,7 @@ fn clip_triggers(cfg: &ClipConfig) -> anyhow::Result<Vec<AnchoredTrigger>> {
 /// come out in the order the triggers were recorded.
 ///
 /// An undecodable trigger is logged and skipped rather than fatal, exactly as
-/// the recorder's `mcap` interface treats one: a single trigger nobody can read
+/// the recorder's `mcap` source treats one: a single trigger nobody can read
 /// must not cost the caller every other clip in the recording. A `cdr` payload
 /// is undecodable in a build without the `ros` feature; `json` decodes in every
 /// build.
@@ -1367,6 +1530,42 @@ fn embedded_triggers(recording: &std::path::Path) -> anyhow::Result<Vec<Anchored
         }
     }
     Ok(triggers)
+}
+
+/// The triggers of `triggers` whose names may reach the filesystem, or the fault
+/// that ends the run.
+///
+/// A trigger name is embedded in the clip's pathname, so it passes the gate
+/// every trigger passes, whichever source it arrived from ([`validate_name`]).
+/// What an unsafe one costs differs with who wrote it: a name the operator typed
+/// is a command line to fix and ends the run, while one the recording carried
+/// costs that trigger its clip and no more — the same isolation an undecodable
+/// trigger gets.
+fn with_usable_names(
+    cfg: &ClipConfig,
+    triggers: Vec<AnchoredTrigger>,
+) -> anyhow::Result<Vec<AnchoredTrigger>> {
+    let mut cuts = Vec::with_capacity(triggers.len());
+    for anchored in triggers {
+        let Err(why) = validate_name(&anchored.trigger.name) else {
+            cuts.push(anchored);
+            continue;
+        };
+        match cfg.trigger_source {
+            TriggerSource::Param => {
+                anyhow::bail!("--trigger-name {:?} {why}", anchored.trigger.name)
+            }
+            TriggerSource::Mcap => warn!(
+                "skipping the trigger at log_time {} in {}: its name {:?} {why}",
+                anchored.anchor_ns,
+                cfg.recording.display(),
+                anchored.trigger.name,
+            ),
+            #[cfg(feature = "ros")]
+            TriggerSource::Ros => return Err(unaccepted_source(CLIP_MODE, TriggerSource::Ros)),
+        }
+    }
+    Ok(cuts)
 }
 
 /// `clipper clip`: cut one clip per trigger out of one finished recording and
@@ -1439,27 +1638,7 @@ fn clip_mode(
 
     let triggers = clip_triggers(&cfg)?;
 
-    // A trigger name reaches the filesystem through the clip's pathname, so it
-    // passes the gate every trigger passes, whichever source it arrived from.
-    // What an unsafe one costs differs with who wrote it: a name the operator
-    // typed is a command line to fix and ends the run, while one the recording
-    // carried costs that trigger its clip and no more — the same isolation an
-    // undecodable trigger gets.
-    let mut cuts = Vec::with_capacity(triggers.len());
-    for anchored in triggers {
-        match (validate_name(&anchored.trigger.name), cfg.trigger_source) {
-            (Ok(()), _) => cuts.push(anchored),
-            (Err(why), TriggerSource::Param) => {
-                anyhow::bail!("--trigger-name {:?} {why}", anchored.trigger.name)
-            }
-            (Err(why), TriggerSource::Mcap) => warn!(
-                "skipping the trigger at log_time {} in {}: its name {:?} {why}",
-                anchored.anchor_ns,
-                cfg.recording.display(),
-                anchored.trigger.name,
-            ),
-        }
-    }
+    let cuts = with_usable_names(&cfg, triggers)?;
 
     // A run with nothing to cut is a normal run: it writes no clip, creates no
     // output directory, and says why. Only `mcap` reaches this — `param` either
@@ -1574,7 +1753,7 @@ const MAX_ROLL_NS: u64 = 1_800_000_000_000; // 30 * 60 * 1e9
 /// postroll wall-floor sleep (`anchor + postroll`), so an anchor far in the
 /// future parks a handler for that long; a wildly future anchor is a producer
 /// clock fault or a hostile record stamp, never a real request. The guard is on
-/// the *resolved* anchor, whatever cell produced it: `--interface ros
+/// the *resolved* anchor, whatever cell produced it: `--trigger-source ros
 /// --time-source log` resolves it to `now` and always passes, while a
 /// `ros`+`publish` `trigger_time` or a tail record's own stamp is exactly what it
 /// bites on — and a tail record's stamp is the only one a build without the
@@ -1595,8 +1774,9 @@ const MAX_TRIGGER_NAME_LEN: usize = 128;
 /// rejects:
 ///
 /// - **`trigger_time` in a cell that ignores it.** At most one cell of the
-///   interface × `--time-source` matrix reads `trigger_time` — `--interface ros
-///   --time-source publish`, where it *is* the anchor ([`Anchor::from_trigger_time`]);
+///   trigger-source × `--time-source` matrix reads `trigger_time` —
+///   `--trigger-source ros --time-source publish`, where it *is* the anchor
+///   ([`Anchor::from_trigger_time`]);
 ///   a build without the `ros` feature has no such cell, and every other cell
 ///   anchors on a transport stamp. Sending `trigger_time` where
 ///   it is ignored would silently anchor the window on the trigger's arrival
@@ -1612,7 +1792,7 @@ const MAX_TRIGGER_NAME_LEN: usize = 128;
 fn validate_trigger(trig: &Trigger, anchor: Anchor, now_ns: u64) -> Result<(), String> {
     if !anchor.from_trigger_time && trig.trigger_time.ns() != 0 {
         return Err(format!(
-            "name={:?} sets trigger_time={} but the active interface and \
+            "name={:?} sets trigger_time={} but the active --trigger-source and \
              --time-source anchor on a transport stamp and ignore it; send \
              trigger_time=0",
             trig.name,
@@ -1699,7 +1879,6 @@ fn drive<I: Interface>(
     admission: Arc<Admission>,
     producer: Producer,
 ) -> anyhow::Result<()> {
-    let iface_name = iface.name();
     let announcer = iface.announcer();
 
     // The callback the interface fires per decoded Trigger. `Fn` + `Send`: it is
@@ -1790,8 +1969,9 @@ fn drive<I: Interface>(
     let signal_rx = signal_channel().context("signal handler failed to install")?;
 
     info!(
-        "clipper tail up: {iface_name} interface, triggers on {TRIGGER_TOPIC}, \
+        "clipper tail up: {} interface, triggers on {TRIGGER_TOPIC}, \
          tailing {}, writing clips to {}",
+        I::SOURCE,
         cfg.record_dir.display(),
         cfg.out_dir.display(),
     );
@@ -2004,7 +2184,7 @@ mod tests {
             "3",
             "--clip-compression",
             "lz4",
-            "--interface",
+            "--trigger-source",
             "mcap",
             "--time-source",
             "publish",
@@ -2018,7 +2198,7 @@ mod tests {
         assert_eq!(cfg.grace(), Duration::from_secs(7));
         assert_eq!(cfg.extract_parallelism, 3);
         assert_eq!(cfg.clip_compression, ClipCompression::Lz4);
-        assert_eq!(cfg.interface, InterfaceKind::Mcap);
+        assert_eq!(cfg.trigger_source, TriggerSource::Mcap);
         assert_eq!(cfg.time_source, TimeSource::Publish);
         assert_eq!(cfg.watch_old_files(), Duration::from_secs(90));
         assert!(cfg.delete_old_files);
@@ -2068,50 +2248,74 @@ mod tests {
         );
     }
 
-    /// `--interface mcap` selects the in-recording interface in every build, and
-    /// an unknown value is rejected. (The `MOMENTEDGE_INTERFACE` env fallback is
-    /// covered by `env_prefix_binds_a_momentedge_name_to_every_field`.)
+    /// `--trigger-source mcap` selects the in-recording triggers in every
+    /// build, and an unknown value is rejected. (The
+    /// `MOMENTEDGE_TRIGGER_SOURCE` env fallback is covered by
+    /// `env_prefix_binds_a_momentedge_name_to_every_field`.)
     #[test]
-    fn config_interface_parses_mcap_and_rejects_an_unknown_value() {
+    fn tail_trigger_source_parses_mcap_and_rejects_an_unknown_value() {
         assert_eq!(
-            parse_from(["clipper", "tail", "--interface", "mcap"])
+            parse_from(["clipper", "tail", "--trigger-source", "mcap"])
                 .unwrap()
-                .interface,
-            InterfaceKind::Mcap
+                .trigger_source,
+            TriggerSource::Mcap
         );
-        assert!(parse_from(["clipper", "tail", "--interface", "bogus"]).is_err());
+        assert!(parse_from(["clipper", "tail", "--trigger-source", "bogus"]).is_err());
     }
 
-    /// The device build: the `ros` feature offers the ROS interface, and clipper
-    /// takes it when `--interface` is absent — the deployed behaviour.
-    #[cfg(feature = "ros")]
+    /// The recorder does not take `param`, in any build: it runs until a
+    /// shutdown signal, and a source naming one window would leave its loop with
+    /// nothing to do after the single cut. The refusal is the parser's, so it
+    /// names the value and the sources that *are* accepted while the command
+    /// line is being read.
     #[test]
-    fn config_interface_defaults_to_ros_under_the_ros_feature() {
-        assert_eq!(
-            parse_from(["clipper", "tail"]).unwrap().interface,
-            InterfaceKind::Ros
-        );
-        assert_eq!(
-            parse_from(["clipper", "tail", "--interface", "ros"])
-                .unwrap()
-                .interface,
-            InterfaceKind::Ros
-        );
-    }
-
-    /// The ROS-free build has no ROS interface to select: `--interface ros` is
-    /// refused like any other unknown value, and `mcap` is what an absent flag
-    /// means.
-    #[cfg(not(feature = "ros"))]
-    #[test]
-    fn config_interface_is_mcap_only_without_the_ros_feature() {
-        assert_eq!(
-            parse_from(["clipper", "tail"]).unwrap().interface,
-            InterfaceKind::Mcap
+    fn tail_refuses_the_param_trigger_source() {
+        let err = cli_from(["clipper", "tail", "--trigger-source", "param"])
+            .expect_err("`clipper tail` takes no param trigger source");
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
+        assert_ne!(err.exit_code(), 0, "a rejected command line exits non-zero");
+        let message = err.to_string();
+        assert!(
+            message.contains("invalid value 'param'"),
+            "the refusal names the value: {message}"
         );
         assert!(
-            parse_from(["clipper", "tail", "--interface", "ros"]).is_err(),
-            "a build that links no ROS must not accept --interface ros"
+            message.contains("mcap"),
+            "the refusal names what the recorder does accept: {message}"
+        );
+    }
+
+    /// The device build: the `ros` feature offers the live subscription, and
+    /// clipper takes it when `--trigger-source` is absent — the deployed
+    /// behaviour.
+    #[cfg(feature = "ros")]
+    #[test]
+    fn tail_trigger_source_defaults_to_ros_under_the_ros_feature() {
+        assert_eq!(
+            parse_from(["clipper", "tail"]).unwrap().trigger_source,
+            TriggerSource::Ros
+        );
+        assert_eq!(
+            parse_from(["clipper", "tail", "--trigger-source", "ros"])
+                .unwrap()
+                .trigger_source,
+            TriggerSource::Ros
+        );
+    }
+
+    /// The ROS-free build has no live subscription to select: `--trigger-source
+    /// ros` is refused like any other unknown value, and `mcap` is what an
+    /// absent flag means.
+    #[cfg(not(feature = "ros"))]
+    #[test]
+    fn tail_trigger_source_is_mcap_only_without_the_ros_feature() {
+        assert_eq!(
+            parse_from(["clipper", "tail"]).unwrap().trigger_source,
+            TriggerSource::Mcap
+        );
+        assert!(
+            parse_from(["clipper", "tail", "--trigger-source", "ros"]).is_err(),
+            "a build that links no ROS must not accept --trigger-source ros"
         );
     }
 
@@ -2193,7 +2397,7 @@ mod tests {
             "--grace-secs",
             "--extract-parallelism",
             "--clip-compression",
-            "--interface",
+            "--trigger-source",
             "--time-source",
             "--watch-old-files-duration",
             "--delete-old-files",
@@ -2209,20 +2413,25 @@ mod tests {
         );
     }
 
-    /// `clipper tail --help` names the interfaces *this* build can select — the
-    /// one place the `ros` cargo feature is visible on the command line. The
-    /// feature build offers both values and defaults to `ros`; the ROS-free
-    /// build offers `mcap` alone and says outright that the ROS interface was
-    /// not built in, so an operator reading `--help` on a host with no ROS is
-    /// told why rather than left guessing.
+    /// `clipper tail --help` names the trigger sources *this* build of *this*
+    /// subcommand can select — the one place the `ros` cargo feature is visible
+    /// on the command line. The feature build offers `ros` and `mcap` and
+    /// defaults to `ros`; the ROS-free build offers `mcap` alone and says
+    /// outright that the ROS source was not built in, so an operator reading
+    /// `--help` on a host with no ROS is told why rather than left guessing.
+    /// `param` is the cutter's and appears in neither.
     #[test]
-    fn tail_help_names_the_interfaces_this_build_offers() {
+    fn tail_help_names_the_trigger_sources_this_build_offers() {
         let err =
             cli_from(["clipper", "tail", "--help"]).expect_err("--help short-circuits the parse");
         let help = err.to_string();
-        // `--help` renders a `ValueEnum`'s accepted values as a `Possible
-        // values:` list, one `- <name>:` line each.
+        // `--help` renders the accepted values as a `Possible values:` list, one
+        // `- <name>:` line each.
         assert!(help.contains("- mcap:"), "every build offers mcap: {help}");
+        assert!(
+            !help.contains("- param:"),
+            "`param` belongs to `clipper clip`: {help}"
+        );
         #[cfg(feature = "ros")]
         {
             assert!(help.contains("- ros:"), "{help}");
@@ -2232,12 +2441,12 @@ mod tests {
         {
             assert!(
                 !help.contains("- ros:"),
-                "a build that links no ROS must not offer --interface ros: {help}"
+                "a build that links no ROS must not offer --trigger-source ros: {help}"
             );
             assert!(help.contains("[default: mcap]"), "{help}");
             assert!(
                 help.contains("this build was made without it"),
-                "the help says the ros interface is absent from this build: {help}"
+                "the help says the ros source is absent from this build: {help}"
             );
         }
     }
@@ -2882,15 +3091,37 @@ mod tests {
             .collect())
     }
 
-    /// `CLIP_MODE` is the name clap gave [`Mode::Clip`] — `parse_cli` raises a
-    /// trigger fault against that subcommand, so a rename that left the constant
-    /// behind would panic there instead of reporting the fault.
+    /// [`MODES`] spells the names clap gave the two variants — `scan_mode` finds
+    /// the mode in argv by them and `parse_cli` raises a trigger fault against
+    /// `clip` by name, so a rename that left a constant behind would read no
+    /// configuration file and panic instead of reporting the fault.
     #[test]
-    fn clip_mode_is_the_name_clap_built() {
-        assert!(
-            Cli::command().find_subcommand(CLIP_MODE).is_some(),
-            "CLIP_MODE must name a subcommand clipper actually has"
+    fn the_mode_names_are_the_ones_clap_built() {
+        let cmd = Cli::command();
+        for (name, _) in MODES {
+            assert!(
+                cmd.find_subcommand(name).is_some(),
+                "{name} must name a subcommand clipper actually has"
+            );
+        }
+        assert_eq!(
+            cmd.get_subcommands().count(),
+            MODES.len(),
+            "every subcommand clipper has must be in MODES"
         );
+        // A mode reachable by a second spelling is a mode `scan_mode` would miss
+        // while clap accepted it, which is the one way `parse_cli` can hold a
+        // parsed command line whose files were never read — and there it panics
+        // rather than reporting anything. An alias or `infer_subcommands` is
+        // fine to add; the scan has to learn the same spellings in the same
+        // change, and this is what says so.
+        for sub in cmd.get_subcommands() {
+            assert!(
+                sub.get_all_aliases().next().is_none(),
+                "{} carries an alias, which `scan_mode` does not know",
+                sub.get_name()
+            );
+        }
     }
 
     /// The flag defaults to the command line, parses `mcap`, and refuses
@@ -2936,18 +3167,23 @@ mod tests {
 
     /// `clipper clip --help` names the sources it accepts and the default it
     /// takes, rendered from the `ValueEnum` itself, and says where a recorded
-    /// trigger is read from.
+    /// trigger is read from. `ros` is a live subscription and appears in no
+    /// build of this subcommand.
     #[test]
     fn clip_help_names_the_trigger_sources() {
         let err =
             cli_from(["clipper", "clip", "--help"]).expect_err("--help short-circuits the parse");
         let help = err.to_string();
         assert!(help.contains("--trigger-source"), "{help}");
-        // `--help` renders a `ValueEnum`'s accepted values as a `Possible
-        // values:` list, one `- <name>:` line each.
+        // `--help` renders the accepted values as a `Possible values:` list, one
+        // `- <name>:` line each.
         for value in ["- param:", "- mcap:"] {
             assert!(help.contains(value), "the help lists {value}: {help}");
         }
+        assert!(
+            !help.contains("- ros:"),
+            "a finished recording has no live topic: {help}"
+        );
         assert!(
             help.contains("[default: param]"),
             "the default is rendered from the enum's own value name: {help}"
@@ -2955,6 +3191,121 @@ mod tests {
         assert!(
             help.contains(TRIGGER_TOPIC),
             "the long help names the topic a recorded trigger is read from: {help}"
+        );
+    }
+
+    /// The cutter does not take `ros`, in any build: a finished recording has no
+    /// live topic to subscribe to. Under the `ros` feature the variant exists
+    /// and the cutter's own subset is what refuses it; without the feature there
+    /// is no such value at all. Either way the refusal is clap's, names the
+    /// value, and happens before anything is written.
+    #[test]
+    fn clip_refuses_the_ros_trigger_source() {
+        let err = cli_from(clip_argv(&["--trigger-source", "ros"]))
+            .expect_err("`clipper clip` takes no ros trigger source");
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
+        assert_ne!(err.exit_code(), 0, "a rejected command line exits non-zero");
+        let message = err.to_string();
+        assert!(
+            message.contains("invalid value 'ros'"),
+            "the refusal names the value: {message}"
+        );
+        for accepted in ["mcap", "param"] {
+            assert!(
+                message.contains(accepted),
+                "the refusal names what the cutter does accept ({accepted}): {message}"
+            );
+        }
+    }
+
+    /// The subsets are the type's, and every subcommand's `--trigger-source`
+    /// surface is derived from them: each subcommand accepts exactly the sources
+    /// [`TriggerSource::modes`] lists for it, no source belongs to nothing, and
+    /// the default a subcommand takes with the flag absent is one it accepts.
+    ///
+    /// Stated over the parser clap actually built, so the table and the two
+    /// arguments cannot drift: a variant added without a `modes` entry does not
+    /// compile, and one whose entry disagrees with the surface fails here.
+    #[test]
+    fn each_subcommand_accepts_exactly_its_own_trigger_sources() {
+        let cmd = Cli::command();
+        for (name, mode) in MODES {
+            let expected: Vec<String> = TriggerSource::accepted_by(mode)
+                .map(|source| source.to_string())
+                .collect();
+            assert!(
+                !expected.is_empty(),
+                "{name} must accept at least one trigger source"
+            );
+            let arg = cmd
+                .find_subcommand(name)
+                .unwrap_or_else(|| panic!("{name} is a subcommand of clipper"))
+                .get_arguments()
+                .find(|arg| arg.get_id().as_str() == "trigger_source")
+                .unwrap_or_else(|| panic!("{name} carries --trigger-source"));
+            let offered: Vec<String> = arg
+                .get_value_parser()
+                .possible_values()
+                .expect("--trigger-source is parsed against a fixed value set")
+                .map(|value| value.get_name().to_string())
+                .collect();
+            assert_eq!(offered, expected, "{name}: --trigger-source value set");
+            let default: Vec<String> = arg
+                .get_default_values()
+                .iter()
+                .map(|value| value.to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(default.len(), 1, "{name}: one default");
+            assert!(
+                expected.contains(&default[0]),
+                "{name}: the default {} is not a source it accepts ({expected:?})",
+                default[0],
+            );
+        }
+
+        for source in TriggerSource::value_variants() {
+            assert!(
+                !source.modes().is_empty(),
+                "{source} belongs to no subcommand"
+            );
+        }
+    }
+
+    /// The completion half follows from the trigger source: each interface the
+    /// recorder can drive names the source that selects it, and carries the
+    /// announcer that pairing implies. `ros` answers each clip with a `Recorded`
+    /// publish; `mcap` has the clip's move into `out_dir` as its only signal, so
+    /// its announcer is the no-op one. There is no separate announcer setting —
+    /// these two cells are the whole matrix.
+    #[test]
+    fn each_tail_trigger_source_carries_the_announcer_its_interface_implies() {
+        assert_eq!(McapInterface::SOURCE, TriggerSource::Mcap);
+        // A compile-time assertion on the associated type: this coerces only if
+        // the MCAP interface's announcer *is* the no-op one.
+        let _: fn(interface::NullAnnouncer) -> <McapInterface as Interface>::Announcer =
+            std::convert::identity;
+        #[cfg(feature = "ros")]
+        {
+            assert_eq!(RosInterface::SOURCE, TriggerSource::Ros);
+            let _: fn(interface::ros::RosAnnouncer) -> <RosInterface as Interface>::Announcer =
+                std::convert::identity;
+        }
+        // And the two sides are the same set: every source the recorder accepts
+        // names an interface this build compiled in, and every such interface is
+        // selectable.
+        #[cfg(feature = "ros")]
+        let interfaces = [McapInterface::SOURCE, RosInterface::SOURCE];
+        #[cfg(not(feature = "ros"))]
+        let interfaces = [McapInterface::SOURCE];
+        let mut served: Vec<String> = interfaces.iter().map(ToString::to_string).collect();
+        served.sort_unstable();
+        let mut accepted: Vec<String> = TriggerSource::accepted_by(config::Mode::Tail)
+            .map(|source| source.to_string())
+            .collect();
+        accepted.sort_unstable();
+        assert_eq!(
+            served, accepted,
+            "every source `clipper tail` accepts names an interface, and back"
         );
     }
 
@@ -3871,6 +4222,73 @@ mod tests {
         assert_eq!(scan_flag(&[eq], "--config"), Some(PathBuf::from(&raw)));
     }
 
+    /// The mode is found by a scan of one word, and this is the pair of claims
+    /// that makes reading `argv[1]` sound: every mode is named there, and a
+    /// command line that names no mode there names none at all.
+    #[test]
+    fn the_mode_scan_reads_the_word_after_the_program_name() {
+        let argv = |args: &[&str]| -> Vec<std::ffi::OsString> {
+            args.iter().map(std::ffi::OsString::from).collect()
+        };
+
+        assert_eq!(
+            scan_mode(&argv(&["clipper", "tail", "--grace-secs", "5"])),
+            Some(config::Mode::Tail)
+        );
+        assert_eq!(
+            scan_mode(&argv(&["clipper", "clip", "/tmp/rec.mcap"])),
+            Some(config::Mode::Clip)
+        );
+        for line in [
+            vec!["clipper"],
+            vec!["clipper", "--help"],
+            vec!["clipper", "--version"],
+            vec!["clipper", "bogus"],
+            vec!["clipper", "--config", "/tmp/a.toml", "tail"],
+        ] {
+            assert_eq!(
+                scan_mode(&argv(&line)),
+                None,
+                "{line:?} names no mode at argv[1]"
+            );
+        }
+    }
+
+    /// What makes the scan's one word enough: a mode can only ever be the word
+    /// after the program name, because `clipper` itself takes no argument that
+    /// could precede it. Every command line the scan reads as mode-less is one
+    /// clap refuses, so a parse that succeeds is a parse whose files were read.
+    #[test]
+    fn nothing_may_stand_between_clipper_and_its_mode() {
+        let mut root = with_config_args(Cli::command());
+        root.build();
+        for arg in root.get_arguments() {
+            assert!(
+                !arg.get_action().takes_values(),
+                "clipper's own `{}` takes a value, so it could stand before the mode",
+                arg.get_id()
+            );
+        }
+
+        for line in [
+            vec!["clipper"],
+            vec!["clipper", "--help"],
+            vec!["clipper", "bogus"],
+            vec!["clipper", "--", "tail"],
+            vec!["clipper", "--config", "/tmp/a.toml", "tail"],
+        ] {
+            let argv: Vec<std::ffi::OsString> = line.iter().map(std::ffi::OsString::from).collect();
+            assert!(
+                scan_mode(&argv).is_none(),
+                "{line:?} must be mode-less to the scan"
+            );
+            assert!(
+                matches!(loaded_from(&line), Err(StartupError::Cli(_))),
+                "{line:?} must not parse"
+            );
+        }
+    }
+
     /// The `(value, origin)` a report line carries for `key`.
     fn reported(report: &str, key: &str) -> (String, String) {
         let line = report
@@ -4183,6 +4601,57 @@ mod tests {
         Ok(())
     }
 
+    /// The same two files under `clipper clip`, which has no `--record-dir`:
+    /// the key is neither refused nor fatal there, so nothing is reported and
+    /// the run proceeds on the keys it does have.
+    ///
+    /// This is what `scan_mode` buys end to end. The scope line is the running
+    /// subcommand's, so the same per-run file that `clipper tail` is refused
+    /// `record_dir` from costs `clipper clip` nothing — and a device's system
+    /// file describing the recorder stays readable by both.
+    #[test]
+    fn a_key_the_running_mode_does_not_have_is_neither_refused_nor_fatal() -> anyhow::Result<()> {
+        let dir = clip::testing::test_dir("cli-inert-key")?;
+        let system = dir.join("system.toml");
+        std::fs::write(
+            &system,
+            "[settings]\nrecord_dir = \"/data/record\"\nout_dir = \"/data/clipped\"\n",
+        )?;
+        let run = dir.join("run.toml");
+        std::fs::write(&run, "[settings]\nrecord_dir = \"/tmp/mine\"\n")?;
+        let (system, run) = (system.display().to_string(), run.display().to_string());
+
+        let loaded = loaded_from(&[
+            "clipper",
+            "clip",
+            "/tmp/rec.mcap",
+            "--trigger-time",
+            "1",
+            "--preroll",
+            "2",
+            "--postroll",
+            "3",
+            "--system-config",
+            &system,
+            "--config",
+            &run,
+        ])
+        .map_err(|_| anyhow::anyhow!("the recorder's keys must not fail a clip run"))?;
+        let report = loaded.report.clone();
+        let Mode::Clip(cfg) = loaded.cli.mode else {
+            unreachable!("this argv names the clip mode")
+        };
+
+        assert_eq!(cfg.out_dir, PathBuf::from("/data/clipped"));
+        assert!(
+            !report.contains("record_dir"),
+            "`clipper clip` has no --record-dir, so the key is inert and unreported:\n{report}"
+        );
+
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
     /// The effective configuration a report prints is the configuration the run
     /// uses: every line is checked against the field the mode actually reads.
     #[test]
@@ -4259,7 +4728,7 @@ mod tests {
                 cfg.delete_old_files.to_string(),
                 "system",
             ),
-            ("interface", cfg.interface.to_string(), "built-in"),
+            ("trigger_source", cfg.trigger_source.to_string(), "built-in"),
         ] {
             let (value, origin) = reported(&report, key);
             assert_eq!(value, used, "{key}: the report is the value in use");
@@ -4301,48 +4770,385 @@ mod tests {
         Ok(())
     }
 
-    /// Every argument of every mode is a `[settings]` key, and every key is some
-    /// mode's argument.
+    /// Why an argument of a mode is deliberately not a `[settings]` key of that
+    /// mode. The exclusions are not one list with one reason, and stating them
+    /// as one would lose the distinction a reader needs.
+    #[derive(Clone, Copy, Debug)]
+    enum NotASettingsKey {
+        /// clap's own `--help` and `--version`. They end the process rather
+        /// than configure a run, so there is nothing for a file to say.
+        ClapsOwn,
+        /// The three configuration flags. They are *about* the configuration
+        /// rather than in it, so no file can name another file or ask for the
+        /// report of one.
+        AboutTheConfiguration,
+        /// `--trigger-source`. It says how *this process was launched* rather
+        /// than what the machine is configured with — a device sets it once in
+        /// the unit file that already carries the rest of the invocation — so
+        /// it is the flag and `MOMENTEDGE_TRIGGER_SOURCE` and nothing else.
+        HowTheProcessWasLaunched,
+    }
+
+    impl NotASettingsKey {
+        /// The reason in words, for the assertion that names it. An exhaustive
+        /// match, so a reason added here has to be spelled out.
+        fn reason(self) -> &'static str {
+            match self {
+                Self::ClapsOwn => "clap's own; it configures no run",
+                Self::AboutTheConfiguration => {
+                    "about the configuration rather than in it, so no file names another file"
+                }
+                Self::HowTheProcessWasLaunched => {
+                    "how this process was launched, not what the machine is configured with"
+                }
+            }
+        }
+    }
+
+    /// Every argument that is deliberately not a key, and which reason it is.
+    ///
+    /// An argument named nowhere here and nowhere in the scope table fails
+    /// [`every_mode_argument_is_a_settings_key_and_back`], so a flag added
+    /// without a key has to say which of these it is rather than being waved
+    /// through. This list is the drift test's alone: `effective_config` has its
+    /// own and shorter one, because `trigger_source` is a setting the run uses
+    /// and belongs in the report even though no file may name it.
+    const NOT_SETTINGS_KEYS: &[(&str, NotASettingsKey)] = &[
+        ("help", NotASettingsKey::ClapsOwn),
+        ("version", NotASettingsKey::ClapsOwn),
+        (CONFIG_ARG, NotASettingsKey::AboutTheConfiguration),
+        (SYSTEM_CONFIG_ARG, NotASettingsKey::AboutTheConfiguration),
+        (PRINT_CONFIG_ARG, NotASettingsKey::AboutTheConfiguration),
+        ("trigger_source", NotASettingsKey::HowTheProcessWasLaunched),
+    ];
+
+    /// Every argument of a mode is a `[settings]` key **of that mode**, and
+    /// every key of a mode is an argument of it.
     ///
     /// The scope table lives in the library and the arguments live here, so
     /// nothing but this test stops the two drifting: a flag added to a mode
-    /// would otherwise be unsettable from a file, and a key removed from a mode
-    /// would name nothing. The three configuration flags are excluded by name —
-    /// they are about the configuration rather than in it.
+    /// would otherwise be unsettable from a file, and a key listed under a mode
+    /// that has no such flag would name nothing a run of it can use. Checking
+    /// each mode against its own rows rather than against the union is what
+    /// makes the second half bite — a `recording` row under `tail` passes a
+    /// union check and fails this one. The deliberate exceptions are
+    /// [`NOT_SETTINGS_KEYS`], each carrying the reason it is one; an argument
+    /// listed there must be a key of no mode, and an argument listed nowhere
+    /// must be a key of its own.
     #[test]
     fn every_mode_argument_is_a_settings_key_and_back() {
         let cmd = with_config_args(Cli::command());
-        let mut named = std::collections::BTreeSet::new();
-        for mode in ["tail", "clip"] {
+        for (name, mode) in MODES {
             let sub = cmd
-                .find_subcommand(mode)
-                .unwrap_or_else(|| panic!("{mode} is a subcommand of clipper"));
+                .find_subcommand(name)
+                .unwrap_or_else(|| panic!("{name} is a subcommand of clipper"));
+            let mut named = std::collections::BTreeSet::new();
             for arg in sub.get_arguments() {
                 let id = arg.get_id().as_str();
-                if matches!(
-                    id,
-                    "help" | "version" | CONFIG_ARG | SYSTEM_CONFIG_ARG | PRINT_CONFIG_ARG
-                ) {
+                let excused = NOT_SETTINGS_KEYS
+                    .iter()
+                    .find_map(|(excluded, why)| (*excluded == id).then_some(*why));
+                if let Some(why) = excused {
                     assert_eq!(
-                        clip::config::scope_of(id),
+                        config::scope_of(mode, id),
                         None,
-                        "{id} must not be a settings key"
+                        "{name}: {id} must not be a settings key — {}",
+                        why.reason()
                     );
                     continue;
                 }
                 assert!(
-                    clip::config::scope_of(id).is_some(),
-                    "{mode}: {id} is a flag with no `[settings]` key"
+                    config::scope_of(mode, id).is_some(),
+                    "{name}: {id} is a flag with no `[settings]` key"
                 );
                 named.insert(id.to_string());
             }
+            for key in config::setting_keys(mode) {
+                assert!(
+                    named.contains(key),
+                    "{name}: the `{key}` settings key names no argument of this mode"
+                );
+            }
         }
-        for key in clip::config::setting_keys() {
-            assert!(
-                named.contains(key),
-                "the `{key}` settings key names no mode's argument"
+    }
+
+    /// An argument both subcommands carry accepts the same values in both,
+    /// unless [`VALUE_SETS_MAY_DIVERGE`] excuses it and says why.
+    ///
+    /// One name shared by two subcommands is one name a *layer* can set for
+    /// both. A configuration file is read by whichever subcommand runs, and the
+    /// `MOMENTEDGE_*` binding is the same word for both, so a value legal for
+    /// one is handed to the other — and a value the other refuses stops it at
+    /// parse time, on a machine configured for the first. Sharing a name is safe
+    /// only while either subcommand would take what a layer wrote for the other.
+    ///
+    /// The check is over the arguments, not over the `[settings]` keys, because
+    /// a key is only one of the layers that can do this: `trigger_source` is no
+    /// file's key at all and still shares `MOMENTEDGE_TRIGGER_SOURCE` across
+    /// both subcommands.
+    #[test]
+    fn an_argument_both_subcommands_share_accepts_the_same_values_in_both() {
+        let cmd = with_config_args(Cli::command());
+        let subcommand = |mode_name: &str| {
+            cmd.find_subcommand(mode_name)
+                .unwrap_or_else(|| panic!("{mode_name} is a subcommand of clipper"))
+        };
+        let values = |mode_name: &str, id: &str| -> Vec<String> {
+            subcommand(mode_name)
+                .get_arguments()
+                .find(|arg| arg.get_id().as_str() == id)
+                .unwrap_or_else(|| panic!("{mode_name} carries {id}"))
+                .get_possible_values()
+                .iter()
+                .map(|value| value.get_name().to_string())
+                .collect()
+        };
+
+        let clip_ids: std::collections::BTreeSet<&str> = subcommand(CLIP_MODE)
+            .get_arguments()
+            .map(|arg| arg.get_id().as_str())
+            .collect();
+        let shared: Vec<&str> = subcommand(TAIL_MODE)
+            .get_arguments()
+            .map(|arg| arg.get_id().as_str())
+            .filter(|id| clip_ids.contains(id) && !matches!(*id, "help" | "version"))
+            .collect();
+        assert!(
+            shared.contains(&"out_dir") && shared.contains(&"trigger_source"),
+            "the subcommands share at least where clips go and where triggers \
+             come from: {shared:?}"
+        );
+
+        for id in shared {
+            let excused = VALUE_SETS_MAY_DIVERGE
+                .iter()
+                .find_map(|(excused, why)| (*excused == id).then_some(*why));
+            if let Some(why) = excused {
+                assert_ne!(
+                    values(TAIL_MODE, id),
+                    values(CLIP_MODE, id),
+                    "`{id}` is excused from sharing a value set — {why} — but the \
+                     subcommands agree on it, so the excuse is stale"
+                );
+                continue;
+            }
+            assert_eq!(
+                values(TAIL_MODE, id),
+                values(CLIP_MODE, id),
+                "`{id}` is an argument of both subcommands, so a layer setting it \
+                 for one must not hand the other a value it refuses"
             );
         }
+    }
+
+    /// The arguments both subcommands carry whose value sets deliberately
+    /// differ, each with the reason no layer can exploit the difference.
+    ///
+    /// An entry is a promise that nothing reaching *both* subcommands by default
+    /// can set the argument, so only a deliberate act can hand one subcommand
+    /// the other's value. It is not a way to wave the check through: an excused
+    /// argument whose value sets agree also fails, so an entry that stops being
+    /// needed reports itself.
+    const VALUE_SETS_MAY_DIVERGE: &[(&str, &str)] = &[(
+        "trigger_source",
+        "no configuration file may name it, so the only layer reaching both is \
+         `MOMENTEDGE_TRIGGER_SOURCE`, which an operator exports deliberately \
+         rather than a run picking it up from /etc",
+    )];
+
+    /// A configuration file naming `trigger_source` fails the run, whichever
+    /// subcommand reads it, and the error names the key.
+    ///
+    /// It is not a key of either mode, so it is not "some other subcommand's
+    /// key" and therefore inert — it is nobody's key, which is the misspelling
+    /// case. The trigger source is the flag and `MOMENTEDGE_TRIGGER_SOURCE`,
+    /// and a file that tries to decide it is told so at the first start.
+    #[test]
+    fn a_file_naming_trigger_source_fails_either_subcommand() -> anyhow::Result<()> {
+        let dir = clip::testing::test_dir("cli-trigger-source-file")?;
+        let named = dir.join("named.toml");
+        std::fs::write(&named, "[settings]\ntrigger_source = \"ros\"\n")?;
+        let named = named.display().to_string();
+
+        for argv in [
+            vec!["clipper", "tail", "--system-config", &named],
+            vec![
+                "clipper",
+                "clip",
+                "rec.mcap",
+                "--out-dir",
+                "/data/clips",
+                "--trigger-time",
+                "1",
+                "--preroll",
+                "0",
+                "--postroll",
+                "1",
+                "--system-config",
+                &named,
+            ],
+        ] {
+            match loaded_from(&argv) {
+                Err(StartupError::Config(err)) => {
+                    let rendered = format!("{err:#}");
+                    assert!(rendered.contains("trigger_source"), "{rendered}");
+                    assert!(rendered.contains("named.toml"), "{rendered}");
+                }
+                Err(StartupError::Cli(err)) => {
+                    panic!("{argv:?}: a file fault is not a parse fault: {err}")
+                }
+                Ok(_) => panic!("{argv:?}: a file may not name `trigger_source`"),
+            }
+        }
+
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    /// A device's system file, describing the recorder that runs on that
+    /// machine, leaves `clipper clip` on the same machine able to start.
+    ///
+    /// What this pins is the hazard of a shared name: a file is read by
+    /// whichever subcommand runs, so any key both carry is a value one of them
+    /// can hand the other. The trigger source being no file's key is what keeps
+    /// the recorder's own settings from reaching the cutter — a system file
+    /// describing the machine's recorder has nothing in it that `clipper clip`
+    /// must accept, so the cutter starts on a fully configured device.
+    #[test]
+    fn the_recorders_system_file_leaves_the_cutter_able_to_start() -> anyhow::Result<()> {
+        let dir = clip::testing::test_dir("cli-device-file-under-clip")?;
+        let system = dir.join("clipper.toml");
+        std::fs::write(
+            &system,
+            "[settings]\n\
+             record_dir = \"/data/record\"\n\
+             out_dir = \"/data/clipped\"\n\
+             extract_parallelism = 1\n\
+             grace_secs = 45\n",
+        )?;
+        let system = system.display().to_string();
+
+        let loaded = loaded_from(&[
+            "clipper",
+            "clip",
+            "rec.mcap",
+            "--trigger-time",
+            "1",
+            "--preroll",
+            "0",
+            "--postroll",
+            "1",
+            "--system-config",
+            &system,
+        ])
+        .map_err(|e| match e {
+            StartupError::Cli(e) => anyhow::anyhow!("{e}"),
+            StartupError::Config(e) => e,
+        })?;
+        let Mode::Clip(cfg) = loaded.cli.mode else {
+            unreachable!("this argv names the clip mode")
+        };
+        assert_eq!(
+            cfg.trigger_source,
+            TriggerSource::Param,
+            "the recorder's file has nothing to say about the cutter's source"
+        );
+        assert_eq!(
+            cfg.out_dir,
+            PathBuf::from("/data/clipped"),
+            "the keys the two subcommands share still cross"
+        );
+
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    /// `MOMENTEDGE_TRIGGER_SOURCE` reaches both subcommands' argument, and the
+    /// report says the environment decided it.
+    ///
+    /// The environment layer is the other half of what the trigger source has:
+    /// whoever launches the process commands it, from the unit file or from the
+    /// command line, and from nowhere below.
+    #[test]
+    fn the_trigger_source_environment_variable_reaches_both_subcommands() -> anyhow::Result<()> {
+        let _env = EnvVar::set("MOMENTEDGE_TRIGGER_SOURCE", "mcap");
+
+        let tail = loaded_from(&["clipper", "tail"])
+            .map_err(|_| anyhow::anyhow!("`clipper tail` must parse"))?;
+        let Mode::Tail(tail_cfg) = tail.cli.mode else {
+            unreachable!("this argv names the tail mode")
+        };
+        assert_eq!(tail_cfg.trigger_source, TriggerSource::Mcap);
+        assert_eq!(
+            reported(&tail.report, "trigger_source"),
+            ("mcap".to_string(), "environment".to_string())
+        );
+
+        let clip = loaded_from(&["clipper", "clip", "rec.mcap", "--out-dir", "/data/clips"])
+            .map_err(|_| anyhow::anyhow!("`clipper clip` must parse"))?;
+        let Mode::Clip(clip_cfg) = clip.cli.mode else {
+            unreachable!("this argv names the clip mode")
+        };
+        assert_eq!(clip_cfg.trigger_source, TriggerSource::Mcap);
+        assert_eq!(
+            reported(&clip.report, "trigger_source"),
+            ("mcap".to_string(), "environment".to_string())
+        );
+
+        Ok(())
+    }
+
+    /// `--print-config` reports `trigger_source` under both subcommands, and
+    /// never at a file layer.
+    ///
+    /// It is a setting the run uses, so leaving it out of the report would hide
+    /// which source a run took; it simply has no layer below the environment to
+    /// resolve to, so the report reads `flag` or `built-in default` and nothing
+    /// else. The system file here is the device's, to prove a file present and
+    /// full of the recorder's keys still cannot claim the line.
+    #[test]
+    fn trigger_source_is_reported_by_both_subcommands_at_no_file_layer() -> anyhow::Result<()> {
+        let dir = clip::testing::test_dir("cli-trigger-source-report")?;
+        let system = dir.join("clipper.toml");
+        std::fs::write(
+            &system,
+            "[settings]\nrecord_dir = \"/data/record\"\nout_dir = \"/data/clipped\"\n",
+        )?;
+        let system = system.display().to_string();
+
+        let clip_argv = ["clipper", "clip", "rec.mcap"];
+        let clip_window = ["--trigger-time", "1", "--preroll", "0", "--postroll", "1"];
+        let defaulted: Vec<&str> = ["clipper", "tail", "--system-config", &system]
+            .into_iter()
+            .collect();
+        let clip_defaulted: Vec<&str> = clip_argv
+            .into_iter()
+            .chain(clip_window)
+            .chain(["--system-config", &system])
+            .collect();
+        let flagged: Vec<&str> = ["clipper", "tail", "--trigger-source", "mcap"]
+            .into_iter()
+            .chain(["--system-config", &system])
+            .collect();
+        let clip_flagged: Vec<&str> = clip_argv
+            .into_iter()
+            .chain(["--trigger-source", "mcap"])
+            .chain(["--system-config", &system])
+            .collect();
+
+        for (argv, expected) in [
+            (defaulted, "built-in default"),
+            (clip_defaulted, "built-in default"),
+            (flagged, "flag"),
+            (clip_flagged, "flag"),
+        ] {
+            let loaded = loaded_from(&argv).map_err(|_| anyhow::anyhow!("{argv:?} must parse"))?;
+            let (_, origin) = reported(&loaded.report, "trigger_source");
+            assert_eq!(origin, expected, "{argv:?}");
+        }
+
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
     }
 
     /// The three configuration flags reach every mode, and carry the same
@@ -4374,9 +5180,14 @@ mod tests {
 
     /// `--print-config` is what a caller asks the report for; every mode takes
     /// it and nothing else is run.
+    ///
+    /// Both modes are given the *same* file, one written with `clipper clip`'s
+    /// keys: a file is one file, and the keys of a mode that is not running are
+    /// inert rather than fatal, so `clipper tail` reads it and simply applies
+    /// the `out_dir` they share.
     #[test]
     fn print_config_is_requested_per_mode() -> anyhow::Result<()> {
-        for mode in ["tail", "clip"] {
+        for mode in [TAIL_MODE, CLIP_MODE] {
             let dir = clip::testing::test_dir(&format!("cli-print-{mode}"))?;
             let system = write_clip_system_file(&dir, "system.toml", None)?
                 .display()

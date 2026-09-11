@@ -6,8 +6,9 @@
 //! `Context`, a `Node`, or a subscription, and the only reason the binary links
 //! r2r at all.
 //!
-//! Without the feature this module does not exist, `--interface` offers `mcap`
-//! alone, and the recorder links no ROS — see the parent module.
+//! Without the feature this module does not exist, `clipper tail
+//! --trigger-source` offers `mcap` alone, and the recorder links no ROS — see
+//! the parent module.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -23,6 +24,7 @@ use log::{error, info};
 use r2r::{Publisher, QosProfile};
 
 use super::{Anchor, Interface};
+use crate::TriggerSource;
 use crate::supervision::{harvest_panic, spawn_supervised};
 
 /// The window anchor the ROS interface resolves for one trigger. A live ROS
@@ -90,9 +92,7 @@ impl RosInterface {
 impl Interface for RosInterface {
     type Announcer = RosAnnouncer;
 
-    fn name(&self) -> &'static str {
-        "ros"
-    }
+    const SOURCE: TriggerSource = TriggerSource::Ros;
 
     fn announcer(&self) -> RosAnnouncer {
         self.announcer.clone()

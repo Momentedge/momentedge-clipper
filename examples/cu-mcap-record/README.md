@@ -2,8 +2,8 @@
 
 A standalone [copper (cu29)](https://github.com/copper-project/copper-rs)
 application whose sink task appends routed task outputs to an MCAP **Recording**
-that `clipper tail --interface mcap` follows live — the copper **Producer** path beside
-the two plain-`mcap`-crate writer examples,
+that `clipper tail --trigger-source mcap` follows live — the copper **Producer**
+path beside the two plain-`mcap`-crate writer examples,
 [`custom-mcap-writer`](../custom-mcap-writer/README.md) (unchunked) and
 [`chunked-mcap-writer`](../chunked-mcap-writer/README.md) (buffered chunks +
 zstd). No ROS stack is involved anywhere: the **Trigger** travels in-band,
@@ -81,7 +81,7 @@ rather than silently producing empty Clips.
 The trigger channel is the one channel with no exporter parity: clipper's decoder
 reads the `Trigger` fields at the top level, so the sink writes them unwrapped.
 The payload carries `preroll` = `postroll` = 3 s and a constant `trigger_time` of
-`{"sec": 0, "nanosec": 0}`: under `--interface mcap` clipper resolves the
+`{"sec": 0, "nanosec": 0}`: under `--trigger-source mcap` clipper resolves the
 **Anchor** from the Trigger record's own MCAP stamp, and its admission gate
 rejects a non-zero payload `trigger_time`.
 
@@ -108,7 +108,8 @@ Point unmodified clipper at the same directory with `--record-dir` (the tailed
 Recording directory) and `--out-dir` (where finished Clips land):
 
 ```bash
-clipper tail --interface mcap --record-dir examples/cu-mcap-record/out --out-dir clips
+clipper tail --trigger-source mcap \
+  --record-dir examples/cu-mcap-record/out --out-dir clips
 ```
 
 Clipper tails the growing Recording, lifts each Trigger out of it, cuts a Clip
@@ -120,9 +121,9 @@ writes one continuous Recording and leaves pruning to clipper.
 
 Clipper's live e2e suite drives this binary as its copper Producer fixture: the
 `copper_sink_recording_produces_clip` test runs this app and unmodified clipper
-together on `--interface mcap` and asserts a Clip appears and parses. The suite
-provisions the binary beside the clipper binary under test (`CU_MCAP_RECORD_BIN`,
-or an on-demand `-p cu-mcap-record` build).
+together on `--trigger-source mcap` and asserts a Clip appears and parses. The
+suite provisions the binary beside the clipper binary under test
+(`CU_MCAP_RECORD_BIN`, or an on-demand `-p cu-mcap-record` build).
 
 ## Production notes
 

@@ -40,11 +40,11 @@ cd "$REPO_ROOT"
 #
 #    --features clipper/ros is what makes clipper the device build. ROS is a
 #    cargo feature of the recorder and it is off by default, so without this flag
-#    the binary would link no ROS and offer no `--interface ros` — exactly the
-#    wrong artefact for a target set up with an apt ROS2 above. The flag is added
-#    only when clipper is selected: cargo rejects a `<pkg>/<feature>` naming a
-#    package no `-p` picked. trigger-pub has no such feature; it links r2r
-#    unconditionally.
+#    the binary would link no ROS and offer no `--trigger-source ros` — exactly
+#    the wrong artefact for a target set up with an apt ROS2 above. The flag is
+#    added only when clipper is selected: cargo rejects a `<pkg>/<feature>`
+#    naming a package no `-p` picked. trigger-pub has no such feature; it links
+#    r2r unconditionally.
 read -ra _build_pkgs <<< "${BUILD_PACKAGES:-clipper trigger-pub}"
 _pkg_flags=()
 _feature_flags=()

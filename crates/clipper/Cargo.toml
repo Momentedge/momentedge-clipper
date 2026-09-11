@@ -15,14 +15,14 @@ path = "src/main.rs"
 [features]
 default = []
 # The ROS interface: a live `momentedge_msgs/Trigger` subscription on a node and
-# the `Recorded` publish answering it (`--interface ros`), plus everything that
-# exists only to serve it — r2r, the futures its typed subscription stream is
-# drained with, and `clip`'s CDR trigger decoder. This is the device build, and
+# the `Recorded` publish answering it (`--trigger-source ros`), plus everything
+# that exists only to serve it — r2r, the futures its typed subscription stream
+# is drained with, and `clip`'s CDR trigger decoder. This is the device build, and
 # every packaging path asks for it: the nix package, the on-target build behind
 # the .deb, and the per-distro CI matrix.
 #
 # Off by default, so a plain `cargo build -p clipper` links no ROS, needs no ROS
-# installation anywhere, and offers `--interface mcap` alone — the recorder
+# installation anywhere, and offers `--trigger-source mcap` alone — the recorder
 # reading its triggers out of the recording it already tails. The ROS-free CI
 # lane holds that down by asserting r2r is absent from the default dependency
 # tree before it builds the crate.

@@ -1,8 +1,8 @@
 # chunked-mcap-writer — tailable chunked + compressed MCAP
 
 A standalone program that writes a **chunked, zstd-compressed MCAP file that
-`clipper tail --interface mcap` can still follow live** — the second producer path
-that satisfies clipper's tailability contract, next to
+`clipper tail --trigger-source mcap` can still follow live** — the second
+producer path that satisfies clipper's tailability contract, next to
 [`custom-mcap-writer`](../custom-mcap-writer/README.md)'s unchunked output.
 Its only job is to show the [`mcap`](https://crates.io/crates/mcap) crate
 configuration that makes this work; everything else is deliberately minimal:
@@ -75,7 +75,7 @@ wall clock at write: this example lives entirely on log time, and the
 capture-time `publish_time` story belongs to
 [`custom-mcap-writer`](../custom-mcap-writer/README.md). The trigger payload
 carries `preroll` = `postroll` = 3 s and leaves `trigger_time` at `{"sec": 0,
-"nanosec": 0}`: under `--interface mcap` that field is inert — clipper
+"nanosec": 0}`: under `--trigger-source mcap` that field is inert — clipper
 anchors the clip window on the trigger *record's own* MCAP stamp (here its
 `log_time`) — and a non-zero value in that cell is a mis-anchoring hazard
 clipper rejects (see ["Why `trigger_time` is
@@ -95,6 +95,6 @@ cleanly and finalises the file (summary + footer).
 
 No ROS environment is needed — the crate carries no r2r dependency and
 builds with the system toolchain. Point clipper at the growing file with
-`--interface mcap` and `--grace-secs 4` (see the [repo
+`--trigger-source mcap` and `--grace-secs 4` (see the [repo
 README](../../README.md)) to cut clips from it live, or open the finished
 file in [Foxglove](https://foxglove.dev).

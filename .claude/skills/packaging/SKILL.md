@@ -46,12 +46,13 @@ wants apt. An OCI image built from this package is the natural next artefact, an
 belongs to whatever pipeline runs it.
 
 **What proves it.** The derivation's `installCheckPhase`, in a sandbox that holds
-no ROS 2 of any kind: `clipper --help` running at all proves the binary needs
-none, and `clipper tail --interface ros` must fail with clap's
+no ROS 2 of any kind: `clipper --help` and
+`clipper tail --trigger-source mcap --help` running at all prove the binary
+needs none, and `clipper tail --trigger-source ros` must fail with clap's
 `invalid value 'ros'`. Asserting that parse error rather than merely a non-zero
 exit is what makes the check bite — a build that leaked the `ros` feature would
 accept the flag and start a recorder, whose own exit status says nothing about
-which interfaces the binary offers.
+which trigger sources the binary offers.
 
 ## The device artefact: two debs, two tools
 
@@ -185,13 +186,13 @@ the two in step.
   `--output`). Select with `cargo deb --variant <distro>`.
 - **The packaged binary is the `ros` feature build.** ROS is a cargo feature of
   `clipper`, off by default, so a plain `cargo build -p clipper` produces a
-  binary that links no ROS and offers no `--interface ros` — the wrong artefact
-  for a package whose whole `Depends` list is ROS. `build-on-target.sh` adds
-  `--features clipper/ros` whenever clipper is among its `BUILD_PACKAGES`, and
-  that is the only place the choice is made: cargo-deb runs `--no-build` and
-  packages whatever binary is at `target/release/clipper`. A build that skipped
-  the feature would install and start cleanly and then never see a trigger, so
-  the smoke-test's live run is worth keeping.
+  binary that links no ROS and offers no `--trigger-source ros` — the wrong
+  artefact for a package whose whole `Depends` list is ROS.
+  `build-on-target.sh` adds `--features clipper/ros` whenever clipper is among
+  its `BUILD_PACKAGES`, and that is the only place the choice is made: cargo-deb
+  runs `--no-build` and packages whatever binary is at `target/release/clipper`.
+  A build that skipped the feature would install and start cleanly and then
+  never see a trigger, so the smoke-test's live run is worth keeping.
 - **One package, one executable.** The cargo package, the `[[bin]]` target and
   the installed file are all `clipper`; `cargo deb -p clipper` and
   `BUILD_PACKAGES=clipper` name it, and the artefact both scripts hand each other

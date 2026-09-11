@@ -30,13 +30,26 @@ the layers below it.
 A setting's `[settings]` key is its flag without the `--` and with `-` written
 `_` (`--grace-secs` → `grace_secs`), and its environment variable is
 `MOMENTEDGE_` + that key upper-cased (`MOMENTEDGE_GRACE_SECS`). The **Per-run**
-column below says whether a per-run file may set the key at all — see
+column below reads three ways: **yes**, either configuration file may set the
+key; **no**, the system file alone may (a per-run file naming it is refused);
+and **—**, no configuration file may name it at all — that setting has no
+`[settings]` key, and a file naming one fails the run. The column is read per
+table: the line is drawn by the mode that is running, so one key name may answer
+differently under each. See
 [The configuration file](#the-configuration-file).
 
 Three flags belong to every mode and to none of the tables below, because they
 are about the configuration rather than in it: `--config PATH` names the per-run
 file, `--system-config PATH` moves the system file, and `--print-config` prints
 [the effective configuration](#the-effective-configuration) and exits.
+
+`--trigger-source` is the one setting in the tables below that carries a **—**.
+It says how *this process was launched* rather than what the machine is
+configured with, which puts it in the same category as those three flags: it is
+the flag and `MOMENTEDGE_TRIGGER_SOURCE`, and nothing else. A device sets it
+once, in the unit file that already carries the rest of the invocation. A
+configuration file naming `trigger_source` fails the run at startup, naming the
+file and the key, exactly as a misspelling does.
 
 ## `clipper tail`
 
@@ -46,7 +59,7 @@ Every flag is optional — `clipper tail` runs with no further arguments.
 |---|---|---|---|---|---|
 | `--record-dir` | `MOMENTEDGE_RECORD_DIR` | path | `./record` | no | bag directory of the continuous recording to tail |
 | `--out-dir` | `MOMENTEDGE_OUT_DIR` | path | `./clipped` | yes | where finished clips are written |
-| `--interface` | `MOMENTEDGE_INTERFACE` | `ros` \| `mcap` | `ros` (`mcap` in a ROS-free build) | no | how triggers arrive and completions are signalled (see [Two ways in](triggers-and-time.md#two-ways-in-ros-and-mcap)) |
+| `--trigger-source` | `MOMENTEDGE_TRIGGER_SOURCE` | `ros` \| `mcap` | `ros` (`mcap` in a ROS-free build) | — | where triggers come from, and with them how completion is signalled (see [Two ways in](triggers-and-time.md#two-ways-in-ros-and-mcap)) |
 | `--time-source` | `MOMENTEDGE_TIME_SOURCE` | `log` \| `publish` | `log` | no | clock domain the clip window lives in (see [Time source](triggers-and-time.md#time-source-log-or-publish)) |
 | `--grace-secs` | `MOMENTEDGE_GRACE_SECS` | integer, seconds | `30` | yes | how long past the window end to wait for the recording to cover it before cutting from what is on disk |
 | `--clip-compression` | `MOMENTEDGE_CLIP_COMPRESSION` | `none` \| `lz4` \| `zstd` | `zstd` | yes | codec for written clips (`zstd` writes the smallest) |
@@ -70,7 +83,7 @@ arguments apply depends on `--trigger-source` — see
 |---|---|---|---|---|---|
 | `<recording>` | `MOMENTEDGE_RECORDING` | path | — | yes | the finished recording to cut from (positional): one `.mcap`, or a bag directory of splits |
 | `--out-dir` | `MOMENTEDGE_OUT_DIR` | path | — | yes | where the clips are written |
-| `--trigger-source` | `MOMENTEDGE_TRIGGER_SOURCE` | `param` \| `mcap` | `param` | yes | where this run's triggers come from (see [Where a run's triggers come from](clip-command.md#where-a-clip-runs-triggers-come-from-param-and-mcap)) |
+| `--trigger-source` | `MOMENTEDGE_TRIGGER_SOURCE` | `param` \| `mcap` | `param` | — | where this run's triggers come from (see [Where a run's triggers come from](clip-command.md#where-a-clip-runs-triggers-come-from-param-and-mcap)) |
 | `--trigger-time` | `MOMENTEDGE_TRIGGER_TIME` | integer, ns | — | yes | the instant the window centres on, in nanoseconds since the epoch (`param` only, required) |
 | `--preroll` | `MOMENTEDGE_PREROLL` | integer, ns | — | yes | nanoseconds before that instant to include (`param` only, required) |
 | `--postroll` | `MOMENTEDGE_POSTROLL` | integer, ns | — | yes | nanoseconds after it to include (`param` only, required) |
@@ -82,14 +95,17 @@ arguments apply depends on `--trigger-source` — see
 Both configuration files are TOML and share one schema: a `[settings]` table
 whose keys are the modes' settings, and a `[topics]` table deciding
 [which topics a clip contains](#which-topics-a-clip-contains). One loader reads
-them for every mode, so `clipper tail` and `clipper clip` take the same file.
+them for every mode, so `clipper tail` and `clipper clip` take the same file — a
+device's `/etc/momentedge/clipper.toml` can describe the recorder and still be
+the file a `clipper clip` run on that machine reads. A key belonging to the
+*other* mode is inert: it matches no argument of this run and does nothing. Only
+a key **no** mode has is a misspelling, and that fails the run.
 
 ```toml
 # /etc/momentedge/clipper.toml — the system file: this machine's recorder
 [settings]
 record_dir = "/data/record"
 out_dir = "/data/clipped"
-interface = "ros"
 extract_parallelism = 1
 grace_secs = 45
 
@@ -125,10 +141,10 @@ value of the wrong type is a startup error naming the file and the key — a
 misspelled key never silently does nothing.
 
 **What a per-run file may set.** The system file may set every key. A per-run
-file may set only the keys marked *yes* in the **Per-run** column of the tables
-above and of [`[topics]`](#which-topics-a-clip-contains) below. The line is
-what the key describes: a key naming the machine the recorder runs on or the
-resources it may spend there — where the recording lives, how triggers arrive,
+file may set only the keys marked *yes* in the **Per-run** column of the running
+mode's table above and of [`[topics]`](#which-topics-a-clip-contains) below. The
+line is what the key describes: a key naming the machine the recorder runs on or
+the resources it may spend there — where the recording lives, how triggers arrive,
 which clock windows live on, how much IO and memory the tail may take, and
 whether clipper may unlink a recording — is the system's alone. A key
 describing one job — where its clips go, how long it waits, how they are
@@ -136,8 +152,51 @@ compressed, which window, and which topics — is the per-run file's to set.
 
 A per-run file that sets a system-only key is **refused**: the key is named in a
 warning and in `--print-config`, the system file's value (or the built-in
-default) stands, and the run continues. The environment and the flags are not
-scoped this way — whoever launches the process already commands both.
+default) stands, and the run continues. The line is drawn per mode, not per
+process — a key can be one mode's machine setting and another mode's per-job
+one — so it is the table of the mode about to run that decides, and a key that
+mode does not have is not refused at all, only inert. The environment and the
+flags are not scoped this way — whoever launches the process already commands
+both.
+
+The **—** rows are outside that line rather than at one end of it: no file may
+name `trigger_source`, so there is nothing for either file to be refused. A file
+that names it fails the run at startup the way an unknown key does, whichever
+mode is running.
+
+## Upgrading a deployment configured for an earlier release
+
+Releases before this one spelled the recorder's trigger source `interface`, with
+the same two values, and let a configuration file set it. **There is no
+compatibility alias and no migration path**: every configuration file, unit file
+and environment naming the old spelling has to be edited *before* the new
+package lands. Two of the three ways of naming it stop the run; the third is
+read by nothing at all.
+
+The trigger source is a flag and an environment variable alone, and no
+configuration file may set it, so a file is the one place the replacement cannot
+go: put it in the unit file that launches clipper, as `--trigger-source` or as
+`MOMENTEDGE_TRIGGER_SOURCE`.
+
+**Set it for that unit, not for the machine.** `MOMENTEDGE_TRIGGER_SOURCE`
+reaches every subcommand, and the two take different values, so `ros` exported
+from a login profile or a shared `EnvironmentFile=` is handed to `clipper clip`
+as well — which takes `mcap` and `param`, and refuses to start. It belongs in
+the recorder unit's own `Environment=`, or on its `ExecStart` line as
+`--trigger-source`, where it reaches the one process it is about.
+
+| Where it was named | What happens | Replace it with |
+|---|---|---|
+| `interface` in a configuration file | the loader fails the run, naming the file and the key and listing the keys each mode does have; exit status 2 | `--trigger-source ros` on the recorder's `ExecStart`, or `MOMENTEDGE_TRIGGER_SOURCE=ros` in that unit's own environment — **not** `trigger_source` in the file, which fails the run the same way |
+| `--interface ros` on the command line | clap refuses it as an unexpected argument; exit status 2 | `--trigger-source ros` |
+| `MOMENTEDGE_INTERFACE` in the environment | nothing reads it, so the run starts on whatever the remaining layers decide — silently, and possibly on the wrong source | `MOMENTEDGE_TRIGGER_SOURCE=ros`, in the recorder unit's environment rather than the machine's |
+
+A device whose `/etc/momentedge/clipper.toml` still carries `interface = "ros"`
+does not come up, and neither does one that carries `trigger_source = "ros"`; a
+systemd unit still passing `--interface ros` restart-loops. That is deliberate:
+an operator meets the fault at the first start after the upgrade, with the key
+named, rather than discovering weeks later that a run has been taking its
+triggers from somewhere else.
 
 ## Which topics a clip contains
 
@@ -211,10 +270,10 @@ clipper tail effective configuration
     delete_old_files         = false                  <- built-in default
     extract_parallelism      = 1                      <- system file /etc/momentedge/clipper.toml
     grace_secs               = 12                     <- flag
-    interface                = ros                    <- system file /etc/momentedge/clipper.toml
     out_dir                  = ./clips/night-run      <- per-run file ./night-run.toml
     record_dir               = /data/record           <- system file /etc/momentedge/clipper.toml
     time_source              = log                    <- built-in default
+    trigger_source           = ros                    <- built-in default
     watch_old_files_duration = 600                    <- built-in default
   [topics]
     all                      = false                  <- built-in default
@@ -226,6 +285,9 @@ clipper tail effective configuration
 ```
 
 The values are read back out of the parsed command line rather than re-derived,
-so what the report prints is what the run uses. A per-run file's refused key is
-listed under the report, naming the key and the file it came from.
+so what the report prints is what the run uses. Every setting the run uses is
+listed, `trigger_source` among them — its origin reads `flag`, `environment` or
+`built-in default` and never a file, since no file layer can decide it. A
+per-run file's refused key is listed under the report, naming the key and the
+file it came from.
 

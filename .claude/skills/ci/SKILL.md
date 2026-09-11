@@ -39,7 +39,8 @@ cu-mcap-record` build then finds it up to date.
 can link the format layer, the recording index, the cut path and the tail with no
 ROS installation anywhere, and the recorder joins them there because ROS is a
 cargo feature of `clipper` too, off by default — a default-features recorder
-links no ROS and runs its MCAP interface on a host that never had one. The
+links no ROS and runs on its `mcap` trigger source on a host that never had one.
+The
 `libraries` job (`name: clip + tail + clipper (ROS-free)`) is what holds all of
 that down. Before anything is compiled it asserts that `cargo tree --locked -p
 <crate> -e normal` names no r2r for any of the three — the tree is captured into
@@ -159,9 +160,10 @@ type). `ros-tooling/setup-ros@v0.7` (desktop) covers `ros-base`,
 debhelper dpkg-dev` (bloom + the msgs deb), and `cargo install cargo-deb` follows.
 `scripts/build-on-target.sh` selects the recorder's `ros` feature, so the
 packaged binary is the device build (a default-features one would link no ROS at
-all and offer no `--interface ros`), and the `Unit tests` step passes the same
-`--features ros` so it tests that binary rather than compiling a second feature
-set. The job ends with a smoke-test that installs both `.deb` files and runs
+all and offer no `--trigger-source ros`), and the `Unit tests` step passes the
+same `--features ros` so it tests that binary rather than compiling a second
+feature set. The job ends with a smoke-test that installs both `.deb` files and
+runs
 `clipper tail` against the apt-installed typesupport, confirming the `Depends`
 chain resolves. The package installs one executable,
 `/opt/momentedge-clipper/bin/clipper`, whose modes are subcommands, so the step

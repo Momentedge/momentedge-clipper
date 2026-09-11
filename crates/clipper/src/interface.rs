@@ -1,5 +1,8 @@
 //! The outside-facing interface seam: trigger input and completion output as
-//! one unit, in exactly one of two forms selected by `--interface`.
+//! one unit, in exactly one of two forms. Which one a run drives is
+//! `clipper tail --trigger-source` — the flag names where the triggers come
+//! from, and the completion half follows from it, because these two pairings are
+//! the only ones there are ([`Interface::SOURCE`]).
 //!
 //! An [`Interface`] is the only layer that knows ROS from MCAP or one wire
 //! encoding from another. It produces decoded [`Trigger`]s (calling the driver's
@@ -27,12 +30,15 @@ use clip::trigger::{Announce, Completion, Trigger, TriggerRecord};
 use crossbeam_channel::Receiver;
 use log::{info, warn};
 
+use crate::TriggerSource;
+
 #[cfg(feature = "ros")]
 pub(crate) mod ros;
 
 /// The window anchor an interface resolved for one trigger, plus whether it came
 /// from the trigger's own `trigger_time` field. At most one cell of the
-/// interface × `--time-source` matrix reads `trigger_time` — `ros` + `publish`,
+/// trigger-source × `--time-source` matrix reads `trigger_time` — `ros` +
+/// `publish`,
 /// so a build without the `ros` feature has no such cell at all; every other
 /// cell anchors on a transport stamp and ignores it. The driver uses
 /// `from_trigger_time` to reject a trigger that set `trigger_time` in a cell that
@@ -61,14 +67,24 @@ fn resolve_mcap_anchor(record: &TriggerRecord, source: TimeSource) -> Anchor {
 }
 
 /// One active interface to the outside world: a trigger source paired with its
-/// completion sink. Exactly one is active per run (`--interface`). Generic so the
-/// driver dispatches statically — no `Box<dyn>`.
+/// completion sink. Exactly one is active per run, and the one that is active is
+/// the trigger source's: `clipper tail --trigger-source` names where the
+/// triggers come from, and [`SOURCE`](Interface::SOURCE) is each implementation
+/// saying which value names it. There is no separate setting for the completion
+/// half — the two cells here are the only pairings, and splitting them would
+/// offer a third (in-recording triggers answered by a `Recorded` publish) that
+/// no build without the `ros` feature could even provide.
+///
+/// Generic so the driver dispatches statically — no `Box<dyn>`.
 pub(crate) trait Interface: Send + Sized + 'static {
     /// The completion sink, cloned once per trigger handler thread.
     type Announcer: Announce;
 
-    /// A short label for logs (`"ros"` / `"mcap"`).
-    fn name(&self) -> &'static str;
+    /// The `--trigger-source` value that selects this interface. It is also the
+    /// label the recorder logs itself up with, so the word an operator types and
+    /// the word the log prints are one fact rather than two strings to keep in
+    /// step.
+    const SOURCE: TriggerSource;
 
     /// A fresh announcer handle for a trigger handler.
     fn announcer(&self) -> Self::Announcer;
@@ -121,9 +137,7 @@ impl McapInterface {
 impl Interface for McapInterface {
     type Announcer = NullAnnouncer;
 
-    fn name(&self) -> &'static str {
-        "mcap"
-    }
+    const SOURCE: TriggerSource = TriggerSource::Mcap;
 
     fn announcer(&self) -> NullAnnouncer {
         NullAnnouncer

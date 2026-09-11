@@ -186,7 +186,7 @@ fn trigger_produces_clip_ros_publish_anchors_on_trigger_time() {
 
 /// The MCAP interface end to end (clipper-535): a ROS-published `Trigger` is
 /// captured into the continuous recording, and clipper — running ROS-free on
-/// `--interface mcap` — reads it back out of the MCAP, decodes it (CDR, as
+/// `--trigger-source mcap` — reads it back out of the MCAP, decodes it (CDR, as
 /// rosbag2 writes it), and cuts the clip. No `Recorded` is published; the clip's
 /// appearance in `out_dir` is the completion signal. The recorder, not clipper,
 /// subscribes to the trigger topic — clipper learns of the trigger only from the
@@ -241,7 +241,7 @@ fn mcap_interface_reads_trigger_from_the_recording() {
 /// The MCAP interface over a chunked recording (clipper-535): with the deployed
 /// `zstd_fast` profile the trigger lands inside a chunk that is only visible once
 /// flushed, so the test stops the recorder after the window to flush the footer.
-/// clipper — ROS-free on `--interface mcap` — then reads the trigger out of the
+/// clipper — ROS-free on `--trigger-source mcap` — then reads the trigger out of the
 /// chunk, decodes it (CDR), and cuts the clip. Exercises the chunk-interior tap
 /// path end to end, the path a write-through bag never takes.
 #[rstest]
@@ -368,7 +368,7 @@ fn time_source_selects_the_window_clock_domain(
 
 /// Live capture-time windowing end to end (clipper-7jg): the momentedge
 /// `custom-mcap-writer` appends a growing, unchunked recording while clipper
-/// tails it `--interface mcap`, and the trigger clipper lifts back out of that
+/// tails it `--trigger-source mcap`, and the trigger clipper lifts back out of that
 /// file drives the cut. Every data message's `publish_time` trails its
 /// `log_time` by the writer's 3 s `--publish-offset-ms`, and the trigger's
 /// ±2 s window is anchored on the trigger record's own stamp per `--time-source`:
@@ -465,7 +465,7 @@ fn live_writer_capture_time_windowing(#[case] time_source: &str) {
 /// A copper (cu29) app produces the Recording, clipper cuts the clip (clipper-a6q).
 /// The `examples/cu-mcap-record` binary — a copper `CuSinkTask` — appends a
 /// growing, unchunked, epoch-stamped Recording while clipper tails it
-/// `--interface mcap`, entirely ROS-free at runtime: no ros2 stack, no
+/// `--trigger-source mcap`, entirely ROS-free at runtime: no ros2 stack, no
 /// `ros2 bag record`. The copper app writes its own in-Recording `json`
 /// `Trigger` (`periodic-1`) on its first iteration with a fixed ±3 s window, and
 /// clipper lifts that Trigger back out of the file it tails and cuts the clip;

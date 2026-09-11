@@ -13,7 +13,7 @@ A trigger is a `momentedge_msgs/Trigger` message:
 |---|---|---|
 | `name` | `string` | trigger identifier; becomes part of the clip filename |
 | `description` | `string` | optional free-form context |
-| `trigger_time` | `builtin_interfaces/Time` | publish-domain anchor; read only under `--interface ros --time-source publish` (see [the anchor matrix](#the-anchor-which-instant-the-window-centres-on)), must be `0` in every other cell |
+| `trigger_time` | `builtin_interfaces/Time` | publish-domain anchor; read only under `--trigger-source ros --time-source publish` (see [the anchor matrix](#the-anchor-which-instant-the-window-centres-on)), must be `0` in every other cell |
 | `preroll` | `uint64` | nanoseconds before the anchor to keep |
 | `postroll` | `uint64` | nanoseconds after the anchor to keep |
 
@@ -27,8 +27,8 @@ check is logged at `error!` and ignored — no clip, no `Recorded`. The limits
   a hostile record stamp) is refused rather than parking a handler for that long.
 - `name` — non-empty, at most **128 bytes**, and safe to embed in the clip
   pathname: no path separator, NUL, leading `.`, or `..`.
-- `trigger_time` — `0` except in the one cell that reads it (`--interface ros
-  --time-source publish`); non-zero elsewhere is rejected (see
+- `trigger_time` — `0` except in the one cell that reads it (`--trigger-source
+  ros --time-source publish`); non-zero elsewhere is rejected (see
   [the anchor matrix](#the-anchor-which-instant-the-window-centres-on)).
 
 For each finished clip, clipper publishes a `momentedge_msgs/Recorded` on
@@ -45,28 +45,45 @@ all listed in `filenames`.
 
 ## Two ways in: `ros` and `mcap`
 
-How a trigger reaches clipper and how completion is signalled is one choice, set
-by `--interface`. clipper runs exactly one interface per launch.
+Where `clipper tail`'s triggers come from is one choice, set by
+`--trigger-source`, and exactly one source is active per launch. The **completion
+half follows from it** — there is no second setting for how a finished clip is
+announced:
 
 - **`ros`** (the deployed path, and the default where it exists) subscribes to
   `/events/momentedge/trigger` and publishes `momentedge_msgs/Recorded` on
   `/events/momentedge/recorded`.
 - **`mcap`** reads triggers straight out of the recording clipper already tails
   (run `ros2 bag record --all` so the trigger topic is captured) and runs
-  **ROS-free** — no node, subscription, or publisher. A finished clip is
-  signalled only by the file appearing in `--out-dir`.
+  **ROS-free** — no node, subscription, or publisher. It publishes nothing, so
+  the clip's atomic move into `--out-dir` is the only completion signal.
 
 Both cut identical clips; only the trigger and completion edges differ.
 
-`ros` is the interface the `ros` cargo feature adds, so a
+`ros` is the source the `ros` cargo feature adds, so a
 [ROS-free build](../README.md#install) offers `mcap` alone and takes it by default, and
-`clipper tail --help` lists the values the binary in front of you accepts. The
-`mcap` interface decodes each trigger by its MCAP `message_encoding`: `json`
+`clipper tail --help` lists the values the binary in front of you accepts. Asking
+a build for a source it does not carry is a parse error naming the value and
+listing what it does take.
+
+The `mcap` source decodes each trigger by its MCAP `message_encoding`: `json`
 decodes in every build, while `cdr` — what `ros2 bag record` writes — needs the
 rmw typesupport the same feature links, and a ROS-free build skips such a trigger
 with an error naming the feature. So a ROS-free deployment wants a producer that
 writes its triggers as `json` (see
 [`examples/custom-mcap-writer`](../examples/custom-mcap-writer/README.md)).
+
+**`mcap` means the same thing on both sides of the recording's end.**
+`--trigger-source` is one key spanning both subcommands, and its `mcap` value
+names the recorded trigger in either: under `clipper tail` the tailed recording
+that is still growing, under
+[`clipper clip`](clip-command.md#where-a-clip-runs-triggers-come-from-param-and-mcap)
+the finished one. Same topic, same decoder, same anchor rule — so a trigger
+stream that drives the recorder on the vehicle re-cuts the same clips from the
+bag afterwards. The values that do not span both are the ones with nowhere to
+land: `ros` is a live subscription, which a finished recording has none of, and
+`param` names a single trigger on the command line, which a run with no end has
+no use for.
 
 ## Time source: `log` or `publish`
 
@@ -87,16 +104,16 @@ windows on whichever the flag selects:
 
 ## The anchor: which instant the window centres on
 
-The window centres on an **anchor** the active interface resolves from what it
-has. A live ROS trigger carries no recording stamp, so the ROS interface anchors
-on `now` or the publisher's `trigger_time`; an in-recording trigger carries its
-own stamps, so the MCAP interface anchors on those. The four
-interface × `--time-source` cells resolve it thus:
+The window centres on an **anchor** the active trigger source resolves from what
+it has. A live ROS trigger carries no recording stamp, so the `ros` source
+anchors on `now` or the publisher's `trigger_time`; an in-recording trigger
+carries its own stamps, so the `mcap` source anchors on those. The four
+`--trigger-source` × `--time-source` cells resolve it thus:
 
 | | `--time-source log` | `--time-source publish` |
 |---|---|---|
-| **`--interface ros`** | `now` at the subscription instant | the trigger's `trigger_time` |
-| **`--interface mcap`** | the trigger record's `log_time` | the trigger record's `publish_time` |
+| **`--trigger-source ros`** | `now` at the subscription instant | the trigger's `trigger_time` |
+| **`--trigger-source mcap`** | the trigger record's `log_time` | the trigger record's `publish_time` |
 
 **`trigger_time` is read in exactly one cell — `ros` + `publish`.** There it is
 the anchor: a publisher declaring its own publish-domain instant, standing in for

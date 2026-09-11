@@ -51,17 +51,18 @@ nix develop --command \
 
 Both produce the same one binary with the same subcommands (`clipper tail`,
 `clipper clip`) and the same flags. The feature buys exactly one thing: the `ros`
-interface — a live `momentedge_msgs/Trigger` subscription on a node, the
+trigger source — a live `momentedge_msgs/Trigger` subscription on a node, the
 `Recorded` publish that answers it, and `clip`'s CDR trigger decoder underneath.
-`clipper clip`, which cuts one window out of one finished recording, touches none
-of that and runs identically in either build. So:
+`clipper clip` cuts one window out of one finished recording, which has no live
+topic, so it never offers `ros` in either build; only a `cdr`-encoded trigger it
+reads out of the recording asks for the feature's decoder. So:
 
 |  | default build | `--features ros` |
 |---|---|---|
 | links r2r / needs a ROS install | no | yes |
 | needs the dev shell | no | yes |
-| `--interface` accepts | `mcap` | `ros`, `mcap` |
-| default `--interface` | `mcap` | `ros` |
+| `clipper tail --trigger-source` accepts | `mcap` | `ros`, `mcap` |
+| default `clipper tail --trigger-source` | `mcap` | `ros` |
 | `cdr` triggers in the recording | skipped, with an error naming the feature | decoded |
 
 Every packaging path that ships to a ROS 2 device asks for the feature:
@@ -86,9 +87,10 @@ cargo test -p clip -p tail -p clipper
 
 Straight from the repo root, on the system toolchain. That is the fast inner
 loop for anything in the index, the cut, the trigger types, the tail, or the
-recorder's own CLI, supervision and MCAP interface. Only what actually links r2r
-goes back through `nix develop`: `--features ros` on the recorder, `clip` with
-`ros` on, and the e2e suite (which drives the binary on `--interface ros`).
+recorder's own CLI, supervision and `mcap` trigger source. Only what actually
+links r2r goes back through `nix develop`: `--features ros` on the recorder,
+`clip` with `ros` on, and the e2e suite (which drives the binary on
+`--trigger-source ros`).
 
 `clip` carries three features, `tail` one, and `clipper` one, all off by
 default, so nothing a consumer has not asked for gets linked:
@@ -109,9 +111,9 @@ default, so nothing a consumer has not asked for gets linked:
   calls (its own coverage updates go through `send_if_modified`); the recorder's
   admission-gate test drives waiters with them. The same dev-only opt-in, under
   `[dev-dependencies]`.
-- **`clipper/ros`** — the ROS interface, and with it `dep:r2r`, `dep:futures`
-  and `clip/ros`. The one feature that decides which of the recorder's two
-  builds you get.
+- **`clipper/ros`** — the `ros` trigger source and the `Recorded` publish that
+  answers it, and with it `dep:r2r`, `dep:futures` and `clip/ros`. The one
+  feature that decides which of the recorder's two builds you get.
 
 The recorder takes `clap` on its normal dependency on `clip` and adds `clip`'s
 `ros` through its own, plus both crates' `test-support` under
@@ -183,11 +185,12 @@ anywhere the store path is available.
 ROS-free lane, far cheaper there than a release-profile rebuild in the sandbox.
 The derivation runs an `installCheckPhase` instead, asserting the one property
 that makes it this artefact: the sandbox holds no ROS 2 of any kind, so
-`clipper --help` running at all proves the binary needs none, and
-`clipper tail --interface ros` must fail with clap's `invalid value 'ros'` —
-that parse error, not merely a non-zero exit, since a build that leaked the
-feature would accept the flag and start a recorder, whose own exit status says
-nothing about which interfaces the binary offers.
+`clipper --help` and `clipper tail --trigger-source mcap --help` running at all
+prove the binary needs none, and `clipper tail --trigger-source ros` must fail
+with clap's `invalid value 'ros'` — that parse error, not merely a non-zero
+exit, since a build that leaked the feature would accept the flag and start a
+recorder, whose own exit status says nothing about which trigger sources the
+binary offers.
 
 **Both take the r2r vendor hash.** `Cargo.lock` carries r2r's git source
 regardless of features, and nix vendors the whole lockfile before cargo picks a
@@ -233,8 +236,8 @@ consumes no split events.
 
 Unit/integration tests run with plain `cargo test` in the dev shell; everything
 ROS-free runs outside it (above). The suite spans all three crates, so coverage
-names all three, and `--features clipper/ros` is what puts the ROS interface's
-lines in the report at all:
+names all three, and `--features clipper/ros` is what puts the `ros` trigger
+source's lines in the report at all:
 
 ```bash
 cargo llvm-cov -p clip -p tail -p clipper                                       # everything ROS-free, no shell
@@ -274,8 +277,8 @@ nix develop --command bash -c \
 ```
 
 `--features ros` is not optional here: the suite starts the recorder on
-`--interface ros` and reads its `Recorded` announcements, and only the device
-build has either.
+`--trigger-source ros` and reads its `Recorded` announcements, and only the
+device build has either.
 
 The copper live e2e (`copper_sink_recording_produces_clip`) drives the
 `cu-mcap-record` member binary as its Producer fixture, building it on demand

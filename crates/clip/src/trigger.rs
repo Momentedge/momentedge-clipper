@@ -43,10 +43,10 @@ pub const ANNOUNCE_TOPIC: &str = "/events/momentedge/recorded";
 
 /// A `builtin_interfaces/Time` flattened to its two fields, free of `r2r`. It is
 /// the publisher's own publish-domain timestamp (`trigger_time`), one possible
-/// source of a window's anchor: read only by the ros interface under the
-/// `publish` time source. Every other interface × time-source cell resolves the
-/// anchor from a transport stamp and rejects a non-zero `trigger_time` (see the
-/// recorder's interface layer).
+/// source of a window's anchor: read only under the `ros` trigger source with
+/// the `publish` time source. Every other trigger-source × time-source cell
+/// resolves the anchor from a transport stamp and rejects a non-zero
+/// `trigger_time` (see the recorder's interface layer).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 pub struct Stamp {
     pub sec: i32,

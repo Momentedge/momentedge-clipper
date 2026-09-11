@@ -28,10 +28,10 @@
 //! ## The trigger payload's `trigger_time`
 //!
 //! Which timestamp clipper resolves a clip window's anchor from depends on
-//! its interface and time source. Under `--interface mcap`, on either time
+//! its interface and time source. Under `--trigger-source mcap`, on either time
 //! source, the anchor is the trigger *record's own* MCAP stamp (`log_time` or
 //! `publish_time`) — the JSON payload's `trigger_time` field is read only
-//! under `--interface ros` with the `publish` time source, standing in there
+//! under `--trigger-source ros` with the `publish` time source, standing in there
 //! for the `publish_time` a ROS publisher cannot set on the wire. A non-zero
 //! `trigger_time` in any other cell is a mis-anchoring hazard clipper rejects.
 //! So this program leaves the payload's `trigger_time` at `{sec: 0, nanosec:

@@ -27,7 +27,7 @@
 //! There is no capture-time machinery here — owning `publish_time` as a
 //! capture stamp is `examples/custom-mcap-writer`'s story. The synthetic
 //! trigger's JSON payload leaves `trigger_time` at `{sec: 0, nanosec: 0}`:
-//! under `--interface mcap` the field is inert — clipper anchors the clip
+//! under `--trigger-source mcap` the field is inert — clipper anchors the clip
 //! window on the trigger *record's own* MCAP stamp (here its `log_time`) —
 //! and a non-zero value in that cell is a mis-anchoring hazard clipper
 //! rejects (see "Why `trigger_time` is zero" in custom-mcap-writer's README).

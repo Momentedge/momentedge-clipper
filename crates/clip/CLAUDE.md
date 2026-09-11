@@ -108,8 +108,8 @@ trigger topic's channel IDs from the same registry pass, so a body is read only
 for a message it has already matched to that topic. A trigger is sent the moment
 it is durable: a top-level record as soon as its framing is read, a
 chunk-interior one only once the chunk's CRC has verified. With the tap disabled
-— the `ros` interface, the default — the scan is byte-for-byte the
-timestamp-only walk above: no message body is ever read.
+— the `ros` interface, which the device build takes by default — the scan is
+byte-for-byte the timestamp-only walk above: no message body is ever read.
 
 **Damage in the recording is survivable up to the point of framing desync.**
 The scan tolerates localized damage the same way extraction does (see "The copy
@@ -495,6 +495,41 @@ argument definition can — whether a **per-run** file may set a key at all, sin
 a key naming the machine or the resources it may spend there is the system
 file's alone, and a per-run file setting one is reported by name with the system
 value left standing (`Layered::refusals`).
+
+**The table is keyed by subcommand.** Its rows are `(Mode, key, Scope)`, and
+`scope_of`, `setting_keys` and `Layered::load` take the `Mode` — the subcommand
+about to run — because the scope of a key is a fact about the subcommand that
+reads it, not about the process: `record_dir` names the machine `clipper tail`
+records on, and a subcommand without that flag has no opinion about it. A key
+both subcommands carry (`out_dir`) is written out once per mode, and that
+duplication is the point: two rows are what let one name answer differently
+depending on which subcommand is asking. No shipped key answers differently
+today — `out_dir` is `Scope::Any` under each — so the capability is stated by
+`one_name_can_carry_a_different_scope_under_each_mode` over a table written for
+it (`scope_in` takes the table as an argument for exactly that), not over
+`SETTINGS`. The shape stays because the scope of a key *is* a fact about the
+subcommand reading it, whether or not two rows currently disagree.
+
+**Some flags are deliberately not keys, for two distinct reasons.** `--config`,
+`--system-config` and `--print-config` are *about* the configuration rather than
+in it, so no file can name another file. `--trigger-source` is absent because it
+says how *this process was launched* rather than what the machine is configured
+with: a device sets it once in the unit file that already carries the rest of
+the invocation, so it lives in the flag and in `MOMENTEDGE_TRIGGER_SOURCE` and
+nowhere else, and a file naming `trigger_source` fails the run the way any
+unknown key does. The recorder's `every_mode_argument_is_a_settings_key_and_back`
+carries the same list with the same two reasons spelled out, so an argument
+added without a key has to say which it is.
+
+**The mode governs the scope and nothing else.** Whether a name is a key at all
+is `is_setting_key`, read across the modes, so one file serves every subcommand:
+a device's system file describing the recorder is read unchanged by a
+`clipper clip` run on the same machine. A key the running subcommand does not
+have is *inert* — `scope_of` answers `None`, nothing refuses it, and it matches
+no argument — while a key **no** subcommand has is a misspelling and fails the
+run, naming the key and where each key belongs. Keeping those two questions
+apart is what lets the scope line move per subcommand without the key set moving
+with it.
 
 The crate stops there on purpose. How those two layers join the environment
 variable and the flag above them is `clap`'s side of the seam and lives with the

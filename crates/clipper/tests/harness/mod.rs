@@ -435,7 +435,7 @@ impl TestEnv {
         self.start_extractor_src(grace_secs, "log")
     }
 
-    /// [`Self::start_extractor`] (the ROS interface, the default) on an explicit
+    /// [`Self::start_extractor`] (the `ros` trigger source, the default) on an explicit
     /// `--time-source` (`MOMENTEDGE_TIME_SOURCE`) — `log` or `publish`.
     pub(crate) fn start_extractor_src(&self, grace_secs: u64, time_source: &str) -> Proc {
         let mut cmd = self.command(env!("CARGO_BIN_EXE_clipper"));
@@ -449,10 +449,11 @@ impl TestEnv {
         proc
     }
 
-    /// The binary under test on the MCAP interface: it reads triggers out of the
-    /// tailed recording (decoding each by its `message_encoding`) and runs
+    /// The binary under test on the `mcap` trigger source: it reads triggers out
+    /// of the tailed recording (decoding each by its `message_encoding`) and runs
     /// ROS-free — no trigger subscription, no `Recorded` publish. Same temp-tree
-    /// wiring as [`Self::start_extractor`], plus `MOMENTEDGE_INTERFACE=mcap`.
+    /// wiring as [`Self::start_extractor`], plus
+    /// `MOMENTEDGE_TRIGGER_SOURCE=mcap`.
     pub(crate) fn start_extractor_mcap(&self, grace_secs: u64) -> Proc {
         self.start_extractor_mcap_src(grace_secs, "log")
     }
@@ -466,7 +467,7 @@ impl TestEnv {
             .env("MOMENTEDGE_RECORD_DIR", self.record_dir())
             .env("MOMENTEDGE_OUT_DIR", self.out_dir())
             .env("MOMENTEDGE_GRACE_SECS", grace_secs.to_string())
-            .env("MOMENTEDGE_INTERFACE", "mcap")
+            .env("MOMENTEDGE_TRIGGER_SOURCE", "mcap")
             .env("MOMENTEDGE_TIME_SOURCE", time_source);
         let proc = self.spawn("extractor", cmd);
         proc.expect_log("clipper tail up", Duration::from_secs(30));
@@ -549,7 +550,7 @@ impl TestEnv {
     }
 
     /// Publish one `Trigger` with an explicit payload `trigger_time` and confirm
-    /// the extractor received it. Only `--interface ros --time-source publish`
+    /// the extractor received it. Only `--trigger-source ros --time-source publish`
     /// reads `trigger_time` (as the window anchor); every other cell rejects a
     /// non-zero one, so this is for the publish-domain ROS case.
     ///
@@ -646,7 +647,7 @@ impl TestEnv {
     }
 
     /// Publish one `Trigger` so it lands in the recording, for the MCAP
-    /// interface to read back out. clipper on `--interface mcap` does NOT
+    /// interface to read back out. clipper on `--trigger-source mcap` does NOT
     /// subscribe to the trigger topic, so the only subscriber to wait for is the
     /// `--all` recorder (`-w 1`); the publish lands in the bag and clipper reads
     /// it off the file. Publishes exactly once — a republish would write a second
@@ -705,7 +706,7 @@ impl TestEnv {
     /// Poll `out_dir` for a finished clip whose file name ends with `suffix`,
     /// returning its path. A clip is named `<anchor_ns>_<name>.mcap`, where the
     /// anchor is the window centre the interface resolved — the trigger record's
-    /// own stamp under `--interface mcap`, not the publisher's `trigger_time`. A
+    /// own stamp under `--trigger-source mcap`, not the publisher's `trigger_time`. A
     /// test that does not know the exact anchor locates the clip by its
     /// `_<name>.mcap` suffix.
     pub(crate) fn wait_for_clip_matching(&self, suffix: &str, timeout: Duration) -> PathBuf {
@@ -745,7 +746,7 @@ pub(crate) fn anchor_from_clip(path: &Path) -> u64 {
 }
 
 /// The inclusive `[start, end]` window a cut announced, read back from its first
-/// segment's `<anchor>_<name>.mcap` name. Under `--interface ros --time-source
+/// segment's `<anchor>_<name>.mcap` name. Under `--trigger-source ros --time-source
 /// log` the anchor is clipper's own subscription instant — not the test's
 /// pre-publish `now()`, which the `ros2 topic pub` startup precedes by around a
 /// second — so window assertions recover the anchor from the announced clip
@@ -1105,7 +1106,7 @@ pub(crate) fn read_clip_stamps(path: &Path) -> Vec<(String, u64, u64)> {
 
 /// The `(preroll, postroll)` nanoseconds carried by the trigger record inside a
 /// clip, decoded from its `json` payload on the trigger topic — the window
-/// bounds the Producer actually asked for. Under `--interface mcap` the window
+/// bounds the Producer actually asked for. Under `--trigger-source mcap` the window
 /// is anchored on the trigger record's own stamp, so that record normally lies
 /// inside its own window and is copied into the clip; `None` if it is not there
 /// (or the payload lacks the fields). Lets a window assertion tether to the

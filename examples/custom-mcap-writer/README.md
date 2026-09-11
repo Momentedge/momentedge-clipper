@@ -16,15 +16,16 @@ on [Foxglove's quickstart writer](https://docs.foxglove.dev/docs/sdk/example).
 
 ## Tailability: unchunked output
 
-This writer's output is meant to be tailed **live** by `clipper tail --interface
-mcap`, not just read after the fact — that is the deployment story capture-time
-windowing is built for. A producer clipper can tail live appends complete
-top-level records only and never seeks back to rewrite one. MCAP's chunked
-writer (the `mcap` crate's default) buffers messages into a `Chunk` record
-whose header is written with a placeholder length and back-patched once the
-chunk closes, so a chunk is parseable only after that close: read mid-write,
-the placeholder reads as an enormous, framing-breaking record length, and a
-live tailer sees it as corruption rather than an in-progress write. This
+This writer's output is meant to be tailed **live** by
+`clipper tail --trigger-source mcap`, not just read after the fact — that is
+the deployment story capture-time windowing is built for. A producer clipper
+can tail live appends complete top-level records only and never seeks back to
+rewrite one. MCAP's chunked writer (the `mcap` crate's default) buffers
+messages into a `Chunk` record whose header is written with a placeholder
+length and back-patched once the chunk closes, so a chunk is parseable only
+after that close: read mid-write, the placeholder reads as an enormous,
+framing-breaking record length, and a live tailer sees it as corruption rather
+than an in-progress write. This
 program builds its writer with `mcap::WriteOptions::new().use_chunks(false)`,
 so every message is its own complete top-level `Message` record — appended
 once and never rewritten, readable the instant it hits disk. That is the same
@@ -70,20 +71,21 @@ absolute.
 ## Why `trigger_time` is zero
 
 Which timestamp clipper resolves a clip window's anchor from is a matrix of
-its interface (`ros` / `mcap`) and its time source (`log` / `publish`). Under
-`--interface mcap`, on either time source, the anchor is the trigger record's
-own MCAP stamp — its `log_time` or `publish_time` — never the JSON payload.
-The payload's `trigger_time` field is read only under `--interface ros` with
-the `publish` time source, where it stands in for the `publish_time` a ROS
-publisher cannot set on the wire. A non-zero `trigger_time` in any other cell
-of that matrix is a mis-anchoring hazard clipper rejects outright.
+its trigger source (`ros` / `mcap`) and its time source (`log` / `publish`).
+Under `--trigger-source mcap`, on either time source, the anchor is the trigger
+record's own MCAP stamp — its `log_time` or `publish_time` — never the JSON
+payload. The payload's `trigger_time` field is read only under
+`--trigger-source ros` with the `publish` time source, where it stands in for
+the `publish_time` a ROS publisher cannot set on the wire. A non-zero
+`trigger_time` in any other cell of that matrix is a mis-anchoring hazard
+clipper rejects outright.
 
 So this writer leaves the trigger payload's `trigger_time` at `{"sec": 0,
 "nanosec": 0}` by default: the record's own `publish_time` (above) already
-declares the anchor for the mcap interface, and a non-zero payload value would
-only be misread as one. `--stamp-payload-trigger-time` opts back into stamping
-it with the anchor, for producing a ros+publish-shaped payload or exercising
-the rejection path directly.
+declares the anchor for the `mcap` trigger source, and a non-zero payload value
+would only be misread as one. `--stamp-payload-trigger-time` opts back into
+stamping it with the anchor, for producing a ros+publish-shaped payload or
+exercising the rejection path directly.
 
 ## Run
 
@@ -106,7 +108,8 @@ cargo run -p custom-mcap-writer -- --out demo.mcap --duration 5 --trigger-after-
 No ROS environment is needed — the crate carries no r2r dependency and builds
 with the system toolchain. Open the result in [Foxglove](https://foxglove.dev)
 or inspect it with the [`mcap` CLI](https://github.com/foxglove/mcap); feed it
-to `clipper tail --interface mcap` to exercise capture-time clip windows end to end.
+to `clipper tail --trigger-source mcap` to exercise capture-time clip windows
+end to end.
 
 ## How it works
 
@@ -128,7 +131,7 @@ format and writes bytes:
   `--stamp-payload-trigger-time` is set (see "Why `trigger_time` is zero"
   above) — the record's own `publish_time` carries the anchor regardless.
   Written once, `--trigger-after-ms` milliseconds after startup, on a
-  schemaless channel — clipper's MCAP interface decodes triggers by
+  schemaless channel — clipper's `mcap` trigger source decodes triggers by
   `message_encoding` alone, never a schema. `json` is the arm of that decoder
   every build of `crates/clip` carries; `cdr` is deserialized through r2r's rmw
   typesupport behind the crate's `ros` feature, so a JSON trigger is the one a

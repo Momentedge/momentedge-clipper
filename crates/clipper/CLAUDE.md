@@ -34,9 +34,10 @@ clipper ◀── trigger ── EITHER /events/momentedge/trigger (ros interfac
              the only signal (no Recorded published)
 ```
 
-The trigger and the completion are paired into one **interface**, selected by
-`--interface`; the interfaces are mutually exclusive and clipper drives exactly
-one per run. The `ros` interface subscribes on a ROS node and publishes
+The trigger and the completion are paired into one **interface**, named by
+`clipper tail --trigger-source`: the key says where the run's triggers come from
+and the completion half follows from it. The interfaces are mutually exclusive and
+clipper drives exactly one per run. The `ros` interface subscribes on a ROS node and publishes
 `Recorded`; the `mcap` interface reads triggers out of the recording clipper
 already tails and runs ROS-free, with the clip's move into `out_dir` as the only
 completion signal. Which of them the binary has is the build: `mcap` is in every
@@ -63,13 +64,20 @@ The cut itself is therefore unchanged, and so are the manifest, the
 passes the same `validate_name` gate a name arriving on a topic does, so a name
 accepted by one mode is accepted by the other.
 
-**Where the triggers come from is `--trigger-source`** (`TriggerSource`), and
-exactly one source is active per run — the same shape `--interface` has on the
-recorder, down to rendering its `--help` default through a `Display` that reads
-the `ValueEnum`'s own possible-value name, so the accepted values and the help
-text cannot drift. Unlike `InterfaceKind` the variant set is not the build's:
-both sources exist in every build, and the `ros` feature is visible here only in
-what a *recorded* trigger may be encoded as.
+**Where the triggers come from is `--trigger-source`** (`TriggerSource`), the
+same key over the same value set the recorder takes, and exactly one source is
+active per run. **Which subcommands take which source is a property of the type**:
+`TriggerSource::modes` is an exhaustive match with no catch-all naming the
+`config::Mode`s that take each variant, and `trigger_source_parser(mode)` derives
+both `--trigger-source` surfaces from that one answer — so adding a variant is a
+compile error until it says who takes it, and a source a subcommand does not take
+never reaches its `--help` and is refused by name while the command line is being
+read. This subcommand's subset is `param` and `mcap`; `ros` is a live subscription
+and a finished recording has no live topic. Neither of the two is behind a cargo
+feature, so the cutter's surface is the same in every build — the `ros` feature
+shows here only in what a *recorded* trigger may be encoded as. The `--help`
+default renders through a `Display` reading the `ValueEnum`'s own possible-value
+name, so the accepted values and the help text cannot drift.
 
 - **`param`** (the default) cuts the one trigger the flags name.
   `ClipConfig::param_trigger` is where the flags become that trigger, and it is
@@ -134,12 +142,13 @@ is the verdict. No ROS is involved anywhere on this path, so a default (ROS-free
 `interface.rs`) — the instant the window centres on, plus whether it came from
 `trigger_time` — and passes it to the driver's `fire` callback, which hands
 `anchor.ns` to `handle_trigger` for both the window bounds and the output name
-`<anchor_ns>_<name>.mcap`. The four interface × `--time-source` cells resolve it:
+`<anchor_ns>_<name>.mcap`. The four `clipper tail --trigger-source` ×
+`--time-source` cells resolve it:
 
-|                    | `--time-source log`             | `--time-source publish`      |
-| ------------------ | ------------------------------- | ---------------------------- |
-| **`--interface ros`**  | `now_ns()` at the subscription | the trigger's `trigger_time` |
-| **`--interface mcap`** | the record's `log_time`        | the record's `publish_time`  |
+|                             | `--time-source log`            | `--time-source publish`      |
+| --------------------------- | ------------------------------ | ---------------------------- |
+| **`--trigger-source ros`**  | `now_ns()` at the subscription | the trigger's `trigger_time` |
+| **`--trigger-source mcap`** | the record's `log_time`        | the record's `publish_time`  |
 
 `resolve_ros_anchor` (in `interface/ros.rs`) and `resolve_mcap_anchor` (in
 `interface.rs`) do the
@@ -179,18 +188,30 @@ in `main.rs`; each value exactly at its bound is accepted:
 ## The two interfaces
 
 The trigger input and the completion output are one unit — an **interface** —
-chosen by `--interface`. They are mutually exclusive; clipper drives exactly one
-per run. No `rosbag2_interfaces` subscription either way — coverage always comes
-from the file itself.
+named by `clipper tail --trigger-source`. They are mutually exclusive; clipper
+drives exactly one per run. No `rosbag2_interfaces` subscription either way —
+coverage always comes from the file itself.
+
+**There is no separate setting for the completion half.** The two cells here are
+the only pairings there are, so naming the trigger source names both: splitting
+them would offer a third — in-recording triggers answered by a `Recorded` publish
+— that nobody asked for and no build without the `ros` feature could provide.
+`Interface::SOURCE` is each implementation saying which `--trigger-source` value
+names it, and it is also the label the recorder logs itself up with, so the word
+an operator types and the word the log prints are one fact rather than two strings
+to keep in step.
 
 Which interfaces the binary offers is decided at compile time by the `ros`
-feature. `InterfaceKind::Ros` is a `#[cfg(feature = "ros")]` variant, so clap
-derives the accepted `--interface` values from what the build actually has: a
-ROS-free build refuses `--interface ros` as an unknown value at parse time rather
+feature. `TriggerSource::Ros` is a `#[cfg(feature = "ros")]` variant, so the
+accepted `--trigger-source` values are what the build actually has: a ROS-free
+build refuses `--trigger-source ros` as an unknown *value* at parse time rather
 than failing later on a node it cannot create, and `clipper tail --help` lists
-`mcap` alone (with a `long_help` saying which feature the missing one needs).
-`DEFAULT_INTERFACE` follows the same `#[cfg]` split, so an absent flag means
-`ros` where it exists and `mcap` where it does not.
+`mcap` alone (with a `long_help` saying which feature the missing one needs). That
+parse-time refusal is what `nix/clipper-ros-free.nix`'s `installCheckPhase`
+asserts — on the error text, because a build that leaked the feature would accept
+the flag and start a recorder whose own exit status says nothing about which
+sources it offers. `TAIL_DEFAULT_TRIGGER_SOURCE` follows the same `#[cfg]` split,
+so an absent flag means `ros` where it exists and `mcap` where it does not.
 
 **`ros`** (the deployed path, and the default where the feature built it) talks
 to the ROS graph:
@@ -419,11 +440,13 @@ this section is the rationale.
   ends (producing a valid empty clip), and the no-recovery guarantee — a file
   still on disk after replacement contributes nothing to any subsequent clip.
 - **The MCAP interface is exercised end to end** (`mcap_interface_*`): clipper
-  runs `--interface mcap`, fully ROS-free, against a `ros2 bag record --all`
-  that captures a ROS-published trigger into the bag. clipper lifts that trigger
-  back out of the recording it tails, cuts the clip, and signals completion by
-  the file's appearance in `out_dir` — there is no `Recorded` topic to echo, so
-  the assertion is on the clipped file rather than a published message.
+  runs on the `mcap` trigger source (the harness sets `MOMENTEDGE_TRIGGER_SOURCE`,
+  since `tail` is the binary's only command-line argument there), fully ROS-free,
+  against a `ros2 bag record --all` that captures a ROS-published trigger into the
+  bag. clipper lifts that trigger back out of the recording it tails, cuts the
+  clip, and signals completion by the file's appearance in `out_dir` — there is no
+  `Recorded` topic to echo, so the assertion is on the clipped file rather than a
+  published message.
 - **Capture-time windowing is proved against a live momentedge writer**
   (`live_writer_capture_time_windowing`, ROS-free at runtime): clipper tails a
   recording while `examples/custom-mcap-writer` appends it, with every
@@ -436,9 +459,9 @@ this section is the rationale.
 - **A copper (cu29) Producer reaches clipper end to end**
   (`copper_sink_recording_produces_clip`, ROS-free at runtime): the
   `examples/cu-mcap-record` binary — a copper `CuSinkTask` — appends an
-  unchunked, epoch-stamped Recording while clipper tails it `--interface mcap`,
-  writing its own in-Recording `json` `Trigger`; clipper lifts that trigger back
-  out and cuts the clip, proving a copper-rs robot with no ROS surface reaches
+  unchunked, epoch-stamped Recording while clipper tails it on the `mcap` trigger
+  source, writing its own in-Recording `json` `Trigger`; clipper lifts that trigger
+  back out and cuts the clip, proving a copper-rs robot with no ROS surface reaches
   clipper through the Recording alone. The Producer (a workspace member whose
   cu29 deps stay crate-local) is resolved by `cu_mcap_record_bin` beside the
   clipper binary — `CU_MCAP_RECORD_BIN`, else built on demand with `-p
@@ -488,8 +511,9 @@ hint, because the caller already said which mode they wanted. `main.rs`'s
 
 `Config` is the recorder mode's `derive(Args)` and `ClipConfig` the cutter's:
 every field is a CLI flag (or, for the cutter's recording, the positional) with a
-`MOMENTEDGE_*` environment fallback and a `[settings]` key in the configuration
-file, so precedence is CLI flag > env var > per-run file > system file > default
+`MOMENTEDGE_*` environment fallback, and every one but `trigger_source` also has
+a `[settings]` key in the configuration file, so precedence is CLI flag > env var
+> per-run file > system file > default
 where there is one ([the four layers](#the-four-configuration-layers) below). `Config`'s fields all have defaults, so
 `clipper tail` runs bare; `ClipConfig`'s window arguments deliberately do not —
 which moment a clip is about is the one thing only the caller knows, so omitting
@@ -507,9 +531,34 @@ feature provides the per-arg env fallback and `string` lets the runtime-built
 env names be set on the args. The flags, env vars, and defaults are tabulated in
 the [Configuration](../../docs/configuration.md).
 
-The interface seam is one such flag: `--interface {ros|mcap}` (env
-`MOMENTEDGE_INTERFACE`, default `ros`), a clap `ValueEnum` over `InterfaceKind`
-that picks the active [interface](#the-two-interfaces) at startup.
+`--trigger-source` is one such flag, and the one whose surface differs per
+subcommand: `clipper tail` takes `{ros|mcap}` and defaults to `ros`,
+`clipper clip` takes `{mcap|param}` and defaults to `param`, both under the one
+env name `MOMENTEDGE_TRIGGER_SOURCE`. Each argument is narrowed to its
+subcommand's subset by `trigger_source_parser`, so the two surfaces stay one fact
+about `TriggerSource` rather than two literals. Under `tail` the value picks the
+active [interface](#the-two-interfaces) at startup; under `clip` there is no
+completion half to pick, so it names the input alone.
+
+**It is also the one flag with no `[settings]` key**, under either subcommand.
+Why is [`clip`'s to state](../clip/CLAUDE.md#the-configuration-file-clipconfig),
+beside the table it is absent from. What that buys *here* is a device's system
+file staying readable by `clipper clip`, whose `--trigger-source` takes neither
+of the recorder's values: a file naming `trigger_source` fails the run the way
+any unknown key does, so a file describing the recorder has nothing in it the
+cutter must accept. `every_mode_argument_is_a_settings_key_and_back` is where
+both reasons for a flag to be no key are written down, one variant each, so an
+argument added without a key has to say which it is; `effective_config` keeps a
+shorter list of its own, because `trigger_source` is a setting the run uses and
+belongs in `--print-config` even though no file may name it.
+
+The layer a shared name can still be set through is the environment:
+`MOMENTEDGE_TRIGGER_SOURCE` is one word bound to both subcommands, whose value
+sets differ, so `ros` exported machine-wide reaches `clipper clip` and stops it.
+`an_argument_both_subcommands_share_accepts_the_same_values_in_both` is the
+guard, over *arguments* rather than keys for exactly that reason, with
+`VALUE_SETS_MAY_DIVERGE` naming the one excused argument and why — and failing
+too when an excuse stops being needed.
 
 ### The four configuration layers
 
@@ -526,23 +575,41 @@ have refused. `required` is cleared with the same stroke, since clap's required
 check does not count a default as an answer: a configuration file that names
 `recording`, `--out-dir` and the window is a complete `clipper clip` invocation.
 
-The files have to be read *before* the parser exists, so `config_paths` scans
-argv for `--config` and `--system-config` (either spelling, on bytes, stopping at
-`--`) and falls back to the environment variable clap would have read for the
-same flag. Those two flags and `--print-config` are also declared as real
+The files have to be read *before* the parser exists, so they are found by scans
+rather than by a parse. `scan_mode` reads the mode out of `argv[1]`, since which
+keys a file may carry is the mode's; `config_paths` scans argv for `--config` and
+`--system-config` (either spelling, on bytes, stopping at `--`) and falls back to
+the environment variable clap would have read for the same flag. Reading one word
+for the mode is sound because nothing can stand between `clipper` and its
+subcommand: `Cli` declares no argument of its own, clap's generated `--help` and
+`--version` take no value, and the three configuration flags go on the
+subcommands. A command line that names no mode there names none at all, has no
+key set, and so reads no file — `parse_cli` builds the parser on its built-in
+defaults and lets clap report it. Those two flags and `--print-config` are also declared as real
 arguments, injected onto every subcommand by `with_config_args` rather than
 declared as fields of `Config`/`ClipConfig` — so `--help` lists them, an unknown
 spelling is refused the ordinary way, and neither mode's struct grows a field it
 never reads. None of the three is a `[settings]` key, so no file can name another
 file.
 
-`clip::config::SETTINGS` is the key table, and it carries the one thing no
-argument definition can: whether a **per-run** file may set the key at all. A key
-naming the machine or the resources it may spend there is the system file's
-alone, and a per-run file setting one is reported by name with the system value
-left standing (`Layered::refusals`). `main.rs`'s
-`every_mode_argument_is_a_settings_key_and_back` is what keeps that table and the
-modes' arguments from drifting apart in either direction.
+`clip::config::SETTINGS` is the key table, keyed by subcommand, and it carries
+the one thing no argument definition can: whether a **per-run** file may set the
+key at all. A key naming the machine or the resources it may spend there is the
+system file's alone, and a per-run file setting one is reported by name with the
+system value left standing (`Layered::refusals`). `scope_of` takes the mode, so
+one key name may carry a different scope under each subcommand — a capability no
+shipped key exercises, since the only name both subcommands share, `out_dir`, is
+`Any` under each; `config.rs`'s
+`one_name_can_carry_a_different_scope_under_each_mode` states it over a table
+built for the purpose rather than pretending `SETTINGS` has such a pair. The mode
+governs the scope and nothing else. The key set stays every subcommand's
+(`is_setting_key`), so one file serves both: a key this mode does not have is
+inert, carried through to match no argument, and only a key no mode has fails
+the run. `MODES` is where clap's names for the two subcommands are tied to the
+`clip::config::Mode` whose rows they read, and `main.rs`'s
+`every_mode_argument_is_a_settings_key_and_back` keeps the tie honest in both
+directions: every argument of a mode is a key of *that* mode, and every key of a
+mode is an argument of it.
 
 `--print-config` prints `effective_config` and exits; the same text goes to the
 log at startup, so a run's log states the configuration it ran with. It is built

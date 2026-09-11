@@ -485,7 +485,7 @@ enum TriggerSink {
     /// `Live` sink. A damaged chunk is discarded whole, so its staged triggers
     /// never emit.
     Staged(Vec<TriggerRecord>),
-    /// The tap is disabled (no `--interface mcap`): no trigger is ever lifted.
+    /// The tap is disabled (no `--trigger-source mcap`): no trigger is ever lifted.
     #[default]
     Off,
 }

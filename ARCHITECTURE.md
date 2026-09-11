@@ -57,10 +57,11 @@ the same format layer and the same copy the device runs. The ROS-shaped pieces
 sit behind features that are off by default: `clip`'s `ros` carries the `cdr`
 trigger decoder and the two r2r message conversions, and `clipper`'s `ros`
 carries the live trigger subscription, the `Recorded` publish, and `clip/ros`
-underneath. So the recorder has **two builds** — a default one that links no ROS
-and offers `--interface mcap` alone, and `--features ros`, the device build every
-release artefact is, which adds `--interface ros` and defaults to it. The tail,
-the window plan, the cut and every other flag are the same code in both.
+underneath. So the recorder has **two builds** — a default one that links no ROS,
+whose `clipper tail --trigger-source` offers `mcap` alone, and `--features ros`,
+the device build every release artefact is, which adds `ros` there and takes it by
+default. The tail, the window plan, the cut and every other flag are the same code
+in both.
 
 The `libraries` CI job (`clip + tail + clipper (ROS-free)`) holds that property
 down for all three crates: before compiling anything it asserts `cargo tree`
@@ -481,9 +482,11 @@ segment from that file.
 ## The two interfaces
 
 The trigger input and the completion output are one unit — an **interface** —
-chosen by `--interface`. The recorder is decoupled around one neutral boundary so
-the clip-cutting half (`tail::handler` and the `clip` code under it) never learns
-of ROS or any wire encoding:
+named by `clipper tail --trigger-source`: the key says where a run's triggers come
+from, and the completion half follows from it, because these two pairings are the
+only ones there are and there is no third to select. The recorder is decoupled
+around one neutral boundary so the clip-cutting half (`tail::handler` and the
+`clip` code under it) never learns of ROS or any wire encoding:
 
 - **`clip::trigger`** is the neutral contract (`Trigger`, `Stamp`, `Completion`,
   the `Announce` trait), depending on neither `r2r` nor `mcap`.
@@ -500,18 +503,27 @@ of ROS or any wire encoding:
 Which interfaces exist is the build. `mcap` is in every one and is the default
 where it is alone; the `ros` feature adds `ros` and makes it the default. The
 variant set drives the CLI, so `clipper tail --help` lists exactly the values the
-binary in front of you accepts, and a ROS-free build refuses `--interface ros` as
-an unknown value rather than failing later at a node it cannot create.
+binary in front of you accepts, and a ROS-free build refuses `--trigger-source
+ros` as an unknown value rather than failing later at a node it cannot create.
+
+`clipper clip` takes the same key over the same value set — `param` or `mcap`, see
+[Cutting from a finished recording](#cutting-from-a-finished-recording) — and has
+no completion half to pair one with, which is why the key names the input alone.
+Which subcommands take which source is a property of the value set itself
+(`TriggerSource::modes`, an exhaustive match), and both `--trigger-source`
+surfaces are derived from that one answer: a source a subcommand does not take
+never reaches its `--help` and is refused by name while the command line is being
+read.
 
 **The anchor seam.** An interface resolves each trigger's anchor — the instant
 its window centres on — and hands it to the handler alongside the neutral
 `Trigger`, so the clip-cutting half never derives an anchor itself. The four
-interface × `--time-source` cells resolve it thus:
+`clipper tail --trigger-source` × `--time-source` cells resolve it thus:
 
 | | `--time-source log` | `--time-source publish` |
 |---|---|---|
-| **`--interface ros`** | `now` at the subscription instant | the trigger's `trigger_time` |
-| **`--interface mcap`** | the trigger record's `log_time` | the trigger record's `publish_time` |
+| **`--trigger-source ros`** | `now` at the subscription instant | the trigger's `trigger_time` |
+| **`--trigger-source mcap`** | the trigger record's `log_time` | the trigger record's `publish_time` |
 
 A live ROS trigger carries no recording stamp and r2r surfaces no wire timestamp,
 so the ROS interface anchors on `now` or the publisher's own `trigger_time`; an

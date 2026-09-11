@@ -23,8 +23,8 @@ against nothing.
 
 **It is a live e2e fixture.** `copper_sink_recording_produces_clip` in
 `crates/clipper/tests/e2e.rs` runs this binary as a real producer against
-`clipper tail --interface mcap`, with the trigger this example writes into its
-own recording as the only input. The harness resolves the binary via
+`clipper tail --trigger-source mcap`, with the trigger this example writes into
+its own recording as the only input. The harness resolves the binary via
 `CU_MCAP_RECORD_BIN`, else builds it on demand with `-p cu-mcap-record`; CI's
 matrix `Build` step prebuilds it so the on-demand path stays inside the test
 timeout. Changing the trigger topic, its `json` encoding, or the stamp domain

@@ -43,7 +43,7 @@ from. Expressed entirely in one time source.
 
 **Anchor**:
 The single instant a window is centred on. It is *resolved*, not carried: which
-timestamp becomes the anchor depends on the interface and the time source.
+timestamp becomes the anchor depends on the trigger source and the time source.
 _Avoid_: reference time, trigger time, centre, `trigger_time` (that is one
 possible source of an anchor, not a synonym for it)
 
@@ -97,9 +97,18 @@ _Avoid_: capture time, timestamp, stamp
 
 ### Interfaces
 
+**Trigger source**:
+Where one run's triggers come from — `ros`, `mcap`, or `param`. Exactly one is
+active per run, and each says what it names: a live topic, the recording itself,
+or the command line.
+_Avoid_: interface (that is the paired unit one of these selects), input, mode
+
 **Interface**:
-The paired trigger input and completion output, chosen as one unit. The **ros**
-interface subscribes for triggers and publishes `Recorded`. The **mcap**
+The paired trigger input and completion output, chosen as one unit — so the
+trigger source names both halves and there is no separate completion setting. The
+**ros** interface subscribes for triggers and publishes `Recorded`. The **mcap**
 interface lifts triggers out of the recording it already tails, and the clip's
-appearance in the output directory is the only completion signal.
+appearance in the output directory is the only completion signal. Cutting from a
+recording nobody is writing has a trigger source and no interface: there is no
+completion half to pair one with.
 _Avoid_: mode, transport, backend
