@@ -2,8 +2,11 @@
 
 A technical overview of how Momentedge Clipper is built. For what it does and
 how to run it, start with the [README](README.md). For deep implementation
-rationale and concurrency invariants, see
-[`crates/clipper/CLAUDE.md`](crates/clipper/CLAUDE.md).
+rationale and concurrency invariants, see the per-crate notes:
+[`crates/clip`](crates/clip/CLAUDE.md) (the format layer, the cut, the
+manifest), [`crates/tail`](crates/tail/CLAUDE.md) (following a growing
+recording), [`crates/clipper`](crates/clipper/CLAUDE.md) (the binary), and
+[`crates/CLAUDE.md`](crates/CLAUDE.md) for what the three share.
 
 ## System overview
 
@@ -435,7 +438,8 @@ Between the last copied message and `finish()` the writer emits the clip's
 metadata index and the statistics' metadata count, so a reader finds it by name
 without walking the file — and its counters are the copy's final ones rather
 than a guess. See [What a clip carries](README.md#what-a-clip-carries) for the
-keys; `crates/clipper/CLAUDE.md` for how the two halves reach the writer.
+keys; [`crates/clip/CLAUDE.md`](crates/clip/CLAUDE.md) for how the two halves
+reach the writer.
 
 Publication is **two-staged** so `out_dir` only ever holds finished clips:
 

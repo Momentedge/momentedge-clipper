@@ -842,9 +842,10 @@ Setup guides for the recording + clipper stack live under
   recording without running the recorder. `tail` adds what a recording still
   being written needs: discovery, the recording collection, coverage, retention,
   and the waiting a cut does when its window reaches past the last byte on disk.
-- **[CLAUDE.md](CLAUDE.md)** and **[crates/clipper/CLAUDE.md](crates/clipper/CLAUDE.md)**
-  — contributor and agent notes: workspace layout, build mechanics, and the
-  internal design of all three crates.
+- **[CLAUDE.md](CLAUDE.md)** and the per-crate notes under
+  **[crates/](crates/CLAUDE.md)** — contributor and agent notes: workspace
+  layout, build mechanics, and the internal design of each of the three
+  crates.
 - **[Momentedge/clipper-benchmarks](https://github.com/Momentedge/clipper-benchmarks)**
   — the overhead benchmarks behind [Resource overhead](#resource-overhead): the
   harness, the full report, and the methodology each figure depends on.

@@ -7,14 +7,36 @@ own their angle, and this file does not repeat them:
   configure, and the trigger interface. Start there to *use* clipper.
 - **[ARCHITECTURE.md](ARCHITECTURE.md)** — the technical overview: thread model,
   tailing, atomic clip publication, recovery, the `ros`/`mcap` seam, deployment.
-- **[crates/clipper/CLAUDE.md](crates/clipper/CLAUDE.md)** — the recorder's deep
-  internals and concurrency invariants, for changing any of it. It covers all
-  three crates: the binary and the two libraries under it are one design, cut
-  along two lines — what every consumer of a recording shares (`crates/clip`),
-  what following one still being written adds (`crates/tail`), and what only a
-  ROS node needs (`crates/clipper`).
-- **[examples/trigger-pub/CLAUDE.md](examples/trigger-pub/CLAUDE.md)** and
-  **[sim/CLAUDE.md](sim/CLAUDE.md)** — the example trigger source and sim camera.
+- **[crates/CLAUDE.md](crates/CLAUDE.md)** — what the three crates share: the
+  seam between them, the cargo-feature matrix that keeps ROS out of two, the
+  clock domain every window lives in, and the contract for keeping these files
+  true.
+- **[crates/clip/CLAUDE.md](crates/clip/CLAUDE.md)** — the format layer and the
+  scan that makes a live MCAP readable, the copy, the manifest, segment assembly
+  and publication, the whole-file index and bag directories.
+- **[crates/tail/CLAUDE.md](crates/tail/CLAUDE.md)** — discovery, the recording
+  collection and its lifecycle, coverage, the scan-fault budget, retention, and
+  the per-trigger flow with the two waits a growing file costs.
+- **[crates/clipper/CLAUDE.md](crates/clipper/CLAUDE.md)** — the binary: the two
+  interfaces, the anchor seam and admission gate, thread supervision, `clipper
+  clip`, configuration, and the live e2e suite.
+- **[examples/CLAUDE.md](examples/CLAUDE.md)** — the examples' shared rules, with
+  a file per example crate ([`trigger-pub`](examples/trigger-pub/CLAUDE.md),
+  [`custom-mcap-writer`](examples/custom-mcap-writer/CLAUDE.md),
+  [`chunked-mcap-writer`](examples/chunked-mcap-writer/CLAUDE.md),
+  [`cu-mcap-record`](examples/cu-mcap-record/CLAUDE.md)).
+- **[sim/CLAUDE.md](sim/CLAUDE.md)** — the sim camera.
+
+**These nested files load lazily.** Claude Code injects the `CLAUDE.md` of every
+directory between this one and a file you *read or edit with the file tools* —
+so opening `crates/clip/src/cut.rs` brings in `crates/CLAUDE.md` and
+`crates/clip/CLAUDE.md`, and nothing from `crates/tail/` or `crates/clipper/`.
+Two things follow. Work done entirely through shell commands (`cat`, `grep`)
+sees none of that layer, so read a file you are about to change with the Read
+tool. And a fact filed under the wrong directory is a fact nobody working there
+is shown — which is why changing a crate's behaviour obliges updating that
+crate's own `CLAUDE.md` in the same change. The rules for doing that well are in
+[crates/CLAUDE.md](crates/CLAUDE.md#keeping-these-files-true).
 
 Build, CI, packaging, and release mechanics live in **skills** (loaded on demand):
 
@@ -40,8 +62,8 @@ is a periodic `Trigger` publisher that drives it during development. The mode is
 a subcommand: `clipper tail` is that recorder, and `clipper clip` cuts one window
 out of one already-finished recording and exits — same window plan, same copy,
 same manifest, without the two waits a growing file costs. The full
-design is in [ARCHITECTURE.md](ARCHITECTURE.md) and
-[crates/clipper/CLAUDE.md](crates/clipper/CLAUDE.md).
+design is in [ARCHITECTURE.md](ARCHITECTURE.md) and the per-crate notes indexed
+above.
 
 ## The sim camera (`sim/`)
 
@@ -149,8 +171,9 @@ behaviour, build/run steps, dependencies, or layout, update the relevant docs in
 the same change** — do not duplicate; cross-reference:
 
 - User-facing overview, quickstart, configuration → **README.md**.
-- Technical/system design → **ARCHITECTURE.md** (crate internals →
-  `crates/clipper/CLAUDE.md`).
+- Technical/system design → **ARCHITECTURE.md** (crate internals → that
+  crate's own `CLAUDE.md` under `crates/`; anything the three share →
+  `crates/CLAUDE.md`).
 - Build / CI / packaging mechanics → the **`build` / `ci` / `packaging`** skills.
 - Contributor orientation and conventions → this **CLAUDE.md**.
 
