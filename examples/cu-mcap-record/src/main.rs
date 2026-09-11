@@ -761,18 +761,22 @@ fn main() -> Result<()> {
         .ok_or_else(|| anyhow!("'sink' node vanished from the graph"))?
         .set_param::<String>("out_dir", args.out.clone());
 
-    let mut app = RecorderApp::builder()
+    let app = RecorderApp::builder()
         .with_config(cfg)
         .build()
         .map_err(|e| anyhow!("building copper app: {e}"))?;
 
-    // Ctrl+C flips the flag so the bounded loop stops and reaches stop_all_tasks
-    // (and the sink's finish()) rather than dying mid-write.
+    // Ctrl+C flips the flag so the bounded loop stops and reaches the stop
+    // transition (and the sink's finish()) rather than dying mid-write.
     let stop = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&stop))?;
 
-    app.start_all_tasks()
-        .map_err(|e| anyhow!("starting tasks: {e}"))?;
+    // The application lifecycle is a typestate: `build()` hands back an
+    // `Initialized` handle, `start()` consumes it into a `Running` one, and
+    // `stop()` consumes that into a `Stopped` one. Each transition moves the
+    // handle, so a stale pre-transition one cannot be reused and the loop below
+    // cannot run against an application that has already been stopped.
+    let mut app = app.start().map_err(|e| anyhow!("starting tasks: {e}"))?;
     println!(
         "cu-mcap-record: recording to {}/ — Ctrl+C to stop",
         args.out
@@ -781,14 +785,13 @@ fn main() -> Result<()> {
         app.run_one_iteration()
             .map_err(|e| anyhow!("running iteration: {e}"))?;
         // Pace the loop, then stop after the sleep (before the next iteration)
-        // so Ctrl+C lands between iterations and reaches stop_all_tasks below.
+        // so Ctrl+C lands between iterations and reaches the stop below.
         std::thread::sleep(LOOP_PERIOD);
         if stop.load(Ordering::Relaxed) {
             break;
         }
     }
-    app.stop_all_tasks()
-        .map_err(|e| anyhow!("stopping tasks: {e}"))?;
+    app.stop().map_err(|e| anyhow!("stopping tasks: {e}"))?;
     println!("cu-mcap-record: stopped, Recording finalised");
     Ok(())
 }

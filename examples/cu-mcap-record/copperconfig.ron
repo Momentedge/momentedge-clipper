@@ -1,7 +1,7 @@
 (
     // Global loop-rate limiter: the whole CopperList graph is pulled at this
-    // rate. There is no per-task Hz in cu29 1.0 — the ~10 s trigger decimates
-    // internally (it clears its payload on every non-fire iteration).
+    // rate. cu29 has no per-task Hz — the ~10 s trigger decimates internally
+    // (it clears its payload on every non-fire iteration).
     runtime: (rate_target_hz: 50),
     tasks: [
         (

@@ -99,9 +99,9 @@ mcap-writer examples (`examples/custom-mcap-writer`,
 `examples/chunked-mcap-writer`), and the copper producer example
 (`examples/cu-mcap-record`) — the examples stay members so they inherit
 `[workspace.package]` and the shared `[workspace.dependencies]` versions, rather
-than for shipping. `examples/cu-mcap-record` keeps its copper dependencies
-(`cu29` and the `cu-bincode` fork) declared in its own `Cargo.toml` rather than
-in `[workspace.dependencies]`, so the heavy cu29 tree stays scoped to that one
+than for shipping. `examples/cu-mcap-record` keeps every copper dependency it
+takes declared in its own `Cargo.toml` rather than in
+`[workspace.dependencies]`, so the heavy cu29 tree stays scoped to that one
 member; it still lives in the shared root lockfile, and a lean ROS-free CI job
 builds and tests it with `-p cu-mcap-record`. `momentedge_msgs/` (ROS2 interface
 package) and `sim/` (the sim camera's launch/config tree) are not Cargo members.

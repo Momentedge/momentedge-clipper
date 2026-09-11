@@ -4,9 +4,9 @@ name = "cu-mcap-record"
 publish = false
 # A workspace member (see the root Cargo.toml): it inherits the shared
 # version / edition / license and the `[workspace.dependencies]` versions via
-# `.workspace = true`, like the sibling examples. Its copper dependencies (cu29
-# and the cu-bincode fork) stay declared here by decision — they are NOT hoisted
-# into `[workspace.dependencies]`, so the cu29 tree stays scoped to this crate.
+# `.workspace = true`, like the sibling examples. Every copper dependency it
+# takes stays declared here by decision — none is hoisted into
+# `[workspace.dependencies]`, so the cu29 tree stays scoped to this crate.
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -17,7 +17,7 @@ license.workspace = true
 # `Reflect` / `Serialize` / `Deserialize` derives via `cu29::prelude`. Kept
 # crate-local (not a workspace dependency) so its cu29 tree does not enter
 # `[workspace.dependencies]`.
-cu29 = "1.0"
+cu29 = "1.2"
 # MUST be the `cu-bincode` fork imported under the key `bincode`: cu29's
 # `CuMsgPayload` bound requires the fork's `Encode` / `Decode` traits, not plain
 # crates.io bincode's. Crate-local for the same reason as cu29.
@@ -29,6 +29,12 @@ serde_json.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 signal-hook.workspace = true
+
+[build-dependencies]
+# The build-script half of copper, released in lockstep with `cu29` above and
+# pinned to the same version. What `build.rs` uses it for is stated there.
+# Crate-local for the same reason as `cu29`.
+cu29-build = "1.2"
 
 # The workspace lint policy (root `Cargo.toml`), inherited whole.
 [lints]

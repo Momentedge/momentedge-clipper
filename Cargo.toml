@@ -25,10 +25,10 @@ members = [
     # `disable_seeking(true)`): the second compliant producer path.
     "examples/chunked-mcap-writer",
     # Copper (cu29) CuSinkTask producer example — appends a tailable MCAP
-    # Recording clipper cuts clips from, ROS-free. Its copper deps (cu29 and the
-    # cu-bincode fork) stay declared in the crate's own Cargo.toml by decision —
-    # do NOT hoist them into [workspace.dependencies]; keeping them crate-local
-    # keeps the cu29 tree scoped to this one member.
+    # Recording clipper cuts clips from, ROS-free. Every copper dependency it
+    # takes stays declared in the crate's own Cargo.toml by decision — do NOT
+    # hoist one into [workspace.dependencies]; keeping them crate-local keeps
+    # the cu29 tree scoped to this one member.
     "examples/cu-mcap-record",
 ]
 
@@ -53,7 +53,7 @@ repository = "https://github.com/Momentedge/momentedge-clipper"
 r2r = { git = "https://github.com/sequenceplanner/r2r.git", tag = "0.9.6" }
 futures = "0.3"
 crossbeam-channel = "0.5"
-signal-hook = "0.3"
+signal-hook = "0.4"
 # The MCAP format layer: record parsing for the scan and the cut, and the clip
 # writer. One version across the workspace, matching the `mcap` CLI on the dev
 # shell, so a recording and a clip are read and written by the same format code
