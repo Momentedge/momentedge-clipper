@@ -433,6 +433,26 @@ this section is the rationale.
   closed file. Only `corrupt_tail_health_live` races the scan by design (the
   closest test to real corruption) and is the one case with extra nextest
   retries.
+- **The window's anchor is clipper's clock, not the harness's.** Under the
+  default `ros` interface on `log`, the anchor is the recorder's own
+  subscription instant, and it trails the harness's `ros2 topic pub` by a second
+  or more — a python CLI startup plus DDS discovery, unbounded and growing with
+  machine load. So window assertions read the anchor back out of the announced
+  clip's name (`announced_window`) rather than off a captured `now()`; and a
+  test that needs data *inside* its window keeps the source publishing across
+  the trigger rather than going quiet first and hoping the preroll outruns the
+  CLI. `quiet_topics_grace_timeout_cut` stops its source only once the trigger
+  is in, and `recorder_killed_mid_trigger_still_announces_via_grace_cut` kills
+  the recorder inside the postroll, for exactly that reason: a window anchored
+  past the last recorded message holds nothing, and the recorder's correct,
+  documented empty clip is indistinguishable at the assertion from a lost one.
+  Where the quiet must come first — `recording_deleted_without_restart_grace_cuts_the_old_data`'s
+  pre-trigger case, whose whole point is a trigger arriving against an
+  already-frozen tail — the preroll is sized to span the harness's own latency
+  and says so. The data a preroll must cover is established with
+  `TestEnv::wait_for_recording_span`, which blocks on the recording's own
+  `log_time` extent; a fixed sleep cannot promise it, because the ros2 CLI
+  source starts publishing an unbounded moment after it is spawned.
 - **Restart and deletion scenarios are exercised live** against a real
   `ros2 bag record`: restarts inside an open trigger window (clean restart,
   deletion-then-restart, deletion before the trigger), deletion without a

@@ -946,40 +946,80 @@ fn window_straddling_an_in_run_split_recovers_both_sides() {
     assert!(extractor.is_running(), "the extractor must outlive the cut");
 }
 
-/// Quiet topics: the recording's topics go silent, so coverage never reaches
-/// the window end. The grace timeout cuts a valid, possibly short clip. The
-/// recording is restricted to the source topic so no ambient topic (/rosout)
-/// can cover the window by accident.
+/// Quiet topics: the recording's topics fall silent inside an open window, so
+/// the tail's coverage high-water freezes short of the window end and only the
+/// grace timeout can release the cut. The recorder stays alive throughout — no
+/// footer, no rollover, no vanished inode — so a stream that stopped arriving is
+/// the sole reason coverage stalls, which is what separates this case from the
+/// other grace-cut tests. The recording is restricted to the source topic so no
+/// ambient topic (`/rosout`) can cover the window by accident.
+///
+/// **The source is stopped after the trigger is received, not before.** The
+/// window is anchored on clipper's own subscription instant, which trails the
+/// harness's `ros2 topic pub` by a second or more, and the source's teardown
+/// trails its own last recorded message by several hundred milliseconds
+/// further. Going quiet first spends that whole unbounded, load-dependent sum
+/// out of the preroll, and a window anchored far enough past the last message
+/// holds no data at all — a legitimately empty clip the assertions below would
+/// read as a lost one. Going quiet after fixes the preroll over a stream that
+/// was live when the trigger arrived, and still leaves most of the postroll
+/// with nothing to cover it.
 #[rstest]
 fn quiet_topics_grace_timeout_cut() {
     if !require_e2e() {
         return;
     }
+    let (preroll, postroll) = (2 * SEC, 6 * SEC);
     let env = TestEnv::new();
     let _recorder = env.start_recorder_topics(&[SRC_TOPIC], "fastwrite", 0);
     let mut source = env.start_source(SRC_TOPIC, SRC_RATE);
     env.wait_for_recording(Duration::from_secs(60));
     let mut extractor = env.start_extractor(5);
-    std::thread::sleep(Duration::from_secs(3));
+    // The preroll must reach back over recorded data, so wait for the recording
+    // to hold a preroll's worth. The listener's head start and the trigger
+    // publish only add to it — both run while the source is still going.
+    env.wait_for_recording_span(Duration::from_nanos(preroll), Duration::from_secs(60));
 
     let mut listener = env.start_recorded_listener("quiet");
-    // Stop the source, then fire a trigger whose window extends past the
-    // last data: coverage can never reach the window end.
+    env.fire_trigger("quiet", preroll, postroll);
+    // The topics go quiet a moment into the window: the coverage high-water
+    // freezes there, seconds short of the window end, and can never reach it.
     source.stop(libc::SIGTERM, Duration::from_secs(10));
-    env.fire_trigger("quiet", 2 * SEC, 6 * SEC);
 
     let r = wait_for_recorded(&mut listener, Duration::from_secs(60));
     assert!(
         extractor.log_text().contains("still uncovered after"),
         "the cut must have come from the grace timeout"
     );
+    let (ws, we) = announced_window(&r, preroll, postroll);
     let msgs = read_clip(Path::new(r.only()));
-    assert!(
-        !msgs.is_empty(),
-        "the preroll data recorded before the quiet period lies in the window"
-    );
-    let (ws, we) = announced_window(&r, 2 * SEC, 6 * SEC);
     assert_clip_within_window(&msgs, ws, we);
+
+    // What a grace cut owes its window is every message the recording holds
+    // inside it — a short clip, never a lossy one. The recording has been static
+    // since the source died a second into the window, ten seconds before the
+    // grace timeout released the cut, so the file read here is byte for byte the
+    // one the cut read; and it carries the source topic alone, so its stamps and
+    // the clip's compare directly.
+    let recording = env.newest_recording().expect("the recording exists");
+    let mut in_window: Vec<u64> = partial_recording_stamps(&recording)
+        .into_iter()
+        .filter(|t| (ws..=we).contains(t))
+        .collect();
+    in_window.sort_unstable();
+    assert!(
+        !in_window.is_empty(),
+        "the trigger fired while the source was still publishing, so the window \
+         must lie over recorded data — an empty one means the setup failed, not \
+         the cut"
+    );
+    let mut cut: Vec<u64> = msgs.iter().map(|(_, log_time)| *log_time).collect();
+    cut.sort_unstable();
+    assert_eq!(
+        cut, in_window,
+        "the grace cut must carry every recorded message inside the window"
+    );
+
     env.assert_capturing_drained();
     assert!(extractor.is_running());
 }

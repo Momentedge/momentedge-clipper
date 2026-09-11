@@ -388,6 +388,39 @@ impl TestEnv {
         }
     }
 
+    /// Block until the newest recording holds at least `span` of data, measured
+    /// on its own `log_time` extent rather than on the harness's wall clock.
+    ///
+    /// A test whose assertion rests on a window's preroll covering recorded data
+    /// needs that data to exist before it triggers, and a fixed sleep cannot
+    /// promise it: the ros2 CLI source starts publishing an unbounded moment
+    /// after it is spawned. Waiting on the recording's extent states the
+    /// precondition instead of estimating it. Unchunked recordings only (the
+    /// suite's `fastwrite` profile) — see [`partial_recording_stamps`].
+    pub(crate) fn wait_for_recording_span(&self, span: Duration, timeout: Duration) {
+        let want = span.as_nanos() as u64;
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(path) = self.newest_recording() {
+                let stamps = partial_recording_stamps(&path);
+                let reach = match (stamps.iter().min(), stamps.iter().max()) {
+                    (Some(first), Some(last)) => last - first,
+                    _ => 0,
+                };
+                if reach >= want {
+                    return;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the recording under {} did not reach {span:?} of data within \
+                 {timeout:?} — source log: see logs/source.log",
+                self.record_dir().display(),
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
     /// Delete the recording file out from under the live recorder — the
     /// external-cleanup fault the deletion tests inject. The recorder keeps
     /// appending to the unlinked inode; the tail sees the path vanish.
