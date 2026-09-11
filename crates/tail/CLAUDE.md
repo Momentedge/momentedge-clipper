@@ -224,6 +224,6 @@ never breaks a clip already in progress.
 **Prune vs in-flight trigger:** `watch_old_files_duration` must be set
 comfortably above the largest preroll any trigger will request. A trigger whose
 preroll reaches past the retention floor may lose its oldest segment — that
-recording was intentionally forgotten. See the [README](../../README.md#configuration)
+recording was intentionally forgotten. See the [Configuration](../../docs/configuration.md)
 for the flag reference.
 

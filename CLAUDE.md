@@ -3,8 +3,19 @@
 This is the entry point for contributing to or operating clipper. The other docs
 own their angle, and this file does not repeat them:
 
-- **[README.md](README.md)** — user-facing: what clipper is, how to install, run,
-  configure, and the trigger interface. Start there to *use* clipper.
+- **[README.md](README.md)** — the human primer: what clipper is, why it is
+  worth running, what it costs, how to install it and cut a first clip. It is
+  short on purpose and links onward rather than explaining. Keep it that way.
+- **[docs/](docs/)** — the user-facing reference the README links to, one page
+  per question a user arrives with:
+  [`configuration.md`](docs/configuration.md) (every flag, env var and TOML key,
+  and the layering rule), [`triggers-and-time.md`](docs/triggers-and-time.md)
+  (the `Trigger` message, the two interfaces, the clock a window lives on),
+  [`clip-command.md`](docs/clip-command.md) (`clipper clip` over a finished
+  recording), [`clip-manifest.md`](docs/clip-manifest.md) (the `momentedge.clip`
+  record), [`operating.md`](docs/operating.md) (shutdown, logs, retention,
+  overload, tuning). These are for *humans looking something up* — the agent
+  view of the same code is the `CLAUDE.md` files below.
 - **[ARCHITECTURE.md](ARCHITECTURE.md)** — the technical overview: thread model,
   tailing, atomic clip publication, recovery, the `ros`/`mcap` seam, deployment.
 - **[crates/CLAUDE.md](crates/CLAUDE.md)** — what the three crates share: the
@@ -170,7 +181,13 @@ The docs describe the same system from different angles. **After a change to
 behaviour, build/run steps, dependencies, or layout, update the relevant docs in
 the same change** — do not duplicate; cross-reference:
 
-- User-facing overview, quickstart, configuration → **README.md**.
+- User-facing reference — a flag, a TOML key, the trigger contract, the manifest,
+  what a deployed recorder does about logs or overload → the matching page under
+  **`docs/`**.
+- The pitch, the quickstart and the install path → **README.md**. It is a primer
+  that has to stay readable in one sitting, so a new fact earns a place there
+  only by changing what clipper *is* or what it costs to run. Everything else
+  goes to `docs/` and is linked from "Where to go next".
 - Technical/system design → **ARCHITECTURE.md** (crate internals → that
   crate's own `CLAUDE.md` under `crates/`; anything the three share →
   `crates/CLAUDE.md`).

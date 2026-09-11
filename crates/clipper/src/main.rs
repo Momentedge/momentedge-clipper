@@ -76,8 +76,8 @@
 //! every mode ([`with_env_prefix`]); and `--print-config` prints what they came
 //! to ([`effective_config`]), as the log does at startup. `--version` prints the
 //! version; [`Config`]'s field docs are the `clipper tail --help` text and the
-//! authoritative per-flag reference (the README configuration table is the
-//! user-facing copy of the same set).
+//! authoritative per-flag reference (`docs/configuration.md` is the user-facing
+//! copy of the same set).
 //!
 //! Which topics a clip is cut from is the one setting with no flag: the files'
 //! `[topics]` table becomes a [`clip::ChannelSelection`] that both modes hand to

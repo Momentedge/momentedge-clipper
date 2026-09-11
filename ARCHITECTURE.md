@@ -23,7 +23,7 @@ executable to deploy. The other one is **`clipper clip`**: one clip out of one
 finished recording, named by a trigger on the command line, then exit — see
 [Cutting from a finished recording](#cutting-from-a-finished-recording). `tail`
 is the mode most of this document describes; the flags each takes are tabulated
-in the [README](README.md#configuration).
+in the [Configuration](docs/configuration.md).
 
 The split is deliberate. Recording and deciding-what-matters are different jobs
 with different change rates: the recorder keeps its own config, lifecycle, and
@@ -424,7 +424,7 @@ on every message, the selection once per channel — in the same step that
 registers a channel in the output, so an excluded topic contributes to a clip
 neither a channel, nor a schema, nor a message, nor a manifest key. The selection
 comes from the configuration file's `[topics]` table
-([README](README.md#which-topics-a-clip-contains)) and rides in the staging
+([Configuration](docs/configuration.md#which-topics-a-clip-contains)) and rides in the staging
 worker pool beside the compression codec, so one configuration cuts the same
 channel set on the device and out of the finished recording afterwards. The clip writer is built from
 explicit `mcap::WriteOptions` with both knobs that decide a clip's layout set
@@ -437,7 +437,7 @@ Between the last copied message and `finish()` the writer emits the clip's
 (`clip::manifest`). Written there and not earlier, it lands in the summary's
 metadata index and the statistics' metadata count, so a reader finds it by name
 without walking the file — and its counters are the copy's final ones rather
-than a guess. See [What a clip carries](README.md#what-a-clip-carries) for the
+than a guess. See [What a clip carries](docs/clip-manifest.md) for the
 keys; [`crates/clip/CLAUDE.md`](crates/clip/CLAUDE.md) for how the two halves
 reach the writer.
 

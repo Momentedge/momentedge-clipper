@@ -454,7 +454,7 @@ nix develop --command cargo run -p clipper -- tail
 Needs `scripts/record.sh` running (for `./record`) and a
 trigger publisher (`trigger-pub`). Logs go to stdout (`main` says why);
 `RUST_LOG=debug` raises verbosity. Where the ROS layer's own diagnostics land
-is in the [README](../../README.md#operational-notes).
+is in the [Operating clipper](../../docs/operating.md).
 
 The other mode needs neither, and no ROS toolchain either — it takes a finished
 recording and exits:
@@ -505,7 +505,7 @@ untouched — so a mode added later inherits the same env fallback with no new
 wiring. Changing the prefix is the one `ENV_PREFIX` constant. clap's `env`
 feature provides the per-arg env fallback and `string` lets the runtime-built
 env names be set on the args. The flags, env vars, and defaults are tabulated in
-the [README](../../README.md#configuration).
+the [Configuration](../../docs/configuration.md).
 
 The interface seam is one such flag: `--interface {ros|mcap}` (env
 `MOMENTEDGE_INTERFACE`, default `ros`), a clap `ValueEnum` over `InterfaceKind`
@@ -557,4 +557,4 @@ The `[topics]` half of the same files becomes the `clip::select::ChannelSelectio
 both modes hand to their staging pool — see
 [the copy](../clip/CLAUDE.md#the-copy-is-direct-clipcut). The schema, the layering rule and the
 per-key scope are documented in the
-[README](../../README.md#the-configuration-file).
+[Configuration](../../docs/configuration.md#the-configuration-file).

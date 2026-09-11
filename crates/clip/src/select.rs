@@ -281,8 +281,8 @@ mod tests {
     }
 
     /// The patterns are unanchored: `^/camera/` matches at the start of a name,
-    /// a bare word matches anywhere in one. The README says so, so a test holds
-    /// it down.
+    /// a bare word matches anywhere in one. `docs/configuration.md` says so, so a
+    /// test holds it down.
     #[test]
     fn patterns_are_unanchored() {
         let sel = selection(Spec {

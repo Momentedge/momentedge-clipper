@@ -166,7 +166,7 @@ decide what a clip looks like set outright, not inherited from the mcap crate
 defaults, so a change of those defaults cannot silently alter clip output.
 `.compression(..)` carries the codec — a deliberate choice
 (`--clip-compression`, default zstd; see the
-[README](../../README.md#configuration)) — travelling as an
+[Configuration](../../docs/configuration.md)) — travelling as an
 `Option<mcap::Compression>` (`None` = uncompressed) from `Config` into the
 staging worker pool, which captures it for its lifetime (it is a property of the
 output, not of any one window, and no window may disagree with it) and through
@@ -202,7 +202,7 @@ not the configuration's to make: the announcement topic
 (`clip::trigger::ANNOUNCE_TOPIC`) is refused unconditionally, and the trigger
 topic is kept unless `exclude_trigger_topic` drops it. The keys and their
 `ros2 bag record` counterparts are in the
-[README](../../README.md#which-topics-a-clip-contains).
+[Configuration](../../docs/configuration.md#which-topics-a-clip-contains).
 
 **Two-staged atomic publication.** The cut is two separate calls so the output
 directory only ever holds finished clips, and so a window that straddled a
@@ -261,7 +261,7 @@ recorder's logs nor the recording beside it, so it states what it is: one
 `mcap::records::Metadata` record under the vendor-namespaced name
 `momentedge.clip`, flat dotted keys and string values. The key groups and what a
 consumer does with them are in the
-[README](../../README.md#what-a-clip-carries); this section is where they come
+[What a clip carries](../../docs/clip-manifest.md); this section is where they come
 from. The name is namespaced because a recording `ros2 bag record` wrote carries
 its *own* metadata record under the bare name `rosbag2` — a manifest under that
 name would be found by whichever record a tool read first.
@@ -502,4 +502,4 @@ binary that owns the parser — see
 The `[topics]` half of the same files becomes the `clip::select::ChannelSelection`
 described under [the copy](#the-copy-is-direct-clipcut). The schema, the layering
 rule and the per-key scope are documented in the
-[README](../../README.md#the-configuration-file).
+[Configuration](../../docs/configuration.md#the-configuration-file).

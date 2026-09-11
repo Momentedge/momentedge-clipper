@@ -45,7 +45,7 @@ Fire test triggers with `cargo run -p trigger-pub` (or publish
 `--features ros` is what puts the live trigger subscription in the binary: ROS is
 a cargo feature of the recorder and it is off by default, so without it clipper
 runs on `--interface mcap` and reads its triggers out of the recording instead of
-off the topic. See the README's [From source](../../README.md#from-source).
+off the topic. See the README's [Install](../../README.md#install).
 
 ## The two latency knobs
 
