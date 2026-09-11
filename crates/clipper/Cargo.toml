@@ -76,7 +76,7 @@ tempfile = "3"
 libc = "0.2"
 # Test structuring: expands the storage-profile matrix into per-case tests
 # that nextest runs as isolated processes.
-rstest = "0.26"
+rstest = "0.27"
 # `Watch`'s test-only setter, which the admission-gate test parks and releases
 # sixteen handlers with. Cargo's v2+ resolver does not enable a dev-dependency's
 # features for a normal build, so a release binary compiles none of it.
