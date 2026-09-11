@@ -426,11 +426,12 @@ neither a channel, nor a schema, nor a message, nor a manifest key. The selectio
 comes from the configuration file's `[topics]` table
 ([Configuration](docs/configuration.md#which-topics-a-clip-contains)) and rides in the staging
 worker pool beside the compression codec, so one configuration cuts the same
-channel set on the device and out of the finished recording afterwards. The clip writer is built from
-explicit `mcap::WriteOptions` with both knobs that decide a clip's layout set
-deliberately — the codec (`--clip-compression`) and the 1 MiB chunk size
-(`clip::cut::CLIP_CHUNK_SIZE`) — and finished with `Writer::finish()` (summary +
-footer + closing magic) so every clip is a complete, standalone MCAP file.
+channel set on the device and out of the finished recording afterwards. The clip
+writer is built from `mcap::WriteOptions` carrying one deliberate setting, the
+codec (`--clip-compression`); what it inherits instead is
+[`crates/clip/CLAUDE.md`](crates/clip/CLAUDE.md). It is finished with
+`Writer::finish()` (summary + footer + closing magic), so every clip is a
+complete, standalone MCAP file.
 
 Between the last copied message and `finish()` the writer emits the clip's
 **manifest**: one `mcap::records::Metadata` record named `momentedge.clip`

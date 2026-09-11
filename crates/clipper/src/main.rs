@@ -484,12 +484,9 @@ struct Config {
     /// Compression codec for written clips (none, lz4, zstd).
     ///
     /// `zstd` (the default) writes the smallest clips; `lz4` trades size for
-    /// lower CPU; `none` skips recompression entirely. The codec is set
-    /// explicitly on the clip writer rather than inherited from the mcap crate
-    /// default. Only the codec is configurable here: chunking stays on, and the
-    /// chunk size is the one the cut path names
-    /// (`clip::cut::CLIP_CHUNK_SIZE`), also set explicitly rather than
-    /// inherited.
+    /// lower CPU; `none` skips recompression entirely. It is the only property
+    /// of a clip's encoding this binary sets; everything else about the file
+    /// layout belongs to [`clip::cut`].
     #[arg(long, value_enum, default_value_t = ClipCompression::Zstd)]
     clip_compression: ClipCompression,
 
