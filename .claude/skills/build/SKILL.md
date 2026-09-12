@@ -249,8 +249,13 @@ everything else runs straight from the repo root:
 | `nix develop --command just e2e` | the live ROS 2 suite (`CLIPPER_E2E=1`) |
 | `just test-examples` | the example crates CI splits into their own jobs |
 
-Three files hold the policy, and all three want a **nightly** toolchain (the dev
-box's system Rust is one, as is the CI `fmt` job's):
+Three files hold the policy, and all three want a **nightly** toolchain — the dev
+box's system Rust is one, and in CI both the `fmt` job and the `libraries` job's
+clippy and rustdoc steps install one. The `libraries` job still builds and tests
+on stable, which is what proves the crates need nothing special; only the lint
+pass is pinned to the toolchain the lint policy is written against. The
+`cu-mcap-record` job stays on stable throughout, because nightly is exactly where
+its cu29 tree hits a rustc ICE (beads `clipper-fgs`):
 
 - **`rustfmt.toml`** — `edition`, the std/external/own import grouping, one `use`
   per module path, formatted doc-comment code, and `hex_literal_case = "Upper"`
@@ -272,6 +277,12 @@ box's system Rust is one, as is the CI `fmt` job's):
 `indexing_slicing` and the shape lints all fire inside `#[cfg(test)] mod tests`
 and in `tests/*.rs` too. Each test module carries one inner `#![allow(…, reason
 = "…")]` for them rather than an attribute per case.
+
+Six of those blocks name `clippy::assert_is_empty`, which nightly clippy has and
+stable clippy does not — and a lint name stable does not know is an `unknown
+lint` **error** under `-D warnings`, not a warning. That is the concrete reason
+the lint pass is a nightly pass: run it on stable and the whole job fails before
+it lints anything.
 
 ## Tests and coverage
 

@@ -157,9 +157,25 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      # stable for the edition-2024 build/clippy/test, as in the job above.
+      # stable for the edition-2024 build and test: this lane's whole point is
+      # that the three crates need nothing special, and compiling them on stable
+      # is what proves it.
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      # Clippy runs on nightly, because the lint policy is a nightly policy —
+      # the test modules allow `clippy::assert_is_empty`, which stable clippy
+      # does not know and rejects outright as an unknown lint under `-D
+      # warnings`, exactly as stable rustfmt rejects `rustfmt.toml`'s unstable
+      # keys (which is why the `fmt` job installs nightly too). Running the
+      # gate here on the toolchain it is written against is what keeps
+      # `just check` and CI the same gate; when they differed, this job was red
+      # for three days without the dev box being able to reproduce it.
+      #
+      # Each step names its toolchain explicitly, since installing two leaves
+      # the last one default.
+      - name: Install nightly clippy
+        uses: dtolnay/rust-toolchain@nightly
         with:
           components: clippy
 
@@ -194,7 +210,7 @@ jobs:
           done
 
       - name: Clippy
-        run: cargo clippy --locked --all-targets -p clip -p tail -p clipper -- -D warnings
+        run: cargo +nightly clippy --locked --all-targets -p clip -p tail -p clipper -- -D warnings
 
       # Building the docs is the only thing that runs rustdoc's lints, and
       # `RUSTDOCFLAGS` is what promotes the `[workspace.lints.rustdoc]` block to
@@ -202,10 +218,10 @@ jobs:
       # resolves, or one from public documentation into a private item. Same
       # command as `just check`'s last line.
       - name: Docs
-        run: RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps -p clip -p tail -p clipper
+        run: RUSTDOCFLAGS="-D warnings" cargo +nightly doc --locked --no-deps -p clip -p tail -p clipper
 
       - name: Test
-        run: cargo test --locked -p clip -p tail -p clipper
+        run: cargo +stable test --locked -p clip -p tail -p clipper
 
   recorder:
     name: ${{ matrix.distro }}
