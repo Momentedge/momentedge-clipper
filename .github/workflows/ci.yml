@@ -18,9 +18,8 @@
 # Distros: humble, jazzy, lyrical — the three the Rust crates build under
 # (rolling cannot build r2r 0.9.6; see the `build` skill, "r2r / IDL build model
 # and distro support"). The e2e step below runs the full suite on every leg under
-# the `e2e` nextest profile, skipping only the one inherently flaky
-# live-corruption test (via an env gate);
-# the matrix comment explains why.
+# the `e2e` nextest profile — the whole binary, nothing filtered out and nothing
+# skipped from inside a test; the matrix comment says what each distro costs.
 
 name: CI
 

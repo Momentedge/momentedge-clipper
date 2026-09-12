@@ -66,8 +66,13 @@ test-examples:
 # ros` is not optional — the suite starts the recorder on `--trigger-source ros`.
 # Run it from inside the dev shell:
 #   nix develop --command just e2e
+#
+# `--no-fail-fast` because the suite is serialized and one live test's DDS
+# discovery miss would otherwise hide the other twenty-odd results, turning a
+# twenty-minute run into one data point. CI keeps the default, where stopping
+# early is worth the runner minutes.
 e2e:
-    CLIPPER_E2E=1 cargo nextest run -p clipper --features ros --profile e2e -E 'binary(e2e)'
+    CLIPPER_E2E=1 cargo nextest run --no-fail-fast -p clipper --features ros --profile e2e -E 'binary(e2e)'
 
 # One instrumented run, three renderings of it: `--no-report` leaves the raw
 # profile behind so the cobertura file, the browsable HTML and the table all
