@@ -1174,14 +1174,22 @@ fn corrupt_tail_fails_fast_offline() {
     );
 }
 
-/// Corrupt tail, live: damage injected into the growing file mid-record.
-/// Racy by design (nextest retries cover it): depending on where the scan
-/// was, the extractor either tolerates localized damage — stays up, and a
-/// later trigger over undamaged data still announces — or fail-fast exits
-/// non-zero on a framing desync. It must never hang or die silently.
+/// Corrupt tail, live: a run of bytes overwritten inside one message's payload
+/// while the recorder keeps appending — the damage class the cut is built to
+/// absorb. The record's framing header, its channel and both its stamps survive,
+/// so the tail's framing walk is indifferent to whether it had already consumed
+/// those bytes, and the cut — which copies message payloads through without ever
+/// decoding one — carries the damage into the clip and finishes normally.
+///
+/// Placing the run inside a record chosen from the recording's own framing is
+/// what makes that a fact rather than a coin toss. A run dropped at an offset
+/// picked without reading the framing straddles a record header whenever the
+/// grid happens to fall that way — about one time in three at this suite's
+/// 64-byte run and ~240-byte records — and that is a different failure
+/// entirely: see [`corrupt_tail_framing_damage_live`].
 #[rstest]
-fn corrupt_tail_health_live() {
-    if !require_e2e() || skip_flaky() {
+fn corrupt_tail_payload_damage_live() {
+    if !require_e2e() {
         return;
     }
     let env = TestEnv::new();
@@ -1189,65 +1197,120 @@ fn corrupt_tail_health_live() {
     let _source = env.start_source(SRC_TOPIC, 50);
     env.wait_for_recording(Duration::from_secs(60));
     let mut extractor = env.start_extractor(10);
-    std::thread::sleep(Duration::from_secs(3));
+    env.wait_for_recording_span(Duration::from_secs(2), Duration::from_secs(60));
 
-    // Damage a run of bytes halfway into the recorded region, under the live
-    // writer. The tail has typically consumed those bytes already, so the
-    // damage surfaces at extraction; if the scan was still behind it, it
-    // surfaces as a scan fault.
     let bag = env.newest_recording().expect("the recording exists");
-    let len = std::fs::metadata(&bag).expect("recording metadata").len();
-    overwrite_bytes(&bag, len / 2, 64);
+    let records = message_records(&bag);
+    assert!(
+        records.len() >= 4,
+        "recording too short to damage mid-file ({} messages)",
+        records.len()
+    );
+    let (target, _) = records[records.len() / 2];
+    let damage = overwrite_message_payload(&bag, &target);
 
-    let fail_fast = |extractor: &mut Proc| {
-        let status = extractor
-            .wait_exit(Duration::from_secs(30))
-            .expect("an extractor that stopped must fully exit");
-        assert!(
-            !status.success(),
-            "a framing desync must exit non-zero, got {status}"
-        );
-        assert!(
-            extractor.log_text().contains("faulted at offset"),
-            "the exit must name the scan fault"
-        );
-    };
-
-    // Trigger A spans the damaged region (preroll reaches the file's start).
-    // Legal outcomes: a degraded-but-complete clip is announced, or the
-    // extraction aborts per-trigger (no announcement) while the process
-    // stays up, or the scan faulted and the process fail-fast exited.
-    let mut listener_a = env.start_recorded_listener("over-damage");
-    if !extractor.is_running() {
-        fail_fast(&mut extractor);
-        return;
-    }
+    // The preroll reaches the recording's start, so the damaged record lies
+    // inside the window and the clip has to account for it.
+    let mut listener = env.start_recorded_listener("over-damage");
     env.fire_trigger("over-damage", 60 * SEC, SEC);
-    if let Some(a) = try_wait_for_recorded(&mut listener_a, Duration::from_secs(30)) {
-        // Whatever the damage did, an announced file is a complete MCAP.
-        let msgs = read_clip(Path::new(a.only()));
-        let (ws, we) = announced_window(&a, 60 * SEC, SEC);
-        assert_clip_within_window(&msgs, ws, we);
-    }
-    if !extractor.is_running() {
-        fail_fast(&mut extractor);
-        return;
-    }
-
-    // Health proof: a fresh window past the damage must still announce.
-    std::thread::sleep(Duration::from_secs(2));
-    let mut listener_b = env.start_recorded_listener("post-damage");
-    env.fire_trigger("post-damage", SEC, SEC);
-    let b = wait_for_recorded(&mut listener_b, Duration::from_secs(60));
-    let msgs = read_clip(Path::new(b.only()));
+    let recorded = wait_for_recorded(&mut listener, Duration::from_secs(60));
+    let clip = Path::new(recorded.only());
+    // `read_clip` insists on a complete summary/footer/magic, so this is also
+    // the proof that the announced file is a whole MCAP, damage and all.
+    let msgs = read_clip(clip);
     assert!(
         !msgs.is_empty(),
-        "a window over undamaged data must still produce a full clip"
+        "a window over the recording must produce a full clip"
     );
-    let (ws, we) = announced_window(&b, SEC, SEC);
+    let (ws, we) = announced_window(&recorded, 60 * SEC, SEC);
     assert_clip_within_window(&msgs, ws, we);
     assert!(
-        extractor.is_running(),
-        "localized damage must not take the extractor down"
+        clip_holds_payload(clip, &damage),
+        "the damaged record is copied through, not skipped"
     );
+    assert!(
+        extractor.is_running(),
+        "payload damage must not take the extractor down"
+    );
+    env.assert_capturing_drained();
+}
+
+/// Corrupt tail, live: a run of bytes overwritten across a record's framing
+/// header, in a region the tail has already indexed. The scan never returns to
+/// consumed bytes, so the recorder stays up — and the copy, walking that same
+/// framing afresh, finds a length no record can have and refuses the clip
+/// rather than assembling one out of bytes that changed since the scan.
+///
+/// The refusal is per trigger, is named in the log, and covers the whole extent
+/// the damage sits in: extents close at 4 MiB, so a later window over data
+/// recorded after the damage reads those bytes too and is refused with them.
+/// That blast radius is the case's point — the recorder answers such a trigger
+/// with the fault named, and never with a hang, a silent stop, or a clip built
+/// on the changed bytes.
+///
+/// Which of the two faults the damage causes turns on whether the scan is past
+/// it, so the test establishes that rather than assuming it: a clip cut before
+/// the damage names the newest message the scan had indexed, and the damaged
+/// record is taken from the first half of what the scan had therefore already
+/// walked. Damage the scan has yet to reach is the offline case
+/// ([`corrupt_tail_fails_fast_offline`]), where the fault is fatal instead.
+#[rstest]
+fn corrupt_tail_framing_damage_live() {
+    if !require_e2e() {
+        return;
+    }
+    let env = TestEnv::new();
+    let _recorder = env.start_recorder("fastwrite", 0);
+    let _source = env.start_source(SRC_TOPIC, 50);
+    env.wait_for_recording(Duration::from_secs(60));
+    let mut extractor = env.start_extractor(10);
+    env.wait_for_recording_span(Duration::from_secs(2), Duration::from_secs(60));
+
+    // One clean cut first, purely to establish how far the scan has read: a
+    // clip can only carry a message the scan had indexed, so every record
+    // ahead of that one in the file is behind the scan as well.
+    env.fire_trigger("probe", 60 * SEC, SEC);
+    let probe = env.wait_for_clip_matching("_probe.mcap", Duration::from_secs(60));
+    let indexed_through = read_clip(&probe)
+        .iter()
+        .map(|(_, log_time)| *log_time)
+        .max()
+        .expect("the probe clip carries the data it proves was indexed");
+
+    let bag = env.newest_recording().expect("the recording exists");
+    let records = message_records(&bag);
+    let reach = records
+        .iter()
+        .position(|(_, log_time)| *log_time == indexed_through)
+        .expect("the clip's newest message is a record of the recording");
+    assert!(
+        reach >= 4,
+        "recording too short to damage behind the scan ({reach} indexed messages)"
+    );
+    let (target, _) = records[reach / 2];
+    overwrite_record_header(&bag, &target);
+
+    // A window over data recorded seconds after the damaged record — over
+    // nothing the damage touched, except the extent it shares with it.
+    env.fire_trigger("over-damage", SEC, SEC);
+    extractor.expect_log(
+        "extent framing inconsistent with the tail's scan",
+        Duration::from_secs(60),
+    );
+    assert!(
+        extractor.is_running(),
+        "a refused cut must not take the extractor down"
+    );
+    assert_eq!(
+        env.published_clips(),
+        vec![
+            probe
+                .file_name()
+                .expect("the probe clip has a name")
+                .to_string_lossy()
+                .into_owned(),
+        ],
+        "a refused cut publishes nothing"
+    );
+    env.assert_capturing_drained();
 }

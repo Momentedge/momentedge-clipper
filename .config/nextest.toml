@@ -31,12 +31,6 @@ leak-timeout = "2s"
 filter = "binary(e2e)"
 test-group = "ros-e2e"
 
-# Live damage injection races the tail's scan by design — the closest test to
-# real corruption, and the one acknowledged flaky case.
-[[profile.e2e.overrides]]
-filter = "test(corrupt_tail_health_live)"
-retries = 2
-
 # The copper live e2e builds its Producer fixture (the cu-mcap-record member)
 # on demand with `-p cu-mcap-record` when no prebuilt binary is present. That
 # compiles the cu29 tree — minutes on a cold cache, far past the default two

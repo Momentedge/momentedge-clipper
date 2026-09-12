@@ -28,6 +28,18 @@ overload. For the flags behind any of it, see
   while all 16 slots are busy is rejected with a logged error and produces no
   clip and no `Recorded` announcement. Automation waiting on the announcement
   should treat its absence — and the logged error — as a dropped trigger.
+- **A damaged recording need not stop the process.** clipper never re-reads
+  bytes it has already tailed, so damage appearing behind its scan leaves it
+  running and surfaces when a clip is cut. Damage inside a message's payload is
+  copied into the clip as recorded. Damage that breaks a record's length prefix
+  is refused: clipper logs `trigger handling failed: … extent framing
+  inconsistent with the tail's scan`, publishes no clip for that trigger, and
+  goes on refusing every window that reads the same region — up to 4 MiB of
+  recording, data written after the damage included. So a healthy process that
+  has quietly stopped producing clips is worth grepping the log for that line;
+  restarting the recording (a rollover or a fresh `ros2 bag record`) clears it.
+  Damage *ahead* of the scan is the other case, and there clipper exits non-zero
+  for the supervisor rather than limping on.
 
 ## Tuning under load
 

@@ -249,6 +249,17 @@ that could be mistaken for a clip. A *deleted* recording is not an error — the
 plan's `Arc<File>` keeps the inode readable, so extractions in flight across a
 recorder restart still complete.
 
+**A framing abort costs the extent, not the byte.** The walk enters at the
+extent's own offset and has no resync point, so one broken record header takes
+with it every record behind it in that extent — and an extent closes at
+`EXTENT_CAP_BYTES` (4 MiB), which at a modest data rate is minutes of
+recording. Every window whose plan includes that extent is refused, windows over
+data written long after the damage included, for as long as the recording is
+tailed. It is the tail, not the cut, that fails fast, so the recorder names the
+fault once per trigger and stays up: the symptom is clips that stop arriving,
+not a process that stops. `corrupt_tail_framing_damage_live` holds that shape
+down.
+
 **Detection limit:** the leniency applies to damage loud enough to break
 parsing or a CRC. The default fastwrite profile is unchunked and carries no
 CRCs, so corruption inside a message *body* that leaves the framing and the
