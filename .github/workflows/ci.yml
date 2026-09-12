@@ -16,9 +16,10 @@
 # libraries together with the recorder's own default (ROS-free) build, and the
 # `cu-mcap-record` copper example (trigger-pub is not in CI).
 # Distros: humble, jazzy, lyrical — the three the Rust crates build under
-# (rolling cannot build r2r 0.9.6; see README "Integration tests"). The e2e step
-# below runs the full suite on every leg under the `e2e` nextest profile,
-# skipping only the one inherently flaky live-corruption test (via an env gate);
+# (rolling cannot build r2r 0.9.6; see the `build` skill, "r2r / IDL build model
+# and distro support"). The e2e step below runs the full suite on every leg under
+# the `e2e` nextest profile, skipping only the one inherently flaky
+# live-corruption test (via an env gate);
 # the matrix comment explains why.
 
 name: CI
@@ -195,6 +196,14 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --locked --all-targets -p clip -p tail -p clipper -- -D warnings
+
+      # Building the docs is the only thing that runs rustdoc's lints, and
+      # `RUSTDOCFLAGS` is what promotes the `[workspace.lints.rustdoc]` block to
+      # a gate. It catches what clippy cannot: an intra-doc link that does not
+      # resolves, or one from public documentation into a private item. Same
+      # command as `just check`'s last line.
+      - name: Docs
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps -p clip -p tail -p clipper
 
       - name: Test
         run: cargo test --locked -p clip -p tail -p clipper

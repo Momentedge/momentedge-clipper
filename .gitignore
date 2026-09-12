@@ -1,7 +1,9 @@
 /target
 .omc/
 
-# cargo-llvm-cov output (README "Tests and coverage")
+# cargo-llvm-cov output written outside target/. `just cov` keeps its own
+# renderings under target/llvm-cov/; this covers a hand-run --lcov export.
+# (see the `build` skill, "Tests and coverage")
 /lcov.info
 
 record/

@@ -232,19 +232,72 @@ rosbag2 publishes `WriteSplitEvent` on `/events/write_split` at a split, but
 clipper discovers splits by watching the directory for new `*.mcap` files and
 consumes no split events.
 
+## The quality gate
+
+`justfile` is the entry point; `just --list` names every recipe. Each one runs
+the *caller's* toolchain and enters no nix shell of its own, so the two that link
+ROS — `check-ros` and `e2e` — are invoked from inside the dev shell, and
+everything else runs straight from the repo root:
+
+| recipe | what it runs |
+|---|---|
+| `just fmt` / `just fmt-check` | `cargo fmt --all`, writing or checking |
+| `just check` | `fmt-check`, then clippy and rustdoc with warnings denied |
+| `just test` | nextest over the three crates, then the doctests |
+| `just cov` | one instrumented run, rendered three ways (below) |
+| `nix develop --command just check-ros` | the same clippy gate with `--features clipper/ros` |
+| `nix develop --command just e2e` | the live ROS 2 suite (`CLIPPER_E2E=1`) |
+| `just test-examples` | the example crates CI splits into their own jobs |
+
+Three files hold the policy, and all three want a **nightly** toolchain (the dev
+box's system Rust is one, as is the CI `fmt` job's):
+
+- **`rustfmt.toml`** — `edition`, the std/external/own import grouping, one `use`
+  per module path, formatted doc-comment code, and `hex_literal_case = "Upper"`
+  for the MCAP magic and opcodes. Most of those keys are unstable, which is what
+  makes nightly a requirement rather than a preference.
+- **`[workspace.lints]` in `Cargo.toml`** — the lint levels every member inherits.
+  `-D warnings` in `just check` is what makes the `warn` levels a gate; without
+  it clippy exits zero on all of them. `RUSTDOCFLAGS="-D warnings" cargo doc` is
+  the same promotion for the `rustdoc` block, and building the docs is the only
+  thing that runs those lints at all.
+- **`clippy.toml`** — the thresholds for the size and shape lints
+  (`too_many_lines` at 60, `too_many_arguments` at 5, `cognitive_complexity` at
+  15, `excessive_nesting` at 4, one bool per struct and per parameter list). The
+  defaults are loose enough never to fire, so the file *is* the lint config. A
+  hit is a cleanup item: fix it, or `#[expect(lint, reason = "…")]` at the
+  narrowest scope with a reason a reviewer would accept.
+
+`[lints]` is per package, not per target, so `unwrap_used`, `expect_used`,
+`indexing_slicing` and the shape lints all fire inside `#[cfg(test)] mod tests`
+and in `tests/*.rs` too. Each test module carries one inner `#![allow(…, reason
+= "…")]` for them rather than an attribute per case.
+
 ## Tests and coverage
 
-Unit/integration tests run with plain `cargo test` in the dev shell; everything
-ROS-free runs outside it (above). The suite spans all three crates, so coverage
-names all three, and `--features clipper/ros` is what puts the `ros` trigger
-source's lines in the report at all:
+Unit/integration tests run with `just test` (or plain `cargo test`) in the dev
+shell; everything ROS-free runs outside it (above). The suite spans all three
+crates, so coverage names all three, and `--features clipper/ros` is what puts
+the `ros` trigger source's lines in the report at all:
 
 ```bash
-cargo llvm-cov -p clip -p tail -p clipper                                       # everything ROS-free, no shell
-nix develop --command cargo llvm-cov --features clipper/ros -p clip -p tail -p clipper                 # summary table
-nix develop --command cargo llvm-cov --features clipper/ros -p clip -p tail -p clipper --html          # target/llvm-cov/html/index.html
-nix develop --command cargo llvm-cov --features clipper/ros -p clip -p tail -p clipper --lcov --output-path lcov.info
+just cov                                      # the three crates, branches included, no shell
+cargo llvm-cov -p clip -p tail -p clipper     # the same run without the renderings
+nix develop --command cargo llvm-cov --features clipper/ros -p clip -p tail -p clipper          # summary table
+nix develop --command cargo llvm-cov --features clipper/ros -p clip -p tail -p clipper --html   # target/llvm-cov/html/index.html
 ```
+
+`just cov` instruments once and renders that one run three ways — `--no-report`
+leaves the raw profile behind, so the cobertura file
+(`target/llvm-cov/coverage.cobertura.xml`), the browsable HTML
+(`target/llvm-cov/html/index.html`, `just cov-open`) and the printed table all
+describe the same execution. `--branch` adds the branch columns; it rests on
+rustc's `-Z coverage-options=branch`, so it is nightly-only and prints an
+unstable warning. LLVM counts a branch where control flow forks on a condition —
+`if`, `&&`, `||`, `while let` — and a `match` arm is a *region*, not a branch, so
+code that decides by matching reports few branches and a high region count
+rather than a gap in the tests. Doctests are outside the measurement: the test
+runner does not carry them.
 
 `-p clipper` alone builds no test binary for `clip` or `tail`, so the libraries'
 own tests never run and their lines — instrumented all the same, as path

@@ -19,6 +19,11 @@ own their angle, and this file does not repeat them:
   files below.
 - **[ARCHITECTURE.md](ARCHITECTURE.md)** — the technical overview: thread model,
   tailing, atomic clip publication, recovery, the `ros`/`mcap` seam, deployment.
+- **[CONTEXT.md](CONTEXT.md)** — the domain glossary, and the word for each thing
+  every other file here uses: recording, producer, extent, coverage; trigger,
+  window, anchor; trigger source and interface. Above all it separates the
+  several distinct instants a message can be said to have happened at, which are
+  easy to conflate and expensive to conflate. Read it before writing about time.
 - **[crates/CLAUDE.md](crates/CLAUDE.md)** — what the three crates share: the
   seam between them, the cargo-feature matrix that keeps ROS out of two, the
   clock domain every window lives in, and the contract for keeping these files
@@ -54,8 +59,9 @@ Build, CI, packaging, and release mechanics live in **skills** (loaded on demand
 
 - **`build`** ([`.claude/skills/build/SKILL.md`](.claude/skills/build/SKILL.md))
   — the Nix dev shell, the recorder's two builds and the two nix packages that
-  match them, the r2r/IDL model, tests and coverage, the live e2e suite, the
-  binary cache.
+  match them, the r2r/IDL model, the quality gate (`justfile`, `rustfmt.toml`,
+  `clippy.toml` and the `[workspace.lints]` block they tune), tests and
+  coverage, the live e2e suite, the binary cache.
 - **`ci`** ([`.claude/skills/ci/SKILL.md`](.claude/skills/ci/SKILL.md)) — the
   GitHub Actions workflows, skip rules, and local `act` testing.
 - **`packaging`** ([`.claude/skills/packaging/SKILL.md`](.claude/skills/packaging/SKILL.md))
@@ -142,6 +148,9 @@ nix/                    # flake package defs: momentedge-msgs, ros-env, the per-
                         #   ROS binaries, and the ROS-free clipper package
 scripts/                # record.sh, run.sh, build-on-target.sh, packaging scripts
 flake.nix               # per-distro ROS2 dev shells + nix-built binaries + clipper-ros-free
+justfile                # the quality gate: fmt, check, test, cov, e2e (`just --list`)
+rustfmt.toml            # formatting policy (nightly: several keys are unstable)
+clippy.toml             # thresholds for the size and shape lints Cargo.toml enables
 ```
 
 ## Sibling repositories

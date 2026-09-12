@@ -126,6 +126,9 @@ string_slice = "warn"                         # `indexing_slicing` does not cove
 allow_attributes_without_reason = "warn"
 undocumented_unsafe_blocks = "warn"           # meaningful because `unsafe_code` is `deny`, not `forbid`
 await_holding_lock = "deny"                   # nothing here is async; the entry is the ratchet
+# A restriction lint, off by default: its threshold in `clippy.toml` is what
+# makes it the second pass's worklist rather than a style opinion.
+cognitive_complexity = "warn"
 
 # Deliberately not enabled, having been measured rather than assumed:
 #   clippy::arithmetic_side_effects — ~50 hits across `clip` and `tail`, all

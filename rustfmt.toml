@@ -1,18 +1,30 @@
 # rustfmt configuration for the workspace.
 #
-# The import options below are *unstable*: rustfmt only honours them on a
-# nightly toolchain (stable rustfmt rejects an unstable key in this file). They
-# are what make the nightly toolchain a real requirement rather than a
-# preference — the CI `fmt` job (.github/workflows/ci.yml) installs nightly to
-# match the dev box's system rustfmt, which is also nightly.
+# Several options below are *unstable*: rustfmt only honours them on a nightly
+# toolchain, and `unstable_features` is what unlocks them. They are what make
+# the nightly toolchain a real requirement rather than a preference — the CI
+# `fmt` job (.github/workflows/ci.yml) installs nightly to match the dev box's
+# system rustfmt, which is also nightly.
 #
-# Run `cargo fmt --all` from a nightly shell to apply; `cargo fmt --all --check`
-# is the gate CI runs.
+# Run `just fmt` (`cargo fmt --all`) from a nightly shell to apply;
+# `just fmt-check` (`cargo fmt --all --check`) is the gate CI runs.
 
 edition = "2024"
+unstable_features = true
 
 # Imports: keep the std / external-crate / own-crate three-group layout the
-# codebase already uses, and one `use` statement per module path. Both keys are
-# unstable (nightly-only).
+# codebase already uses, and one `use` statement per module path.
 group_imports = "StdExternalCrate"
 imports_granularity = "Module"
+
+# The docs carry compiling examples (doctests on `clip`'s public seams), so the
+# code inside a `///` block is held to the same layout as the code beside it.
+format_code_in_doc_comments = true
+# Nothing here is generated into the source tree today; the key says that a file
+# which becomes generated is still formatted rather than silently exempt.
+format_generated_files = true
+
+# `Foo { bar }` over `Foo { bar: bar }`.
+use_field_init_shorthand = true
+# MCAP magic, record opcodes and CRC constants read as one case throughout.
+hex_literal_case = "Upper"
