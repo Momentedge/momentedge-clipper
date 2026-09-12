@@ -15,6 +15,13 @@
 //! the last byte on disk, so a cut blocks until the wall clock passes the window
 //! end and the tail's coverage catches up (bounded by the caller's grace,
 //! `--grace-secs` in the recorder) before there is anything worth cutting.
+//!
+//! One consequence of being the live path shows up on the way out rather than on
+//! the way in: the same recording is cut from again and again, so a fault that
+//! belongs to the *recording* rather than to the window repeats for every
+//! trigger. [`report_refusal`] is where that repetition is turned into a signal
+//! — announced in full the first time it costs a clip, counted every time after
+//! — against the [`CutFaults`] tally the recorder shares between handlers.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -22,12 +29,15 @@ use std::thread;
 use std::time::Duration;
 
 use clip::TimeSource;
+use clip::cut::FramingDesync;
+use clip::index::EXTENT_CAP_BYTES;
 use clip::manifest::{CutRequest, Producer, WindowCoverage};
 use clip::segment::{self, StageJob};
 use clip::trigger::{Announce, Completion, Trigger, now_ns};
 use crossbeam_channel::Sender;
-use log::{info, warn};
+use log::{error, info, warn};
 
+use crate::faults::CutFaults;
 use crate::tailer::{Coverage, Tailer};
 use crate::watch::Watch;
 
@@ -51,7 +61,10 @@ use crate::watch::Watch;
 /// selects which extents are read, which messages fall inside, and which
 /// coverage the wait blocks on. `producer` is the binary and mode each clip's
 /// manifest names as having cut it; the driver supplies it because only the
-/// binary knows which of its subcommands is running.
+/// binary knows which of its subcommands is running. `faults` is the
+/// recorder-wide tally of clips refused because a recording's bytes changed
+/// under the tail, shared by every handler so [`report_refusal`] announces that
+/// once per recording rather than once per trigger.
 #[expect(
     clippy::too_many_arguments,
     reason = "the arguments are the recorder's cohesive per-trigger inputs — the \
@@ -74,6 +87,7 @@ pub fn handle_trigger<A: Announce>(
     tailer: Arc<Tailer>,
     coverage: Arc<Watch<Coverage>>,
     extract_tx: Sender<StageJob>,
+    faults: Arc<CutFaults>,
     announce: A,
     time_source: TimeSource,
     producer: Producer,
@@ -107,7 +121,8 @@ pub fn handle_trigger<A: Announce>(
         &coverage,
         grace,
         &extract_tx,
-    )?;
+    )
+    .map_err(|e| report_refusal(&faults, e))?;
 
     let mut filenames = Vec::with_capacity(segments.len());
     #[expect(
@@ -149,6 +164,56 @@ pub fn handle_trigger<A: Announce>(
         preroll: trig.preroll,
     });
     Ok(())
+}
+
+/// Turn a failed cut into the error the caller logs, escalating the one fault
+/// that repeats: a recording whose bytes changed under the tail after they were
+/// indexed.
+///
+/// **Only a [`FramingDesync`] is escalated**, because it is the only cut failure
+/// that is permanent for the recording it names — the scan is long past those
+/// bytes and never re-reads them, and a length past `MAX_RECORD_LEN` is a value
+/// no valid record reaches. Every other way a cut fails (an IO error, a full
+/// disk, an output failure, a staging panic) is transient or is fixed somewhere
+/// else, keeps its own per-trigger error, and is deliberately left out of the
+/// tally so that "this recording is damaged" cannot be read off a full disk.
+///
+/// The first refusal against a recording is announced in full: what changed,
+/// which recording, how much of it the refusal covers, and the one thing an
+/// operator can do about it. Every refusal after it carries the running count
+/// instead, so the log shows a tally climbing rather than one indistinguishable
+/// line per trigger.
+///
+/// **It does not exit the process**, which is where this parts company with the
+/// [scan-fault budget](crate::faults). The reasoning is in
+/// [`crate::faults`]: the recorder is still functional here, and a restart makes
+/// things strictly worse — the fresh scan meets the same damage ahead of it and
+/// dies on the budget instead.
+fn report_refusal(faults: &CutFaults, err: anyhow::Error) -> anyhow::Error {
+    let Some(desync) = err.downcast_ref::<FramingDesync>() else {
+        // Not file damage: a different fault with a different remedy, reported
+        // as it is and counted toward nothing.
+        return err;
+    };
+    let recording = desync.recording().display().to_string();
+    let refusals = faults.refused(desync);
+    if refusals == 1 {
+        error!(
+            "recording {recording} changed under the tail after it was indexed: {desync}. \
+             Every clip whose window plans the extent at {} is refused with it — up to \
+             {} MiB of recording, data written after the damage included — for as long \
+             as this recording is tailed, and this recorder goes on cutting every window \
+             that reads elsewhere. Rolling the recording over (a bag split, or \
+             restarting `ros2 bag record`) is what clears it; restarting clipper does \
+             not — a fresh scan meets these bytes ahead of it and exits on the \
+             scan-fault budget instead.",
+            desync.extent_offset(),
+            EXTENT_CAP_BYTES / (1024 * 1024),
+        );
+    }
+    err.context(format!(
+        "clip {refusals} refused against {recording} since its framing desynced"
+    ))
 }
 
 /// The live half of one trigger's cut: wait out the postroll wall floor, wait
@@ -234,8 +299,9 @@ mod tests {
     use clip::index::op;
     use clip::manifest::read_manifest;
     use clip::testing::{
-        TEST_PRODUCER, channel_body, message_body_pub, raw_record, read_clip, test_dir,
-        window_request, write_raw, write_recording, write_unfinished_recording,
+        TEST_PRODUCER, channel_body, desync_record_framing, message_body_pub, raw_record,
+        read_clip, test_dir, window_request, write_raw, write_recording,
+        write_unfinished_recording,
     };
 
     use super::*;
@@ -541,6 +607,7 @@ mod tests {
             tailer,
             coverage,
             extract_tx,
+            Arc::new(CutFaults::new()),
             announcer,
             TimeSource::Log,
             TEST_PRODUCER,
@@ -616,6 +683,7 @@ mod tests {
             tailer,
             coverage,
             extract_tx,
+            Arc::new(CutFaults::new()),
             announcer,
             TimeSource::Log,
             TEST_PRODUCER,
@@ -753,6 +821,225 @@ mod tests {
         Ok(())
     }
 
+    /// A recording a trigger handler has already scanned, then damaged behind
+    /// that scan: the index still plans its extents, the bytes no longer frame
+    /// the way it says they do, and every cut from it is refused.
+    ///
+    /// `stamps` are the message log times; `desync_at` is which of them loses
+    /// its length prefix. The tailer is returned already drained, so the
+    /// recordings are indexed and nothing rescans the broken bytes.
+    fn damaged_recording(
+        root: &Path,
+        recordings: &[(&str, &[(&str, u64)])],
+        desync: (&str, usize),
+    ) -> anyhow::Result<(Arc<Tailer>, Arc<Watch<Coverage>>)> {
+        let (tailer, coverage) = Tailer::new();
+        for (name, stamps) in recordings {
+            let path = root.join(name);
+            write_recording(&path, false, stamps)?;
+            tailer.index_recording(&path);
+        }
+        drain(&tailer)?;
+        desync_record_framing(&root.join(desync.0), desync.1)?;
+        Ok((tailer, coverage))
+    }
+
+    /// A window over the damaged recording of [`damaged_recording`], and one
+    /// over the clean one: disjoint in time, so each plans exactly one of them.
+    const OVER_DAMAGE: (u64, u64) = (900, 3_100);
+    const CLEAN_WINDOW: (u64, u64) = (50, 250);
+
+    /// The trigger a window `[start_ns, end_ns]` is cut for, through the public
+    /// entry point, returning what the handler made of it.
+    fn fire(
+        tailer: &Arc<Tailer>,
+        coverage: &Arc<Watch<Coverage>>,
+        extract_tx: &Sender<StageJob>,
+        faults: &Arc<CutFaults>,
+        out_dir: &Path,
+        name: &str,
+        (start_ns, end_ns): (u64, u64),
+    ) -> anyhow::Result<()> {
+        let half = (end_ns - start_ns) / 2;
+        let anchor_ns = start_ns + half;
+        handle_trigger(
+            Trigger {
+                name: name.to_string(),
+                description: String::new(),
+                trigger_time: clip::trigger::Stamp { sec: 0, nanosec: 0 },
+                preroll: half,
+                postroll: half,
+            },
+            anchor_ns,
+            out_dir,
+            Duration::from_millis(100),
+            tailer.clone(),
+            coverage.clone(),
+            extract_tx.clone(),
+            faults.clone(),
+            CapturingAnnouncer(Arc::new(std::sync::Mutex::new(Vec::new()))),
+            TimeSource::Log,
+            TEST_PRODUCER,
+        )
+    }
+
+    /// The escalation contract, driven through the handler over real damaged
+    /// bytes: the first clip a recording's desync costs says so as clip **1**,
+    /// and the cost of every later one is a number that climbs.
+    ///
+    /// The count riding in the error is what the recorder logs, so this is also
+    /// the assertion that an operator reading the log sees a tally rather than
+    /// one indistinguishable line per trigger.
+    #[test]
+    fn a_recordings_refusals_are_counted_and_the_count_climbs() -> anyhow::Result<()> {
+        let root = test_dir("refusal-count")?;
+        let out_dir = root.join("out");
+        clip::cut::reset_capturing_dir(&out_dir)?;
+        let (tailer, coverage) = damaged_recording(
+            &root,
+            &[("rec.mcap", &[("/t", 100), ("/t", 200), ("/t", 300)])],
+            ("rec.mcap", 1),
+        )?;
+        let extract_tx =
+            segment::spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
+        let faults = Arc::new(CutFaults::new());
+
+        for expected in 1..=3u64 {
+            let err = fire(
+                &tailer,
+                &coverage,
+                &extract_tx,
+                &faults,
+                &out_dir,
+                "over-damage",
+                (0, 400),
+            )
+            .expect_err("a desynced extent refuses the clip");
+            let text = format!("{err:#}");
+            assert!(
+                text.contains(&format!("clip {expected} refused against")),
+                "refusal {expected} must carry its own count: {text}"
+            );
+            assert!(
+                text.contains("extent framing inconsistent with the tail's scan"),
+                "the refusal still names the fault itself: {text}"
+            );
+        }
+        assert!(
+            std::fs::read_dir(&out_dir)?.count() <= 1,
+            "a refused cut publishes nothing but the capturing dir"
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// A clip cut successfully from the damaged recording between two refusals
+    /// does **not** reset the tally.
+    ///
+    /// This is the deliberate difference from the scan-fault budget, which does
+    /// reset on a clean pass because a scan fault can be a record still being
+    /// appended. A framing desync cannot heal: the scan is long past those bytes
+    /// and never re-reads them, so a cut that succeeds only proves its window
+    /// planned a different extent. Resetting here would re-announce in full
+    /// every time windows alternated — exactly the per-trigger noise the
+    /// escalation exists to replace.
+    #[test]
+    fn a_successful_cut_does_not_reset_the_tally() -> anyhow::Result<()> {
+        let root = test_dir("refusal-no-reset")?;
+        let out_dir = root.join("out");
+        clip::cut::reset_capturing_dir(&out_dir)?;
+        // Two recordings: one clean, one damaged, disjoint in time so each
+        // window plans exactly one of them.
+        let (tailer, coverage) = damaged_recording(
+            &root,
+            &[
+                ("clean.mcap", &[("/t", 100), ("/t", 200)]),
+                (
+                    "damaged.mcap",
+                    &[("/t", 1_000), ("/t", 2_000), ("/t", 3_000)],
+                ),
+            ],
+            ("damaged.mcap", 1),
+        )?;
+        let extract_tx =
+            segment::spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
+        let faults = Arc::new(CutFaults::new());
+        let err = fire(
+            &tailer,
+            &coverage,
+            &extract_tx,
+            &faults,
+            &out_dir,
+            "first",
+            OVER_DAMAGE,
+        )
+        .expect_err("the damaged recording refuses");
+        assert!(format!("{err:#}").contains("clip 1 refused against"));
+
+        fire(
+            &tailer,
+            &coverage,
+            &extract_tx,
+            &faults,
+            &out_dir,
+            "between",
+            CLEAN_WINDOW,
+        )
+        .expect("the clean recording still cuts — the recorder is not wedged");
+
+        let err = fire(
+            &tailer,
+            &coverage,
+            &extract_tx,
+            &faults,
+            &out_dir,
+            "second",
+            OVER_DAMAGE,
+        )
+        .expect_err("the damaged recording refuses again");
+        assert!(
+            format!("{err:#}").contains("clip 2 refused against"),
+            "a clip cut elsewhere does not heal the damage: {err:#}"
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// Everything that is not a framing desync stays out of the tally and out of
+    /// the escalation: it keeps its own error, unannotated.
+    ///
+    /// A full disk, an IO error on the recording and an output failure are all
+    /// transient or fixed elsewhere, and folding them in would let "this
+    /// recording is damaged" be read off a disk that filled up.
+    #[test]
+    fn only_a_framing_desync_is_counted() {
+        let faults = CutFaults::new();
+        let other = report_refusal(
+            &faults,
+            anyhow::anyhow!("writing clip: No space left on device (os error 28)"),
+        );
+        assert_eq!(
+            format!("{other:#}"),
+            "writing clip: No space left on device (os error 28)",
+            "a fault that is not file damage is reported exactly as it came"
+        );
+
+        // The tally is untouched by it: the next desync is still the first.
+        let desync = clip::cut::FramingDesync::RecordLength {
+            recording: std::path::PathBuf::from("/rec/record_0.mcap"),
+            extent_offset: 0,
+            offset: 19_773,
+            declared: u64::MAX,
+        };
+        let counted = report_refusal(&faults, anyhow::Error::new(desync));
+        assert!(
+            format!("{counted:#}").contains("clip 1 refused against /rec/record_0.mcap"),
+            "the first desync is clip 1: {counted:#}"
+        );
+    }
+
     /// Through the public entry point: the clip a trigger produces states that
     /// trigger and the producer that cut it.
     ///
@@ -794,6 +1081,7 @@ mod tests {
             tailer,
             coverage,
             extract_tx,
+            Arc::new(CutFaults::new()),
             CapturingAnnouncer(captured.clone()),
             TimeSource::Log,
             TEST_PRODUCER,

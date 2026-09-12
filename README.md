@@ -226,7 +226,7 @@ clipper clip ./record --out-dir ./clipped --trigger-source mcap
 | [Triggers and time](docs/triggers-and-time.md) | the `Trigger` message, the two places a trigger comes from, and which clock a window lives on |
 | [`clipper clip`](docs/clip-command.md) | cutting from a finished recording: bag directories, refusals, re-runs |
 | [What a clip carries](docs/clip-manifest.md) | the `momentedge.clip` manifest inside every clip |
-| [Operating clipper](docs/operating.md) | shutdown, logs, retention, overload, and tuning under load |
+| [Operating clipper](docs/operating.md) | shutdown, logs, retention, a recording that stops producing clips, overload, and tuning under load |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | how it works inside: threads, tailing, atomic publication, recovery |
 | [`examples/`](examples/README.md) | setup guides — continuous recording, split bags, `ros2 launch`, and ROS-free MCAP writers |
 

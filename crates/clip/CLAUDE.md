@@ -255,10 +255,21 @@ with it every record behind it in that extent — and an extent closes at
 `EXTENT_CAP_BYTES` (4 MiB), which at a modest data rate is minutes of
 recording. Every window whose plan includes that extent is refused, windows over
 data written long after the damage included, for as long as the recording is
-tailed. It is the tail, not the cut, that fails fast, so the recorder names the
-fault once per trigger and stays up: the symptom is clips that stop arriving,
-not a process that stops. `corrupt_tail_framing_damage_live` holds that shape
-down.
+tailed. It is the tail, not the cut, that fails fast, so the recorder stays up:
+the symptom is clips that stop arriving, not a process that stops.
+`corrupt_tail_framing_damage_live` holds that shape down.
+
+That refusal is a **type**, `clip::cut::FramingDesync`, and not a message,
+because the repetition has to be answered by whoever is cutting repeatedly: it
+carries the `recording()` whose bytes changed and the `extent_offset()` the walk
+entered at — the fault's identity and its blast radius. What a caller does with
+that is the caller's, and the two callers differ. `clipper clip` cuts one window
+once and only prints it. The recorder meets the same bytes on every trigger, so
+it keeps a per-recording tally and announces the first refusal in full: the
+[cut-fault tally](../tail/CLAUDE.md#the-cut-fault-tally), which also says why
+that is counted rather than made fatal. Typing it is what keeps file damage
+apart from a full disk or an output failure — different faults, different
+remedies, and only this one permanent for the recording it names.
 
 **Detection limit:** the leniency applies to damage loud enough to break
 parsing or a CRC. The default fastwrite profile is unchunked and carries no

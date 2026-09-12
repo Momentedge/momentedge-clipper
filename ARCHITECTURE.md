@@ -582,9 +582,22 @@ time and meets the fault there instead. It refuses the clip rather than assemble
 one out of bytes that changed after they were indexed, and the refusal covers the
 whole extent — up to `EXTENT_CAP_BYTES` (4 MiB) of recording — so every later
 window planned over that extent is refused with it, however far past the damage
-its own data was written. The recorder names the fault per trigger and keeps
-running, so this reads as clips that stop arriving rather than as a process that
-stops.
+its own data was written. The recorder keeps running, so this reads as clips that
+stop arriving rather than as a process that stops.
+
+**The two sides therefore answer the repetition differently, and deliberately.**
+The scan side exits because a wedged scan stops coverage rising at all, which
+degrades every clip to a grace-timeout cut with no other signal. The cut side
+counts, because there the recorder is still doing its job everywhere the damage
+does not reach — and because a restart makes it strictly worse: a fresh clipper
+indexes the same recording from the start, meets those bytes *ahead* of its scan,
+and dies on the scan-fault budget within seconds, with no successor to adopt
+unless the recording is being split. So the recorder announces the first clip a
+recording's desync costs in full — the recording, the extent, the blast radius,
+and that rolling the recording over is what clears it — and carries a climbing
+tally on every refusal after. The mechanism is the
+[cut-fault tally](crates/tail/CLAUDE.md#the-cut-fault-tally); what an operator
+does about it is [Operating clipper](docs/operating.md).
 
 **Detection limit:** the leniency only catches damage loud enough to break
 parsing or a CRC. The default `fastwrite` profile is unchunked and carries no

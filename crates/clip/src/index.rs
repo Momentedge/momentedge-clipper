@@ -73,7 +73,13 @@ pub const MAGIC: [u8; 8] = *b"\x89MCAP0\r\n";
 
 /// Extents close once they cover this many bytes, bounding both the bytes one
 /// index entry stands for and the index's growth (one entry per cap per file).
-const EXTENT_CAP_BYTES: u64 = 4 * 1024 * 1024;
+///
+/// It is also the blast radius of a framing fault met at cut time
+/// ([`crate::cut::FramingDesync`]): the walk enters at the extent's own offset
+/// and has no resync point, so one broken length prefix costs every record
+/// behind it in that extent — which is why the recorder's announcement of such a
+/// refusal states this number to an operator.
+pub const EXTENT_CAP_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Upper bound on a plausible single record. A length beyond this means the
 /// scan is desynchronised from the record framing (or the file is corrupt).

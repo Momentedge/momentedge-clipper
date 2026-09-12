@@ -32,14 +32,58 @@ overload. For the flags behind any of it, see
   bytes it has already tailed, so damage appearing behind its scan leaves it
   running and surfaces when a clip is cut. Damage inside a message's payload is
   copied into the clip as recorded. Damage that breaks a record's length prefix
-  is refused: clipper logs `trigger handling failed: … extent framing
-  inconsistent with the tail's scan`, publishes no clip for that trigger, and
-  goes on refusing every window that reads the same region — up to 4 MiB of
-  recording, data written after the damage included. So a healthy process that
-  has quietly stopped producing clips is worth grepping the log for that line;
-  restarting the recording (a rollover or a fresh `ros2 bag record`) clears it.
+  costs the clips that read that region, and clipper says so — see
+  [A recording that stops producing clips](#a-recording-that-stops-producing-clips).
   Damage *ahead* of the scan is the other case, and there clipper exits non-zero
   for the supervisor rather than limping on.
+
+## A recording that stops producing clips
+
+A run of stray bytes across a record's length prefix — a bad block, a filesystem
+hiccup, anything that rewrites a byte `ros2 bag record` already wrote — leaves
+the recording unreadable from that record onward. clipper refuses to build a clip
+out of bytes whose framing disagrees with what it indexed, and says so the first
+time it costs a clip:
+
+```
+ERROR clipper > recording /data/bags/rec_0.mcap changed under the tail after it was
+indexed: record at extent offset 19773 declares 18446744073709551615 B; extent
+framing inconsistent with the tail's scan. Every clip whose window plans the extent
+at 16777216 is refused with it — up to 4 MiB of recording, data written after the
+damage included — for as long as this recording is tailed, and this recorder goes on
+cutting every window that reads elsewhere. Rolling the recording over (a bag split,
+or restarting `ros2 bag record`) is what clears it; restarting clipper does not — a
+fresh scan meets these bytes ahead of it and exits on the scan-fault budget instead.
+```
+
+That announcement is made **once per recording**. Every trigger refused after it
+carries a running count instead, so the tally is what to watch:
+
+```
+ERROR clipper > trigger handling failed: clip 7 refused against /data/bags/rec_0.mcap
+since its framing desynced: record at extent offset 19773 declares …
+```
+
+What to do about it:
+
+- **Roll the recording over.** A bag split or a fresh `ros2 bag record` puts an
+  undamaged file under the tail, and clipper cuts from it normally. Running the
+  recorder with `--max-bag-size`/`--max-bag-duration` (see
+  [`examples/split-bags`](../examples/split-bags/README.md)) bounds how long any
+  such damage can cost clips in the first place.
+- **Do not restart clipper.** A fresh process indexes that recording from the
+  start, so the damaged bytes are then *ahead* of its scan — the fatal case — and
+  it exits within seconds. Where the recording is not being split there is no
+  later file to adopt instead, so a supervisor restarts it into a loop that
+  publishes nothing at all. A running clipper still cuts every window that reads
+  outside the damaged region; a looping one cuts nothing.
+- **The clips already published are unaffected**, and so is the recording outside
+  the refused region. clipper runs no repair; `mcap recover` salvages the file
+  offline once the recorder has moved on from it.
+
+Only file damage is counted this way. A cut that fails for another reason — a
+full disk, an IO error, an output failure — reports itself as that and counts
+toward nothing.
 
 ## Tuning under load
 

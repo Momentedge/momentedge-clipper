@@ -38,7 +38,7 @@ use std::io::BufWriter;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use log::{error, info, warn};
 use mcap::records::Record;
 
@@ -48,6 +48,75 @@ use crate::index::{ChannelDef, MAX_RECORD_LEN, WindowPlan, op};
 use crate::manifest::WindowCoverage;
 use crate::manifest::{ChannelTally, ClipManifest, CutRequest, Planned};
 use crate::select::ChannelSelection;
+
+/// A recording whose bytes no longer frame the way the tail's scan read them.
+///
+/// The copy walks each planned extent's framing afresh, so it is where bytes
+/// that changed *after* they were indexed surface. A framing walk has no resync
+/// point, so there is no boundary to pick the records behind the fault up at,
+/// and the clip is refused rather than assembled out of bytes whose meaning is
+/// unknown.
+///
+/// It is a type rather than a message because a caller cutting repeatedly from
+/// one recording has to tell **this** fault from a full disk, an IO error or an
+/// output failure: they are different things with different remedies, and only
+/// this one is permanent for the recording it names. That is the distinction the
+/// recorder's per-recording tally is built on (`tail::CutFaults`); cutting once
+/// from a finished recording (`clipper clip`) only ever prints it.
+///
+/// Both arms carry the `recording` the bytes belong to and the `extent_offset`
+/// the walk entered at — the fault's identity and its blast radius, since every
+/// window whose plan includes that extent is refused with it.
+#[derive(Debug, thiserror::Error)]
+pub enum FramingDesync {
+    /// A length prefix no valid record can carry (past
+    /// [`MAX_RECORD_LEN`](crate::index::MAX_RECORD_LEN)), or one whose record
+    /// would run past the extent the scan closed around it.
+    #[error(
+        "record at extent offset {offset} declares {declared} B; \
+         extent framing inconsistent with the tail's scan"
+    )]
+    RecordLength {
+        recording: PathBuf,
+        extent_offset: u64,
+        /// Where in the extent the broken length prefix sits; the absolute file
+        /// offset is `extent_offset + offset`.
+        offset: usize,
+        declared: u64,
+    },
+    /// The extent's records do not tile it: the walk ran out of bytes mid-record
+    /// where the scan had found a boundary.
+    #[error("extent ends mid-record at offset {offset}; framing inconsistent with the tail's scan")]
+    ShortExtent {
+        recording: PathBuf,
+        extent_offset: u64,
+        offset: usize,
+    },
+}
+
+impl FramingDesync {
+    /// The recording whose bytes changed — the identity a per-recording tally of
+    /// these refusals is kept under, and the file an operator repairs or rolls
+    /// over.
+    #[must_use]
+    pub fn recording(&self) -> &Path {
+        match self {
+            Self::RecordLength { recording, .. } | Self::ShortExtent { recording, .. } => recording,
+        }
+    }
+
+    /// The offset of the extent the walk entered at. The refusal covers that
+    /// whole extent — up to `EXTENT_CAP_BYTES` (4 MiB) of recording — not just
+    /// the broken record, because the walk has no resync point behind it.
+    #[must_use]
+    pub fn extent_offset(&self) -> u64 {
+        match self {
+            Self::RecordLength { extent_offset, .. } | Self::ShortExtent { extent_offset, .. } => {
+                *extent_offset
+            }
+        }
+    }
+}
 
 /// The stamp a message's window membership is tested on, per the window's
 /// [`TimeSource`]: its `log_time` or its `publish_time`.
@@ -341,7 +410,7 @@ fn copy_window(
                 .with_context(|| {
                     format!("reading extent at {} (+{} B)", extent.offset, extent.len)
                 })?;
-            clip.copy_extent(&buf)?;
+            clip.copy_extent(&buf, &source.path, extent.offset)?;
         }
     }
     clip.write_manifest(planned, plan.source.as_ref().map(|s| s.path.as_path()))?;
@@ -475,27 +544,32 @@ impl ClipWriter<'_> {
     /// where the library readers halt on the first error. Framing that no
     /// longer matches the tail's scan (an oversized length, a record running
     /// past or short of the extent) means the bytes changed since the scan,
-    /// and that aborts the clip.
+    /// and that aborts the clip as a typed [`FramingDesync`] naming `recording`
+    /// and `extent_offset` — the identity a caller cutting repeatedly from the
+    /// same recording counts these refusals under.
     #[expect(
         clippy::indexing_slicing,
         clippy::unwrap_used,
         clippy::cast_possible_truncation,
         reason = "the framing walk is the design here: the loop guard proves the \
-                  9-byte header is present, the `bail!` below proves the body is, \
+                  9-byte header is present, the refusal below proves the body is, \
                   and `MAX_RECORD_LEN` (2^31) keeps every length inside `usize`. \
                   Replacing the indexing with `get()` would add error plumbing no \
                   input can reach"
     )]
-    fn copy_extent(&mut self, buf: &[u8]) -> Result<()> {
+    fn copy_extent(&mut self, buf: &[u8], recording: &Path, extent_offset: u64) -> Result<()> {
         let mut offset = 0usize;
         while offset + 9 <= buf.len() {
             let opcode = buf[offset];
             let len = u64::from_le_bytes(buf[offset + 1..offset + 9].try_into().unwrap());
             if len > MAX_RECORD_LEN || offset + 9 + len as usize > buf.len() {
-                bail!(
-                    "record at extent offset {offset} declares {len} B; \
-                     extent framing inconsistent with the tail's scan"
-                );
+                return Err(FramingDesync::RecordLength {
+                    recording: recording.to_path_buf(),
+                    extent_offset,
+                    offset,
+                    declared: len,
+                }
+                .into());
             }
             let end = offset + 9 + len as usize;
             let body = &buf[offset + 9..end];
@@ -514,9 +588,12 @@ impl ClipWriter<'_> {
             offset = end;
         }
         if offset != buf.len() {
-            bail!(
-                "extent ends mid-record at offset {offset}; framing inconsistent with the tail's scan"
-            );
+            return Err(FramingDesync::ShortExtent {
+                recording: recording.to_path_buf(),
+                extent_offset,
+                offset,
+            }
+            .into());
         }
         Ok(())
     }
@@ -1283,6 +1360,15 @@ mod tests {
             format!("{err:#}").contains("framing inconsistent"),
             "unexpected error: {err:#}"
         );
+        // The refusal is a *type*, not a message. A caller cutting repeatedly
+        // from one recording branches on this to tell file damage from a full
+        // disk, and reads the recording off it to count under and the extent off
+        // it to state the blast radius.
+        let desync = err
+            .downcast_ref::<FramingDesync>()
+            .unwrap_or_else(|| panic!("a framing refusal is a FramingDesync: {err:#}"));
+        assert_eq!(desync.recording(), junk, "the desync names its recording");
+        assert_eq!(desync.extent_offset(), 0, "and the extent the walk entered");
         assert!(!out.exists(), "nothing partial reaches the final dir");
         assert_eq!(
             std::fs::read_dir(root.join(".capturing"))?.count(),

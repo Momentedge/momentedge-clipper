@@ -349,6 +349,17 @@ any legitimate concurrent trigger burst. Per-trigger failures stay isolated
 inside each handler thread — logged and counted, never propagated to the
 consumer.
 
+**The other per-run handle every trigger reads is `tail::CutFaults`**, the
+recorder-wide tally of clips refused because a recording's bytes changed under
+the tail. `drive` builds it — it carries no configuration, so unlike `Admission`
+it is born at the wiring rather than passed down from `main` — clones it into the
+per-trigger callback, and hands it to `handler::handle_trigger`, which is the
+only thing that reads it back. Together the two are why a per-trigger failure is
+more than a log line: the admission gate bounds how many handlers exist at once,
+and the tally bounds how often the same damaged recording is announced. What it
+counts, what resets it, and why a repeated refusal is counted rather than made
+fatal are the [cut-fault tally](../tail/CLAUDE.md#the-cut-fault-tally).
+
 **`supervise()`.** Each long-lived companion thread is started with
 `spawn_supervised` (`src/supervision.rs`): the closure sends its return value
 over a `bounded(1)` channel before returning; a panic unwinds without sending,
