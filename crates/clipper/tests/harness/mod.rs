@@ -54,19 +54,6 @@ pub(crate) fn require_e2e() -> bool {
     true
 }
 
-/// Opt-out gate for tests the project flags as inherently flaky under CI-grade
-/// timing. Set `CLIPPER_E2E_SKIP_FLAKY` (CI does) to skip them; unset
-/// locally, so the full suite — including the live-corruption race
-/// `corrupt_tail_health_live` — runs. A skipped test returns early and so
-/// reports as passed, the same skip-and-pass convention as [`require_e2e`].
-pub(crate) fn skip_flaky() -> bool {
-    if std::env::var_os("CLIPPER_E2E_SKIP_FLAKY").is_some() {
-        eprintln!("skipping: flaky-under-CI test (CLIPPER_E2E_SKIP_FLAKY is set)");
-        return true;
-    }
-    false
-}
-
 /// Poll `path` until it contains `needle`, or `timeout` elapses. Used to
 /// confirm a child logged an expected line when only its log file (not its
 /// [`Proc`]) is in scope.
@@ -716,6 +703,28 @@ impl TestEnv {
         }
     }
 
+    /// Every clip published into `out_dir`, by name. The staging directory is
+    /// not one of them, so a test that counts what a run produced counts
+    /// finished clips alone.
+    pub(crate) fn published_clips(&self) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(self.out_dir()) else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "mcap"))
+            .map(|p| {
+                p.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
     /// `out_dir/.capturing` must exist (the extractor ran) and hold nothing
     /// (no finished clip ever lingers there).
     pub(crate) fn assert_capturing_drained(&self) {
@@ -1170,6 +1179,28 @@ pub(crate) fn read_clip(path: &Path) -> Vec<(String, u64)> {
         .collect()
 }
 
+/// Whether any message in the clip carries `needle` in its serialized payload.
+/// The cut copies message bytes through without decoding them, so a run of
+/// bytes overwritten in the recording reappears here verbatim — which is how a
+/// test proves a damaged record was copied rather than skipped.
+pub(crate) fn clip_holds_payload(path: &Path, needle: &[u8]) -> bool {
+    let buf = std::fs::read(path)
+        .unwrap_or_else(|e| panic!("reading announced clip {}: {e}", path.display()));
+    mcap::MessageStream::new(&buf)
+        .unwrap_or_else(|e| {
+            panic!(
+                "announced clip {} is not a complete MCAP: {e}",
+                path.display()
+            )
+        })
+        .any(|msg| {
+            let msg = msg.unwrap_or_else(|e| {
+                panic!("announced clip {} fails to parse: {e}", path.display())
+            });
+            msg.data.windows(needle.len()).any(|w| w == needle)
+        })
+}
+
 /// Read a finished clip back as `(topic, log_time, publish_time)` triples — the
 /// two-stamp form the capture-time windowing e2e asserts on, where the
 /// discriminator is which stamp `--time-source` applied the window to. Like
@@ -1267,47 +1298,87 @@ pub(crate) fn assert_clip_within_window(msgs: &[(String, u64)], start_ns: u64, e
     }
 }
 
-/// Walk the top-level record framing of a possibly unfinished (footer-less)
-/// recording and return the `log_time` of every complete top-level `Message`
-/// record — the same timestamp-only framing walk the extractor's tail performs,
-/// so this works on a live-copied file [`read_clip`] would reject. A torn final
-/// record ends the walk. Top-level only: messages inside `Chunk` records are
-/// not seen, which suffices for the suite's unchunked fastwrite recordings.
-pub(crate) fn partial_recording_stamps(path: &Path) -> Vec<u64> {
-    let buf = std::fs::read(path).expect("reading recording");
-    let mut stamps = Vec::new();
-    let mut off = 8usize; // past the opening magic
-    while off + 9 <= buf.len() {
-        let opcode = buf[off];
-        let len = u64::from_le_bytes(buf[off + 1..off + 9].try_into().unwrap()) as usize;
-        let end = off + 9 + len;
-        if end > buf.len() {
-            break; // still being appended when the file was copied
-        }
-        if opcode == 0x05 && len >= 14 {
-            // Message body: channel_id u16, sequence u32, log_time u64 (LE).
-            stamps.push(u64::from_le_bytes(
-                buf[off + 15..off + 23].try_into().unwrap(),
-            ));
-        }
-        off = end;
-    }
-    stamps
+/// One complete top-level record of a recording: the opcode, where the record
+/// starts (its 1-byte opcode + u64le length header), and how many bytes the
+/// whole record spans including that header.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RecordSpan {
+    pub opcode: u8,
+    pub offset: u64,
+    pub len: u64,
 }
 
-/// Walk the top-level record framing (1-byte opcode + u64le length) and
-/// return every record boundary offset, magic excluded — the same framing the
-/// tail scans, used to place deterministic damage at a known record edge.
+/// A record's own framing header: a 1-byte opcode and a u64le body length.
+const RECORD_HEADER: u64 = 9;
+/// The `Message` opcode.
+const OP_MESSAGE: u8 = 0x05;
+/// The fixed prefix a `Message` body carries before its serialized payload:
+/// `channel_id` u16, `sequence` u32, `log_time` u64, `publish_time` u64,
+/// little-endian throughout — and the offset of `log_time` within it.
+const MESSAGE_PREFIX: u64 = 22;
+const MESSAGE_LOG_TIME: u64 = 6;
+
+/// Walk the top-level record framing of a possibly unfinished (footer-less)
+/// recording — the same framing walk the extractor's tail performs, so this
+/// works on a live, still-growing file [`read_clip`] would reject. A record
+/// still being appended ends the walk; every span returned is complete on disk.
+/// Top-level only: records inside `Chunk` records are not seen, which suffices
+/// for the suite's unchunked fastwrite recordings.
+fn record_spans(buf: &[u8]) -> Vec<RecordSpan> {
+    let header = RECORD_HEADER as usize;
+    let mut spans = Vec::new();
+    let mut off = 8usize; // past the opening magic
+    while off + header <= buf.len() {
+        let len = u64::from_le_bytes(buf[off + 1..off + header].try_into().unwrap());
+        let end = off + header + len as usize;
+        if end > buf.len() {
+            break; // still being appended when the file was read
+        }
+        spans.push(RecordSpan {
+            opcode: buf[off],
+            offset: off as u64,
+            len: RECORD_HEADER + len,
+        });
+        off = end;
+    }
+    spans
+}
+
+/// Every complete top-level `Message` record long enough to carry its own body
+/// prefix, in offset order, paired with the `log_time` that body states. A test
+/// placing damage picks its record from here, so the byte it aims at is one the
+/// tail's own walk agrees is there.
+pub(crate) fn message_records(path: &Path) -> Vec<(RecordSpan, u64)> {
+    let buf = std::fs::read(path).expect("reading recording");
+    record_spans(&buf)
+        .into_iter()
+        .filter(|span| span.opcode == OP_MESSAGE && span.len >= RECORD_HEADER + MESSAGE_PREFIX)
+        .map(|span| {
+            let at = (span.offset + RECORD_HEADER + MESSAGE_LOG_TIME) as usize;
+            let log_time = u64::from_le_bytes(buf[at..at + 8].try_into().unwrap());
+            (span, log_time)
+        })
+        .collect()
+}
+
+/// The `log_time` of every complete top-level `Message` record of a possibly
+/// still-growing recording, in offset order — the extent the recording states
+/// about itself, which a test waiting on data rather than on the clock reads.
+pub(crate) fn partial_recording_stamps(path: &Path) -> Vec<u64> {
+    message_records(path)
+        .into_iter()
+        .map(|(_, log_time)| log_time)
+        .collect()
+}
+
+/// Every complete top-level record's start offset, magic excluded — where a
+/// test places deterministic damage at a known record edge.
 pub(crate) fn record_boundaries(path: &Path) -> Vec<u64> {
     let buf = std::fs::read(path).expect("reading recording");
-    let mut boundaries = Vec::new();
-    let mut off = 8u64; // past the opening magic
-    while (off as usize) + 9 <= buf.len() {
-        boundaries.push(off);
-        let len = u64::from_le_bytes(buf[off as usize + 1..off as usize + 9].try_into().unwrap());
-        off += 9 + len;
-    }
-    boundaries
+    record_spans(&buf)
+        .into_iter()
+        .map(|span| span.offset)
+        .collect()
 }
 
 /// Truncate `path` at a mid-file record boundary and append a record header
@@ -1336,9 +1407,9 @@ pub(crate) fn inject_framing_fault(path: &Path) {
     file.sync_all().expect("syncing the damaged recording");
 }
 
-/// Overwrite `len` bytes at `offset` with 0xFF — localized in-place damage in
-/// a region the tail has typically already consumed, surfacing at extraction.
-pub(crate) fn overwrite_bytes(path: &Path, offset: u64, len: usize) {
+/// Overwrite `len` bytes at `offset` with 0xFF — localized in-place damage
+/// under a live writer, surfacing wherever the recording is next read.
+fn overwrite_bytes(path: &Path, offset: u64, len: usize) {
     use std::os::unix::fs::FileExt;
     let file = std::fs::OpenOptions::new()
         .write(true)
@@ -1347,4 +1418,35 @@ pub(crate) fn overwrite_bytes(path: &Path, offset: u64, len: usize) {
     file.write_all_at(&vec![0xFFu8; len], offset)
         .expect("overwriting recording bytes");
     file.sync_all().expect("syncing the damaged recording");
+}
+
+/// The run of bytes both damage placements write, long enough to span a
+/// record's whole framing header and to be searched for in a clip.
+const DAMAGE_LEN: usize = 64;
+
+/// Overwrite a run of bytes inside `record`'s serialized payload, past the
+/// message body's `channel_id`/`sequence`/`log_time`/`publish_time` prefix.
+/// The record's framing, its channel and both its stamps therefore survive
+/// intact: the tail walks past it and the cut copies it through, payload bytes
+/// and all. Returns the pattern written, which a test looks for in the clip to
+/// prove the damaged record reached it. Panics if the record's payload cannot
+/// hold the run — pick a longer one.
+pub(crate) fn overwrite_message_payload(path: &Path, record: &RecordSpan) -> Vec<u8> {
+    let payload = record.offset + RECORD_HEADER + MESSAGE_PREFIX;
+    assert!(
+        record.offset + record.len >= payload + DAMAGE_LEN as u64,
+        "message record at {} carries {} B of payload, too little for {DAMAGE_LEN} B of damage",
+        record.offset,
+        record.offset + record.len - payload,
+    );
+    overwrite_bytes(path, payload, DAMAGE_LEN);
+    vec![0xFFu8; DAMAGE_LEN]
+}
+
+/// Overwrite a run of bytes starting at `record`'s own framing header, so the
+/// opcode and the declared length become 0xFF — a length no record can have and
+/// no resync point after it. A walk that arrives here desyncs; one that
+/// consumed the record earlier never returns to it.
+pub(crate) fn overwrite_record_header(path: &Path, record: &RecordSpan) {
+    overwrite_bytes(path, record.offset, DAMAGE_LEN);
 }

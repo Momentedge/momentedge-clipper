@@ -575,6 +575,17 @@ is designed to be salvaged:
 Degraded clips (records skipped or chunks dropped) are counted and announced with
 a warning rather than silently; a failed extraction leaves nothing in `out_dir`.
 
+**Which side meets a framing fault is decided by the scan offset.** The tail
+never re-reads bytes it has consumed, so damage written behind it costs the scan
+nothing and the process stays up; the copy walks that same framing afresh at cut
+time and meets the fault there instead. It refuses the clip rather than assemble
+one out of bytes that changed after they were indexed, and the refusal covers the
+whole extent — up to `EXTENT_CAP_BYTES` (4 MiB) of recording — so every later
+window planned over that extent is refused with it, however far past the damage
+its own data was written. The recorder names the fault per trigger and keeps
+running, so this reads as clips that stop arriving rather than as a process that
+stops.
+
 **Detection limit:** the leniency only catches damage loud enough to break
 parsing or a CRC. The default `fastwrite` profile is unchunked and carries no
 CRCs, so corruption inside a message *body* that leaves the framing intact is

@@ -428,11 +428,25 @@ this section is the rationale.
   dependency would each get a different domain.
 - **Determinism over realism, except where realism is the point.** The
   chunked-profile case stops the recorder cleanly so the footer (`ended`)
-  releases the coverage wait instead of racing a chunk flush; the offline
-  corruption test plants a framing fault at a known record boundary of a
-  closed file. Only `corrupt_tail_health_live` races the scan by design (the
-  closest test to real corruption) and is the one case with extra nextest
-  retries.
+  releases the coverage wait instead of racing a chunk flush; every corruption
+  case places its damage against the recording's own record framing
+  (`harness::message_records`) rather than at an arithmetic offset, because
+  *where* a run of bytes lands decides *which* fault it is, and a test that
+  leaves that to chance is asking for a different answer each run.
+- **Damage has two classes and the suite keeps them apart.** A run of bytes
+  inside a message's payload leaves the framing, the channel and both stamps
+  intact: the scan is indifferent to it and the copy carries it into the clip
+  unexamined (`corrupt_tail_payload_damage_live`). A run across a record's
+  framing header is a length no record can have: ahead of the scan it is the
+  fatal [scan fault](../tail/CLAUDE.md#the-scan-fault-budget) the offline case
+  plants in a closed file (`corrupt_tail_fails_fast_offline`); behind the scan
+  the tail never sees it and the *copy* meets it instead, refusing every clip
+  whose plan includes that extent (`corrupt_tail_framing_damage_live`). Extents
+  close at 4 MiB, so that refusal reaches windows over data recorded long after
+  the damage, for as long as the recording lives — the recorder stays up and
+  names the fault per trigger, and no clip is published. Which of the two a
+  framing run causes turns on whether the scan has passed it, so the live case
+  cuts a clip first and damages a record that clip proves was already indexed.
 - **The window's anchor is clipper's clock, not the harness's.** Under the
   default `ros` interface on `log`, the anchor is the recorder's own
   subscription instant, and it trails the harness's `ros2 topic pub` by a second

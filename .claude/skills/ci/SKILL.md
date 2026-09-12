@@ -123,19 +123,22 @@ cold, and saves a fresh one. Only the affected keys need deleting: a job whose
 cache is recent is unaffected, which is why `cu-mcap-record` passed through the
 outage that failed all three distro legs.
 
-## e2e skip rules
+## e2e selection rules
 
-`CLIPPER_E2E_SKIP_FLAKY=1` is set on every CI leg. The `skip_flaky()` gate in
-`tests/harness/mod.rs` reads it to skip (and pass) `corrupt_tail_health_live` —
-a timing-sensitive corruption race that reliably fails under CI-grade scheduling.
-The skip lives in the test next to the reason; a local run (env unset) still
-exercises it.
+`CLIPPER_E2E=1` is the only gate the E2E step sets, and the filterset is
+`binary(e2e)` on all three distros: every live test runs on every leg, none
+filtered out on the command line and none skipping itself from inside. The
+recovery suite discovers recordings by mtime and asserts on path-free log
+needles, so lyrical's timestamped rosbag2 filenames do not break it (beads
+`clipper-7ys`).
 
-Every distro runs the full e2e binary: the recovery suite discovers recordings
-by mtime and asserts on path-free log needles, so lyrical's timestamped rosbag2
-filenames do not break it (beads `clipper-7ys`).
-
-Result: every distro runs the whole binary minus the one flaky-skipped test.
+A test that cannot state one outcome does not belong in that filterset, and an
+environment variable skipping it on CI hides the defect rather than answering
+it. The live-corruption pair earns its place by picking its target out of the
+recording's own record framing rather than at an arithmetic offset: *where* a
+run of bytes lands decides *which* fault the recorder is being asked for, so an
+offset chosen without reading the framing asks a different question each run
+(beads `clipper-3q8`).
 
 ## release.yml — key decisions
 
