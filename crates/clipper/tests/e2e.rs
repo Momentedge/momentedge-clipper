@@ -1024,6 +1024,119 @@ fn quiet_topics_grace_timeout_cut() {
     assert!(extractor.is_running());
 }
 
+/// A window lying entirely past the last recorded message: the empty clip that
+/// is correct, cut deliberately (clipper-vfi).
+///
+/// The source stops and the recording falls silent; the trigger fires only once
+/// that silence has outlasted the preroll, so the whole window — reach-back
+/// included — sits after every message the recording holds. `plan_window` finds
+/// no recording overlapping it, the grace expires on coverage that can never
+/// arrive, and clipper stages, publishes and announces one empty segment. On
+/// disk that clip is byte-identical to one that lost its data, so the assertions
+/// here are the two things that tell them apart: the manifest's
+/// `source.files_planned = 0` with `clip.short = true` — nothing covered the
+/// window, as against the gap-between-splits empty (`0`/`false`) and the
+/// nothing-matched empty (`>= 1`/`false`) — and the extractor's `0 msgs from 0
+/// extents`, where a coverage shortfall would plan one extent and copy fewer
+/// messages out of it.
+///
+/// **Waiting the window clear of the data before firing is sound here, where
+/// waiting is wrong elsewhere in this suite.** A test that needs data *inside*
+/// its window must bound the harness's own latency — the ros2 CLI startup the
+/// anchor trails — which nobody can state, so those tests keep their source
+/// publishing across the trigger instead. This one needs the window *empty*, and
+/// every source of latency pushes the anchor further past the last recorded
+/// message: a longer wait can only make the precondition more true, never less.
+/// The wait is on the recording's own stamps rather than on a fixed sleep
+/// because a source's last message reaches the recorder after the source process
+/// is gone. Its length is the preroll plus a second — the shortest gap that puts
+/// `anchor − preroll` past the last message without leaning on the anchor's lag
+/// at all — and preroll, postroll and grace are the shortest values that still
+/// exercise a two-sided window released by a coverage wait that ran out.
+#[rstest]
+fn window_past_the_last_recorded_message_cuts_an_empty_clip() {
+    if !require_e2e() {
+        return;
+    }
+    let (preroll, postroll) = (2 * SEC, 2 * SEC);
+    let env = TestEnv::new();
+    // Restricted to the source topic, so no ambient topic (`/rosout`, the
+    // trigger itself) can put a message inside the window behind the test's
+    // back — the recording must fall silent for good when the source dies.
+    let _recorder = env.start_recorder_topics(&[SRC_TOPIC], "fastwrite", 0);
+    let mut source = env.start_source(SRC_TOPIC, SRC_RATE);
+    env.wait_for_recording(Duration::from_secs(60));
+    let mut extractor = env.start_extractor(3);
+    // Record data first, so the clip is empty because the window misses the
+    // recording rather than because nothing was ever recorded.
+    env.wait_for_recording_span(Duration::from_nanos(preroll), Duration::from_secs(60));
+
+    source.stop(libc::SIGTERM, Duration::from_secs(10));
+    let mut listener = env.start_recorded_listener("past");
+    env.wait_for_recording_quiet(Duration::from_nanos(preroll + SEC), Duration::from_secs(60));
+    env.fire_trigger("past", preroll, postroll);
+
+    // Every trigger produces a clip, this one included: it is announced, it is a
+    // complete MCAP, and it holds nothing.
+    let r = wait_for_recorded(&mut listener, Duration::from_secs(60));
+    let clip = Path::new(r.only());
+    let (ws, we) = announced_window(&r, preroll, postroll);
+    let msgs = read_clip(clip);
+    assert!(
+        msgs.is_empty(),
+        "the window lies past every recorded message, so the clip holds none: {msgs:?}"
+    );
+
+    // The precondition, restated against the window the cut actually used: the
+    // recording holds data, and all of it lies before the window starts.
+    let recording = env.newest_recording().expect("the recording exists");
+    let stamps = partial_recording_stamps(&recording);
+    let last =
+        stamps.iter().max().copied().unwrap_or_else(|| {
+            panic!("the recording holds the data this window deliberately misses")
+        });
+    assert!(
+        last < ws,
+        "the window [{ws}, {we}] must start after the recording's last message \
+         at {last} — an overlap means the wait failed, not the cut"
+    );
+
+    // Which kind of empty. `files_planned = 0` says no recording held a byte of
+    // the window; `short = true` says the coverage it waited for never arrived.
+    assert_clip_manifest(clip, preroll, postroll);
+    let manifest = clip::manifest::read_manifest(clip)
+        .expect("reading the clip manifest")
+        .expect("the clip carries a manifest");
+    assert_eq!(manifest["clip.messages"], "0");
+    assert_eq!(
+        manifest["source.files_planned"], "0",
+        "no recording overlapped the window"
+    );
+    assert_eq!(
+        manifest["clip.short"], "true",
+        "the recording never covered the window end"
+    );
+
+    // The extractor's own account of the same cut: released by the grace
+    // timeout, and copied from no extent at all.
+    let log = extractor.log_text();
+    assert!(
+        log.contains("still uncovered after"),
+        "the cut must have come from the grace timeout"
+    );
+    assert!(
+        log.contains(&format!(
+            "clip {} written: 0 msgs from 0 extents",
+            clip.display()
+        )),
+        "the extractor must log this clip as copied from no extent; \
+         a coverage shortfall would name one"
+    );
+
+    env.assert_capturing_drained();
+    assert!(extractor.is_running());
+}
+
 /// Corrupt tail, offline and deterministic: a framing fault (oversized
 /// declared record length — no resync point) planted at a known record
 /// boundary. The extractor must fail fast with a non-zero exit for a

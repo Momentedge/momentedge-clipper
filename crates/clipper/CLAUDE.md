@@ -453,6 +453,32 @@ this section is the rationale.
   `TestEnv::wait_for_recording_span`, which blocks on the recording's own
   `log_time` extent; a fixed sleep cannot promise it, because the ros2 CLI
   source starts publishing an unbounded moment after it is spawned.
+  **The asymmetry in that latency is what lets one test wait on purpose.** It
+  only ever pushes the anchor *later*, so it can only take data off the front of
+  a window: a test needing data inside its window cannot absorb it, while a test
+  needing the window *empty* is made more right by it, however long it lasts.
+  `window_past_the_last_recorded_message_cuts_an_empty_clip` is that test, and it
+  waits with `TestEnv::wait_for_recording_quiet` — the mirror of the span wait,
+  blocking until the recording's latest `log_time` is further in the past than
+  the preroll. Both read the recording's own stamps rather than counting wall
+  clock off a CLI: neither the ros2 source's startup nor a dying source's last
+  message is bounded, and the gap that decides either window is between the
+  recorder's clock and the window, not the harness's.
+- **An empty clip that is correct is asserted to be correct.** A window lying
+  entirely past the last recorded message is a documented outcome: no recording
+  overlaps it, the grace expires on coverage that can never arrive, and one empty
+  segment is staged, published and announced.
+  `window_past_the_last_recorded_message_cuts_an_empty_clip` reaches that path
+  deliberately (the wait above), because on disk such a clip is
+  indistinguishable from one that lost its data. What tells them apart is the
+  manifest — `source.files_planned = 0` with `clip.short = true`, as against the
+  gap-between-splits empty and the nothing-matched empty ([the three
+  kinds](../../docs/clip-manifest.md)) — so the manifest is what the test asserts
+  on, with the extractor's `0 msgs from 0 extents` as the corroborating log: a
+  coverage shortfall plans one extent and copies fewer messages out of it, and so
+  can never print that line. The recording is checked to hold data before the
+  window start too, so the clip is empty because the window misses it rather than
+  because nothing was recorded at all.
 - **Restart and deletion scenarios are exercised live** against a real
   `ros2 bag record`: restarts inside an open trigger window (clean restart,
   deletion-then-restart, deletion before the trigger), deletion without a

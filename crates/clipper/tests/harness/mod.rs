@@ -421,6 +421,39 @@ impl TestEnv {
         }
     }
 
+    /// Block until the newest recording has taken no new message for at least
+    /// `quiet`, measured between its own latest `log_time` and the wall clock
+    /// the recorder stamps with.
+    ///
+    /// The mirror of [`Self::wait_for_recording_span`]: that one establishes
+    /// that data exists before a window, this one establishes how far in the
+    /// past the last of it lies, so a caller can fire a trigger whose whole
+    /// window — preroll included — is provably past every recorded message.
+    /// Both read the recording's own stamps rather than counting wall clock off
+    /// the source's teardown, because a source's last message reaches the
+    /// recorder some unbounded moment after the source process itself is gone.
+    /// Unchunked recordings only (the suite's `fastwrite` profile) — see
+    /// [`partial_recording_stamps`].
+    pub(crate) fn wait_for_recording_quiet(&self, quiet: Duration, timeout: Duration) {
+        let want = quiet.as_nanos() as u64;
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(path) = self.newest_recording()
+                && let Some(last) = partial_recording_stamps(&path).into_iter().max()
+                && now_ns().saturating_sub(last) >= want
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the recording under {} did not fall quiet for {quiet:?} within \
+                 {timeout:?} — source log: see logs/source.log",
+                self.record_dir().display(),
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
     /// Delete the recording file out from under the live recorder — the
     /// external-cleanup fault the deletion tests inject. The recorder keeps
     /// appending to the unlinked inode; the tail sees the path vanish.
