@@ -94,6 +94,7 @@ bag directory the message names the split that failed, not the directory.
 | *holds no message* | empty — its statistics report a message count of zero |
 | *summary indexes no chunk* | written with an unchunked profile |
 | *no … chunk index carries a message index* | written by a writer with message indexing disabled |
+| *summary indexes a chunk at offset … which the … recording cannot hold* | describing bytes it does not have — a summary from a longer recording, or a file truncated after its summary was written |
 
 A directory is refused too when it holds no `*.mcap` at all — usually the
 directory *above* the one the splits are in — or when its `metadata.yaml` is

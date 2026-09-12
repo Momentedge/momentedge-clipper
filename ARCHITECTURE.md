@@ -349,7 +349,8 @@ decide that too, so a refusal costs the same seek and read an acceptance does an
 no chunk is decompressed to reach one. `clip::whole::IndexRefusal` is the whole
 taxonomy — a file too small to hold a footer, one with no closing magic, a footer
 pointing at no summary section, a recording holding no message, an unchunked one,
-and chunk indexes that index no message — and each variant's message names the
+chunk indexes that index no message, and a summary indexing a chunk past the end
+of the file it describes — and each variant's message names the
 fault and the `mcap recover` / `mcap compress` / `mcap list chunks` commands an
 operator repairs it with. The empty and unchunked cases are told apart by the
 statistics record, since a recording holding no message indexes no chunk either.

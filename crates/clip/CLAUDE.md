@@ -471,6 +471,7 @@ an operator repairs differently:
 | `Empty` | holds no message | `stats.message_count == 0` |
 | `Unchunked` | an unchunked writer profile | no `ChunkIndex` in the summary |
 | `Unindexed` | message indexing disabled | every chunk index's `message_index_length == 0` |
+| `ChunkOutOfRange` | a summary that does not describe its own bytes | a chunk index's `offset + len` past the file length |
 
 The order is load-bearing at one place: the statistics are read before the chunk
 indexes, because a chunked recording holding no message emits no chunk either, so

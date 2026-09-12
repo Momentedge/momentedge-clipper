@@ -64,10 +64,11 @@ the tail applies that partial delta like any other pass's, then retries from
 exactly the returned offset — never earlier, never re-attaching or rescanning
 from scratch, which the scan's resume invariant requires. Retries are bounded by
 `MAX_SCAN_FAULTS` consecutive faults with backoff escalating from `DISCOVER_POLL`
-toward `SCAN_BACKOFF_CAP`, slept in `DISCOVER_POLL` increments so a recorder
-restart mid-backoff is noticed within one increment and taken as recovery; a
-single fault-free pass resets the count, so transient trouble that clears never
-accumulates. Exhausting the budget is fatal: every retry in a row ended in a
+toward `SCAN_BACKOFF_CAP`; a single fault-free pass resets the count, so transient
+trouble that clears never accumulates. Each backoff is one uninterrupted sleep, so
+a recorder restart landing inside one is taken as recovery on the pass after it
+rather than at once — up to `SCAN_BACKOFF_CAP` late (beads `clipper-i6h` is
+sleeping it in `DISCOVER_POLL` increments instead). Exhausting the budget is fatal: every retry in a row ended in a
 fault — usually the same stuck byte — so `run()` returns the fault (named with
 the path, offset, and attempt count), `supervise()` carries it out, and the
 process exits non-zero for a supervisor to restart. Limping on would degrade every clip to a

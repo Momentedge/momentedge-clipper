@@ -3,7 +3,9 @@
 What a trigger is, how it reaches clipper, and which clock the window it asks
 for lives on. For cutting from a recording that is already finished, see
 [`clipper clip`](clip-command.md); for the flags named here, see
-[Configuration](configuration.md).
+[Configuration](configuration.md). The words this page leans on — anchor, window,
+trigger source, and the several instants a message can be said to have happened
+at — are each defined once in the [glossary](../CONTEXT.md).
 
 ## The trigger message
 
