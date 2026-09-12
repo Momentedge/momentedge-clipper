@@ -11,8 +11,8 @@ Each crate's own internals are in its own `CLAUDE.md`:
   a live MCAP readable, the copy, the manifest, segment assembly and
   publication, the whole-file index and bag directories.
 - [`tail/CLAUDE.md`](tail/CLAUDE.md) — discovery, the recording collection and
-  its lifecycle, coverage, the scan-fault budget, retention, and the per-trigger
-  flow with the two waits a growing file costs.
+  its lifecycle, coverage, the scan-fault budget, the cut-fault tally, retention,
+  and the per-trigger flow with the two waits a growing file costs.
 - [`clipper/CLAUDE.md`](clipper/CLAUDE.md) — the interfaces, the anchor seam and
   admission gate, thread supervision, `clipper clip`, configuration, and the
   live e2e suite.
@@ -35,10 +35,11 @@ and every other setting (`clip::config`).
 
 **What following a recording still being written adds** is [`tail`](tail):
 discovery, the recording collection and its lifecycle, coverage, retention, the
-scan-fault budget, and — in `tail::handler` — the two waits a cut from a growing
-file must clear before the shared cut path runs. A consumer cutting from a
-recording nobody is writing links `clip` alone: no successor to find, no
-lifecycle to run, nothing to wait for.
+scan-fault budget, the cut-fault tally, and — in `tail::handler` — the two waits
+a cut from a growing file must clear before the shared cut path runs. A consumer
+cutting from a recording nobody is writing links `clip` alone: no successor to
+find, no lifecycle to run, nothing to wait for, and — cutting one window once —
+no repetition to count.
 
 **What is left is the binary**, four files in [`clipper`](clipper): the interface
 seam and its MCAP implementation (`clipper/src/interface.rs`), the ROS

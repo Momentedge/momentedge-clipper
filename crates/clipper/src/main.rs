@@ -116,7 +116,7 @@ use interface::{Anchor, Interface, McapInterface};
 use log::{error, info, warn};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use supervision::{Supervised, harvest_panic, spawn_supervised};
-use tail::{Coverage, Tailer, Watch, handler};
+use tail::{Coverage, CutFaults, Tailer, Watch, handler};
 
 /// How many trigger handlers may be active (admitted, waiting, or extracting)
 /// at once. Beyond this limit an arriving trigger is rejected at admission:
@@ -1881,6 +1881,13 @@ fn drive<I: Interface>(
 ) -> anyhow::Result<()> {
     let announcer = iface.announcer();
 
+    // The recorder's memory of clips refused because a recording's bytes changed
+    // under the tail. Per-run state with no configuration behind it, so it is
+    // born here rather than passed in: it is shared by every handler, which is
+    // how the repetition against one recording is announced once and counted
+    // after. Why that is counted rather than made fatal is `tail::faults`.
+    let cut_faults = Arc::new(CutFaults::new());
+
     // The callback the interface fires per decoded Trigger. `Fn` + `Send`: it is
     // moved into the single interface thread and called from there, never shared.
     let fire = {
@@ -1897,6 +1904,7 @@ fn drive<I: Interface>(
         let coverage = coverage.clone();
         let extract_tx = extract_tx.clone();
         let admission = admission.clone();
+        let cut_faults = cut_faults.clone();
         move |trig: Trigger, anchor: Anchor| {
             // The single validation gate every resolved trigger passes before a
             // handler is spawned. A rejected trigger cuts no clip and announces
@@ -1918,6 +1926,7 @@ fn drive<I: Interface>(
             let tailer = tailer.clone();
             let coverage = coverage.clone();
             let extract_tx = extract_tx.clone();
+            let cut_faults = cut_faults.clone();
             let announcer = announcer.clone();
             // Per-trigger error isolation: a failed cut is logged and counted but
             // does not tear down the interface loop, and a panic dies with the
@@ -1934,6 +1943,7 @@ fn drive<I: Interface>(
                         tailer,
                         coverage,
                         extract_tx,
+                        cut_faults,
                         announcer,
                         time_source,
                         producer,

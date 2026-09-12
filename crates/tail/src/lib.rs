@@ -21,15 +21,21 @@
 //!   cut waits for the wall clock to pass the window end and for the tail's
 //!   coverage to catch up, and only then calls [`clip::segment::cut_window`] —
 //!   the same code that cuts from a recording nobody is writing.
+//! - [`faults`] is the other thing only a live recording forces: the same
+//!   damaged bytes are cut against again and again, so the refusals are counted
+//!   per recording and the first one is announced. Cutting once from a finished
+//!   recording has nothing to count.
 //!
 //! Nothing here links r2r or needs a ROS installation. What arrives as a trigger
 //! and who is told about a finished clip are a caller's business; this crate
 //! knows only [`clip`]'s neutral contract.
 
 pub mod discover;
+pub mod faults;
 pub mod handler;
 pub mod tailer;
 pub mod watch;
 
+pub use faults::CutFaults;
 pub use tailer::{Coverage, Tailer};
 pub use watch::Watch;

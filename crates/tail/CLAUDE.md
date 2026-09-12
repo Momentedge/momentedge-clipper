@@ -2,10 +2,11 @@
 
 What following a recording *still being written* costs on top of
 [`clip`](../clip/CLAUDE.md): discovery, the recording collection and its
-lifecycle, coverage, the scan-fault budget, retention, and — in `tail::handler` —
-the two waits a cut from a growing file must clear before the shared cut path
-runs. A consumer cutting from a recording nobody is writing links `clip` alone:
-no successor to find, no lifecycle to run, nothing to wait for.
+lifecycle, coverage, the scan-fault budget, the cut-fault tally, retention, and —
+in `tail::handler` — the two waits a cut from a growing file must clear before
+the shared cut path runs. A consumer cutting from a recording nobody is writing
+links `clip` alone: no successor to find, no lifecycle to run, nothing to wait
+for, and — cutting one window once — no repetition to count.
 
 **No ROS anywhere by default**, and no async runtime. The seam between the three
 crates, the feature matrix, and the clock domain every window lives in are one
@@ -108,6 +109,53 @@ safely against the deleted inode. A magic mismatch stays fatal — an append-onl
 file whose first eight bytes are wrong can never become a valid MCAP. A `NotFound`
 when opening a discovered path (the file vanished between discovery and open) is
 silently skipped; the iterator has already advanced past it.
+
+## The cut-fault tally
+
+The sibling fault on the other side of the scan offset is counted, not made
+fatal, and the asymmetry is the whole of `tail::faults`. A
+[framing desync](../clip/CLAUDE.md#the-copy-is-direct-clipcut) met at *cut* time
+is damage the scan has already walked past, so nothing about the tail is broken:
+the index is intact, coverage keeps rising, windows over other extents still cut,
+and the next recording is untouched. What is lost is the extent the damage sits
+in, and every window whose plan includes it.
+
+**Exiting here would produce fewer clips, not more.** A restarted clipper adopts
+the newest recording and indexes it from the start, so those same bytes are then
+*ahead* of its scan and the scan-fault budget above kills it in about three
+seconds. A recording nobody is splitting has no successor for the startup adopt
+to take instead, so every restart repeats that: the supervisor gets a restart
+loop and the vehicle gets nothing, where staying up costs only the windows that
+read the damaged extent. `corrupt_tail_framing_damage_live` drives that restart
+and pins the exit, which is also what makes the advice in the announcement below
+a tested claim rather than a hunch.
+
+So the recorder makes the repetition *visible* instead. `tail::faults::CutFaults`
+is one tally shared by every handler, and `handler::report_refusal` is what reads
+it:
+
+- **Only a `clip::cut::FramingDesync` counts** — which is why that is the only
+  thing `CutFaults::refused` accepts. An IO error, a full disk, an output failure
+  or a staging panic is transient or is fixed somewhere else, keeps its own
+  per-trigger error, and stays out of the tally so that "this recording is
+  damaged" can never be read off a disk that filled up.
+- **The tally is per recording**, keyed on the path the desync names. A rollover,
+  a split or a recorder restart puts fresh bytes under the tail, so the first
+  refusal there starts at one and is announced in its own right. One recording is
+  tracked at a time; a refusal naming another replaces it.
+- **A successful cut does not reset it.** This is the deliberate difference from
+  the scan-fault budget, which *does* reset on a clean pass because a scan fault
+  can be a record that was still being appended. A framing desync cannot heal — a
+  length past `MAX_RECORD_LEN` is a value no valid record reaches, and the scan is
+  long past those bytes and never re-reads them — so a cut that succeeds only
+  proves its window planned another extent.
+- **The first refusal is announced in full and the rest carry the count.** The
+  announcement names the recording, the extent, the blast radius, and the one
+  thing that clears it (rolling the recording over — not restarting clipper).
+  Every refusal after it rides the running tally into the per-trigger error, so a
+  log shows a number climbing rather than one indistinguishable line. What an
+  operator does with that is
+  [Operating clipper](../../docs/operating.md#a-recording-that-stops-producing-clips).
 
 ## Per-trigger flow
 

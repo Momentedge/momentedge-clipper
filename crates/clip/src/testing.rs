@@ -530,6 +530,49 @@ pub fn write_raw(path: &Path, records: &[Vec<u8>]) -> Result<()> {
     Ok(())
 }
 
+/// Break one record's length prefix in a recording already on disk, the way a
+/// run of stray bytes written across a record header does: the `nth` top-level
+/// `Message` record (counting from zero) comes to declare `u64::MAX` bytes, a
+/// length no valid record reaches. Returns that record's offset in the file.
+///
+/// Which side of the framing walk meets such damage is decided by where the
+/// tail's scan already is, so this is the fixture for the *cut* side: plant it
+/// in a recording a test has already scanned, and every clip whose window plans
+/// the extent it sits in is refused with a [`crate::cut::FramingDesync`].
+/// (Planted ahead of the scan instead, it is the scan that faults on it.)
+/// Nothing else in the file moves, so an index already built over those bytes
+/// still plans exactly the same extents — which is the whole point: the bytes
+/// disagree with the index, and only the copy finds out.
+pub fn desync_record_framing(path: &Path, nth: usize) -> Result<u64> {
+    let mut bytes = std::fs::read(path)?;
+    let mut offset = MAGIC.len();
+    let mut seen = 0usize;
+    while offset + 9 <= bytes.len() {
+        let opcode = bytes[offset];
+        let len = u64::from_le_bytes(bytes[offset + 1..offset + 9].try_into()?);
+        let Some(end) = usize::try_from(len)
+            .ok()
+            .and_then(|l| offset.checked_add(9)?.checked_add(l))
+            .filter(|end| *end <= bytes.len())
+        else {
+            break;
+        };
+        if opcode == op::MESSAGE {
+            if seen == nth {
+                bytes[offset + 1..offset + 9].copy_from_slice(&u64::MAX.to_le_bytes());
+                std::fs::write(path, &bytes)?;
+                return Ok(offset as u64);
+            }
+            seen += 1;
+        }
+        offset = end;
+    }
+    anyhow::bail!(
+        "{} holds no top-level message record #{nth} to desync",
+        path.display()
+    )
+}
+
 /// A recording that is still being written: one schemaless channel and its
 /// messages, with no DataEnd/Footer — exactly the shape a live tail sees.
 pub fn write_unfinished_recording(path: &Path, topic: &str, stamps: &[u64]) -> Result<()> {

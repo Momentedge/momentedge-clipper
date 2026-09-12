@@ -13,9 +13,10 @@ own their angle, and this file does not repeat them:
   (the `Trigger` message, the two interfaces, the clock a window lives on),
   [`clip-command.md`](docs/clip-command.md) (`clipper clip` over a finished
   recording), [`clip-manifest.md`](docs/clip-manifest.md) (the `momentedge.clip`
-  record), [`operating.md`](docs/operating.md) (shutdown, logs, retention,
-  overload, tuning). These are for *humans looking something up* — the agent
-  view of the same code is the `CLAUDE.md` files below.
+  record), [`operating.md`](docs/operating.md) (shutdown, logs, retention, a
+  recording that stops producing clips, overload, tuning). These are for *humans
+  looking something up* — the agent view of the same code is the `CLAUDE.md`
+  files below.
 - **[ARCHITECTURE.md](ARCHITECTURE.md)** — the technical overview: thread model,
   tailing, atomic clip publication, recovery, the `ros`/`mcap` seam, deployment.
 - **[crates/CLAUDE.md](crates/CLAUDE.md)** — what the three crates share: the

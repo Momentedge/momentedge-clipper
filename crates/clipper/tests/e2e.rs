@@ -1254,6 +1254,22 @@ fn corrupt_tail_payload_damage_live() {
 /// record is taken from the first half of what the scan had therefore already
 /// walked. Damage the scan has yet to reach is the offline case
 /// ([`corrupt_tail_fails_fast_offline`]), where the fault is fatal instead.
+///
+/// Because the refusal repeats for every trigger, the recorder's answer to it is
+/// an **escalation with a count**, and the rest of the case is that contract:
+/// the first clip a recording's desync costs is announced in full — the
+/// recording, the extent, the blast radius, and the one thing that clears it —
+/// and every clip after it carries a climbing tally instead of the same line
+/// again. Three facts have to hold together for that to be worth reading: the
+/// announcement is exactly once, the count is per clip, and the recorder is
+/// still up.
+///
+/// The announcement tells an operator not to restart clipper, and the last step
+/// is why: restarted against the same still-growing recording, the fresh scan
+/// meets those bytes *ahead* of it and dies on the scan-fault budget within
+/// seconds. That is the whole reason this fault is counted rather than made
+/// fatal — a fatal cut-side budget would trade a recorder that refuses some
+/// clips for a supervisor loop that produces none.
 #[rstest]
 fn corrupt_tail_framing_damage_live() {
     if !require_e2e() {
@@ -1297,6 +1313,16 @@ fn corrupt_tail_framing_damage_live() {
         "extent framing inconsistent with the tail's scan",
         Duration::from_secs(60),
     );
+    extractor.expect_log("clip 1 refused against", Duration::from_secs(60));
+    let announcement = extractor.log_text();
+    assert!(
+        announcement.contains("changed under the tail after it was indexed"),
+        "the first refusal is announced in full: see extractor log"
+    );
+    assert!(
+        announcement.contains(&bag.display().to_string()),
+        "the announcement must name the damaged recording: see extractor log"
+    );
     assert!(
         extractor.is_running(),
         "a refused cut must not take the extractor down"
@@ -1313,4 +1339,42 @@ fn corrupt_tail_framing_damage_live() {
         "a refused cut publishes nothing"
     );
     env.assert_capturing_drained();
+
+    // A second window over the same extent: the cost is a number that climbs,
+    // and the full announcement is not repeated. One line per trigger is what
+    // the escalation replaces.
+    env.fire_trigger("over-damage-again", SEC, SEC);
+    extractor.expect_log("clip 2 refused against", Duration::from_secs(60));
+    assert_eq!(
+        extractor
+            .log_text()
+            .matches("changed under the tail after it was indexed")
+            .count(),
+        1,
+        "the recording is announced once, not once per trigger: see extractor log"
+    );
+    assert!(extractor.is_running(), "still up after the second refusal");
+
+    // What the announcement tells the operator *not* to do, tested: restarted
+    // against the same damaged recording, the fresh scan meets those bytes
+    // ahead of it and exits on the scan-fault budget. A recording that is not
+    // being split has no successor for the startup adopt to pick up instead, so
+    // a supervisor restarting this gets a loop that publishes nothing at all —
+    // which is why the cut side counts where the scan side exits.
+    extractor.stop(libc::SIGINT, Duration::from_secs(30));
+    let mut restarted = env.start_extractor(10);
+    let status = restarted
+        .wait_exit(Duration::from_secs(60))
+        .unwrap_or_else(|| {
+            restarted.dump_log();
+            panic!("a restart must meet the damage ahead of its scan, not survive it");
+        });
+    assert!(
+        !status.success(),
+        "the restart exits non-zero for the supervisor, got {status}"
+    );
+    assert!(
+        restarted.log_text().contains("giving up"),
+        "the restart's exit must name the exhausted scan-fault budget: see extractor log"
+    );
 }
