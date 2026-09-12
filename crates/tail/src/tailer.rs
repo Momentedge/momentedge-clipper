@@ -274,10 +274,15 @@ impl TailState {
     fn prune(&mut self, floor_ns: u64) -> Vec<PathBuf> {
         let mut pruned = Vec::new();
         self.recordings.retain(|r| {
+            // Retention ages a recording out on the newest message it holds.
+            // One that ended holding none has no such timestamp, and nothing a
+            // clip could ever want, so it goes as soon as it stops being
+            // `current` rather than waiting out a floor it can never cross —
+            // otherwise a producer that crash-loops at startup pins one
+            // descriptor per restart for the life of the process.
             let expired = r.state == RecordingState::Ended
                 && Some(r.id) != self.current
-                && r.index.bounds.has_messages
-                && r.index.bounds.log.max < floor_ns;
+                && (!r.index.bounds.has_messages || r.index.bounds.log.max < floor_ns);
             if expired {
                 pruned.push(r.index.path.clone());
             }
@@ -525,7 +530,12 @@ impl Tailer {
         reason = "a poisoned state lock means the tail thread panicked mid-update, so the recording collection is torn; propagating is the policy"
     )]
     fn prune_aged_out(&self, floor: u64, delete_old_files: bool) {
-        for path in self.state.lock().unwrap().prune(floor) {
+        // Taken into a local first: holding the collection lock across a syscall
+        // per file would queue every handler's `plan_window` behind a retention
+        // pass. The recordings are out of the collection by the time it is
+        // released, so nothing can plan against what is about to be unlinked.
+        let pruned = self.state.lock().unwrap().prune(floor);
+        for path in pruned {
             info!("retention: forgetting {}", path.display());
             if !delete_old_files {
                 continue;
@@ -1178,6 +1188,82 @@ pub(crate) mod tests {
             file.metadata().is_ok(),
             "the in-flight handle stays readable"
         );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// Retention ages a recording out on the newest message it holds, so one
+    /// that ended holding none has no timestamp to age on. It is dropped as soon
+    /// as it stops being `current` instead, because there is nothing in it a
+    /// clip could ever want.
+    ///
+    /// A producer that crash-loops at startup writes one of these per attempt,
+    /// and each keeps an open descriptor for as long as it stays indexed.
+    #[test]
+    fn an_ended_recording_holding_no_message_is_pruned() -> Result<()> {
+        let root = test_dir("prune-empty")?;
+        let empty = root.join("rec_0.mcap");
+        let held = root.join("rec_1.mcap");
+        write_recording(&empty, false, &[])?;
+        write_recording(&held, false, &[("/t", 9_000)])?;
+
+        let (tailer, _) = Tailer::new();
+        tailer.index_recording(&empty);
+        tailer.index_recording(&held);
+        drain(&tailer)?;
+
+        // A floor below every stamp in the collection, so nothing ages out on
+        // time and the message-less recording is the only thing that can go.
+        let dropped = tailer.state.lock().unwrap().prune(0);
+        assert_eq!(
+            dropped,
+            vec![empty],
+            "an ended recording holding no message is dropped whatever the floor"
+        );
+        assert!(
+            !tailer.plan_window(8_900, 9_100, TimeSource::Log).is_empty(),
+            "the recording that does hold messages is retained"
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// `--delete-old-files` is the only thing in clipper that unlinks a
+    /// recording, and it unlinks exactly what retention has already dropped —
+    /// never the recording it retained, and never anything while it is still in
+    /// the collection.
+    #[test]
+    fn retention_deletes_the_file_only_when_told_to() -> Result<()> {
+        let root = test_dir("retention-delete")?;
+        for (name, delete_old_files) in [("keep", false), ("drop", true)] {
+            // One collection per setting. The aged recording needs a successor,
+            // or it stays `current` and is never a candidate.
+            let dir = root.join(name);
+            std::fs::create_dir_all(&dir)?;
+            let aged = dir.join("rec_0.mcap");
+            let newer = dir.join("rec_1.mcap");
+            write_recording(&aged, false, &[("/t", 1_000)])?;
+            write_recording(&newer, false, &[("/t", 9_000)])?;
+
+            let (tailer, _) = Tailer::new();
+            tailer.index_recording(&aged);
+            tailer.index_recording(&newer);
+            drain(&tailer)?;
+
+            tailer.prune_aged_out(5_000, delete_old_files);
+
+            assert_eq!(
+                aged.exists(),
+                !delete_old_files,
+                "the aged recording is unlinked only with --delete-old-files"
+            );
+            assert!(
+                newer.exists(),
+                "the retained recording is never unlinked, either way"
+            );
+        }
 
         std::fs::remove_dir_all(root)?;
         Ok(())
