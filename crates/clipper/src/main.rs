@@ -22,13 +22,13 @@
 //! signalled follows from it: the two are one seam, the [`interface`], with one
 //! form active per run. The `mcap` source reads triggers out of the tailed
 //! recording itself — decoding each by its MCAP `message_encoding`
-//! ([`decode`]) — and runs ROS-free, the clip's atomic move into the output
+//! ([`clip::decode`]) — and runs ROS-free, the clip's atomic move into the output
 //! directory standing in for a completion announcement. The `ros` source
 //! subscribes to `/events/momentedge/trigger` (`momentedge_msgs/Trigger`) on a
 //! ROS node and publishes `/events/momentedge/recorded`
 //! (`momentedge_msgs/Recorded`) naming every durable segment. The handler
 //! cutting the clip is identical either way; it knows only the neutral
-//! [`trigger`] contract.
+//! [`clip::trigger`] contract.
 //!
 //! **Two builds.** The `ros` cargo feature is what links the ROS client and
 //! compiles the `ros` interface in. With it — the device build, which every
@@ -116,7 +116,9 @@ use interface::{Anchor, Interface, McapInterface};
 use log::{error, info, warn};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use supervision::{Supervised, harvest_panic, spawn_supervised};
-use tail::{Coverage, CutFaults, Tailer, Watch, handler};
+#[cfg(test)]
+use tail::Watch;
+use tail::{CutFaults, Tailer, handler};
 
 /// How many trigger handlers may be active (admitted, waiting, or extracting)
 /// at once. Beyond this limit an arriving trigger is rejected at admission:
@@ -1153,6 +1155,32 @@ enum StartupError {
     Config(anyhow::Error),
 }
 
+/// The one thing clap's derive cannot state: a flag whose requirement or conflict
+/// depends on another flag's *value* ([`ClipConfig::trigger_argument_fault`]).
+///
+/// Checked as part of parsing, so both ways of naming a trigger wrongly end the
+/// process with the flag at fault named and nothing written — no output
+/// directory, no clip. The error is raised against `clipper clip` so the usage
+/// line clap prints under the message is the mode's own flag list rather than the
+/// mode listing.
+fn trigger_argument_error(definition: &clap::Command, cli: &Cli) -> Option<StartupError> {
+    let Mode::Clip(cfg) = &cli.mode else {
+        return None;
+    };
+    let fault = cfg.trigger_argument_fault()?;
+    #[expect(
+        clippy::expect_used,
+        reason = "reached only for `Mode::Clip`, so the parse that produced `cli` \
+                  already resolved `CLIP_MODE` against this same definition"
+    )]
+    let mut clip = definition
+        .find_subcommand(CLIP_MODE)
+        .expect("clip is a mode of clipper")
+        .clone()
+        .bin_name(format!("{PROGRAM} {CLIP_MODE}"));
+    Some(StartupError::Cli(clip.error(fault.kind(), fault.message())))
+}
+
 /// Parse `argv` into a fully-resolved [`Loaded`], four layers deep.
 ///
 /// The mode and then the two configuration files are located in `argv` (and the
@@ -1214,27 +1242,8 @@ fn parse_cli(argv: &[std::ffi::OsString]) -> Result<Loaded, StartupError> {
     let print_config = sub.get_flag(PRINT_CONFIG_ARG);
     let cli = Cli::from_arg_matches(&matches).map_err(StartupError::Cli)?;
 
-    // The one thing clap's derive cannot state: a flag whose requirement or
-    // conflict depends on another flag's *value*
-    // ([`ClipConfig::trigger_argument_fault`]). Checked as part of parsing, so
-    // both ways of naming a trigger wrongly end the process with the flag at
-    // fault named and nothing written — no output directory, no clip.
-    if let Mode::Clip(cfg) = &cli.mode
-        && let Some(fault) = cfg.trigger_argument_fault()
-    {
-        // Raised against `clipper clip` so the usage line clap prints under
-        // the message is the mode's own flag list, not the mode listing.
-        #[expect(
-            clippy::expect_used,
-            reason = "reached only from the `Mode::Clip` arm above, so the parse \
-                      already resolved `CLIP_MODE` against this same definition"
-        )]
-        let mut clip = definition
-            .find_subcommand(CLIP_MODE)
-            .expect("clip is a mode of clipper")
-            .clone()
-            .bin_name(format!("{PROGRAM} {CLIP_MODE}"));
-        return Err(StartupError::Cli(clip.error(fault.kind(), fault.message())));
+    if let Some(err) = trigger_argument_error(&definition, &cli) {
+        return Err(err);
     }
 
     Ok(Loaded {
@@ -1447,19 +1456,18 @@ fn tail_mode(
     let result = match cfg.trigger_source {
         #[cfg(feature = "ros")]
         TriggerSource::Ros => {
-            let (tailer, coverage) = Tailer::new();
+            // The second half of the pair is the tailer's own coverage watch,
+            // which `drive` reaches through the tailer; only the tests keep a
+            // handle to it.
+            let (tailer, _) = Tailer::new();
             let iface = RosInterface::new(TRIGGER_TOPIC, ANNOUNCE_TOPIC, cfg.time_source)?;
-            drive(
-                iface, cfg, tailer, coverage, extract_tx, admission, producer,
-            )
+            drive(iface, cfg, tailer, extract_tx, admission, producer)
         }
         TriggerSource::Mcap => {
             let (tx, rx) = unbounded();
-            let (tailer, coverage) = Tailer::with_trigger_tap(TRIGGER_TOPIC, tx);
+            let (tailer, _) = Tailer::with_trigger_tap(TRIGGER_TOPIC, tx);
             let iface = McapInterface::new(TRIGGER_TOPIC, rx, cfg.time_source);
-            drive(
-                iface, cfg, tailer, coverage, extract_tx, admission, producer,
-            )
+            drive(iface, cfg, tailer, extract_tx, admission, producer)
         }
         TriggerSource::Param => Err(unaccepted_source(TAIL_MODE, TriggerSource::Param)),
     };
@@ -1669,75 +1677,71 @@ fn clip_mode(
         cfg.out_dir.display(),
     );
 
-    for AnchoredTrigger { trigger, anchor_ns } in cuts {
-        let request = Arc::new(clip::CutRequest::new(
-            producer,
-            trigger.clone(),
-            anchor_ns,
-            CLIP_TIME_SOURCE,
-        ));
+    for cut in cuts {
+        cut_one(&index, &cfg, producer, cut, &stage_tx)?;
+    }
+    Ok(())
+}
 
-        // The one thing a finished clip cannot show from its own contents:
-        // whether the recording ever reached the window end, or simply stops
-        // inside it.
-        let coverage = if index
-            .log_end_ns()
-            .is_some_and(|end_ns| end_ns >= request.end_ns())
-        {
-            clip::WindowCoverage::Covered
-        } else {
-            warn!(
-                "{} ends before the window end {}; the clip stops where the \
-                 recording does",
-                cfg.recording.display(),
-                request.end_ns(),
-            );
-            clip::WindowCoverage::Short
-        };
+/// Cut one window out of the indexed recording and log what each published
+/// segment holds.
+///
+/// A window that straddles a split in a bag directory publishes one segment per
+/// contributing recording, so the reporting loop runs over however many
+/// `cut_window` returned rather than over one clip.
+fn cut_one(
+    index: &clip::whole::WholeFileIndex,
+    cfg: &ClipConfig,
+    producer: Producer,
+    cut: AnchoredTrigger,
+    stage_tx: &Sender<segment::StageJob>,
+) -> anyhow::Result<()> {
+    let AnchoredTrigger { trigger, anchor_ns } = cut;
+    let request = Arc::new(clip::CutRequest::new(
+        producer,
+        trigger.clone(),
+        anchor_ns,
+        CLIP_TIME_SOURCE,
+    ));
 
-        info!(
-            "cutting {} window=[{}, {}] anchor={anchor_ns}",
-            trigger.name,
-            request.start_ns(),
+    // The one thing a finished clip cannot show from its own contents: whether
+    // the recording ever reached the window end, or simply stops inside it.
+    let coverage = if index
+        .log_end_ns()
+        .is_some_and(|end_ns| end_ns >= request.end_ns())
+    {
+        clip::WindowCoverage::Covered
+    } else {
+        warn!(
+            "{} ends before the window end {}; the clip stops where the \
+             recording does",
+            cfg.recording.display(),
             request.end_ns(),
         );
+        clip::WindowCoverage::Short
+    };
 
-        let base_out_path = cfg.out_dir.join(format!(
-            "{anchor_ns}_{}.mcap",
-            segment::sanitize(&trigger.name)
-        ));
-        let segments = segment::cut_window(
-            &index,
-            &request,
-            coverage,
-            &base_out_path,
-            segment::Publication::Refuse,
-            &stage_tx,
-        )?;
+    info!(
+        "cutting {} window=[{}, {}] anchor={anchor_ns}",
+        trigger.name,
+        request.start_ns(),
+        request.end_ns(),
+    );
 
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "a log line's MiB figure; the loss starts past 8 PiB in one clip"
-        )]
-        for stats in &segments {
-            info!(
-                "clip {} written: {} msgs from {} extents, {:.1} MiB",
-                stats.out_path.display(),
-                stats.messages_copied,
-                stats.extents_read,
-                stats.bytes_copied as f64 / 1_048_576.0,
-            );
-            if stats.records_skipped > 0 || stats.chunks_dropped > 0 {
-                warn!(
-                    "clip {} is missing data over damage in the recording: \
-                     {} records skipped, {} chunks dropped",
-                    stats.out_path.display(),
-                    stats.records_skipped,
-                    stats.chunks_dropped,
-                );
-            }
-        }
-    }
+    let base_out_path = cfg.out_dir.join(format!(
+        "{anchor_ns}_{}.mcap",
+        segment::sanitize(&trigger.name)
+    ));
+    let segments = segment::cut_window(
+        index,
+        &request,
+        coverage,
+        &base_out_path,
+        segment::Publication::Refuse,
+        stage_tx,
+    )?;
+
+    clip::cut::report_clips(&segments);
     Ok(())
 }
 
@@ -1870,11 +1874,22 @@ fn validate_name(name: &str) -> Result<(), &'static str> {
               and moves its own clones of them into the `'static` interface \
               callback; borrowing would push that lifetime back onto `main`"
 )]
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::excessive_nesting,
+    reason = "this is the wiring itself: the interface, the settings, the two \
+              shared handles and the producer, joined into one per-trigger \
+              callback and two supervised threads. The nesting is the two \
+              closures the interface API asks for — an `Fn` moved into the \
+              interface thread, and the handler-thread body it spawns — and \
+              splitting the wiring would hide which clone reaches which thread. \
+              Naming the handler half's inputs as one value is beads clipper-dmq"
+)]
 fn drive<I: Interface>(
     iface: I,
     cfg: Arc<Config>,
     tailer: Arc<Tailer>,
-    coverage: Arc<Watch<Coverage>>,
     extract_tx: Sender<segment::StageJob>,
     admission: Arc<Admission>,
     producer: Producer,
@@ -1901,7 +1916,6 @@ fn drive<I: Interface>(
         let grace = cfg.grace();
         let time_source = cfg.time_source;
         let tailer = tailer.clone();
-        let coverage = coverage.clone();
         let extract_tx = extract_tx.clone();
         let admission = admission.clone();
         let cut_faults = cut_faults.clone();
@@ -1924,7 +1938,6 @@ fn drive<I: Interface>(
             };
             let out_dir = out_dir.clone();
             let tailer = tailer.clone();
-            let coverage = coverage.clone();
             let extract_tx = extract_tx.clone();
             let cut_faults = cut_faults.clone();
             let announcer = announcer.clone();
@@ -1941,7 +1954,6 @@ fn drive<I: Interface>(
                         &out_dir,
                         grace,
                         tailer,
-                        coverage,
                         extract_tx,
                         cut_faults,
                         announcer,
@@ -2060,9 +2072,15 @@ mod tests {
         clippy::cast_possible_truncation,
         clippy::format_push_string,
         clippy::case_sensitive_file_extension_comparisons,
+        clippy::too_many_lines,
+        clippy::excessive_nesting,
+        clippy::cognitive_complexity,
         reason = "a failed unwrap, a panicking index or a truncated stamp is a \
                   failing test, and a fixture that writes `.mcap` in one case reads \
-                  it back in the same one"
+                  it back in the same one, \
+                  and a test that builds a fixture, drives it and asserts on the \
+                  whole result is long, nested and argument-heavy by \
+                  construction — splitting one would scatter the case it states"
     )]
 
     use std::path::Path;

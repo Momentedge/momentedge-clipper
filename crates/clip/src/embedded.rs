@@ -91,8 +91,25 @@ pub fn read_triggers(path: &Path, topic: &str) -> Result<Vec<TriggerRecord>> {
         return Ok(Vec::new());
     }
 
+    collect_triggers(&mut file, &summary, path, topic)
+}
+
+/// Drive the indexed reader over the trigger channel alone: service each chunk
+/// it asks for out of `file`, and collect every message it yields.
+///
+/// Selectivity lives in the reader's options — naming the topic names the chunks
+/// that hold it, so this touches the recording's data section only where the
+/// triggers are. The [`MAX_EMBEDDED_TRIGGERS`] ceiling is checked as the messages
+/// arrive rather than after, so a stuck publisher's recording is refused without
+/// first being materialised.
+fn collect_triggers(
+    file: &mut File,
+    summary: &mcap::Summary,
+    path: &Path,
+    topic: &str,
+) -> Result<Vec<TriggerRecord>> {
     let mut reader = IndexedReader::new_with_options(
-        &summary,
+        summary,
         IndexedReaderOptions::new()
             .include_topics([topic])
             // The same record-length ceiling the scan applies, so a summary
@@ -341,6 +358,36 @@ mod tests {
         assert_eq!(
             records[0].publish_time,
             7_000 + crate::testing::FIXTURE_PUBLISH_SKEW_NS
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// The ceiling is a refusal, not a truncation. A recording carrying more
+    /// messages on the trigger topic than any real trigger list has is a stuck
+    /// publisher or the wrong topic, and answering with the first
+    /// [`MAX_EMBEDDED_TRIGGERS`] of them would turn that into a plausible-looking
+    /// cut list instead of an error.
+    #[test]
+    fn a_recording_past_the_trigger_ceiling_is_refused() -> Result<()> {
+        let root = test_dir("embedded-ceiling")?;
+        let rec = root.join("rec.mcap");
+        // One past the ceiling: the check runs before each push, so the
+        // `MAX_EMBEDDED_TRIGGERS`-th message is still accepted and the next is
+        // what refuses the recording.
+        let flood: Vec<FixtureMsg<'static>> = (0..=MAX_EMBEDDED_TRIGGERS)
+            .map(|i| trigger_at(i as u64 + 1, "flood"))
+            .collect();
+        write_recording_with_triggers(&rec, TRIGGER_TOPIC, &[&flood])?;
+
+        let err = read_triggers(&rec, TRIGGER_TOPIC)
+            .expect_err("a recording past the ceiling is refused, not truncated");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains(&MAX_EMBEDDED_TRIGGERS.to_string())
+                && rendered.contains(TRIGGER_TOPIC),
+            "the refusal names the ceiling it hit and the topic it counted on: {rendered}"
         );
 
         std::fs::remove_dir_all(root)?;

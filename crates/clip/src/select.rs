@@ -49,6 +49,38 @@ pub struct Spec {
     pub exclude_trigger_topic: bool,
 }
 
+/// The include side of a selection: either everything, or exactly what the
+/// include keys name.
+///
+/// The two are a choice rather than a flag beside a list, because they are: a
+/// spec resolves `all` from its own key or from whether any include key was set,
+/// and once that is resolved the lists are either the selection or dead weight.
+#[derive(Clone, Debug)]
+enum Include {
+    /// Every topic the recording carries, before the exclusions are applied.
+    All,
+    /// Only the topics these name. An empty `exact` with no `regex` is a
+    /// selection that takes nothing — what an operator asked for by setting
+    /// `all = false` and naming no include.
+    Named {
+        exact: Vec<String>,
+        regex: Option<Regex>,
+    },
+}
+
+impl Include {
+    /// Whether the include side takes `topic`, before any exclusion is applied.
+    fn takes(&self, topic: &str) -> bool {
+        match self {
+            Include::All => true,
+            Include::Named { exact, regex } => {
+                exact.iter().any(|t| t == topic)
+                    || regex.as_ref().is_some_and(|re| re.is_match(topic))
+            }
+        }
+    }
+}
+
 /// Which topics a clip is cut from: the include side, the exclude side, and the
 /// two rules no configuration reaches.
 ///
@@ -56,9 +88,7 @@ pub struct Spec {
 /// still not the announcement topic.
 #[derive(Clone, Debug)]
 pub struct ChannelSelection {
-    all: bool,
-    include: Vec<String>,
-    include_regex: Option<Regex>,
+    include: Include,
     exclude: Vec<String>,
     exclude_regex: Option<Regex>,
     exclude_trigger_topic: bool,
@@ -67,9 +97,7 @@ pub struct ChannelSelection {
 impl Default for ChannelSelection {
     fn default() -> Self {
         Self {
-            all: true,
-            include: Vec::new(),
-            include_regex: None,
+            include: Include::All,
             exclude: Vec::new(),
             exclude_regex: None,
             exclude_trigger_topic: false,
@@ -90,10 +118,16 @@ impl TryFrom<Spec> for ChannelSelection {
                 .transpose()
         };
         let names_an_include = !spec.include.is_empty() || spec.include_regex.is_some();
+        let include_regex = named("include_regex", spec.include_regex)?;
         Ok(Self {
-            all: spec.all.unwrap_or(!names_an_include),
-            include: spec.include,
-            include_regex: named("include_regex", spec.include_regex)?,
+            include: if spec.all.unwrap_or(!names_an_include) {
+                Include::All
+            } else {
+                Include::Named {
+                    exact: spec.include,
+                    regex: include_regex,
+                }
+            },
             exclude: spec.exclude,
             exclude_regex: named("exclude_regex", spec.exclude_regex)?,
             exclude_trigger_topic: spec.exclude_trigger_topic,
@@ -108,6 +142,27 @@ impl ChannelSelection {
     /// own exclusions, so an operator can name a wide include and carve one
     /// topic back out of it. The two fixed rules are tested first: they are not
     /// exclusions an include can outrank.
+    ///
+    /// ```
+    /// use clip::ChannelSelection;
+    /// use clip::select::Spec;
+    ///
+    /// // No configuration at all takes every topic but the announcement.
+    /// let every = ChannelSelection::default();
+    /// assert!(every.selects("/imu/data"));
+    /// assert!(!every.selects("/events/momentedge/recorded"));
+    ///
+    /// // An exclusion outranks the include that selected the topic.
+    /// let carved = ChannelSelection::try_from(Spec {
+    ///     include_regex: Some("^/camera/".to_string()),
+    ///     exclude: vec!["/camera/depth".to_string()],
+    ///     ..Spec::default()
+    /// })?;
+    /// assert!(carved.selects("/camera/image_raw"));
+    /// assert!(!carved.selects("/camera/depth"));
+    /// assert!(!carved.selects("/imu/data"), "an include narrows to itself");
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
     #[must_use]
     pub fn selects(&self, topic: &str) -> bool {
         if topic == ANNOUNCE_TOPIC {
@@ -126,12 +181,7 @@ impl ChannelSelection {
         {
             return false;
         }
-        self.all
-            || self.include.iter().any(|t| t == topic)
-            || self
-                .include_regex
-                .as_ref()
-                .is_some_and(|re| re.is_match(topic))
+        self.include.takes(topic)
     }
 
     /// Whether this selection can refuse anything at all — false only for the
@@ -141,7 +191,7 @@ impl ChannelSelection {
     /// nothing to say about it.
     #[must_use]
     pub fn is_narrowing(&self) -> bool {
-        !self.all
+        !matches!(self.include, Include::All)
             || self.exclude_trigger_topic
             || !self.exclude.is_empty()
             || self.exclude_regex.is_some()
@@ -311,6 +361,17 @@ mod tests {
                 ..Spec::default()
             })
             .is_err()
+        );
+        assert!(
+            ChannelSelection::try_from(Spec {
+                all: Some(true),
+                include_regex: Some("(".to_string()),
+                ..Spec::default()
+            })
+            .is_err(),
+            "a pattern the regex crate will not take is a fault in the \
+             configuration, so it is reported even where the resolved selection \
+             would never have consulted it"
         );
     }
 }

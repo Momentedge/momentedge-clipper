@@ -10,8 +10,8 @@
 //! inspected is the one stamp the window lives on.
 //!
 //! The two conditions are asked at the two places they can be: the window on
-//! every message ([`ClipWriter::copy_message`]), and the selection once per
-//! channel ([`ClipWriter::route`]) — the same step that registers a channel in
+//! every message (`ClipWriter::copy_message`), and the selection once per
+//! channel (`ClipWriter::route`) — the same step that registers a channel in
 //! the output, so an excluded topic contributes to a clip neither a channel, nor
 //! a schema, nor a message, nor a manifest key.
 //!
@@ -70,7 +70,7 @@ use crate::select::ChannelSelection;
 #[derive(Debug, thiserror::Error)]
 pub enum FramingDesync {
     /// A length prefix no valid record can carry (past
-    /// [`MAX_RECORD_LEN`](crate::index::MAX_RECORD_LEN)), or one whose record
+    /// [`MAX_RECORD_LEN`]), or one whose record
     /// would run past the extent the scan closed around it.
     #[error(
         "record at extent offset {offset} declares {declared} B; \
@@ -274,6 +274,38 @@ pub fn extract_clip(
     )?)
 }
 
+/// Log what each published clip of one window holds.
+///
+/// A window straddling a rollover publishes one clip per contributing recording,
+/// so this runs over however many the cut produced. Damage the cut worked around
+/// is warned about per clip rather than summed: a clip is missing data or it is
+/// not, and an operator reading one clip's line should see what *that* clip is
+/// missing.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "a log line's MiB figure; the loss starts past 8 PiB in one clip"
+)]
+pub fn report_clips(clips: &[ClipStats]) {
+    for stats in clips {
+        info!(
+            "clip {} written: {} msgs from {} extents, {:.1} MiB",
+            stats.out_path.display(),
+            stats.messages_copied,
+            stats.extents_read,
+            stats.bytes_copied as f64 / 1_048_576.0,
+        );
+        if stats.records_skipped > 0 || stats.chunks_dropped > 0 {
+            warn!(
+                "clip {} is missing data over damage in the recording: \
+                 {} records skipped, {} chunks dropped",
+                stats.out_path.display(),
+                stats.records_skipped,
+                stats.chunks_dropped,
+            );
+        }
+    }
+}
+
 /// Stage one: assemble the clip in the capturing directory under
 /// `out_path`'s parent, fsync the file, and return it for publication. The
 /// final directory is never touched here, so an observer of it never sees the
@@ -281,6 +313,15 @@ pub fn extract_clip(
 /// capturing directory only. `out_path`'s file name is carried as the desired
 /// final name; the capturing file may take a `_<n>` suffix to avoid an
 /// in-flight collision with a concurrent stage, independent of the final name.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the window (`plan`, `request`, `planned`), where it goes \
+              (`out_path`), and the two properties of the output rather than of \
+              the window (`compression`, `selection`). The last pair is the one \
+              grouping worth taking — both are fixed for a staging pool's \
+              lifetime — and beads clipper-9kb tracks it, since it moves a public \
+              signature and every call site in three crates"
+)]
 pub fn stage_clip(
     plan: &WindowPlan,
     out_path: &Path,
@@ -373,6 +414,12 @@ pub fn publish_clip(mut staged: StagedClip) -> Result<ClipStats> {
 /// The manifest goes in between the last copied message and `finish`, which is
 /// what puts it in the summary's metadata index and the statistics' metadata
 /// count: writing it any earlier would have to guess the counters it reports.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the same six [`stage_clip`] takes, one call deep: this is where they \
+              are used rather than a second place they are chosen. Grouping them \
+              is beads clipper-9kb"
+)]
 fn copy_window(
     plan: &WindowPlan,
     out_file: File,
@@ -605,27 +652,8 @@ impl ClipWriter<'_> {
     /// say which of the chunk's bytes are damaged, so the whole chunk is
     /// dropped with an error log and counted. Output-side errors stay fatal.
     fn copy_chunk(&mut self, body: &[u8], at: usize) -> Result<()> {
-        let (start_ns, end_ns, time_source) = (
-            self.request.start_ns(),
-            self.request.end_ns(),
-            self.request.time_source(),
-        );
         let mut pending: Vec<(mcap::records::MessageHeader, Vec<u8>)> = Vec::new();
-        let salvage = (|| -> mcap::McapResult<()> {
-            let Record::Chunk { header, data } = mcap::parse_record(op::CHUNK, body)? else {
-                unreachable!("a CHUNK opcode parses to Record::Chunk");
-            };
-            for rec in mcap::read::ChunkReader::new(header, &data)? {
-                if let Record::Message { header, data } = rec? {
-                    let stamp = message_stamp(&header, time_source);
-                    if stamp >= start_ns && stamp <= end_ns {
-                        pending.push((header, data.into_owned()));
-                    }
-                }
-            }
-            Ok(())
-        })();
-        match salvage {
+        match Self::salvage_chunk(body, self.request, &mut pending) {
             Ok(()) => {
                 for (header, data) in pending {
                     self.copy_message(&header, &data)?;
@@ -634,6 +662,39 @@ impl ClipWriter<'_> {
             Err(e) => {
                 error!("dropping chunk at extent offset {at}: {e}");
                 self.stats.chunks_dropped += 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// Buffer every message in `body`'s chunk that falls inside `request`'s
+    /// window, on `request`'s own time source.
+    ///
+    /// An `Err` means the chunk could not be read whole — decompression, the
+    /// chunk CRC verified at the end of iteration, or an interior record — and
+    /// `pending` then holds whatever was collected before the failure. Making
+    /// that all-or-nothing is [`Self::copy_chunk`]'s: it drops the buffer
+    /// instead of copying it.
+    fn salvage_chunk(
+        body: &[u8],
+        request: &CutRequest,
+        pending: &mut Vec<(mcap::records::MessageHeader, Vec<u8>)>,
+    ) -> mcap::McapResult<()> {
+        let (start_ns, end_ns, time_source) =
+            (request.start_ns(), request.end_ns(), request.time_source());
+        let Record::Chunk { header, data } = mcap::parse_record(op::CHUNK, body)? else {
+            unreachable!("a CHUNK opcode parses to Record::Chunk");
+        };
+        for rec in mcap::read::ChunkReader::new(header, &data)? {
+            // Only messages are copied out of a chunk; the schema and channel
+            // records inside it were registered from the recording's own index
+            // before the copy began.
+            let Record::Message { header, data } = rec? else {
+                continue;
+            };
+            let stamp = message_stamp(&header, time_source);
+            if stamp >= start_ns && stamp <= end_ns {
+                pending.push((header, data.into_owned()));
             }
         }
         Ok(())
@@ -792,9 +853,13 @@ mod tests {
         clippy::assert_is_empty,
         clippy::items_after_statements,
         clippy::cast_possible_truncation,
+        clippy::cognitive_complexity,
         reason = "a failed unwrap or a panicking index is a failing test, and \
                   `assert!(x.is_empty())` names the claim better than the \
-                  empty-array `assert_eq!` the lint asks for"
+                  empty-array `assert_eq!` the lint asks for, \
+                  and a test that builds a fixture, drives it and asserts on the \
+                  whole result is long, nested and argument-heavy by \
+                  construction — splitting one would scatter the case it states"
     )]
 
     use std::collections::BTreeMap;

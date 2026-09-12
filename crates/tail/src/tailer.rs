@@ -88,9 +88,13 @@ pub(crate) const MAX_SCAN_FAULTS: u32 = 5;
 /// from [`DISCOVER_POLL`] (200, 400, 800, 1600 ms) up to this cap, so the
 /// `MAX_SCAN_FAULTS` retries span roughly three seconds before exhaustion —
 /// long enough to ride out a brief hiccup, short enough that a genuinely stuck
-/// file is escalated promptly. The backoff is slept in `DISCOVER_POLL`
-/// increments so a recorder restart (the file replaced) is noticed within one
-/// increment and treated as recovery.
+/// file is escalated promptly.
+///
+/// Each backoff is one uninterrupted sleep, so a recorder restart that lands
+/// mid-backoff is noticed on the pass after it rather than at once: recovery can
+/// lag the replacement by up to this cap. Sleeping in [`DISCOVER_POLL`]
+/// increments and re-checking for replacement between them is beads
+/// `clipper-i6h`.
 pub(crate) const SCAN_BACKOFF_CAP: Duration = Duration::from_millis(3200);
 
 /// How far the recordings provably reach on each time source: the highest
@@ -356,6 +360,16 @@ impl Tailer {
         )
     }
 
+    /// The collection-wide coverage watch a handler waits on before cutting.
+    ///
+    /// The same watch [`Tailer::new`] hands back beside the tailer — a handler
+    /// that already holds the tailer needs no second handle, and cannot be given
+    /// one belonging to a different collection.
+    #[must_use]
+    pub fn coverage(&self) -> &Watch<Coverage> {
+        &self.coverage
+    }
+
     /// Tail forever: follow the directory's recordings as a time-ordered
     /// collection, scanning each in turn and recovering across rollovers.
     /// Blocking — run on its own thread.
@@ -412,20 +426,7 @@ impl Tailer {
 
             // 2. Prune aged-out recordings (every poll, not only at rollover) —
             //    bounds open fds and index memory even when the recorder idles.
-            let floor = now_ns().saturating_sub(watch_ns);
-            #[expect(
-                clippy::unwrap_used,
-                reason = "a poisoned state lock means the tail thread panicked mid-update, so the recording collection is torn; propagating is the policy"
-            )]
-            for path in self.state.lock().unwrap().prune(floor) {
-                info!("retention: forgetting {}", path.display());
-                if delete_old_files {
-                    match std::fs::remove_file(&path) {
-                        Ok(()) => info!("retention: deleted {}", path.display()),
-                        Err(e) => warn!("retention: deleting {}: {e}", path.display()),
-                    }
-                }
-            }
+            self.prune_aged_out(now_ns().saturating_sub(watch_ns), delete_old_files);
 
             // 3. Scan the current recording, if one is in flight.
             let Some(id) = self.current_id() else {
@@ -441,16 +442,7 @@ impl Tailer {
                 PollOutcome::NotReady => std::thread::sleep(TAIL_POLL),
                 PollOutcome::Faulted(fault) => {
                     faults += 1;
-                    if faults >= MAX_SCAN_FAULTS {
-                        return Err(fault).with_context(|| {
-                            format!("scan faulted on {faults} consecutive passes; giving up")
-                        });
-                    }
-                    let backoff = backoff_for(faults);
-                    warn!(
-                        "scan faulted ({fault:#}); retry {faults}/{MAX_SCAN_FAULTS} after {backoff:?}"
-                    );
-                    std::thread::sleep(backoff);
+                    std::thread::sleep(backoff_after_fault(fault, faults)?);
                 }
             }
         }
@@ -497,61 +489,106 @@ impl Tailer {
         self.state.lock().unwrap().mark_ended_and_advance(id);
     }
 
+    /// Everything a poll reads off the collection, taken under one lock so the
+    /// scan that follows holds none.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "a poisoned state lock means the tail thread panicked mid-update, so the recording collection is torn; propagating is the policy"
+    )]
+    fn poll_target(&self, id: RecordingId) -> PollTarget {
+        let st = self.state.lock().unwrap();
+        #[expect(
+            clippy::expect_used,
+            reason = "`id` came from `current_id()` on this same thread, and the \
+                      tail thread is the only writer of the collection — `prune` \
+                      refuses to drop the `current` recording, and \
+                      `mark_ended_and_advance` only ever moves `current` onto \
+                      another indexed one"
+        )]
+        let r = st.recording(id).expect("current id is in the collection");
+        PollTarget {
+            path: r.index.path.clone(),
+            file: r.index.file.clone(),
+            offset: r.index.offset,
+            magic_ok: r.index.magic_ok,
+        }
+    }
+
+    /// Forget every recording whose newest message is older than `floor`, and
+    /// delete the file too when the recorder owns it.
+    ///
+    /// Deleting is best-effort and never fatal: a file the recorder may not
+    /// unlink is warned about and left where it is, while the collection has
+    /// already stopped holding it open.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "a poisoned state lock means the tail thread panicked mid-update, so the recording collection is torn; propagating is the policy"
+    )]
+    fn prune_aged_out(&self, floor: u64, delete_old_files: bool) {
+        for path in self.state.lock().unwrap().prune(floor) {
+            info!("retention: forgetting {}", path.display());
+            if !delete_old_files {
+                continue;
+            }
+            match std::fs::remove_file(&path) {
+                Ok(()) => info!("retention: deleted {}", path.display()),
+                Err(e) => warn!("retention: deleting {}: {e}", path.display()),
+            }
+        }
+    }
+
+    /// First contact with a recording: the writer may not have flushed the 8
+    /// magic bytes yet, so a file too short to validate is waited on rather than
+    /// refused — unless it vanished before it ever became a valid MCAP, which
+    /// retires it.
+    ///
+    /// On success the recording is marked as being tailed and its scan offset
+    /// moved past the magic, so the caller scans the body and nothing re-reads
+    /// the header.
+    fn verify_magic(&self, id: RecordingId, path: &Path, file: &File) -> Result<MagicCheck> {
+        if file_len(file)? < MAGIC.len() as u64 {
+            if inode_changed(path, file)? {
+                self.end_current(id);
+                return Ok(MagicCheck::Stop(PollOutcome::Ended));
+            }
+            return Ok(MagicCheck::Stop(PollOutcome::NotReady));
+        }
+        let mut magic = [0u8; 8];
+        file.read_exact_at(&mut magic, 0)?;
+        if magic != MAGIC {
+            bail!("{} is not an MCAP file", path.display());
+        }
+        let offset = MAGIC.len() as u64;
+        #[expect(
+            clippy::unwrap_used,
+            reason = "a poisoned state lock means the tail thread panicked mid-update, so the recording collection is torn; propagating is the policy"
+        )]
+        let mut st = self.state.lock().unwrap();
+        if let Some(r) = st.recording_mut(id) {
+            r.index.offset = offset;
+            r.index.magic_ok = true;
+        }
+        st.mark_tailing(id);
+        info!("tailing {}", path.display());
+        Ok(MagicCheck::Ready(offset))
+    }
+
     /// One scan poll of the `current` recording: verify its magic on first
     /// contact, scan the bytes added since the last pass (applying them to its
     /// index and refreshing coverage), then decide whether it has finished.
     fn poll_current(&self, id: RecordingId) -> Result<PollOutcome> {
-        let (path, file, mut offset, magic_ok) = {
-            #[expect(
-                clippy::unwrap_used,
-                reason = "a poisoned state lock means the tail thread panicked mid-update, so the recording collection is torn; propagating is the policy"
-            )]
-            let st = self.state.lock().unwrap();
-            #[expect(
-                clippy::expect_used,
-                reason = "`id` came from `current_id()` on this same thread, and the \
-                          tail thread is the only writer of the collection — \
-                          `prune` refuses to drop the `current` recording, and \
-                          `mark_ended_and_advance` only ever moves `current` onto \
-                          another indexed one"
-            )]
-            let r = st.recording(id).expect("current id is in the collection");
-            (
-                r.index.path.clone(),
-                r.index.file.clone(),
-                r.index.offset,
-                r.index.magic_ok,
-            )
-        };
+        let PollTarget {
+            path,
+            file,
+            mut offset,
+            magic_ok,
+        } = self.poll_target(id);
 
-        // First contact: the writer may not have flushed the 8 magic bytes yet.
         if !magic_ok {
-            if file_len(&file)? < MAGIC.len() as u64 {
-                // Too short to validate. If it vanished before it ever became a
-                // valid MCAP, retire it; otherwise wait for the magic.
-                if inode_changed(&path, &file)? {
-                    self.end_current(id);
-                    return Ok(PollOutcome::Ended);
-                }
-                return Ok(PollOutcome::NotReady);
+            match self.verify_magic(id, &path, &file)? {
+                MagicCheck::Ready(at) => offset = at,
+                MagicCheck::Stop(outcome) => return Ok(outcome),
             }
-            let mut magic = [0u8; 8];
-            file.read_exact_at(&mut magic, 0)?;
-            if magic != MAGIC {
-                bail!("{} is not an MCAP file", path.display());
-            }
-            offset = MAGIC.len() as u64;
-            #[expect(
-                clippy::unwrap_used,
-                reason = "a poisoned state lock means the tail thread panicked mid-update, so the recording collection is torn; propagating is the policy"
-            )]
-            let mut st = self.state.lock().unwrap();
-            if let Some(r) = st.recording_mut(id) {
-                r.index.offset = offset;
-                r.index.magic_ok = true;
-            }
-            st.mark_tailing(id);
-            info!("tailing {}", path.display());
         }
 
         // Incremental scan to the current EOF; applies the delta to `current`
@@ -582,14 +619,19 @@ impl Tailer {
             reason = "a poisoned state lock means the tail thread panicked mid-update, so the recording collection is torn; propagating is the policy"
         )]
         let has_successor = self.state.lock().unwrap().has_successor(id);
-        if progress.ended || inode_dead || (has_successor && !made_progress) {
-            let why = if progress.ended {
-                "footer on disk"
-            } else if inode_dead {
-                "inode vanished/replaced"
-            } else {
-                "successor present, length stable"
-            };
+        // Three independent signals, read in priority order; the string is the
+        // reason an operator gets in the log, which is the only place they are
+        // told apart.
+        let ended = if progress.ended {
+            Some("footer on disk")
+        } else if inode_dead {
+            Some("inode vanished/replaced")
+        } else if has_successor && !made_progress {
+            Some("successor present, length stable")
+        } else {
+            None
+        };
+        if let Some(why) = ended {
             info!("recording {} ended ({why})", path.display());
             self.end_current(id);
             return Ok(PollOutcome::Ended);
@@ -739,6 +781,42 @@ impl WindowPlanner for Tailer {
     }
 }
 
+/// What one poll of the `current` recording reads off the collection: where the
+/// recording is, the handle the scan reads through, the offset the last pass
+/// left, and whether its 8-byte magic has been validated yet.
+#[derive(Debug)]
+struct PollTarget {
+    path: PathBuf,
+    file: Arc<File>,
+    offset: u64,
+    magic_ok: bool,
+}
+
+/// What a first-contact magic check leaves the poll to do.
+#[derive(Debug)]
+enum MagicCheck {
+    /// The magic is on disk; scan the recording from this offset.
+    Ready(u64),
+    /// There is nothing to scan this pass; the poll returns this outcome
+    /// unchanged.
+    Stop(PollOutcome),
+}
+
+/// How long to wait after a faulted scan pass, or the error that ends the tail.
+///
+/// The budget counts *consecutive* passes: `MAX_SCAN_FAULTS` in a row means the
+/// recording is not going to come back, and the recorder says so rather than
+/// retrying forever. Any successful pass resets the count at the call site.
+fn backoff_after_fault(fault: anyhow::Error, faults: u32) -> Result<Duration> {
+    if faults >= MAX_SCAN_FAULTS {
+        return Err(fault)
+            .with_context(|| format!("scan faulted on {faults} consecutive passes; giving up"));
+    }
+    let backoff = backoff_for(faults);
+    warn!("scan faulted ({fault:#}); retry {faults}/{MAX_SCAN_FAULTS} after {backoff:?}");
+    Ok(backoff)
+}
+
 /// The outcome of one [`Tailer::poll_current`] scan pass, telling [`Tailer::run`]
 /// how to pace the next iteration and how to count faults.
 #[derive(Debug)]
@@ -807,7 +885,11 @@ pub(crate) mod tests {
         clippy::unwrap_used,
         clippy::expect_used,
         clippy::indexing_slicing,
-        reason = "a failed unwrap or a panicking index is a failing test"
+        clippy::excessive_nesting,
+        reason = "a failed unwrap or a panicking index is a failing test, \
+                  and a test that builds a fixture, drives it and asserts on the \
+                  whole result is long, nested and argument-heavy by \
+                  construction — splitting one would scatter the case it states"
     )]
 
     use std::time::SystemTime;

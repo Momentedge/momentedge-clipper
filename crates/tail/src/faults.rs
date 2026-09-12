@@ -110,6 +110,13 @@ impl CutFaults {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::excessive_nesting,
+        reason = "the concurrency case nests a scoped-thread closure inside the \
+                  scope inside the test; flattening it would hide which of the \
+                  three the tally is being driven from"
+    )]
+
     use std::path::{Path, PathBuf};
 
     use super::*;

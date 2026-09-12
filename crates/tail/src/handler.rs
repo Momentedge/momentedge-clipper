@@ -19,7 +19,7 @@
 //! One consequence of being the live path shows up on the way out rather than on
 //! the way in: the same recording is cut from again and again, so a fault that
 //! belongs to the *recording* rather than to the window repeats for every
-//! trigger. [`report_refusal`] is where that repetition is turned into a signal
+//! trigger. `report_refusal` is where that repetition is turned into a signal
 //! — announced in full the first time it costs a clip, counted every time after
 //! — against the [`CutFaults`] tally the recorder shares between handlers.
 
@@ -38,8 +38,7 @@ use crossbeam_channel::Sender;
 use log::{error, info, warn};
 
 use crate::faults::CutFaults;
-use crate::tailer::{Coverage, Tailer};
-use crate::watch::Watch;
+use crate::tailer::Tailer;
 
 /// Run one trigger's wait-then-stage-then-announce flow. A window that stays in
 /// one recording yields one clip; one that straddles a rollover yields one
@@ -63,12 +62,12 @@ use crate::watch::Watch;
 /// manifest names as having cut it; the driver supplies it because only the
 /// binary knows which of its subcommands is running. `faults` is the
 /// recorder-wide tally of clips refused because a recording's bytes changed
-/// under the tail, shared by every handler so [`report_refusal`] announces that
+/// under the tail, shared by every handler so `report_refusal` announces that
 /// once per recording rather than once per trigger.
 #[expect(
     clippy::too_many_arguments,
     reason = "the arguments are the recorder's cohesive per-trigger inputs — the \
-              resolved anchor, the neutral trigger, the shared tail/coverage/staging \
+              resolved anchor, the neutral trigger, the shared tail and staging \
               handles, the announcer, and the settings the seam unpacks. Bundling \
               them into a struct purely to satisfy the argument-count heuristic \
               would add indirection without making the seam clearer"
@@ -85,7 +84,6 @@ pub fn handle_trigger<A: Announce>(
     out_dir: &Path,
     grace: Duration,
     tailer: Arc<Tailer>,
-    coverage: Arc<Watch<Coverage>>,
     extract_tx: Sender<StageJob>,
     faults: Arc<CutFaults>,
     announce: A,
@@ -114,40 +112,14 @@ pub fn handle_trigger<A: Announce>(
         "{anchor_ns}_{}.mcap",
         segment::sanitize(&trig.name)
     ));
-    let segments = record_clip(
-        &tailer,
-        &request,
-        &base_out_path,
-        &coverage,
-        grace,
-        &extract_tx,
-    )
-    .map_err(|e| report_refusal(&faults, e))?;
+    let segments = record_clip(&tailer, &request, &base_out_path, grace, &extract_tx)
+        .map_err(|e| report_refusal(&faults, e))?;
 
-    let mut filenames = Vec::with_capacity(segments.len());
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "a log line's MiB figure; the loss starts past 8 PiB in one clip"
-    )]
-    for stats in &segments {
-        info!(
-            "clip {} written: {} msgs from {} extents, {:.1} MiB",
-            stats.out_path.display(),
-            stats.messages_copied,
-            stats.extents_read,
-            stats.bytes_copied as f64 / 1_048_576.0,
-        );
-        if stats.records_skipped > 0 || stats.chunks_dropped > 0 {
-            warn!(
-                "clip {} is missing data over damage in the recording: \
-                 {} records skipped, {} chunks dropped",
-                stats.out_path.display(),
-                stats.records_skipped,
-                stats.chunks_dropped,
-            );
-        }
-        filenames.push(stats.out_path.to_string_lossy().into_owned());
-    }
+    clip::cut::report_clips(&segments);
+    let filenames: Vec<String> = segments
+        .iter()
+        .map(|stats| stats.out_path.to_string_lossy().into_owned())
+        .collect();
     if segments.len() > 1 {
         info!(
             "trigger name={:?} spanned a rollover into {} segments: {filenames:?}",
@@ -234,10 +206,12 @@ fn record_clip(
     tailer: &Arc<Tailer>,
     request: &Arc<CutRequest>,
     base_out_path: &Path,
-    coverage: &Watch<Coverage>,
     grace: Duration,
     extract_tx: &Sender<StageJob>,
 ) -> anyhow::Result<Vec<clip::cut::ClipStats>> {
+    // The watch the tailer itself feeds, so the wait cannot be pointed at a
+    // different collection's coverage than the plan is taken from.
+    let coverage = tailer.coverage();
     let (end_ns, time_source) = (request.end_ns(), request.time_source());
 
     // 1. Postroll wall floor: never cut before the wall clock passes the window
@@ -290,9 +264,13 @@ mod tests {
         clippy::expect_used,
         clippy::indexing_slicing,
         clippy::assert_is_empty,
+        clippy::too_many_arguments,
         reason = "a failed unwrap or a panicking index is a failing test, and \
                   `assert!(x.is_empty())` names the claim better than the \
-                  empty-array `assert_eq!` the lint asks for"
+                  empty-array `assert_eq!` the lint asks for, \
+                  and a test that builds a fixture, drives it and asserts on the \
+                  whole result is long, nested and argument-heavy by \
+                  construction — splitting one would scatter the case it states"
     )]
 
     use clip::ChannelSelection;
@@ -321,7 +299,7 @@ mod tests {
     #[test]
     fn record_clip_grace_timeout_cuts_what_is_on_disk() -> anyhow::Result<()> {
         let root = test_dir("grace")?;
-        let (tailer, coverage) = Tailer::new();
+        let (tailer, _) = Tailer::new();
         let extract_tx =
             segment::spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
 
@@ -333,7 +311,6 @@ mod tests {
             &tailer,
             &window((0, 1_000), TimeSource::Log),
             &root.join("clip.mcap"),
-            &coverage,
             Duration::from_millis(50),
             &extract_tx,
         )?;
@@ -360,7 +337,7 @@ mod tests {
         let rec = root.join("rec.mcap");
         write_recording(&rec, false, &[("/t", 100), ("/t", 900)])?;
 
-        let (tailer, coverage) = Tailer::new();
+        let (tailer, _) = Tailer::new();
         let file = Arc::new(std::fs::File::open(&rec)?);
         tailer.attach(file.clone());
         scan_to_end(&tailer, &file, 8)?;
@@ -373,7 +350,6 @@ mod tests {
                 &tailer,
                 &window((100, 900), TimeSource::Log),
                 &base,
-                &coverage,
                 Duration::from_secs(10),
                 &extract_tx,
             )
@@ -399,7 +375,7 @@ mod tests {
         // The tail discovers and scans the recording a little later, as a
         // live tail would; record_clip must block on the coverage watch until
         // a message at/after the window end (1_000) is on disk.
-        let (tailer, coverage) = Tailer::new();
+        let (tailer, _) = Tailer::new();
         let scanner = tailer.clone();
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(50));
@@ -414,7 +390,6 @@ mod tests {
             &tailer,
             &window((100, 1_000), TimeSource::Log),
             &root.join("clip.mcap"),
-            &coverage,
             Duration::from_secs(10),
             &extract_tx,
         )?;
@@ -439,7 +414,7 @@ mod tests {
         // is already satisfied — only the wall-clock wait holds the cut back.
         write_recording(&rec, false, &[("/t", now), ("/t", now + 300_000_000)])?;
 
-        let (tailer, coverage) = Tailer::new();
+        let (tailer, _) = Tailer::new();
         let file = Arc::new(std::fs::File::open(&rec)?);
         tailer.attach(file.clone());
         scan_to_end(&tailer, &file, 8)?;
@@ -452,7 +427,6 @@ mod tests {
             &tailer,
             &window((now.saturating_sub(1_000_000_000), end_ns), TimeSource::Log),
             &root.join("clip.mcap"),
-            &coverage,
             Duration::from_secs(10),
             &extract_tx,
         )?;
@@ -478,7 +452,7 @@ mod tests {
         // the window end: there is no ended short-circuit, so the coverage wait
         // runs out the (short) grace and then cuts what is on disk. The grace is
         // the only bound — the postroll floor is already in the past here.
-        let (tailer, coverage) = Tailer::new();
+        let (tailer, _) = Tailer::new();
         let file = Arc::new(std::fs::File::open(&rec)?);
         tailer.attach(file.clone());
         scan_to_end(&tailer, &file, 8)?;
@@ -491,7 +465,6 @@ mod tests {
             &tailer,
             &window((50, 1_000_000), TimeSource::Log),
             &root.join("clip.mcap"),
-            &coverage,
             grace,
             &extract_tx,
         )?;
@@ -533,7 +506,6 @@ mod tests {
             &tailer,
             &window((0, 1_000), TimeSource::Log),
             &root.join("clip.mcap"),
-            &coverage,
             Duration::from_secs(30),
             &extract_tx,
         )?;
@@ -576,7 +548,7 @@ mod tests {
         write_recording(&rec, false, &[("/t", 100), ("/t", 900), ("/t", 2_000)])?;
 
         clip::cut::reset_capturing_dir(&out_dir)?;
-        let (tailer, coverage) = Tailer::new();
+        let (tailer, _) = Tailer::new();
         let file = Arc::new(std::fs::File::open(&rec)?);
         tailer.attach(file.clone());
         scan_to_end(&tailer, &file, 8)?;
@@ -605,7 +577,6 @@ mod tests {
             &out_dir,
             Duration::from_secs(5),
             tailer,
-            coverage,
             extract_tx,
             Arc::new(CutFaults::new()),
             announcer,
@@ -651,7 +622,7 @@ mod tests {
         write_recording(&split1, false, &[("/t", 5_000), ("/t", 6_000)])?;
 
         clip::cut::reset_capturing_dir(&out_dir)?;
-        let (tailer, coverage) = Tailer::new();
+        let (tailer, _) = Tailer::new();
         tailer.index_recording(&split0);
         tailer.index_recording(&split1);
         drain(&tailer)?;
@@ -681,7 +652,6 @@ mod tests {
             &out_dir,
             Duration::from_secs(5),
             tailer,
-            coverage,
             extract_tx,
             Arc::new(CutFaults::new()),
             announcer,
@@ -749,7 +719,6 @@ mod tests {
             &tailer,
             &window((900, 1_500), TimeSource::Publish),
             &root.join("clip.mcap"),
-            &coverage,
             Duration::from_secs(10),
             &extract_tx,
         )?;
@@ -779,7 +748,7 @@ mod tests {
         let rec = root.join("rec.mcap");
         write_recording(&rec, false, &[("/t", 100), ("/t", 200)])?;
 
-        let (tailer, coverage) = Tailer::new();
+        let (tailer, _) = Tailer::new();
         let file = Arc::new(std::fs::File::open(&rec)?);
         tailer.attach(file.clone());
         scan_to_end(&tailer, &file, 8)?;
@@ -796,7 +765,6 @@ mod tests {
             &tailer,
             &window((0, 200), TimeSource::Log),
             &root.join("covered.mcap"),
-            &coverage,
             Duration::from_secs(10),
             &extract_tx,
         )?;
@@ -810,7 +778,6 @@ mod tests {
             &tailer,
             &window((0, 1_000_000), TimeSource::Log),
             &root.join("short.mcap"),
-            &coverage,
             Duration::from_millis(100),
             &extract_tx,
         )?;
@@ -832,8 +799,8 @@ mod tests {
         root: &Path,
         recordings: &[(&str, &[(&str, u64)])],
         desync: (&str, usize),
-    ) -> anyhow::Result<(Arc<Tailer>, Arc<Watch<Coverage>>)> {
-        let (tailer, coverage) = Tailer::new();
+    ) -> anyhow::Result<Arc<Tailer>> {
+        let (tailer, _) = Tailer::new();
         for (name, stamps) in recordings {
             let path = root.join(name);
             write_recording(&path, false, stamps)?;
@@ -841,7 +808,7 @@ mod tests {
         }
         drain(&tailer)?;
         desync_record_framing(&root.join(desync.0), desync.1)?;
-        Ok((tailer, coverage))
+        Ok(tailer)
     }
 
     /// A window over the damaged recording of [`damaged_recording`], and one
@@ -853,7 +820,6 @@ mod tests {
     /// entry point, returning what the handler made of it.
     fn fire(
         tailer: &Arc<Tailer>,
-        coverage: &Arc<Watch<Coverage>>,
         extract_tx: &Sender<StageJob>,
         faults: &Arc<CutFaults>,
         out_dir: &Path,
@@ -874,7 +840,6 @@ mod tests {
             out_dir,
             Duration::from_millis(100),
             tailer.clone(),
-            coverage.clone(),
             extract_tx.clone(),
             faults.clone(),
             CapturingAnnouncer(Arc::new(std::sync::Mutex::new(Vec::new()))),
@@ -895,7 +860,7 @@ mod tests {
         let root = test_dir("refusal-count")?;
         let out_dir = root.join("out");
         clip::cut::reset_capturing_dir(&out_dir)?;
-        let (tailer, coverage) = damaged_recording(
+        let tailer = damaged_recording(
             &root,
             &[("rec.mcap", &[("/t", 100), ("/t", 200), ("/t", 300)])],
             ("rec.mcap", 1),
@@ -907,7 +872,6 @@ mod tests {
         for expected in 1..=3u64 {
             let err = fire(
                 &tailer,
-                &coverage,
                 &extract_tx,
                 &faults,
                 &out_dir,
@@ -951,7 +915,7 @@ mod tests {
         clip::cut::reset_capturing_dir(&out_dir)?;
         // Two recordings: one clean, one damaged, disjoint in time so each
         // window plans exactly one of them.
-        let (tailer, coverage) = damaged_recording(
+        let tailer = damaged_recording(
             &root,
             &[
                 ("clean.mcap", &[("/t", 100), ("/t", 200)]),
@@ -967,7 +931,6 @@ mod tests {
         let faults = Arc::new(CutFaults::new());
         let err = fire(
             &tailer,
-            &coverage,
             &extract_tx,
             &faults,
             &out_dir,
@@ -979,7 +942,6 @@ mod tests {
 
         fire(
             &tailer,
-            &coverage,
             &extract_tx,
             &faults,
             &out_dir,
@@ -990,7 +952,6 @@ mod tests {
 
         let err = fire(
             &tailer,
-            &coverage,
             &extract_tx,
             &faults,
             &out_dir,
@@ -1054,7 +1015,7 @@ mod tests {
         write_recording(&rec, false, &[("/t", 100), ("/t", 900), ("/t", 2_000)])?;
 
         clip::cut::reset_capturing_dir(&out_dir)?;
-        let (tailer, coverage) = Tailer::new();
+        let (tailer, _) = Tailer::new();
         let file = Arc::new(std::fs::File::open(&rec)?);
         tailer.attach(file.clone());
         scan_to_end(&tailer, &file, 8)?;
@@ -1079,7 +1040,6 @@ mod tests {
             &out_dir,
             Duration::from_secs(5),
             tailer,
-            coverage,
             extract_tx,
             Arc::new(CutFaults::new()),
             CapturingAnnouncer(captured.clone()),

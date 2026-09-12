@@ -58,6 +58,29 @@ impl Stamp {
     /// `use_sim_time`); negative seconds clamp to 0. The same arithmetic the
     /// ROS path applies to a `builtin_interfaces/Time`, so a CDR-decoded trigger
     /// and a live ROS trigger anchor their windows identically.
+    ///
+    /// ```
+    /// use clip::Stamp;
+    ///
+    /// assert_eq!(
+    ///     Stamp {
+    ///         sec: 2,
+    ///         nanosec: 500_000_000
+    ///     }
+    ///     .ns(),
+    ///     2_500_000_000
+    /// );
+    /// // A pre-epoch stamp clamps rather than wrapping: the seconds are signed
+    /// // on the wire and the window's bounds are not.
+    /// assert_eq!(
+    ///     Stamp {
+    ///         sec: -5,
+    ///         nanosec: 7
+    ///     }
+    ///     .ns(),
+    ///     7
+    /// );
+    /// ```
     #[must_use]
     #[expect(
         clippy::cast_sign_loss,

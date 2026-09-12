@@ -13,11 +13,11 @@
 //!   no ROS node, executor, or subscription. Completion is implicit: the clip's
 //!   atomic move into `out_dir` is the signal, so its [`Announce`]r is a no-op.
 //!   Every build offers it.
-//! - [`ros::RosInterface`] subscribes to the trigger topic on a ROS node and
+//! - `ros::RosInterface` subscribes to the trigger topic on a ROS node and
 //!   publishes `Recorded` on completion. Its `run` owns the node and spawns its
 //!   own spin thread, so the driver supervises one uniform interface thread in
 //!   either mode. The `ros` cargo feature compiles it in; without the feature
-//!   the [`ros`] module does not exist and the recorder links no ROS at all.
+//!   the `ros` module does not exist and the recorder links no ROS at all.
 //!
 //! The trait is generic (not `dyn`), so the driver dispatches statically over
 //! whichever interface is active.

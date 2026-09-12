@@ -35,6 +35,7 @@
 //! matched is `files_planned>=1 short=false`.
 
 use std::collections::BTreeMap;
+use std::ops::Range;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -65,7 +66,7 @@ pub const MANIFEST_VERSION: &str = "1";
 /// clip states which binary and which mode produced it without the cut path
 /// learning anything about either. The crate version and project URL are not
 /// carried here: they are build facts of the cut path itself, taken from this
-/// crate's own manifest ([`ClipManifest::entries`]).
+/// crate's own manifest (`ClipManifest::entries`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Producer {
     /// The binary's name, as an operator invokes it (`clipper`).
@@ -123,6 +124,30 @@ pub struct CutRequest {
 impl CutRequest {
     /// The window `[anchor - preroll, anchor + postroll]` on `time_source`, as
     /// `trigger` asked for it and `producer` is about to cut it.
+    ///
+    /// ```
+    /// use clip::{CutRequest, Producer, Stamp, TimeSource, Trigger};
+    ///
+    /// let trigger = Trigger {
+    ///     name: "brake".to_string(),
+    ///     description: String::new(),
+    ///     trigger_time: Stamp { sec: 0, nanosec: 0 },
+    ///     preroll: 400,
+    ///     postroll: 600,
+    /// };
+    /// let producer = Producer {
+    ///     program: "clipper",
+    ///     mode: "tail",
+    /// };
+    ///
+    /// let request = CutRequest::new(producer, trigger.clone(), 1_000, TimeSource::Log);
+    /// assert_eq!((request.start_ns(), request.end_ns()), (600, 1_600));
+    ///
+    /// // The bounds saturate: an anchor closer to the epoch than the preroll
+    /// // clamps to 0 rather than wrapping into a window somewhere else.
+    /// let early = CutRequest::new(producer, trigger, 100, TimeSource::Log);
+    /// assert_eq!((early.start_ns(), early.end_ns()), (0, 700));
+    /// ```
     #[must_use]
     pub fn new(
         producer: Producer,
@@ -312,6 +337,26 @@ impl ClipManifest<'_> {
     }
 }
 
+/// The byte range inside a recording's buffer that a metadata index addresses,
+/// or `None` when the index points outside it.
+///
+/// Both numbers come out of the file, so both the addition and the narrowing to
+/// `usize` are checked rather than trusted: a metadata index is as forgeable as
+/// any other record, and a clip read far from where it was cut may simply be
+/// damaged. The range starts past the frame header — the opcode and the u64
+/// length prefix every record carries, which the index's offset addresses the
+/// front of — and ends where the framed record does, so a `length` shorter than
+/// that header addresses nothing and is refused with the rest.
+fn manifest_range(offset: u64, length: u64, buf_len: usize) -> Option<Range<usize>> {
+    /// The opcode and the u64 length prefix the framing puts in front of every
+    /// record, which a metadata index's offset addresses the front of.
+    const FRAME_HEADER_LEN: u64 = 1 + size_of::<u64>() as u64;
+
+    let start = usize::try_from(offset.checked_add(FRAME_HEADER_LEN)?).ok()?;
+    let end = usize::try_from(offset.checked_add(length)?).ok()?;
+    (end <= buf_len && end >= start).then_some(start..end)
+}
+
 /// The manifest a written clip carries, read back through the summary's metadata
 /// index: the record is addressed directly rather than found by walking the
 /// message section.
@@ -323,10 +368,6 @@ impl ClipManifest<'_> {
 /// MCAP from somewhere else, or one whose summary was lost. Errors are a file
 /// that will not parse at all.
 pub fn read_manifest(path: &Path) -> Result<Option<BTreeMap<String, String>>> {
-    /// The opcode and the u64 length prefix the framing puts in front of every
-    /// record, which a metadata index's offset addresses the front of.
-    const FRAME_HEADER_LEN: u64 = 1 + size_of::<u64>() as u64;
-
     let buf = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let Some(summary) = mcap::Summary::read(&buf)
         .with_context(|| format!("reading the summary of {}", path.display()))?
@@ -340,25 +381,14 @@ pub fn read_manifest(path: &Path) -> Result<Option<BTreeMap<String, String>>> {
     else {
         return Ok(None);
     };
-    // Both numbers come out of the file, so both the addition and the narrowing
-    // to `usize` are checked rather than trusted.
-    let start = index
-        .offset
-        .checked_add(FRAME_HEADER_LEN)
-        .and_then(|start| usize::try_from(start).ok())
-        .with_context(|| format!("{} indexes its manifest out of bounds", path.display()))?;
-    let end = index
-        .offset
-        .checked_add(index.length)
-        .and_then(|end| usize::try_from(end).ok())
-        .filter(|end| *end <= buf.len() && *end >= start)
+    let range = manifest_range(index.offset, index.length, buf.len())
         .with_context(|| format!("{} indexes its manifest out of bounds", path.display()))?;
     #[expect(
         clippy::indexing_slicing,
-        reason = "the `filter` above rejects any `end` past the buffer or behind \
-                  `start`, so the range is in bounds by the time it is taken"
+        reason = "`manifest_range` returns a range only when it lies inside a \
+                  buffer of the length it was given, which is this one's"
     )]
-    let body = &buf[start..end];
+    let body = &buf[range];
     let record = mcap::parse_record(op::METADATA, body)
         .with_context(|| format!("parsing the manifest of {}", path.display()))?;
     #[expect(
@@ -526,5 +556,69 @@ mod tests {
             !entries.keys().any(|k| k.starts_with("channel.")),
             "a clip that copied nothing carries no per-channel keys"
         );
+    }
+
+    /// A metadata index is as forgeable as any other record, and a clip read far
+    /// from where it was cut may simply be damaged. Every way the addressed
+    /// range can fall outside the buffer is refused, so the slice that follows
+    /// cannot panic.
+    #[test]
+    fn a_manifest_index_pointing_outside_the_file_is_refused() {
+        // The frame header is 9 bytes, so a record at offset 0 declaring 20
+        // bytes carries an 11-byte body at 9..20.
+        assert_eq!(
+            manifest_range(0, 20, 64),
+            Some(9..20),
+            "a record wholly inside the buffer addresses its own body"
+        );
+        assert_eq!(
+            manifest_range(0, 9, 64),
+            Some(9..9),
+            "a record that is all header addresses an empty body, not a fault"
+        );
+
+        assert_eq!(
+            manifest_range(0, 65, 64),
+            None,
+            "a record running past the end of the file"
+        );
+        assert_eq!(
+            manifest_range(60, 20, 64),
+            None,
+            "a record starting inside the file and ending past it"
+        );
+        assert_eq!(
+            manifest_range(0, 8, 64),
+            None,
+            "a record shorter than its own frame header, which would invert the range"
+        );
+        assert_eq!(
+            manifest_range(u64::MAX, 9, 64),
+            None,
+            "an offset whose frame header overflows the address space"
+        );
+        assert_eq!(
+            manifest_range(9, u64::MAX, 64),
+            None,
+            "a length that overflows the address space"
+        );
+    }
+
+    /// Reading a clip clipper did not write is ordinary: an MCAP from somewhere
+    /// else carries no manifest, and saying so is not an error.
+    #[test]
+    fn a_recording_without_a_manifest_reports_none() -> anyhow::Result<()> {
+        let dir = crate::testing::test_dir("manifest-absent")?;
+        let path = dir.join("rec.mcap");
+        crate::testing::write_recording(&path, false, &[("/a", 1_000)])?;
+
+        assert_eq!(
+            read_manifest(&path)?,
+            None,
+            "a finished recording with no metadata record has no manifest to report"
+        );
+
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
     }
 }

@@ -284,21 +284,7 @@ impl Layered {
             }
         }
         if let (Some(file), Some(path)) = (&run_file, run) {
-            let path = path.display();
-            for (key, value) in &file.settings {
-                // A refusal is reported and dropped, not fatal: the run is
-                // legitimate, it simply does not get to decide this key.
-                if scope_of(mode, key) == Some(Scope::SystemOnly) {
-                    let refusal = format!(
-                        "the per-run configuration file {path} may not set `{key}`; \
-                         the system configuration decides it"
-                    );
-                    warn!("{refusal}");
-                    refusals.push(refusal);
-                    continue;
-                }
-                settings.insert(key.clone(), Setting::new(value, Layer::Run));
-            }
+            refusals = apply_run_layer(&mut settings, mode, file, path);
         }
 
         // Which files were actually read, for the one error the merge can
@@ -432,6 +418,35 @@ struct TopicsFile {
     exclude_trigger_topic: Option<bool>,
 }
 
+/// Lay the per-run file's `[settings]` over the system layer, dropping every key
+/// a run is not allowed to decide under `mode` and returning one message per
+/// dropped key.
+///
+/// A refusal is reported and dropped, not fatal: the run is legitimate, it
+/// simply does not get to decide this key.
+fn apply_run_layer(
+    settings: &mut BTreeMap<String, Setting>,
+    mode: Mode,
+    file: &ParsedFile,
+    path: &Path,
+) -> Vec<String> {
+    let mut refusals = Vec::new();
+    for (key, value) in &file.settings {
+        if scope_of(mode, key) == Some(Scope::SystemOnly) {
+            let refusal = format!(
+                "the per-run configuration file {} may not set `{key}`; \
+                 the system configuration decides it",
+                path.display()
+            );
+            warn!("{refusal}");
+            refusals.push(refusal);
+            continue;
+        }
+        settings.insert(key.clone(), Setting::new(value, Layer::Run));
+    }
+    refusals
+}
+
 /// Read and validate one file. `Ok(None)` is "there is no such file", legal in
 /// every combination; `named` only decides whether that is worth a warning.
 fn read_file(path: &Path, named: bool) -> Result<Option<ParsedFile>> {
@@ -550,44 +565,48 @@ fn merge_topics(system: &TopicsFile, run: &TopicsFile) -> (Spec, Vec<(&'static s
     let effective_all = spec
         .all
         .unwrap_or(spec.include.is_empty() && spec.include_regex.is_none());
-    let report = vec![
-        ("all", Setting::new(&effective_all.to_string(), all_layer)),
-        (
-            "include",
-            Setting::new(&render_list(&spec.include), include_layer),
-        ),
-        (
-            "include_regex",
-            Setting::new(
-                &render_pattern(spec.include_regex.as_ref()),
-                include_regex_layer,
-            ),
-        ),
-        (
-            "exclude",
-            Setting::new(&render_list(&spec.exclude), exclude_layer),
-        ),
-        (
-            "exclude_regex",
-            Setting::new(
-                &render_pattern(spec.exclude_regex.as_ref()),
-                exclude_regex_layer,
-            ),
-        ),
-        (
-            "exclude_trigger_topic",
-            Setting::new(
-                &spec.exclude_trigger_topic.to_string(),
-                exclude_trigger_layer,
-            ),
-        ),
+    let layers = [
+        all_layer,
+        include_layer,
+        include_regex_layer,
+        exclude_layer,
+        exclude_regex_layer,
+        exclude_trigger_layer,
     ];
-    debug_assert_eq!(
-        report.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
-        TOPIC_KEYS,
-        "the report covers every topic key"
-    );
+    let report = topic_report(&spec, effective_all, layers);
     (spec, report)
+}
+
+/// Render one `[topics]` key per row, in [`TOPIC_KEYS`] order, each paired with
+/// the layer that decided it.
+///
+/// Every key is reported because the rows are built from [`TOPIC_KEYS`] itself.
+/// What that construction cannot check is that `values` and `layers` are written
+/// in the same order as the keys they are zipped against; the configuration
+/// tests pin that, asserting each key's rendered value *and* its layer by name.
+///
+/// `effective_all` is passed rather than read off `spec`: the report states the
+/// value the selection uses, and with no `all` key of its own that is the one
+/// the include keys imply.
+fn topic_report(
+    spec: &Spec,
+    effective_all: bool,
+    layers: [Layer; TOPIC_KEYS.len()],
+) -> Vec<(&'static str, Setting)> {
+    let values = [
+        effective_all.to_string(),
+        render_list(&spec.include),
+        render_pattern(spec.include_regex.as_ref()),
+        render_list(&spec.exclude),
+        render_pattern(spec.exclude_regex.as_ref()),
+        spec.exclude_trigger_topic.to_string(),
+    ];
+    TOPIC_KEYS
+        .into_iter()
+        .zip(values)
+        .zip(layers)
+        .map(|((key, value), layer)| (key, Setting::new(&value, layer)))
+        .collect()
 }
 
 /// A topic list as a report prints it: `["/a", "/b"]`, `[]` when empty.
@@ -811,7 +830,8 @@ mod tests {
         let system = file(
             &dir,
             "system.toml",
-            "[topics]\nexclude_regex = \"^/diagnostics\"\nexclude = [\"/tf_static\"]\n",
+            "[topics]\nexclude_regex = \"^/diagnostics\"\nexclude = [\"/tf_static\"]\n\
+             exclude_trigger_topic = true\n",
         );
         let run = file(
             &dir,
@@ -837,6 +857,15 @@ mod tests {
         );
         assert_eq!(topic_of(&layered, "all").layer(), Layer::Builtin);
         assert_eq!(topic_of(&layered, "include_regex").value(), "(unset)");
+        assert_eq!(
+            topic_of(&layered, "exclude_trigger_topic").value(),
+            "true",
+            "the sixth key is reported from the file that set it, not from its default"
+        );
+        assert_eq!(
+            topic_of(&layered, "exclude_trigger_topic").layer(),
+            Layer::System
+        );
 
         let selection = layered.selection();
         assert!(selection.selects("/imu/data"));

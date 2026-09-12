@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::thread;
 
 use anyhow::Context as _;
-use crossbeam_channel::{Sender, bounded, unbounded};
+use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 
 use crate::index::{WindowPlan, WindowPlanner};
 use crate::manifest::{CutRequest, Planned, WindowCoverage};
@@ -101,33 +101,44 @@ pub fn spawn_stage_workers(
         )]
         thread::Builder::new()
             .name(format!("stage-{i}"))
-            .spawn(move || {
-                for job in &rx {
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        cut::stage_clip(
-                            &job.plan,
-                            &job.out_path,
-                            &job.request,
-                            job.planned,
-                            compression,
-                            &selection,
-                        )
-                    }))
-                    .unwrap_or_else(|payload| {
-                        Err(anyhow::anyhow!(
-                            "staging panicked: {}",
-                            panic_text(payload.as_ref())
-                        ))
-                    });
-                    // A send failure means the caller that queued this job is
-                    // gone (its thread died); there is no one left to care about
-                    // this clip.
-                    let _ = job.reply.send(result);
-                }
-            })
+            .spawn(move || stage_jobs(&rx, compression, &selection))
             .expect("spawning staging worker");
     }
     tx
+}
+
+/// One staging worker's whole life: take jobs off the shared FIFO until the
+/// queue closes, stage each one, and answer its sender.
+///
+/// A panic inside [`cut::stage_clip`] is caught and replied as that job's error
+/// rather than unwinding the worker, so one malformed window costs one clip
+/// instead of a thread out of the pool. A reply that cannot be sent means the
+/// caller that queued the job is gone; there is no one left to care about the
+/// clip, so the send failure is dropped.
+fn stage_jobs(
+    rx: &Receiver<StageJob>,
+    compression: Option<mcap::Compression>,
+    selection: &ChannelSelection,
+) {
+    for job in rx {
+        let staged = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cut::stage_clip(
+                &job.plan,
+                &job.out_path,
+                &job.request,
+                job.planned,
+                compression,
+                selection,
+            )
+        }))
+        .unwrap_or_else(|payload| {
+            Err(anyhow::anyhow!(
+                "staging panicked: {}",
+                panic_text(payload.as_ref())
+            ))
+        });
+        let _ = job.reply.send(staged);
+    }
 }
 
 /// What a cut does about a clip the output directory already holds under a name
@@ -207,6 +218,13 @@ pub struct ClipExists {
     reason = "`plans` and `planned` are the domain's own two words: the per-file \
               window plans, and the window-level facts every segment's manifest \
               repeats. Renaming either would cost more than the similarity does"
+)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "six inputs from six owners: the planner, the window, the caller's \
+              coverage verdict, the output base name, the collision policy, and \
+              the pool handle. No two of them are chosen together, so a parameter \
+              struct would be a tuple with a name on it"
 )]
 pub fn cut_window(
     planner: &dyn WindowPlanner,
@@ -425,9 +443,13 @@ mod tests {
         clippy::expect_used,
         clippy::indexing_slicing,
         clippy::assert_is_empty,
+        clippy::too_many_lines,
         reason = "a failed unwrap or a panicking index is a failing test, and \
                   `assert!(x.is_empty())` names the claim better than the \
-                  empty-array `assert_eq!` the lint asks for"
+                  empty-array `assert_eq!` the lint asks for, \
+                  and a test that builds a fixture, drives it and asserts on the \
+                  whole result is long, nested and argument-heavy by \
+                  construction — splitting one would scatter the case it states"
     )]
 
     use std::collections::HashMap;

@@ -24,9 +24,13 @@
     clippy::cast_possible_wrap,
     clippy::cast_sign_loss,
     clippy::cast_possible_truncation,
+    clippy::too_many_arguments,
+    clippy::excessive_nesting,
     reason = "a failed unwrap, a panicking index or a wrapped cast is a failing \
               test, and `assert!(x.is_empty())` names the claim better than the \
-              empty-array `assert_eq!` the lint asks for"
+              empty-array `assert_eq!` the lint asks for; the harness brings a \
+              whole process stack up per test, so its bring-up takes the \
+              arguments and the nesting that stack has"
 )]
 
 mod harness;

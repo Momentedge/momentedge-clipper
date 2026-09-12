@@ -53,14 +53,16 @@ impl NewFileWatchIterator {
     /// behind it is deliberately not indexed.
     pub fn seeded(dir: impl Into<PathBuf>) -> Self {
         let dir = dir.into();
-        let mut seen = HashSet::new();
-        if let Ok(entries) = std::fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                if let Some(id) = mcap_id(&entry.path()) {
-                    seen.insert(id);
-                }
-            }
-        }
+        let seen = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries
+                .flatten()
+                .filter_map(|entry| mcap_id(&entry.path()))
+                .collect(),
+            // A directory that cannot be read seeds nothing, so everything in it
+            // is new on the first pass — the same outcome as a directory that is
+            // genuinely empty, and the pass itself reports the read error.
+            Err(_) => HashSet::new(),
+        };
         Self { dir, seen }
     }
 }

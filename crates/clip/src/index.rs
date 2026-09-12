@@ -733,6 +733,63 @@ impl ScanDelta {
     }
 }
 
+/// Absorb one top-level `Message` record: its 22-byte fixed header in one read —
+/// `channel_id` u16, `sequence` u32, `log_time` u64, `publish_time` u64, all
+/// little-endian — and, when the record sits on a trigger channel, the payload
+/// behind those fields. Every other body stays untouched until extraction.
+///
+/// A body shorter than the fixed header cannot yield both stamps, so it is
+/// skipped like other localized damage: the record is still consumed (the
+/// framing is self-consistent), but its time counts toward neither extent bounds
+/// nor coverage — `Ok(())`, with a warning.
+///
+/// An `Err` is a *read* fault rather than a damaged record: the framing itself
+/// is then in doubt, so the caller leaves `offset` at this record and ends the
+/// pass there.
+#[expect(
+    clippy::unwrap_used,
+    clippy::cast_possible_truncation,
+    reason = "`header` is `[u8; 22]`, so every fixed-field slice below is exactly \
+              the width `try_into` needs; and `len` was bounded by \
+              `MAX_RECORD_LEN` (2^31) before this is called, so the payload \
+              length is inside `usize`"
+)]
+fn absorb_message(file: &File, offset: u64, len: u64, delta: &mut ScanDelta) -> Result<()> {
+    if len < 22 {
+        warn!(
+            "message record at {offset} is only {len} B; \
+             the 22-byte fixed header is incomplete, skipping it"
+        );
+        return Ok(());
+    }
+
+    let mut header = [0u8; 22];
+    file.read_exact_at(&mut header, offset + 9)
+        .with_context(|| format!("reading message header at {offset}; framing desynchronised?"))?;
+    let channel_id = u16::from_le_bytes(header[0..2].try_into().unwrap());
+    let log_time = u64::from_le_bytes(header[6..14].try_into().unwrap());
+    let publish_time = u64::from_le_bytes(header[14..22].try_into().unwrap());
+    delta.absorb_time(log_time, publish_time);
+
+    let Some(encoding) = delta.trigger_channels.get(&channel_id).cloned() else {
+        return Ok(());
+    };
+    // The payload follows the 22-byte fixed fields; an exactly-22-byte trigger
+    // message lifts an empty body.
+    let mut payload = vec![0u8; (len - 22) as usize];
+    file.read_exact_at(&mut payload, offset + 9 + 22)
+        .with_context(|| format!("reading trigger payload at {offset}; framing desynchronised?"))?;
+    // A top-level record is durable the instant its framing is read, so this
+    // goes straight down the tap (no chunk CRC to clear).
+    delta.emit_trigger(TriggerRecord {
+        message_encoding: encoding,
+        body: payload,
+        log_time,
+        publish_time,
+    });
+    Ok(())
+}
+
 /// One incremental pass over `file`: consume every record completely on disk in
 /// `[offset, file_len)` and return the registry/extent updates it collected.
 /// Stops without error at the first record still being appended.
@@ -760,10 +817,11 @@ impl ScanDelta {
 #[must_use]
 #[expect(
     clippy::too_many_lines,
+    clippy::cognitive_complexity,
     reason = "one record-framing walk. The fault/resync invariant — `offset` left \
               unadvanced at the faulted record, the partial delta returned anyway — \
-              holds across the whole loop, so splitting the opcode arms out would \
-              scatter the one thing this function guarantees"
+              holds across the whole loop, so splitting the remaining opcode arms \
+              out would scatter the one thing this function guarantees"
 )]
 pub fn scan_available(
     file: &File,
@@ -850,64 +908,9 @@ pub fn scan_available(
                 }
             }
             op::MESSAGE => {
-                // Decode the 22-byte fixed header in one read: channel_id
-                // u16, sequence u32, log_time u64, publish_time u64 (all
-                // LE). A message on a trigger channel also has its payload
-                // (past those 22 fixed fields) lifted out; every other body
-                // stays untouched until extraction.
-                #[expect(
-                    clippy::unwrap_used,
-                    clippy::cast_possible_truncation,
-                    reason = "`header` is `[u8; 22]`, so every fixed-field slice \
-                              below is exactly the width `try_into` needs; and \
-                              `len` was bounded by `MAX_RECORD_LEN` (2^31) above, \
-                              so the payload length is inside `usize`"
-                )]
-                if len >= 22 {
-                    let mut header = [0u8; 22];
-                    if let Err(e) = file.read_exact_at(&mut header, offset + 9) {
-                        fault = Some(anyhow::Error::new(e).context(format!(
-                            "reading message header at {offset}; framing desynchronised?"
-                        )));
-                        break;
-                    }
-                    let channel_id = u16::from_le_bytes(header[0..2].try_into().unwrap());
-                    let log_time = u64::from_le_bytes(header[6..14].try_into().unwrap());
-                    let publish_time = u64::from_le_bytes(header[14..22].try_into().unwrap());
-                    delta.absorb_time(log_time, publish_time);
-
-                    if let Some(encoding) = delta.trigger_channels.get(&channel_id).cloned() {
-                        // The payload follows the 22-byte fixed fields; an
-                        // exactly-22-byte trigger message lifts an empty
-                        // body.
-                        let mut payload = vec![0u8; (len - 22) as usize];
-                        if let Err(e) = file.read_exact_at(&mut payload, offset + 9 + 22) {
-                            fault = Some(anyhow::Error::new(e).context(format!(
-                                "reading trigger payload at {offset}; framing desynchronised?"
-                            )));
-                            break;
-                        }
-                        // A top-level record is durable the instant its
-                        // framing is read, so this goes straight down the
-                        // tap (no chunk CRC to clear).
-                        delta.emit_trigger(TriggerRecord {
-                            message_encoding: encoding,
-                            body: payload,
-                            log_time,
-                            publish_time,
-                        });
-                    }
-                } else {
-                    // A conformant Message body is >= 22 bytes — its fixed
-                    // header alone. A shorter one cannot yield both stamps,
-                    // so it is skipped like other localized damage: the
-                    // record is still consumed (the framing is
-                    // self-consistent), but its time counts toward neither
-                    // extent bounds nor coverage.
-                    warn!(
-                        "message record at {offset} is only {len} B; \
-                         the 22-byte fixed header is incomplete, skipping it"
-                    );
+                if let Err(e) = absorb_message(file, offset, len, &mut delta) {
+                    fault = Some(e);
+                    break;
                 }
             }
             op::CHUNK => {

@@ -342,12 +342,7 @@ impl WholeFileIndex {
             let (index, counts) = index_split(path)?;
             splits.push(index);
             indexed = match (indexed, counts) {
-                (Some(mut total), Some(counts)) => {
-                    for (topic, count) in counts {
-                        *total.entry(topic).or_default() += count;
-                    }
-                    Some(total)
-                }
+                (Some(total), Some(counts)) => Some(sum_counts(total, counts)),
                 _ => None,
             };
         }
@@ -454,6 +449,19 @@ fn cross_check(
             })
         })
         .collect()
+}
+
+/// Fold one split's per-topic message counts into the collection's running
+/// total. Topics absent from `total` start at zero, so a topic that appears
+/// only in a later split still sums correctly.
+fn sum_counts(
+    mut total: BTreeMap<String, u64>,
+    counts: BTreeMap<String, u64>,
+) -> BTreeMap<String, u64> {
+    for (topic, count) in counts {
+        *total.entry(topic).or_default() += count;
+    }
+    total
 }
 
 /// Index one recording from its summary: the [`RecordingIndex`] a window is
@@ -764,7 +772,11 @@ mod tests {
         clippy::indexing_slicing,
         clippy::single_match_else,
         clippy::cast_possible_truncation,
-        reason = "a failed unwrap or a panicking index is a failing test"
+        clippy::too_many_lines,
+        reason = "a failed unwrap or a panicking index is a failing test, \
+                  and a test that builds a fixture, drives it and asserts on the \
+                  whole result is long, nested and argument-heavy by \
+                  construction — splitting one would scatter the case it states"
     )]
 
     use std::collections::BTreeMap;
@@ -2347,5 +2359,77 @@ mod tests {
 
         std::fs::remove_dir_all(root)?;
         Ok(())
+    }
+
+    /// A recording's `log_time` span comes from its own statistics record where
+    /// it has one — the record covers every message in the file, chunked or not,
+    /// and outranks whatever the chunk indexes say. The format makes that record
+    /// optional, so a producer writing none is described by the union of its
+    /// chunk spans instead, and a statistics record stating zero messages means
+    /// "holds none" rather than "holds one stamped 0".
+    #[test]
+    fn a_log_span_prefers_the_statistics_record_and_falls_back_to_the_chunks() {
+        fn stats(message_count: u64, start: u64, end: u64) -> mcap::records::Statistics {
+            mcap::records::Statistics {
+                message_count,
+                message_start_time: start,
+                message_end_time: end,
+                ..Default::default()
+            }
+        }
+        fn chunk(start: u64, end: u64) -> mcap::records::ChunkIndex {
+            mcap::records::ChunkIndex {
+                message_start_time: start,
+                message_end_time: end,
+                chunk_start_offset: 0,
+                chunk_length: 0,
+                message_index_offsets: BTreeMap::new(),
+                message_index_length: 0,
+                compression: String::new(),
+                compressed_size: 0,
+                uncompressed_size: 0,
+            }
+        }
+
+        let counted = mcap::Summary {
+            stats: Some(stats(3, 100, 400)),
+            chunk_indexes: vec![chunk(1, 2)],
+            ..Default::default()
+        };
+        assert_eq!(
+            log_span(&counted),
+            Some(Span { min: 100, max: 400 }),
+            "the statistics record is the recording's own answer about every \
+             message in it, so the chunk spans do not get a vote"
+        );
+
+        let counted_empty = mcap::Summary {
+            stats: Some(stats(0, 0, 0)),
+            chunk_indexes: vec![chunk(1, 2)],
+            ..Default::default()
+        };
+        assert_eq!(
+            log_span(&counted_empty),
+            None,
+            "a recording stating zero messages holds none, not one stamped 0"
+        );
+
+        let uncounted = mcap::Summary {
+            stats: None,
+            chunk_indexes: vec![chunk(300, 400), chunk(100, 250)],
+            ..Default::default()
+        };
+        assert_eq!(
+            log_span(&uncounted),
+            Some(Span { min: 100, max: 400 }),
+            "with no statistics record the span is the union of the chunk spans, \
+             whatever order the summary lists them in"
+        );
+
+        assert_eq!(
+            log_span(&mcap::Summary::default()),
+            None,
+            "no statistics record and no chunks describe no messages at all"
+        );
     }
 }
