@@ -45,6 +45,17 @@ const SRC_TOPIC: &str = "/e2e/chatter";
 const SRC_RATE: u32 = 20;
 const SEC: u64 = 1_000_000_000;
 
+/// The status a fatal fault ends the recorder with, as
+/// [the operating guide](../../../docs/operating.md) promises a supervisor.
+///
+/// Asserted as an exact code rather than "non-zero": a process killed by a
+/// signal is non-zero too, so `!success()` would accept a death that says
+/// nothing about whether clipper decided to stop.
+const FATAL_EXIT_CODE: i32 = 1;
+
+/// The status an orderly stop ends with — SIGINT and SIGTERM alike.
+const CLEAN_EXIT_CODE: i32 = 0;
+
 /// Read every announced segment and concatenate their `(topic, log_time)` pairs
 /// in announcement order — the window's full content across a multi-file cut. A
 /// window straddling a rollover is published as one segment per source file, so
@@ -1168,9 +1179,10 @@ fn corrupt_tail_fails_fast_offline() {
             extractor.dump_log();
             panic!("the extractor must fail fast on a framing fault, not limp on");
         });
-    assert!(
-        !status.success(),
-        "a framing fault must exit non-zero for a supervisor, got {status}"
+    assert_eq!(
+        status.code(),
+        Some(FATAL_EXIT_CODE),
+        "a framing fault must exit {FATAL_EXIT_CODE} for a supervisor, got {status}"
     );
     assert!(
         extractor.log_text().contains("faulted at offset"),
@@ -1365,7 +1377,13 @@ fn corrupt_tail_framing_damage_live() {
     // being split has no successor for the startup adopt to pick up instead, so
     // a supervisor restarting this gets a loop that publishes nothing at all —
     // which is why the cut side counts where the scan side exits.
-    extractor.stop(libc::SIGINT, Duration::from_secs(30));
+    let stopped = extractor.stop(libc::SIGINT, Duration::from_secs(30));
+    assert_eq!(
+        stopped.code(),
+        Some(CLEAN_EXIT_CODE),
+        "a requested stop is the orderly one, whatever the run met on the way, \
+         got {stopped}"
+    );
     let mut restarted = env.start_extractor(10);
     let status = restarted
         .wait_exit(Duration::from_secs(60))
@@ -1373,9 +1391,10 @@ fn corrupt_tail_framing_damage_live() {
             restarted.dump_log();
             panic!("a restart must meet the damage ahead of its scan, not survive it");
         });
-    assert!(
-        !status.success(),
-        "the restart exits non-zero for the supervisor, got {status}"
+    assert_eq!(
+        status.code(),
+        Some(FATAL_EXIT_CODE),
+        "the restart exits {FATAL_EXIT_CODE} for the supervisor, got {status}"
     );
     assert!(
         restarted.log_text().contains("giving up"),

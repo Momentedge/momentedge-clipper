@@ -386,14 +386,32 @@ arms:
 
 A dead tailer silently degrades every clip to a grace-timeout cut; a dead
 interface thread silently stops delivering and acting on triggers — both must
-run for the process's lifetime, so either ending is non-zero exit for a
-supervisor to restart.
+run for the process's lifetime, so either ending is exit 1 for a supervisor to
+restart.
 
-**Process-exit teardown.** `main` returning ends the process, which kills all
-remaining threads — the immortal tail and interface loops, parked handler
-threads, and any in-flight extraction. That is safe by construction: the capturing-dir reset
-at startup reclaims any stranded staged file, and `out_dir` only ever holds
-complete clips. There is no explicit runtime teardown step.
+**Process-exit teardown.** There is no runtime teardown step: ending the process
+kills all remaining threads — the immortal tail and interface loops, parked
+handler threads, and any in-flight extraction — and that is safe by
+construction, since the capturing-dir reset at startup reclaims any stranded
+staged file and `out_dir` only ever holds complete clips.
+
+**Which is why `main` does not end the process by returning** — it is `-> ()`,
+and every door out goes through `end_process` (`src/main.rs`, which carries the
+whole argument). The failure signature it exists against: a returning `main`
+ends the process through `exit(3)`, whose static destructors tear the ROS
+middleware down underneath an interface thread still spinning a node inside
+`rcl`, so the recorder prints its fault and *then* dies of **SIGSEGV — status
+139**, with a core dump per fault. `std::process::exit` takes the same path and
+is no fix. A signal death out of a supervised process is worse than a wrong
+number: it is indistinguishable from the supervisor's own kill.
+
+Two things to keep true here. The statuses are clipper's own, so a main-thread
+**panic is caught** (`catch_unwind` in `main`) rather than unwound out of the
+process, since unwinding reaches that same teardown; `Verdict` and `CONFIG_EXIT_CODE`
+are where the four are decided, and [the operating
+guide](../../docs/operating.md) is where they are tabulated for operators. And
+`tests/e2e.rs` asserts exit *codes* — never `!success()`, which a signal death
+satisfies too.
 
 ## Integration tests (`tests/e2e.rs`)
 

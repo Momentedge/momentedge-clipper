@@ -6,9 +6,15 @@ overload. For the flags behind any of it, see
 
 ## In normal operation
 
-- **Lifecycle.** Ctrl-C (SIGINT/SIGTERM) stops clipper cleanly with exit 0. Any
-  internal fault — a dead tail thread, an unrecoverable scan fault — exits
-  non-zero so a process supervisor (systemd, …) restarts it.
+- **Lifecycle.** Ctrl-C (SIGINT/SIGTERM) stops clipper cleanly with exit **0**.
+  Any internal fault — a dead tail thread, an unrecoverable scan fault — exits
+  **1** so a process supervisor (systemd, …) restarts it; a command line or
+  configuration file clipper cannot use exits **2** before the recorder starts,
+  which under `Restart=on-failure` is a restart loop until the file or the unit
+  is fixed; and a panic — a clipper bug, its message in the log — exits **101**.
+  Those four are the statuses a run ends with: clipper ends its own process on
+  the status it chose, so a signal death in the journal means something outside
+  clipper killed it.
 - **Logs go to stdout.** clipper logs at `info` on stdout; `RUST_LOG`
   raises or lowers that. A run publishes nothing machine-readable on stdout —
   its result is the clips in `--out-dir`, each carrying its own metadata — so
@@ -34,8 +40,8 @@ overload. For the flags behind any of it, see
   copied into the clip as recorded. Damage that breaks a record's length prefix
   costs the clips that read that region, and clipper says so — see
   [A recording that stops producing clips](#a-recording-that-stops-producing-clips).
-  Damage *ahead* of the scan is the other case, and there clipper exits non-zero
-  for the supervisor rather than limping on.
+  Damage *ahead* of the scan is the other case, and there clipper exits 1 for
+  the supervisor rather than limping on.
 
 ## A recording that stops producing clips
 

@@ -71,7 +71,7 @@ rather than at once — up to `SCAN_BACKOFF_CAP` late (beads `clipper-i6h` is
 sleeping it in `DISCOVER_POLL` increments instead). Exhausting the budget is fatal: every retry in a row ended in a
 fault — usually the same stuck byte — so `run()` returns the fault (named with
 the path, offset, and attempt count), `supervise()` carries it out, and the
-process exits non-zero for a supervisor to restart. Limping on would degrade every clip to a
+process exits 1 for a supervisor to restart. Limping on would degrade every clip to a
 grace-timeout cut with no other signal, which is exactly what the fail-fast
 budget exists to prevent.
 

@@ -48,7 +48,7 @@ Five things follow from the input being finished:
   summary, before anything is written — see below.
 - **A clip that is already there is refused too.** The same recording and the
   same trigger describe the same window, so a re-run would write the clip that is
-  already in `--out-dir`. It names that clip and exits non-zero instead — see
+  already in `--out-dir`. It names that clip and exits 1 instead — see
   [below](#when-a-clip-is-already-there).
 
 ## A bag directory is one collection
@@ -82,8 +82,8 @@ a directory copied mid-recording is the usual offender.
 ## When a recording is refused
 
 Not every `.mcap` carries a summary worth planning a window from. `clipper clip`
-decides that from the footer and the summary alone, names the fault, exits
-non-zero, and writes nothing at all — no output directory, no staged file. Over a
+decides that from the footer and the summary alone, names the fault, exits 1,
+and writes nothing at all — no output directory, no staged file. Over a
 bag directory the message names the split that failed, not the directory.
 
 | The message says | The recording is |
@@ -119,7 +119,7 @@ field the last refusal above reads, and a repaired recording has it non-zero.
 
 A finished recording and a trigger describe one window and one copy of its bytes,
 so running the same cut twice would write the clip that is already in
-`--out-dir`. The second run names that clip, exits non-zero, and writes nothing —
+`--out-dir`. The second run names that clip, exits 1, and writes nothing —
 no clip, no suffixed sibling, nothing left in the staging directory:
 
 ```console

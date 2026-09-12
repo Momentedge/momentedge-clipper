@@ -147,7 +147,7 @@ process's lifetime; one short-lived thread is added per admitted trigger.
 `supervise()` selects on three channels — **tail**, **interface**, and
 **signal**. A delivered signal is the requested, orderly stop: the process exits
 0. Either critical thread ending — clean return or panic — is a fault: the
-process exits non-zero for a supervisor to restart it. A dead tail would
+process exits 1 for a supervisor to restart it. A dead tail would
 silently degrade every clip to a grace-timeout cut; a dead interface would
 silently stop delivering triggers — so neither is allowed to fail quietly. The
 `ros` interface's node spin and subscription drain are supervised *inside* the
@@ -358,13 +358,13 @@ Every split of a bag directory faces that contract on its own, so a directory
 holding one that fails it is refused naming *that recording* — the file an
 operator repairs or removes — rather than the directory they typed; the last
 split of a directory copied off a device mid-recording is the usual offender.
-The run exits non-zero having written nothing, and the input is left byte for
+The run exits 1 having written nothing, and the input is left byte for
 byte as it was found: clipper never rewrites, recovers or re-indexes a recording.
 
 **A clip that is already there is refused too.** A finished recording and a
 trigger describe one window and one copy of its bytes, so a second run over both
 would write the clip that is already in the output directory. It names that clip
-and exits non-zero instead — `clip::segment::Publication::Refuse`, checked before
+and exits 1 instead — `clip::segment::Publication::Refuse`, checked before
 the window is planned, so the refused run stages nothing and publishes nothing.
 The recorder takes the other half of the same policy (`Publication::Suffix`), and
 the two differ because their inputs do: on a vehicle a taken name means a
@@ -571,7 +571,7 @@ is designed to be salvaged:
   reading a record, has no resync point. The scan stops there and reports the
   offset it stopped at; the tail retries from exactly that byte under a bounded,
   backing-off `MAX_SCAN_FAULTS` budget, and exhausting it exits the process
-  non-zero.
+  with status 1.
 
 Degraded clips (records skipped or chunks dropped) are counted and announced with
 a warning rather than silently; a failed extraction leaves nothing in `out_dir`.

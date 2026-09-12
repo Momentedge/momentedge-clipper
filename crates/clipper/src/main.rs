@@ -94,6 +94,7 @@
 mod interface;
 mod supervision;
 
+use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1272,11 +1273,11 @@ fn load_cli() -> Loaded {
             if let Some(hint) = hint {
                 eprintln!("\n{hint}");
             }
-            std::process::exit(code);
+            end_process(code);
         }
         Err(StartupError::Config(err)) => {
             eprintln!("clipper: {err:#}");
-            std::process::exit(CONFIG_EXIT_CODE);
+            end_process(CONFIG_EXIT_CODE);
         }
     }
 }
@@ -1285,6 +1286,22 @@ fn load_cli() -> Loaded {
 /// usage code, since a file that names an unknown key is the same mistake as a
 /// command line that does.
 const CONFIG_EXIT_CODE: i32 = 2;
+
+/// The status a run that did what it was asked exits with: an orderly stop on
+/// SIGINT or SIGTERM, a finished `clipper clip`, a printed configuration.
+const CLEAN_EXIT_CODE: i32 = 0;
+
+/// The status any internal fault exits with — a dead supervised thread, an
+/// exhausted scan-fault budget, an output directory that cannot be prepared —
+/// for the process supervisor that restarts on it. One code covers them all:
+/// what went wrong is the message on stderr, and the status says only that
+/// clipper decided to stop.
+const FATAL_EXIT_CODE: i32 = 1;
+
+/// The status a panicking run exits with: the one the Rust runtime gives an
+/// unwound panic, so a bug reaching the shell is the number a Rust program's
+/// bug has always been rather than a clipper invention.
+const PANIC_EXIT_CODE: i32 = 101;
 
 /// Deliver SIGINT/SIGTERM as a message on the returned channel: a dedicated
 /// thread blocks on signal-hook's iterator and forwards the first shutdown
@@ -1352,11 +1369,12 @@ impl Drop for AdmissionPermit {
     }
 }
 
-/// Entry point: install logging, then run the mode the command line named.
+/// Entry point: install logging, run the mode the command line named, then end
+/// the process on what that run returned.
 ///
-/// The `match` is the dispatch table over [`Mode`], so a mode added to the enum
-/// is a compile error here until it has a body to run.
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// `main` returns nothing, because returning is not how this process ends — see
+/// [`end_process`], which every door out of a started run goes through.
+fn main() {
     // Logs go to stdout: there is no machine-readable contract on that stream
     // and there will not be one — a run's result is the contents of `out_dir`
     // when the process exits, each clip carrying its own metadata record — so
@@ -1369,6 +1387,100 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .parse_default_env()
         .init();
 
+    let verdict = verdict_of(run);
+    if let Verdict::Fault(report) = &verdict {
+        eprintln!("{report}");
+    }
+    end_process(verdict.status())
+}
+
+/// Run `body` and say how it ended, a panic on this thread included.
+///
+/// The panic is caught for the same reason the exit is taken by hand: unwinding
+/// out of `main` reaches the process teardown [`end_process`] exists to avoid,
+/// and would answer a bug with a signal death instead of a status. Nothing is
+/// lost by dropping the payload — the panic hook has already put the message and
+/// its location on stderr by the time this returns.
+fn verdict_of(body: fn() -> Result<(), Box<dyn std::error::Error>>) -> Verdict {
+    match std::panic::catch_unwind(body) {
+        Ok(result) => Verdict::of(result),
+        Err(_) => Verdict::Panic,
+    }
+}
+
+/// How a run ended, and with it the status the process exits on.
+///
+/// The status and the explanation are one fact rather than two values: a clean
+/// stop has nothing to say and a fault always does, which a `(status, message)`
+/// pair would leave representable the wrong way round. [`main`] is the only
+/// caller, so this is also where the mapping can be tested — the exit itself
+/// never returns.
+#[derive(Debug, PartialEq, Eq)]
+enum Verdict {
+    /// The run did what it was asked: an orderly stop, a finished clip, a
+    /// printed configuration.
+    Clean,
+    /// A fault ended the run, with the cause chain ready for stderr.
+    Fault(String),
+    /// The run panicked. A bug, reported by the panic hook as it unwound.
+    Panic,
+}
+
+impl Verdict {
+    /// The verdict a finished run's result earns.
+    fn of(result: Result<(), Box<dyn std::error::Error>>) -> Self {
+        match result {
+            Ok(()) => Self::Clean,
+            // `{err:?}` on an `anyhow` chain is the message followed by every
+            // cause under "Caused by:", and the `Error:` prefix is the one the
+            // Rust runtime prints for a `main` that returns `Err` — so a
+            // clipper fault reads the way any Rust program's fault reads.
+            Err(err) => Self::Fault(format!("Error: {err:?}")),
+        }
+    }
+
+    /// The status the process exits on. Distinct per verdict, so a supervisor
+    /// reading the code alone can tell a decision from a fault from a bug.
+    fn status(&self) -> i32 {
+        match *self {
+            Self::Clean => CLEAN_EXIT_CODE,
+            Self::Fault(_) => FATAL_EXIT_CODE,
+            Self::Panic => PANIC_EXIT_CODE,
+        }
+    }
+}
+
+/// End the process at `status` now, running no exit handler and no destructor.
+///
+/// The threads still alive at this point are the reason. A recorder that has
+/// decided to stop still has its tail, its interface and any parked handler
+/// running — and under the `ros` interface the interface thread is inside `rcl`,
+/// spinning a node this thread does not own. Returning from `main`, like
+/// [`std::process::exit`], ends the process through `exit(3)`: the atexit
+/// handlers and static destructors of everything linked in, the ROS middleware
+/// included, run while those threads are still calling into it. The DDS
+/// participant is then torn down under the spin thread and the process dies of
+/// SIGSEGV — status 139 from a run whose whole remaining message was the status
+/// it meant to exit with, and a core dump per fault.
+///
+/// `_exit(2)` ends it there instead: no handler, no destructor, and the status
+/// is exactly the one asked for, so a supervisor can tell "clipper decided to
+/// stop" from "clipper was killed". Nothing is lost by skipping that teardown —
+/// a run's result is the contents of `out_dir`, every clip published by an
+/// atomic rename long before, and the startup capturing-dir reset reclaims
+/// anything a killed handler staged.
+fn end_process(status: i32) -> ! {
+    // The one buffer worth saving: stdout is line-buffered, so a final write
+    // without a newline would otherwise go down with the process.
+    let _ = std::io::stdout().flush();
+    signal_hook::low_level::exit(status)
+}
+
+/// The run itself: read the command line, then run the mode it named.
+///
+/// The `match` is the dispatch table over [`Mode`], so a mode added to the enum
+/// is a compile error here until it has a body to run.
+fn run() -> Result<(), Box<dyn std::error::Error>> {
     let loaded = load_cli();
     // The effective configuration goes out on demand and at startup alike, from
     // the one report, so a run's log states the configuration it ran with in the
@@ -1394,14 +1506,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// threads — the tail, the interface (which owns its own trigger source, and for
 /// ROS its node spin), the staging worker pool, and the signal forwarder — then
 /// blocks in [`supervise`] until a shutdown signal (exit 0) or the first dead
-/// critical thread (exit non-zero, for a supervisor to restart the process).
+/// critical thread (exit 1, for a supervisor to restart the process).
 ///
-/// Returning ends the process, which kills the remaining threads: the
-/// immortal tail and interface loops, parked handlers, and any in-flight
-/// extraction.
-/// That is safe for clips by construction — the capturing-dir reset at
-/// startup reclaims any stranded staged file, and `out_dir` only ever holds
-/// complete clips.
+/// Returning hands that verdict to [`main`], which ends the process on it
+/// ([`end_process`]) and with it the remaining threads: the immortal tail and
+/// interface loops, parked handlers, and any in-flight extraction. That is safe
+/// for clips by construction — the capturing-dir reset at startup reclaims any
+/// stranded staged file, and `out_dir` only ever holds complete clips.
 fn tail_mode(
     cfg: Config,
     producer: Producer,
@@ -3918,6 +4029,84 @@ mod tests {
         assert!(
             format!("{err:#}").contains("signal handler"),
             "error must name the signal handler, got: {err:#}"
+        );
+    }
+
+    // ── the process's exit ─────────────────────────────────────────────────
+
+    /// What a run that did what it was asked ends with: status zero and not a
+    /// word more. The exit itself is [`end_process`] and never returns, so the
+    /// decision is what is tested here; that the status reaches the shell
+    /// intact is the e2e's (`tests/e2e.rs`).
+    #[test]
+    fn a_finished_run_exits_zero_and_explains_nothing() {
+        let verdict = Verdict::of(Ok(()));
+
+        assert_eq!(verdict, Verdict::Clean);
+        assert_eq!(verdict.status(), CLEAN_EXIT_CODE);
+    }
+
+    /// A bug on the main thread is a verdict like any other, not an unwind out
+    /// of the process: unwinding past `main` would reach the teardown
+    /// [`end_process`] exists to avoid and answer the bug with a signal death.
+    #[test]
+    fn a_panicking_run_ends_as_a_verdict_rather_than_an_unwind() {
+        let verdict = verdict_of(|| panic!("an invariant nothing checks"));
+
+        assert_eq!(verdict, Verdict::Panic);
+        assert_eq!(verdict.status(), PANIC_EXIT_CODE);
+    }
+
+    /// Each way a run can end takes its own status, the configuration faults
+    /// clap answers before the run included: a supervisor branching on the code
+    /// alone can tell an orderly stop from a fault, a bug, and a command line or
+    /// file that was never usable.
+    #[test]
+    fn every_ending_exits_on_a_status_of_its_own() {
+        let mut statuses = vec![
+            Verdict::Clean.status(),
+            Verdict::Fault(String::new()).status(),
+            Verdict::Panic.status(),
+            CONFIG_EXIT_CODE,
+        ];
+        let count = statuses.len();
+
+        statuses.sort_unstable();
+        statuses.dedup();
+
+        assert_eq!(
+            statuses.len(),
+            count,
+            "two endings share a status, leaving them indistinguishable: {statuses:?}"
+        );
+    }
+
+    /// A fault exits one — the status a supervisor reads as *clipper decided to
+    /// stop* — and carries the whole cause chain to stderr on the way, since the
+    /// status itself can say only that something failed.
+    #[test]
+    fn a_fault_exits_one_and_keeps_the_whole_cause_chain() {
+        let err = anyhow::anyhow!("record at offset 31731 declares u64::MAX bytes")
+            .context("scan faulted on 5 consecutive passes; giving up")
+            .context("tail thread failed");
+
+        let verdict = Verdict::of(Err(err.into()));
+
+        assert_eq!(verdict.status(), FATAL_EXIT_CODE);
+        let Verdict::Fault(report) = verdict else {
+            panic!("a fault carries the report explaining it")
+        };
+        assert!(
+            report.starts_with("Error: tail thread failed"),
+            "the first line names what failed, got: {report}"
+        );
+        assert!(
+            report.contains("scan faulted on 5 consecutive passes"),
+            "the context chain survives, got: {report}"
+        );
+        assert!(
+            report.contains("declares u64::MAX bytes"),
+            "the root cause survives, got: {report}"
         );
     }
 
