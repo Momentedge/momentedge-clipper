@@ -166,37 +166,41 @@ mode is running.
 
 ## Upgrading a deployment configured for an earlier release
 
-Releases before this one spelled the recorder's trigger source `interface`, with
-the same two values, and let a configuration file set it. **There is no
-compatibility alias and no migration path**: every configuration file, unit file
-and environment naming the old spelling has to be edited *before* the new
-package lands. Two of the three ways of naming it stop the run; the third is
-read by nothing at all.
+**Every unit file has to be rewritten for this release, whatever else it says.**
+Earlier releases put the recorder's flags on the bare binary — `clipper
+--record-dir ./record` — and the recorder is a subcommand, so that line is a
+parse error naming no mode. The `ExecStart` becomes `clipper tail --record-dir
+./record`, and the same edit is where the rest of this section lands.
 
-The trigger source is a flag and an environment variable alone, and no
-configuration file may set it, so a file is the one place the replacement cannot
-go: put it in the unit file that launches clipper, as `--trigger-source` or as
-`MOMENTEDGE_TRIGGER_SOURCE`.
-
-**Set it for that unit, not for the machine.** `MOMENTEDGE_TRIGGER_SOURCE`
-reaches every subcommand, and the two take different values, so `ros` exported
-from a login profile or a shared `EnvironmentFile=` is handed to `clipper clip`
-as well — which takes `mcap` and `param`, and refuses to start. It belongs in
-the recorder unit's own `Environment=`, or on its `ExecStart` line as
-`--trigger-source`, where it reaches the one process it is about.
+Inside that rewrite, the recorder's trigger source changes spelling: it was
+`interface`, with the same two values. **There is no compatibility alias and no
+migration path.** The table says what each way of naming it does now.
 
 | Where it was named | What happens | Replace it with |
 |---|---|---|
-| `interface` in a configuration file | the loader fails the run, naming the file and the key and listing the keys each mode does have; exit status 2 | `--trigger-source ros` on the recorder's `ExecStart`, or `MOMENTEDGE_TRIGGER_SOURCE=ros` in that unit's own environment — **not** `trigger_source` in the file, which fails the run the same way |
-| `--interface ros` on the command line | clap refuses it as an unexpected argument; exit status 2 | `--trigger-source ros` |
-| `MOMENTEDGE_INTERFACE` in the environment | nothing reads it, so the run starts on whatever the remaining layers decide — silently, and possibly on the wrong source | `MOMENTEDGE_TRIGGER_SOURCE=ros`, in the recorder unit's environment rather than the machine's |
+| `--interface ros` on the `ExecStart` | clap refuses it as an unexpected argument; exit status 2, and the unit restart-loops | `--trigger-source ros`, on the `clipper tail` line the rewrite produces |
+| `MOMENTEDGE_INTERFACE` in the environment | **nothing reads it.** The run starts, on whatever the remaining layers decide — possibly on a trigger source nobody chose | `MOMENTEDGE_TRIGGER_SOURCE=ros` |
+| `interface` in a configuration file | the loader fails the run, naming the file and the key; exit status 2 | `--trigger-source ros` or `MOMENTEDGE_TRIGGER_SOURCE=ros` — **not** `trigger_source` in the file, which fails the run the same way |
 
-A device whose `/etc/momentedge/clipper.toml` still carries `interface = "ros"`
-does not come up, and neither does one that carries `trigger_source = "ros"`; a
-systemd unit still passing `--interface ros` restart-loops. That is deliberate:
-an operator meets the fault at the first start after the upgrade, with the key
-named, rather than discovering weeks later that a run has been taking its
-triggers from somewhere else.
+**The environment variable is the one to hunt for.** The other two stop the
+process at its first start, with the offending word named, which is the failure
+an operator wants. `MOMENTEDGE_INTERFACE` survives the `ExecStart` rewrite
+untouched and costs nothing at startup; a recorder can run for weeks taking its
+triggers from somewhere other than the unit intended. Grep the unit, its
+`EnvironmentFile=`, and any profile the service inherits.
+
+**The third row cannot arise from a released deployment.** This is the first
+release to read a configuration file at all, so no device running an earlier
+package has one. It is here for anyone tracking the development branch, who
+could have written the key into a file that only unreleased builds ever read.
+
+**Set the replacement for the unit, not for the machine.**
+`MOMENTEDGE_TRIGGER_SOURCE` reaches every subcommand, and the two take different
+values, so `ros` exported from a login profile or a shared `EnvironmentFile=` is
+handed to `clipper clip` as well — which takes `mcap` and `param`, and refuses
+to start. It belongs in the recorder unit's own `Environment=`, or on its
+`ExecStart` line as `--trigger-source`, where it reaches the one process it is
+about.
 
 ## Which topics a clip contains
 
