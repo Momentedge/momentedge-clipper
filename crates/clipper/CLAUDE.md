@@ -267,6 +267,23 @@ there is no `Recorded` topic and nothing is published; the per-clip `info!` log
 lines are the only completion record. It runs fully ROS-free at runtime: no ROS
 `Context`/`Node`, no spin thread, no subscription.
 
+**Which means the observer under `mcap` lives outside clipper**, and that is the
+whole content of `NullAnnouncer` being a no-op: a run on this interface publishes
+nothing and opens no socket, so what watches for finished clips is whatever
+syncs, uploads or indexes `out_dir`. Giving the announcer a body — a channel, a
+callback, a sidecar file — would invent a second completion signal beside the one
+on disk, and two signals can disagree. What clipper owes that observer is an
+ordering rather than a message: a clip directory answers
+`clip::layout::read_metadata` only once every MCAP file it names is durable, so
+the rule to follow is *the document is present*, never *a file appeared* — a
+directory holding `<id>_0.mcap` and no `clip_metadata.yaml` is a cut still
+running or the residue of one that was killed, and an observer keying on the MCAP
+file takes either for a clip.
+`interface.rs`'s `the_observer_completes_on_the_document_and_never_on_a_files_appearance`
+runs both rules over one output directory holding a finished clip and a stripped
+one, and is where that difference is pinned; the e2e suite's
+`harness::TestEnv::wait_for_clip_named` is the same rule against the real stack.
+
 ## The interface abstraction
 
 The recorder is decoupled into four layers around one neutral boundary, so the
@@ -456,9 +473,13 @@ index, the cut and the segment assembly; `tail`'s cover the discovery iterator,
 the tail loop and its fault budget, the coverage watch and the two waits — both
 against synthetic MCAP files written by `clip::testing`, which `tail` pulls in
 through clip's `test-support` feature as a dev-dependency so no fixture drifts
-from what the scan expects. `clipper`'s need no recording at all: the config
-parser, the four anchor cells, the admission gate and `supervise`'s three arms
-are pure functions and thread choreography. `tests/e2e.rs` covers the contract
+from what the scan expects. `clipper`'s are largely pure functions and thread
+choreography — the config parser, the four anchor cells, the admission gate and
+`supervise`'s three arms. What is not is anything that is a fact about `out_dir`
+rather than about a value, since only writing a clip into one can assert it:
+`interface.rs`'s observer test drives a real cut through the `mcap` interface's
+`NullAnnouncer` over an empty window, which costs the staging pool and a temp
+tree but still no recording. `tests/e2e.rs` covers the contract
 against the real stack — a live `ros2 bag record` matching the production
 `scripts/record.sh` invocation (the harness builds the command directly),
 triggers published with the ros2 CLI, and
@@ -569,9 +590,11 @@ this section is the rationale.
   since `tail` is the binary's only command-line argument there), fully ROS-free,
   against a `ros2 bag record --all` that captures a ROS-published trigger into the
   bag. clipper lifts that trigger back out of the recording it tails, cuts the
-  clip, and signals completion by the file's appearance in `out_dir` — there is no
-  `Recorded` topic to echo, so the assertion is on the clipped file rather than a
-  published message.
+  clip, and signals completion by the clip's `clip_metadata.yaml` appearing in
+  `out_dir` — there is no `Recorded` topic to echo, so the harness plays the
+  observer instead: `wait_for_clip_named` polls the output directory and accepts
+  an entry only once `clip::layout::read_metadata` answers for it, which is the
+  same rule a consumer follows and never a file turning up.
 - **Capture-time windowing is proved against a live momentedge writer**
   (`live_writer_capture_time_windowing`, ROS-free at runtime): clipper tails a
   recording while `examples/custom-mcap-writer` appends it, with every

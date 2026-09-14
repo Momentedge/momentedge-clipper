@@ -249,8 +249,23 @@ ignored: no handler runs, no clip is extracted, and no completion is announced.
    announced clip is already crash-durable and already complete by the rule a
    consumer filters on. The `ros` interface turns the `Completion` into one
    `momentedge_msgs/Recorded` published on `/events/momentedge/recorded`; the
-   `mcap` interface's announcer is a no-op — the metadata file's appearance is
-   the only completion signal, with the per-clip `info!` lines as the log.
+   `mcap` interface's announcer is a no-op — there the observer is whatever
+   watches `out_dir`, the metadata file's appearance is the whole signal, and the
+   per-clip `info!` lines are the log.
+
+**That ordering is structural, not a rule to remember.** Step 6 is what
+`cut_window` returns from, so there is no point in this flow at which an
+announcement could reach a subscriber ahead of the document — the announce sits
+after the call, in the `Cut` arm of its outcome. An assertion made once
+`handle_trigger` has returned cannot tell the two orders apart, because by then
+the document is there either way, so the handler tests check it *inside*
+`announce`: `CapturingAnnouncer` records whether the clip it was handed already
+carried its metadata file at that instant, and
+`handle_trigger_cuts_a_clip_and_announces_it` asserts on that field. The negative
+half is the same match's other arm —
+`handle_trigger_announces_nothing_for_a_window_already_cut` fires one trigger
+twice and gets one completion, because a skip wrote nothing and a completion
+names a clip.
 
 ## Retention
 

@@ -10,9 +10,9 @@
 //!
 //! - [`McapInterface`] drains [`TriggerRecord`]s the tail lifts out of the recorded
 //!   MCAP, decoding each by `message_encoding` ([`decode_trigger`]). It touches
-//!   no ROS node, executor, or subscription. Completion is implicit: the clip's
-//!   atomic move into `out_dir` is the signal, so its [`Announce`]r is a no-op.
-//!   Every build offers it.
+//!   no ROS node, executor, or subscription, and it has no announcement channel
+//!   either: completion is a fact on disk, so its [`Announce`]r is a no-op
+//!   ([`NullAnnouncer`]). Every build offers it.
 //! - `ros::RosInterface` subscribes to the trigger topic on a ROS node and
 //!   publishes `Recorded` on completion. Its `run` owns the node and spawns its
 //!   own spin thread, so the driver supervises one uniform interface thread in
@@ -183,9 +183,31 @@ impl Interface for McapInterface {
     }
 }
 
-/// The MCAP completion sink: a no-op. The clip's `clip_metadata.yaml` appearing
-/// in its directory under `out_dir` (`clip::layout`) is the announcement; the
-/// handler's per-clip `info!` lines are the log.
+/// The MCAP completion sink: a no-op, because this interface has no completion
+/// channel to send anything down.
+///
+/// **The observer is the consumer of `out_dir`, and it lives outside clipper.**
+/// A run on this interface publishes nothing and opens no socket, so there is
+/// nothing here for a subscriber to attach to; what watches for finished clips
+/// is whatever syncs, uploads or indexes the output directory. Giving this type
+/// a body — a channel, a callback, a sidecar file — would invent a second
+/// completion signal beside the one on disk, and two signals can disagree.
+///
+/// **What clipper owes that observer is one guarantee, and it is an ordering
+/// rather than a message**: a clip directory answers
+/// [`clip::layout::read_metadata`] only once every MCAP file it names is durable
+/// (`clip::layout::ClipDir::complete` writes the document last and fsyncs it,
+/// the clip directory and the output directory in that order). So the rule an
+/// observer follows is *the document is present*, never *a file appeared*: a
+/// directory holding `<id>_0.mcap` and no `clip_metadata.yaml` is a cut still
+/// running, or the residue of one that was killed, and an observer keying on the
+/// MCAP file would take either for a clip.
+/// `the_observer_completes_on_the_document_and_never_on_a_files_appearance`
+/// drives both rules over one output directory and is where that difference is
+/// pinned.
+///
+/// The handler's per-clip `info!` lines are the log, and the only trace in the
+/// process itself.
 #[derive(Clone)]
 pub(crate) struct NullAnnouncer;
 
@@ -202,7 +224,9 @@ mod tests {
         reason = "a failed unwrap or a panicking index is a failing test"
     )]
 
+    use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use crossbeam_channel::unbounded;
 
@@ -358,5 +382,134 @@ mod tests {
             }],
             "publish anchors on the trigger record's publish_time"
         );
+    }
+
+    /// Cut one clip into `out_dir` through the MCAP interface's own announcer,
+    /// for a window `[anchor - 1s, anchor]` that no recording covers, and hand
+    /// back its directory. The window end is in the past, so nothing sleeps out
+    /// a postroll, and the short grace is what the (never-arriving) coverage
+    /// wait burns before the empty clip is written.
+    fn cut_through_the_mcap_interface(out_dir: &Path, name: &str) -> PathBuf {
+        let (_tx, rx) = unbounded();
+        let announcer = McapInterface::new(crate::TRIGGER_TOPIC, rx, TimeSource::Log).announcer();
+        let (tailer, _) = tail::Tailer::new();
+        let stage_tx =
+            clip::segment::spawn_stage_workers(1, None, clip::ChannelSelection::default());
+        let trigger = Trigger {
+            name: name.to_string(),
+            description: String::new(),
+            trigger_time: clip::Stamp { sec: 0, nanosec: 0 },
+            preroll: 1_000_000_000,
+            postroll: 0,
+        };
+        let anchor_ns = clip::trigger::now_ns();
+
+        tail::handler::handle_trigger(
+            trigger.clone(),
+            anchor_ns,
+            out_dir,
+            Duration::from_millis(50),
+            tailer,
+            stage_tx,
+            Arc::new(tail::CutFaults::new()),
+            announcer,
+            TimeSource::Log,
+            clip::testing::TEST_PRODUCER,
+        )
+        .expect("the cut writes a valid empty clip once the grace expires");
+
+        // Name the directory the way `clip::layout` does rather than by looking
+        // for it: the observer rules below are what is under test here, so the
+        // fixture must not be found by one of them.
+        let request = clip::CutRequest::new(
+            clip::testing::TEST_PRODUCER,
+            trigger,
+            anchor_ns,
+            TimeSource::Log,
+        );
+        let dir = out_dir.join(clip::ClipId::of(&request).to_string());
+        assert!(
+            clip::layout::metadata_path(&dir).is_file(),
+            "a completed clip carries its document: {}",
+            dir.display()
+        );
+        dir
+    }
+
+    /// What an observer of `out_dir` calls a clip, given the `rule` it applies to
+    /// each entry: every entry the rule accepts, in a stable order.
+    fn observed(out_dir: &Path, rule: impl Fn(&Path) -> bool) -> Vec<PathBuf> {
+        let mut found: Vec<PathBuf> = std::fs::read_dir(out_dir)
+            .expect("the output directory")
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| rule(path))
+            .collect();
+        found.sort();
+        found
+    }
+
+    /// The observer's rule: the clip's document is there, which is what
+    /// [`clip::layout::read_metadata`] answering at all means.
+    fn has_the_document(dir: &Path) -> bool {
+        clip::layout::read_metadata(dir).is_ok()
+    }
+
+    /// The rule a consumer must *not* follow: an MCAP file has turned up in the
+    /// directory. It says a copy finished, never that the clip did.
+    fn holds_an_mcap_file(dir: &Path) -> bool {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        entries
+            .flatten()
+            .any(|file| file.path().extension().is_some_and(|ext| ext == "mcap"))
+    }
+
+    /// **T24, the completion half of the `mcap` interface.** The observer is the
+    /// consumer of `out_dir` — this interface publishes nothing — and what it
+    /// completes on is the clip's document, never an MCAP file turning up.
+    ///
+    /// Both rules run over one output directory holding two entries: a clip this
+    /// cut finished, and the residue of a cut that died between naming its files
+    /// and writing its document — which is what a SIGKILL in that window leaves,
+    /// reproduced here by removing the document from a finished clip. The rules
+    /// disagree, which is the whole point: the document finds the one clip,
+    /// while a file's appearance finds the residue too and would hand a consumer
+    /// a clip that was never completed.
+    ///
+    /// Nothing is asserted about an announcement because there is nothing to
+    /// assert: [`NullAnnouncer::announce`] has no body and this interface has no
+    /// channel to publish on, so "no `Recorded` is published here" is a property
+    /// of the build rather than an observation a test can make.
+    #[test]
+    fn the_observer_completes_on_the_document_and_never_on_a_files_appearance() -> anyhow::Result<()>
+    {
+        let root = clip::testing::test_dir("mcap-observer")?;
+        let out_dir = root.join("clipped");
+
+        // The cut that died: complete, then stripped of the one file that says
+        // so. Its `<id>_0.mcap` stays, exactly as an interrupted cut leaves it.
+        let residue = cut_through_the_mcap_interface(&out_dir, "killed-mid-cut");
+        std::fs::remove_file(clip::layout::metadata_path(&residue))?;
+        // The cut that finished.
+        let clip = cut_through_the_mcap_interface(&out_dir, "complete");
+
+        assert_eq!(
+            observed(&out_dir, has_the_document),
+            vec![clip.clone()],
+            "the document is present for the finished clip alone"
+        );
+        let mut both = vec![clip, residue];
+        both.sort();
+        assert_eq!(
+            observed(&out_dir, holds_an_mcap_file),
+            both,
+            "and an observer keying on an MCAP file would have taken the residue \
+             for a clip too — which is why the rule is the document"
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
     }
 }

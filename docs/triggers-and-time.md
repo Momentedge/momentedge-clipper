@@ -36,9 +36,15 @@ check is logged at `error!` and ignored — no clip, no `Recorded`. The limits
 
 For each finished clip, clipper publishes a `momentedge_msgs/Recorded` on
 `/events/momentedge/recorded`, echoing the trigger's `name`, `description`, and
-`trigger_time` and naming the clip's directory — one entry — in its
-`string[] filenames`. The clip it names is complete and crash-durable on disk
-before the announcement goes out.
+`trigger_time` and naming the clip in its `string[] filenames`. **`filenames`
+holds exactly one entry — the clip's directory** — however many MCAP files the
+clip took, so a subscriber opens one handle per clip and never learns the naming
+scheme inside it; which files are in there is the clip's own
+[`clip_metadata.yaml`](clip-manifest.md) to say.
+
+The announcement goes out only once that `clip_metadata.yaml` is written and
+fsynced, so a `Recorded` always names a clip that is already complete by the rule
+below and already survives power loss.
 
 **Clip naming.** A clip is a **directory** named by its **id**,
 `<anchor_ns>_<hash>` — the resolved window anchor, then a digest of the whole
@@ -85,6 +91,17 @@ announced:
   completion signal.
 
 Both cut identical clips; only the trigger and completion edges differ.
+
+**What "finished" means on disk is one rule, and it is the same under either
+source: a clip directory is complete when it holds `clip_metadata.yaml`, and not
+before.** That file is written after every `<id>_N.mcap` beside it is durable, and
+the directories are fsynced after it, so a consumer watching `--out-dir` keys on
+the document and never on an MCAP file turning up. A directory holding
+`<id>_0.mcap` and no `clip_metadata.yaml` is a cut still running, or what a cut
+that was killed left behind — a watcher looking for files would take either for a
+clip and upload half of one. Under `ros` the `Recorded` publish rides on the same
+rule and is simply an earlier notice of it; under `mcap` the document's appearance
+is the only signal there is.
 
 `ros` is the source the `ros` cargo feature adds, so a
 [ROS-free build](../README.md#install) offers `mcap` alone and takes it by default, and
