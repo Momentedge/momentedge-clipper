@@ -13,20 +13,21 @@
 //! postroll]`: the [`handler`] waits until the wall clock passes the window end,
 //! waits until the tail's coverage reaches it (the recording provably holds the
 //! window), then bulk-copies the in-window messages out of the planned extents
-//! into a clip named by its [id](clip::ClipId),
-//! `./clipped/<anchor_ns>_<hash>.mcap` (see [`clip`] — a raw-bytes copy, no CDR
-//! decode, finished with a proper summary + footer, assembled in a capturing dir
-//! and moved atomically into place so observers never see a footer-less file).
+//! into the clip directory its [id](clip::ClipId) names,
+//! `./clipped/<anchor_ns>_<hash>/` (see [`clip`] — a raw-bytes copy, no CDR
+//! decode, one `<id>_N.mcap` per contributing recording, each finished with a
+//! proper summary + footer, and `clip_metadata.yaml` written last, so a
+//! directory carrying it is a complete clip and one without it is residue).
 //!
 //! Where triggers come from is `--trigger-source`, and how completion is
 //! signalled follows from it: the two are one seam, the [`interface`], with one
 //! form active per run. The `mcap` source reads triggers out of the tailed
 //! recording itself — decoding each by its MCAP `message_encoding`
-//! ([`clip::decode`]) — and runs ROS-free, the clip's atomic move into the output
-//! directory standing in for a completion announcement. The `ros` source
-//! subscribes to `/events/momentedge/trigger` (`momentedge_msgs/Trigger`) on a
-//! ROS node and publishes `/events/momentedge/recorded`
-//! (`momentedge_msgs/Recorded`) naming every durable segment. The handler
+//! ([`clip::decode`]) — and runs ROS-free, the clip's metadata file appearing in
+//! the output directory standing in for a completion announcement. The `ros`
+//! source subscribes to `/events/momentedge/trigger` (`momentedge_msgs/Trigger`)
+//! on a ROS node and publishes `/events/momentedge/recorded`
+//! (`momentedge_msgs/Recorded`) naming the durable clip directory. The handler
 //! cutting the clip is identical either way; it knows only the neutral
 //! [`clip::trigger`] contract.
 //!
