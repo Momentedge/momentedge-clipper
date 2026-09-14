@@ -62,10 +62,10 @@ use crate::tailer::Tailer;
 /// the interface × time-source anchor matrix (the ROS interface from the
 /// subscription instant under `log` or `trigger_time` under `publish`, the MCAP
 /// interface from the trigger record's own stamp on the active `time_source`);
-/// the same instant names the output clip. `time_source` is the clock domain the window lives in — it
+/// the same instant leads the clip's id, which names its directory. `time_source` is the clock domain the window lives in — it
 /// selects which extents are read, which messages fall inside, and which
 /// coverage the wait blocks on. `producer` is the binary and mode each clip's
-/// manifest names as having cut it; the driver supplies it because only the
+/// document names as having cut it; the driver supplies it because only the
 /// binary knows which of its subcommands is running. `faults` is the
 /// recorder-wide tally of clips refused because a recording's bytes changed
 /// under the tail, shared by every handler so `report_refusal` announces that
@@ -98,7 +98,7 @@ pub fn handle_trigger<A: Announce>(
 ) -> anyhow::Result<()> {
     // The request is the window: `CutRequest` derives the bounds from the
     // trigger, so the window logged here, the window every message is tested
-    // against, and the window each segment's manifest states are one value.
+    // against, and the window the clip's document states are one value.
     let request = Arc::new(CutRequest::new(
         producer,
         trig.clone(),
@@ -208,7 +208,7 @@ fn report_refusal(faults: &CutFaults, err: anyhow::Error) -> anyhow::Error {
 ///
 /// The coverage wait's verdict is not just a log line: it is the one thing a
 /// finished clip cannot show from its own contents, so it travels into the cut
-/// as a [`WindowCoverage`] and every segment's manifest reports it.
+/// as a [`WindowCoverage`] and the clip's document reports it.
 fn record_clip(
     tailer: &Arc<Tailer>,
     request: &Arc<CutRequest>,

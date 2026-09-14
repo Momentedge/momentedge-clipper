@@ -726,8 +726,9 @@ struct ClipConfig {
     /// (`--trigger-source param` only, and required there).
     ///
     /// The window is `[trigger-time - preroll, trigger-time + postroll]` on the
-    /// recording's `log_time`, and the instant also names the clip
-    /// (`<trigger-time>_<trigger-name>.mcap`). There is no default: the one
+    /// recording's `log_time`, and the instant leads the clip's id — the name of
+    /// the directory the clip is (`<trigger-time>_<hash>`), so clips sort in
+    /// time order. There is no default: the one
     /// thing only the caller knows is which moment the clip is about. Under
     /// `--trigger-source mcap` each recorded trigger's own log time is that
     /// instant, and passing this flag is a parse error.
@@ -744,12 +745,13 @@ struct ClipConfig {
     #[arg(long)]
     postroll: Option<u64>,
 
-    /// The trigger's name, which also names the clip file
+    /// The trigger's name, carried into the clip's document
     /// (`--trigger-source param` only; defaults to `clip`).
     ///
-    /// Carried into the clip's document under `trigger.name`, and one of the
-    /// six fields the clip's id hashes, so it is bounded the same way a name
-    /// arriving on a topic is. No part of it reaches a path.
+    /// Stated in the document under `trigger.name`, and one of the six fields
+    /// the clip's id hashes, so it is bounded the same way a name arriving on a
+    /// topic is. No part of it reaches a path: the clip is a directory named by
+    /// that id.
     #[arg(long)]
     trigger_name: Option<String>,
 

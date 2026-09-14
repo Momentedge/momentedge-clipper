@@ -87,8 +87,13 @@ arguments apply depends on `--trigger-source` — see
 | `--trigger-time` | `MOMENTEDGE_TRIGGER_TIME` | integer, ns | — | yes | the instant the window centres on, in nanoseconds since the epoch (`param` only, required) |
 | `--preroll` | `MOMENTEDGE_PREROLL` | integer, ns | — | yes | nanoseconds before that instant to include (`param` only, required) |
 | `--postroll` | `MOMENTEDGE_POSTROLL` | integer, ns | — | yes | nanoseconds after it to include (`param` only, required) |
-| `--trigger-name` | `MOMENTEDGE_TRIGGER_NAME` | string | `clip` | yes | the trigger's name, which also names the clip file (`param` only) |
-| `--trigger-description` | `MOMENTEDGE_TRIGGER_DESCRIPTION` | string | *(empty)* | yes | the trigger's description, carried into the manifest (`param` only) |
+| `--trigger-name` | `MOMENTEDGE_TRIGGER_NAME` | string | `clip` | yes | the trigger's name, stated in the clip's document and hashed into its [id](clip-manifest.md#the-clip-id) (`param` only) |
+| `--trigger-description` | `MOMENTEDGE_TRIGGER_DESCRIPTION` | string | *(empty)* | yes | the trigger's description, stated in the clip's document and hashed into its id (`param` only) |
+
+No `--trigger-*` value reaches a path. A clip is a directory named by its
+[id](clip-manifest.md#the-clip-id) — the resolved anchor and a digest of the six
+fields the request is — so two runs differing only in `--trigger-name` cut two
+clips, and a name holding `/`, `..` or nothing at all is hashed like any other.
 
 ## The configuration file
 
@@ -174,7 +179,7 @@ parse error naming no mode. The `ExecStart` becomes `clipper tail --record-dir
 
 Inside that rewrite, the recorder's trigger source changes spelling: it was
 `interface`, with the same two values. **There is no compatibility alias and no
-migration path.** The table says what each way of naming it does now.
+migration path.** The table says what each way of naming it does.
 
 | Where it was named | What happens | Replace it with |
 |---|---|---|
@@ -240,9 +245,10 @@ Two rules sit outside the table:
 
 An excluded topic leaves nothing behind. Its channel and its schema are never
 registered in the clip, so a reader listing the clip's topics or its schemas
-sees neither, and it has no `channel.<id>.*` keys in the
-[manifest](clip-manifest.md). Selection only ever narrows a clip: a topic
-the recording does not carry cannot be added by naming it.
+sees neither, and no source in the clip's
+[document](clip-manifest.md) counts it under `channels`. Selection only ever
+narrows a clip: a topic the recording does not carry cannot be added by naming
+it.
 
 **The keys mirror `ros2 bag record`'s own topic selection**, whose spelling
 moves between ROS 2 distributions. clipper's keys do not move with it:

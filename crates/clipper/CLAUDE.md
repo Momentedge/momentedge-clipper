@@ -214,8 +214,19 @@ in `main.rs`; each value exactly at its bound is accepted:
   path one: the name is free text copied into every clip's document and echoed in
   every `Recorded`, and nothing else. A clip is named by
   [its id](../clip/CLAUDE.md#a-clip-is-named-by-its-id-clipid), a digest, so `/`,
-  `..`, a leading dot, a NUL, unicode and the empty string shape no path and
-  there is nothing to refuse them for.
+  `..`, a leading dot, unicode and the empty string shape no path and there is
+  nothing to refuse them for.
+
+  **An interior NUL is the one byte with a live reason to be refused, and the
+  reason is C strings rather than paths.** A published `Recorded` crosses rmw as
+  a NUL-terminated `rosidl_runtime_c__String`, so a name carrying one would reach
+  a subscriber truncated at it. No path in this crate produces such a name: a
+  `cdr` trigger is deserialized through that same C-string boundary and cannot
+  hold one, and a `json` trigger — whose `serde_json` decode can — is read only
+  by `McapInterface` and by `clip_mode`, neither of which publishes anything
+  (`NullAnnouncer`, and no announcer at all). That is why `validate_name` is a
+  length bound and nothing else, and it is what a publishing path added to either
+  of those two, or a third encoding accepted on the `ros` one, would invalidate.
 
 [`Anchor`]: src/interface.rs
 

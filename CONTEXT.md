@@ -53,13 +53,21 @@ How far before / after the anchor the window reaches.
 **Clip**:
 A directory holding every message whose timestamp on the active time source
 falls inside one trigger's window: one standalone MCAP file per contributing
-recording, plus the metadata file that says what they are. The directory is the
+recording, plus the document that says what they are. The directory is the
 clip — it is what is announced, synced and uploaded — and it is named by the
 clip's id.
 _Avoid_: clip file (a clip is the directory; the MCAP files are its parts)
 
+**Document**:
+The `clip_metadata.yaml` beside a clip's MCAP files, stating what the clip is:
+the trigger it answers, the window it covers, and what was read out of each
+source recording. One per clip, never one per file.
+_Avoid_: manifest; **metadata file** — a producer writes a recording's own
+`metadata.yaml` beside its splits, and clipper reads it for their order, so that
+phrase already names a different file written by someone else
+
 **Complete**:
-A clip whose metadata file is present. It is written after every MCAP file in
+A clip whose document is present. It is written after every MCAP file in
 the directory is durable, so its presence — and nothing else — is what says a
 clip is finished and safe to read or upload. A clip directory without it is
 being written, or is what a cut that died left behind.
@@ -125,7 +133,7 @@ The paired trigger input and completion output, chosen as one unit — so the
 trigger source names both halves and there is no separate completion setting. The
 **ros** interface subscribes for triggers and publishes `Recorded`. The **mcap**
 interface lifts triggers out of the recording it already tails, and a clip's
-metadata file appearing is the only completion signal. Cutting from a
+document appearing is the only completion signal. Cutting from a
 recording nobody is writing has a trigger source and no interface: there is no
 completion half to pair one with.
 _Avoid_: mode, transport, backend
