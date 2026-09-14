@@ -94,6 +94,7 @@ e2e-tests the feature half.
 | `src/tailer.rs` | The recording collection: each recording's lifecycle around a `clip::index` scan, the collection-wide coverage watch, retention pruning, the scan-fault budget, the trigger tap, and the `WindowPlanner` a cut plans through |
 | `src/discover.rs` | `NewFileWatchIterator`: lazy directory iterator yielding each new `*.mcap` once, by `(dev,ino)` identity, mtime-ordered |
 | `src/handler.rs` | The per-trigger flow: wait out the postroll and coverage, then hand the window to `clip::segment` and announce the result |
+| `src/faults.rs` | `CutFaults`: the per-recording tally of clips refused because the bytes under the tail changed after they were indexed, so a repeated refusal reads as a climbing count rather than one line per trigger |
 | `src/watch.rs` | `Watch<T>`: a `Mutex` + `Condvar` primitive for coverage notification |
 
 | `clipper` source file | Role |
@@ -392,6 +393,12 @@ of the same code — a repeated trigger on a vehicle resolves to one window and 
 id, and a clip is written once — so there is no per-subcommand policy to keep in
 sync. To cut a window again, remove its directory.
 
+**A window that fails stops the run**, with exit 1. The windows are cut in order,
+and a disk or input fault outlives the window that met it, so carrying on would
+raise the same fault once per remaining trigger and bury the first report under
+the rest. What such a run leaves behind, and the statuses every run ends with,
+are [When a window fails](docs/clip-command.md#when-a-window-fails).
+
 **Neither wait runs.** There is no later data to wait for, so nothing sleeps out
 the postroll and nothing blocks on coverage. A window reaching past the end of
 the recording is short, and that is a fact the summary's own statistics answer:
@@ -422,8 +429,8 @@ only key on presence.
 
 The mode takes no `--time-source`: `log_time` is the clock a summary states and
 the only one a completeness claim over a finished recording can be made on, so
-passing the flag is a parse error. Everything else about the clip — the document,
-the `<id>/` directory and its `<id>_N.mcap` files, the metadata file written last
+passing the flag is a parse error. Everything else about the clip — the `<id>/`
+directory, its `<id>_N.mcap` files, and the document written last
 — is the shared path, and `producer.mode` reads `clip` rather than `tail` so a
 reader tells the two apart without opening the recording. No ROS is involved, so the
 ROS-free build cuts these clips as well as the device build does.
@@ -507,7 +514,7 @@ reference is [What a clip carries](docs/clip-manifest.md):
    position among the recordings that *contributed*, and the empty ones are
    dropped only once every copy has run, so each copy writes under a staging name
    and is renamed into place afterwards.
-3. **The metadata file is written last and the directories are fsynced.** Every
+3. **The document is written last and the directories are fsynced.** Every
    MCAP file was fsynced by its own copy, so the order — document, clip
    directory, output directory — means a crash can lose a clip but can never
    leave one that carries the document and is missing a file it names. **Its
