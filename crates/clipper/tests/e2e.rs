@@ -35,7 +35,7 @@
 
 mod harness;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use harness::*;
@@ -71,10 +71,12 @@ fn read_all(recorded: &Recorded) -> Vec<(String, u64)> {
 /// The full happy path per storage profile: real append/flush, trigger
 /// publication, `Recorded` semantics, and final-path visibility.
 ///
-/// The fastwrite case (unchunked, write-through) covers the deployed default;
-/// the zstd_fast case covers a chunked profile, where on-disk visibility lags
-/// by a chunk fill — the test stops the recorder cleanly after the window so
-/// the flushed footer (`ended`) releases the coverage wait deterministically.
+/// The fastwrite case covers an unchunked, write-through recording — the shape
+/// the tail reads while it grows, and the one
+/// [`examples/continuous`](../../../examples/continuous/README.md) selects; the
+/// zstd_fast case covers a chunked profile, where on-disk visibility lags by a
+/// chunk fill — the test stops the recorder cleanly after the window so the
+/// flushed footer (`ended`) releases the coverage wait deterministically.
 #[rstest]
 #[case::fastwrite("fastwrite", 0, 30, false)]
 #[case::zstd_fast("zstd_fast", 0, 15, true)]
@@ -156,7 +158,7 @@ fn trigger_produces_clip_and_announcement(
             .map(|(t, _)| t)
             .collect::<std::collections::HashSet<_>>(),
     );
-    assert_clip_metadata(Path::new(recorded.only()), preroll, postroll);
+    assert_clip_metadata(Path::new(recorded.only()), "tail", preroll, postroll);
     env.assert_out_dir_holds_only_clips();
     assert!(extractor.is_running(), "the extractor must outlive the cut");
 }
@@ -259,7 +261,7 @@ fn mcap_interface_reads_trigger_from_the_recording() {
     );
     // The manifest is written by the shared cut, so the ROS-free interface's
     // clips carry the same record the ros interface's do.
-    assert_clip_metadata(&clip, preroll, postroll);
+    assert_clip_metadata(&clip, "tail", preroll, postroll);
     env.assert_out_dir_holds_only_clips();
     assert!(
         extractor.is_running(),
@@ -441,7 +443,7 @@ fn live_writer_capture_time_windowing(#[case] time_source: &str) {
 
     // Read both stamps per message: the discriminator is which one the window
     // was applied to. The clip must be a complete MCAP holding captured data.
-    let msgs = read_clip_stamps(&clip);
+    let msgs = read_clip_dir_stamps(&clip);
     assert!(!msgs.is_empty(), "the clip must hold the windowed data");
     let data: Vec<&(String, u64, u64)> = msgs
         .iter()
@@ -700,6 +702,62 @@ fn recorder_restart_inside_the_window_recovers_across_the_boundary(#[case] delet
         msgs.iter().any(|(_, log_time)| *log_time >= restart_ns),
         "the replacement recording's post-restart data must be in the clip"
     );
+
+    // One clip, one file per contributing recording, and a document naming each
+    // — the shape a window straddling a recorder restart takes on disk. At least
+    // two, rather than exactly two: rosbag2 rolls over into further split files
+    // after its active recording is deleted, so the deletion cases can contribute
+    // more than the closing recording and its replacement.
+    let clip = Path::new(recorded.only());
+    let id = clip
+        .file_name()
+        .expect("the clip has a name")
+        .to_string_lossy()
+        .into_owned();
+    let files = clip_files(clip);
+    assert!(
+        files.len() >= 2,
+        "the window reached across the restart, so the clip holds one file per \
+         contributing recording: {files:?}"
+    );
+    for (n, file) in files.iter().enumerate() {
+        assert_eq!(
+            file.file_name().unwrap_or_default().to_string_lossy(),
+            format!("{id}_{n}.mcap"),
+            "every file of a clip is <id>_N.mcap, numbered from 0"
+        );
+    }
+    let metadata = clip::layout::read_metadata(clip).expect("reading the clip's document");
+    assert_eq!(
+        metadata.sources.len(),
+        files.len(),
+        "the document lists every file the clip holds"
+    );
+    for source in &metadata.sources {
+        assert!(
+            source.path.is_some(),
+            "each file names the recording it came from"
+        );
+    }
+    // Those names repeat, and that is the restart: the record script wipes the
+    // bag directory and the replacement is written at the same path, so the
+    // paths cannot tell the two recordings apart. What does is the data — the
+    // first file carries what was recorded before the restart and the last what
+    // was recorded after, so the files are the two sides of the boundary in
+    // source order rather than an arbitrary split of one stream.
+    assert!(
+        read_clip(&files[0])
+            .iter()
+            .any(|(_, log_time)| *log_time < restart_ns),
+        "the first file is the closing recording's part of the window"
+    );
+    assert!(
+        read_clip(&files[files.len() - 1])
+            .iter()
+            .any(|(_, log_time)| *log_time >= restart_ns),
+        "and the last is the replacement's"
+    );
+
     env.assert_out_dir_holds_only_clips();
     assert!(
         extractor.is_running(),
@@ -922,15 +980,16 @@ fn window_straddling_an_in_run_split_recovers_both_sides() {
 
     let recorded = wait_for_recorded(&mut listener, Duration::from_secs(60));
     assert_eq!(recorded.name, "straddle");
-    assert!(
-        recorded.filenames.len() >= 2,
-        "a window straddling a split must recover one segment per source file, \
-         got {:?}",
+    // One clip whatever the window straddled: the announcement names the
+    // directory — one entry, so a subscriber opens one handle per clip however
+    // many recordings the window reached across — and the two source recordings
+    // are two `<id>_N.mcap` files inside it, each a complete, in-window MCAP.
+    assert_eq!(
+        recorded.filenames.len(),
+        1,
+        "a clip is announced as the one directory it is, got {:?}",
         recorded.filenames,
     );
-    // One clip whatever the window straddled: the announcement names the
-    // directory, and the two source recordings are two `<id>_N.mcap` files
-    // inside it, each a complete, in-window MCAP.
     let clip = Path::new(recorded.only());
     let id = clip
         .file_name()
@@ -942,8 +1001,18 @@ fn window_straddling_an_in_run_split_recovers_both_sides() {
         is_clip_name(&id, anchor),
         "the clip is named by its id: {id}"
     );
+    // One file per contributing recording, however many the window reached
+    // across. How many that is, this test cannot say: the anchor is clipper's
+    // own subscription instant, so a window eight seconds wide over three-second
+    // splits spans two boundaries or three depending on where the anchor falls.
+    // The exact count belongs to the case that can choose its anchor,
+    // [`a_window_straddling_a_split_keeps_one_file_per_source_recording`]; what
+    // is a fact here is that the window was recovered from more than one.
     let files = clip_files(clip);
-    assert_eq!(files.len(), 2, "one file per source recording: {files:?}");
+    assert!(
+        files.len() >= 2,
+        "a window straddling a split recovers one file per source recording: {files:?}"
+    );
     for (n, file) in files.iter().enumerate() {
         assert_eq!(
             file.file_name().unwrap_or_default().to_string_lossy(),
@@ -951,6 +1020,36 @@ fn window_straddling_an_in_run_split_recovers_both_sides() {
             "every file of a clip is <id>_N.mcap, numbered from 0"
         );
     }
+    // The document is the only place the clip says which recordings it came
+    // from, and it has to name each — a consumer reading a several-file clip
+    // cannot otherwise tell a straddled window from a re-read one.
+    let metadata = clip::layout::read_metadata(clip).expect("reading the clip's document");
+    let sources: Vec<&String> = metadata
+        .sources
+        .iter()
+        .map(|s| {
+            s.path
+                .as_ref()
+                .expect("each file names the recording it came from")
+        })
+        .collect();
+    assert_eq!(
+        sources.len(),
+        files.len(),
+        "the document lists every file the clip holds"
+    );
+    assert_eq!(
+        sources
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        sources.len(),
+        "and each names a different split: {sources:?}"
+    );
+    assert!(
+        metadata.window.files_planned >= sources.len(),
+        "every contributing split was planned, and possibly one that held nothing"
+    );
     let msgs = read_all(&recorded);
     assert!(!msgs.is_empty(), "the recovered window must hold data");
     let (ws, we) = announced_window(&recorded, preroll, postroll);
@@ -1139,7 +1238,7 @@ fn window_past_the_last_recorded_message_cuts_an_empty_clip() {
 
     // Which kind of empty. `files_planned = 0` says no recording held a byte of
     // the window; `short = true` says the coverage it waited for never arrived.
-    assert_clip_metadata(clip, preroll, postroll);
+    assert_clip_metadata(clip, "tail", preroll, postroll);
     let metadata = clip::layout::read_metadata(clip).expect("reading the clip's document");
     assert_eq!(metadata.clip.messages, 0);
     assert_eq!(
@@ -1421,4 +1520,1350 @@ fn corrupt_tail_framing_damage_live() {
         restarted.log_text().contains("giving up"),
         "the restart's exit must name the exhausted scan-fault budget: see extractor log"
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Cutting from a recording nobody is writing
+//
+// `clipper clip` is the other half of the live suite: a real clipper process
+// over a real `ros2 bag record` output, observed from outside, with none of the
+// waits a growing file costs. Every window's anchor is a value the test chose
+// (`--trigger-time`, or the recording's own trigger record), so the clip's id —
+// and therefore the directory it lands in — is known before the run starts.
+// That is what lets these scenarios assert the output directory's contents
+// exactly rather than by shape, and it is why the shape, skip and resume rules
+// live here rather than behind the recorder's own clock.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A recording nobody is writing any more: the bag directory, its splits in
+/// recording order, and the `log_time` of every message in each.
+struct Finished {
+    dir: PathBuf,
+    splits: Vec<PathBuf>,
+    stamps: Vec<Vec<u64>>,
+}
+
+impl Finished {
+    /// Read a stopped recorder's bag directory: the splits in the order
+    /// `clip::bag` reads them (modification time, since `ros2 bag record`'s own
+    /// `metadata.yaml` names them in that order too) and each one's stamps.
+    fn of(dir: &Path) -> Self {
+        let splits = clip::bag::splits(dir).expect("listing the bag directory's splits");
+        assert!(
+            !splits.is_empty(),
+            "the recorder left no recording in {}",
+            dir.display()
+        );
+        let stamps = splits
+            .iter()
+            .map(|s| finished_recording_stamps(s))
+            .collect();
+        Finished {
+            dir: dir.to_path_buf(),
+            splits,
+            stamps,
+        }
+    }
+
+    /// The one split of a recording that never rolled over — the single-file
+    /// input `clipper clip` takes beside a bag directory.
+    fn file(&self) -> &Path {
+        assert_eq!(
+            self.splits.len(),
+            1,
+            "this recording rolled over into {} splits",
+            self.splits.len()
+        );
+        &self.splits[0]
+    }
+
+    /// Every stamp of the whole collection, ascending.
+    fn all_stamps(&self) -> Vec<u64> {
+        let mut all: Vec<u64> = self.stamps.iter().flatten().copied().collect();
+        all.sort_unstable();
+        all
+    }
+
+    /// The first and last instant the collection holds a message at.
+    fn span(&self) -> (u64, u64) {
+        let all = self.all_stamps();
+        (
+            *all.first().expect("the recording holds data"),
+            *all.last().expect("the recording holds data"),
+        )
+    }
+
+    /// The midpoint of split `n`'s own extent — an anchor that is inside that
+    /// split and, for a split a few seconds long, comfortably clear of its ends.
+    fn split_midpoint(&self, n: usize) -> u64 {
+        let stamps = &self.stamps[n];
+        let (first, last) = (
+            *stamps.first().expect("the split holds data"),
+            *stamps.last().expect("the split holds data"),
+        );
+        first + (last - first) / 2
+    }
+}
+
+/// The storage profile a recording `clipper clip` will read has to be written
+/// with.
+///
+/// `clipper clip` plans a window out of the recording's own summary, so it takes
+/// the chunked, message-indexed shape and refuses the unchunked one by name —
+/// which is why the live tests' `fastwrite` recordings, readable while they
+/// grow, are exactly what the cutter cannot take. The two halves of the suite
+/// therefore record differently on purpose.
+const CUTTABLE_PRESET: &str = "zstd_fast";
+
+/// Record roughly `span` of the source topic and stop cleanly, leaving a
+/// finished bag.
+///
+/// Topic-restricted, so every message in the recording is the test's own and a
+/// window over it can be reasoned about message for message: `--all` would fold
+/// in `/rosout` and the trigger topic, whose timing no test controls.
+/// `split_secs` rolls the bag over at that period, and the split wait is on the
+/// count rather than on the clock, since a rollover happens when rosbag2 next
+/// writes a message rather than when a timer fires.
+///
+/// **The wait for data is a plain sleep, where the live tests wait on the
+/// recording's own extent.** They have to: a window they trigger has to lie over
+/// bytes that are already on disk. Here nothing is triggered until the recorder
+/// has stopped, and the window is then chosen from the stamps the finished
+/// recording turns out to hold — so how much it recorded is read afterwards
+/// rather than promised beforehand. Which is just as well, since a chunked
+/// recording holds its messages inside chunks that only the close flushes.
+fn finished_recording(env: &TestEnv, span: Duration, split_secs: u64, splits: usize) -> Finished {
+    let mut recorder = if split_secs > 0 {
+        env.start_recorder_topics_split(&[SRC_TOPIC], CUTTABLE_PRESET, 0, split_secs)
+    } else {
+        env.start_recorder_topics(&[SRC_TOPIC], CUTTABLE_PRESET, 0)
+    };
+    let mut source = env.start_source(SRC_TOPIC, SRC_RATE);
+    env.wait_for_recording(Duration::from_secs(60));
+    std::thread::sleep(span);
+    if splits > 1 {
+        wait_for_splits(env, splits, Duration::from_secs(90));
+    }
+    stop_and_read(env, &mut recorder, &mut source, span)
+}
+
+/// The rate and payload a bulk source publishes at: together about 2 MB/s, which
+/// the ros2 CLI sustains and `ros2 bag record` writes through.
+const BULK_RATE: u32 = 50;
+const BULK_PAYLOAD: usize = 40_000;
+
+/// The payload an ordinary source publishes: enough to be a message, little
+/// enough that a window's copy is over before a poll could see it.
+const SRC_PAYLOAD: usize = 200;
+
+/// Stop a recording cleanly and read back what it holds.
+///
+/// The source is stopped first: a recorder stopped under a live source writes
+/// its footer while messages are still arriving, and the last of them may or may
+/// not be in the file the test then reads stamps off.
+fn stop_and_read(
+    env: &TestEnv,
+    recorder: &mut Proc,
+    source: &mut Proc,
+    span: Duration,
+) -> Finished {
+    source.stop(libc::SIGTERM, Duration::from_secs(10));
+    recorder.stop(libc::SIGINT, Duration::from_secs(30));
+    let bag = Finished::of(&env.record_dir());
+    let (first, last) = bag.span();
+    assert!(
+        last - first >= span.as_nanos() as u64 / 2,
+        "the recorder captured only {} ns of the {span:?} asked for",
+        last - first,
+    );
+    bag
+}
+
+/// Block until the bag directory holds at least `count` recordings.
+fn wait_for_splits(env: &TestEnv, count: usize, timeout: Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let splits = clip::bag::splits(&env.record_dir()).map_or(0, |s| s.len());
+        if splits >= count {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the recording rolled over into only {splits} of {count} splits within {timeout:?}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// One window stated on the command line, cut out of `recording` into
+/// `out_dir`.
+///
+/// The description is the harness's fixed one so that [`clip_id_of`] and the run
+/// agree on every field the clip's id hashes — which is what lets a test name
+/// the directory the run is about to create.
+fn run_param_clip(
+    env: &TestEnv,
+    tag: &str,
+    recording: &Path,
+    out_dir: &Path,
+    window: ParamWindow,
+) -> ClipRun {
+    ClipRun::of(&mut spawn_param_clip(env, tag, recording, out_dir, window))
+}
+
+/// [`run_param_clip`] left running, for the scenarios whose subject is what a
+/// run looks like while it is still going.
+fn spawn_param_clip(
+    env: &TestEnv,
+    tag: &str,
+    recording: &Path,
+    out_dir: &Path,
+    window: ParamWindow,
+) -> Proc {
+    env.spawn_clip(
+        tag,
+        recording,
+        out_dir,
+        &[
+            "--trigger-time",
+            &window.anchor_ns.to_string(),
+            "--preroll",
+            &window.preroll_ns.to_string(),
+            "--postroll",
+            &window.postroll_ns.to_string(),
+            "--trigger-name",
+            window.name,
+            "--trigger-description",
+            TRIGGER_DESCRIPTION,
+        ],
+    )
+}
+
+/// The window one `--trigger-source param` run cuts: the four values that,
+/// with the run's fixed clock domain and description, decide both what is
+/// copied and what the clip is called.
+#[derive(Clone, Copy)]
+struct ParamWindow {
+    anchor_ns: u64,
+    preroll_ns: u64,
+    postroll_ns: u64,
+    name: &'static str,
+}
+
+impl ParamWindow {
+    /// The directory name this window's clip will have.
+    fn clip_id(self) -> String {
+        clip_id_of(
+            self.name,
+            self.anchor_ns,
+            self.preroll_ns,
+            self.postroll_ns,
+            CLIP_MODE_TIME_SOURCE,
+            "clip",
+        )
+    }
+
+    /// The inclusive bounds the cut applies.
+    fn bounds(self) -> (u64, u64) {
+        (
+            self.anchor_ns - self.preroll_ns,
+            self.anchor_ns + self.postroll_ns,
+        )
+    }
+}
+
+/// `clipper clip`'s clock domain is fixed: the window lives on `log_time`.
+const CLIP_MODE_TIME_SOURCE: clip::TimeSource = clip::TimeSource::Log;
+
+/// T3 — a window inside one recording is one file and a document, and nothing
+/// else is in the directory.
+///
+/// The shape every clip has, asserted entry for entry rather than by predicate:
+/// `<id>/` holding `<id>_0.mcap` and `clip_metadata.yaml`, no staging file, no
+/// sidecar, no second numbered file. The MCAP's own metadata is asserted the
+/// same way — exactly one record, `momentedge.clip`, carrying the clip's id and
+/// nothing else — which is what says the recorder's own rosbag2 metadata is not
+/// copied through and that a file separated from its directory can still be
+/// grouped.
+///
+/// Expressible against `clipper clip` because the anchor is `--trigger-time`:
+/// the id, and so the directory the run must create, is known before it runs.
+#[rstest]
+fn a_window_inside_one_recording_is_one_file_and_a_document() {
+    if !require_e2e() {
+        return;
+    }
+    let env = TestEnv::new();
+    let bag = finished_recording(&env, Duration::from_secs(4), 0, 1);
+    let window = ParamWindow {
+        anchor_ns: bag.split_midpoint(0),
+        preroll_ns: SEC,
+        postroll_ns: SEC,
+        name: "inside",
+    };
+
+    let out_dir = env.out_dir();
+    let run = run_param_clip(&env, "one-file", bag.file(), &out_dir, window);
+    assert_eq!(run.code(), CLEAN_EXIT_CODE, "log: {}", run.log);
+
+    let id = window.clip_id();
+    assert_eq!(
+        env.published_clips(),
+        vec![id.clone()],
+        "the run leaves one clip directory and nothing else"
+    );
+    let clip_dir = out_dir.join(&id);
+    assert_eq!(
+        entry_names(&clip_dir),
+        vec![
+            format!("{id}_0.mcap"),
+            clip::layout::METADATA_FILE.to_string(),
+        ],
+        "a one-file clip is exactly its file and its document"
+    );
+
+    // The document's account of the same clip, and the one metadata record its
+    // file is allowed to carry.
+    assert_clip_metadata(&clip_dir, "clip", window.preroll_ns, window.postroll_ns);
+    let metadata = clip::layout::read_metadata(&clip_dir).expect("reading the document");
+    assert_eq!(metadata.sources.len(), 1);
+    assert_eq!(
+        metadata.window.files_planned, 1,
+        "one recording was planned and one contributed"
+    );
+    assert!(
+        !metadata.clip.short,
+        "the recording ran past the window end"
+    );
+
+    let file = clip_dir.join(format!("{id}_0.mcap"));
+    assert_eq!(
+        metadata_record_names(&file),
+        vec![clip::manifest::MANIFEST_NAME.to_string()],
+        "a clip's file carries clipper's record and no other"
+    );
+    let record = clip::manifest::read_manifest(&file)
+        .expect("reading the clip's metadata record")
+        .expect("the clip's file carries one");
+    assert_eq!(
+        record,
+        std::collections::BTreeMap::from([(clip::manifest::CLIP_ID_KEY.to_string(), id.clone())]),
+        "the record says which clip the file belongs to, and nothing else"
+    );
+
+    let msgs = read_clip_dir(&clip_dir);
+    assert!(!msgs.is_empty(), "the window lies over recorded data");
+    let (ws, we) = window.bounds();
+    assert_clip_within_window(&msgs, ws, we);
+    env.assert_out_dir_holds_only_clips();
+}
+
+/// T4 — a window straddling a split keeps one file per source recording, each
+/// holding its own recording's messages, and the document names both sources.
+///
+/// The live recorder's side of this is
+/// [`window_straddling_an_in_run_split_recovers_both_sides`]; what a finished
+/// recording adds is exactness. The splits are on disk and unchanging, so the
+/// test can partition the clip's messages against each split's own stamps and
+/// assert that `_0` holds the earlier recording's and `_1` the later one's —
+/// a claim a live cut, racing the recorder's rollover, cannot pin down.
+#[rstest]
+fn a_window_straddling_a_split_keeps_one_file_per_source_recording() {
+    if !require_e2e() {
+        return;
+    }
+    let env = TestEnv::new();
+    // Roll over every 2 s and take three splits, so the middle one is bounded on
+    // both sides by data the window can be kept clear of.
+    let bag = finished_recording(&env, Duration::from_secs(6), 2, 3);
+    // The boundary between splits 0 and 1, with the window reaching half a
+    // second into each — well inside two 2 s splits, so no third is touched.
+    let window = ParamWindow {
+        anchor_ns: bag.stamps[0].last().copied().expect("split 0 holds data"),
+        preroll_ns: SEC / 2,
+        postroll_ns: SEC / 2,
+        name: "straddle",
+    };
+
+    let out_dir = env.out_dir();
+    let run = run_param_clip(&env, "straddle", &bag.dir, &out_dir, window);
+    assert_eq!(run.code(), CLEAN_EXIT_CODE, "log: {}", run.log);
+
+    let id = window.clip_id();
+    let clip_dir = out_dir.join(&id);
+    assert_eq!(env.published_clips(), vec![id.clone()]);
+    assert_eq!(
+        entry_names(&clip_dir),
+        vec![
+            format!("{id}_0.mcap"),
+            format!("{id}_1.mcap"),
+            clip::layout::METADATA_FILE.to_string(),
+        ],
+        "one file per contributing recording, numbered from 0, plus the document"
+    );
+
+    let metadata = clip::layout::read_metadata(&clip_dir).expect("reading the document");
+    assert_eq!(metadata.window.files_planned, 2);
+    let sources: Vec<String> = metadata
+        .sources
+        .iter()
+        .map(|s| {
+            s.path
+                .clone()
+                .expect("a cut file names the recording it came from")
+        })
+        .collect();
+    assert_eq!(
+        sources,
+        vec![
+            bag.splits[0].display().to_string(),
+            bag.splits[1].display().to_string(),
+        ],
+        "the per-file list names both source recordings, in source order"
+    );
+
+    // Each file holds its own recording's messages and no other's.
+    for (n, split_stamps) in bag.stamps.iter().take(2).enumerate() {
+        let cut: Vec<u64> = read_clip(&clip_dir.join(format!("{id}_{n}.mcap")))
+            .into_iter()
+            .map(|(_, log_time)| log_time)
+            .collect();
+        assert!(!cut.is_empty(), "file _{n} holds its recording's part");
+        assert!(
+            cut.iter().all(|stamp| split_stamps.contains(stamp)),
+            "every message of _{n} comes from split {n}"
+        );
+    }
+    let (ws, we) = window.bounds();
+    assert_clip_within_window(&read_clip_dir(&clip_dir), ws, we);
+    env.assert_out_dir_holds_only_clips();
+}
+
+/// T5 — a window over three recordings whose middle one holds none of its
+/// messages: the two that contribute are `_0` and `_1`, renumbered by position,
+/// and the document says three were planned.
+///
+/// **Only a synthetic collection can state this.** A recorder's splits partition
+/// time, so a window reaching into the split before and the split after
+/// necessarily contains everything in between; a middle recording that is read
+/// and contributes nothing needs an extent that spans the window with a gap
+/// inside it, which no rollover produces. The three recordings here are written
+/// with the mcap crate and read by a real `clipper clip` process over the
+/// directory holding them — the same shape
+/// [`time_source_selects_the_window_clock_domain`] uses for the same reason.
+///
+/// What it pins is that a file's number is its position **after** the empty
+/// ones are dropped: numbering by plan position would leave `_0` and `_2` and a
+/// hole where a consumer expects `_1`.
+#[rstest]
+fn a_recording_that_contributes_nothing_is_dropped_and_the_rest_renumbered() {
+    if !require_e2e() {
+        return;
+    }
+    let env = TestEnv::new();
+    let dir = env.path("collection");
+    std::fs::create_dir_all(&dir).expect("creating the collection directory");
+
+    // The window is [t - 2 s, t + 2 s]. The recordings are written in the order
+    // they are read (no `metadata.yaml`, so modification time is the order), and
+    // each one's first stamp ascends with it.
+    let t = now_ns();
+    let at = |k: i64| (t as i64 + k * SEC as i64) as u64;
+    write_plain_recording(&dir.join("collection_0.mcap"), SRC_TOPIC, &[at(-4), at(-1)]);
+    // The middle one reaches across the whole window and holds nothing inside
+    // it: planned, read, and contributing not one message.
+    write_plain_recording(&dir.join("collection_1.mcap"), SRC_TOPIC, &[at(-3), at(3)]);
+    write_plain_recording(&dir.join("collection_2.mcap"), SRC_TOPIC, &[at(1), at(4)]);
+
+    let window = ParamWindow {
+        anchor_ns: t,
+        preroll_ns: 2 * SEC,
+        postroll_ns: 2 * SEC,
+        name: "renumbered",
+    };
+    let out_dir = env.out_dir();
+    let run = run_param_clip(&env, "renumbered", &dir, &out_dir, window);
+    assert_eq!(run.code(), CLEAN_EXIT_CODE, "log: {}", run.log);
+
+    let id = window.clip_id();
+    let clip_dir = out_dir.join(&id);
+    assert_eq!(
+        entry_names(&clip_dir),
+        vec![
+            format!("{id}_0.mcap"),
+            format!("{id}_1.mcap"),
+            clip::layout::METADATA_FILE.to_string(),
+        ],
+        "the contributing recordings are numbered 0 and 1, with no hole where \
+         the empty one was planned"
+    );
+
+    let metadata = clip::layout::read_metadata(&clip_dir).expect("reading the document");
+    assert_eq!(
+        metadata.window.files_planned, 3,
+        "all three recordings overlapped the window and were read"
+    );
+    assert_eq!(
+        metadata.sources.len(),
+        2,
+        "only the two that held an in-window message are files of the clip"
+    );
+    let sources: Vec<String> = metadata
+        .sources
+        .iter()
+        .map(|s| s.path.clone().expect("a cut file names its recording"))
+        .collect();
+    assert_eq!(
+        sources,
+        vec![
+            dir.join("collection_0.mcap").display().to_string(),
+            dir.join("collection_2.mcap").display().to_string(),
+        ],
+        "the per-file list names the two that contributed, and not the one that \
+         did not"
+    );
+    assert_eq!(
+        read_clip_dir(&clip_dir)
+            .into_iter()
+            .map(|(_, log_time)| log_time)
+            .collect::<Vec<_>>(),
+        vec![at(-1), at(1)],
+        "the clip holds exactly the in-window messages, in time order"
+    );
+    env.assert_out_dir_holds_only_clips();
+}
+
+/// Which window of the four an [`an_empty_window_still_says_which_kind_of_empty_it_is`]
+/// case cuts. An enum rather than a label, so the match that places each window
+/// has to answer for every one of them.
+#[derive(Clone, Copy, Debug)]
+enum EmptyWindow {
+    /// Before the first recording's first message.
+    Before,
+    /// Between the two recordings, over the silence separating them.
+    Gap,
+    /// Inside one recording, between two consecutive messages.
+    NothingMatched,
+    /// Past the last recording's last message.
+    Past,
+}
+
+/// T6 — every trigger produces a clip, an empty window included, and the
+/// document says which kind of empty it is.
+///
+/// On disk an empty clip is one `<id>_0.mcap` holding an empty MCAP, whatever
+/// emptied it, so the four windows here are told apart only by their documents
+/// ([the table](../../../docs/clip-manifest.md)):
+///
+/// - **before** the collection, and **in the gap between its two recordings**:
+///   `files_planned = 0`, `short = false`. No recording held a byte of the
+///   window, and the collection ran past its end. These are one kind, not two —
+///   which is itself worth pinning, since the epic's catalogue names them
+///   separately and the document cannot.
+/// - **between two messages** of one recording: `files_planned = 1`,
+///   `short = false`. A recording was read and nothing in it matched.
+/// - **past** the collection's end: `files_planned = 0`, `short = true`.
+///   Nothing covered the window, which is the one thing a clip's contents can
+///   never show.
+///
+/// The gap is real rather than contrived: two recorder runs, seconds apart,
+/// copied side by side into one directory — which is what a collection assembled
+/// off a device looks like, and the only way a gap falls *between* recordings
+/// rather than inside one (a recorder rolls over when it next writes, so a
+/// silence never splits a file).
+#[rstest]
+#[case::before_the_collection(EmptyWindow::Before, 0, false)]
+#[case::in_the_gap_between_recordings(EmptyWindow::Gap, 0, false)]
+#[case::between_two_messages(EmptyWindow::NothingMatched, 1, false)]
+#[case::past_the_collection(EmptyWindow::Past, 0, true)]
+fn an_empty_window_still_says_which_kind_of_empty_it_is(
+    #[case] which: EmptyWindow,
+    #[case] files_planned: usize,
+    #[case] short: bool,
+) {
+    if !require_e2e() {
+        return;
+    }
+    let env = TestEnv::new();
+    let dir = env.path("collection");
+    std::fs::create_dir_all(&dir).expect("creating the collection directory");
+
+    // Two real recordings with a real gap between them: record, copy the split
+    // aside, wait, record again.
+    let first = finished_recording(&env, Duration::from_secs(2), 0, 1);
+    std::fs::copy(first.file(), dir.join("collection_0.mcap")).expect("copying the first");
+    let (first_start, gap_start) = first.span();
+    std::thread::sleep(Duration::from_secs(3));
+    let second = finished_recording(&env, Duration::from_secs(2), 0, 1);
+    std::fs::copy(second.file(), dir.join("collection_1.mcap")).expect("copying the second");
+    let (gap_end, last) = second.span();
+    assert!(
+        gap_end > gap_start + SEC,
+        "precondition: the two recordings must leave a gap to aim a window into"
+    );
+
+    // A window a hundredth of a second wide, so `between two messages` really
+    // does fall between two of the 20 Hz source's stamps.
+    let narrow = SEC / 100;
+    let (anchor, preroll, postroll) = match which {
+        EmptyWindow::Before => (first_start - 5 * SEC, SEC, SEC),
+        EmptyWindow::Gap => (u64::midpoint(gap_start, gap_end), narrow, narrow),
+        EmptyWindow::NothingMatched => {
+            let stamps = &first.stamps[0];
+            let (a, b) = (stamps[stamps.len() / 2], stamps[stamps.len() / 2 + 1]);
+            assert!(
+                b - a > 2 * narrow,
+                "the source's stamps are far enough apart"
+            );
+            (u64::midpoint(a, b), narrow / 2, narrow / 2)
+        }
+        EmptyWindow::Past => (last + 5 * SEC, SEC, SEC),
+    };
+    let window = ParamWindow {
+        anchor_ns: anchor,
+        preroll_ns: preroll,
+        postroll_ns: postroll,
+        name: "empty",
+    };
+
+    let out_dir = env.out_dir();
+    let run = run_param_clip(&env, &format!("{which:?}"), &dir, &out_dir, window);
+    assert_eq!(run.code(), CLEAN_EXIT_CODE, "log: {}", run.log);
+
+    let id = window.clip_id();
+    let clip_dir = out_dir.join(&id);
+    assert_eq!(
+        entry_names(&clip_dir),
+        vec![
+            format!("{id}_0.mcap"),
+            clip::layout::METADATA_FILE.to_string(),
+        ],
+        "an empty window is still one file and a document"
+    );
+    assert!(
+        read_clip_dir(&clip_dir).is_empty(),
+        "the {which:?} window holds no message"
+    );
+
+    let metadata = clip::layout::read_metadata(&clip_dir).expect("reading the document");
+    assert_eq!(metadata.clip.messages, 0);
+    assert_eq!(
+        metadata.window.files_planned, files_planned,
+        "how many recordings the {which:?} window was planned over"
+    );
+    assert_eq!(
+        metadata.clip.short, short,
+        "whether the collection ever reached the {which:?} window's end"
+    );
+    env.assert_out_dir_holds_only_clips();
+}
+
+/// T13 — `--out-dir` is created with parents, is never required to be empty, and
+/// whatever was already in it is left exactly as it was.
+///
+/// The three facts an operator pointing a sync tool at a directory relies on,
+/// asserted in one run because they are one rule: clipper adds clip directories
+/// to that root and does nothing else to it. No staging directory appears
+/// either — which a listing of the root proves only because a staging area would
+/// be a *directory* too, so the check is that every entry is either something
+/// that was already there or a clip named by its id.
+#[rstest]
+fn an_out_dir_is_created_with_parents_and_what_is_already_in_it_is_left_alone() {
+    if !require_e2e() {
+        return;
+    }
+    let env = TestEnv::new();
+    let bag = finished_recording(&env, Duration::from_secs(4), 0, 1);
+
+    // A path whose parents do not exist: the run creates the whole tree.
+    let out_dir = env.path("deep/er/still/clipped");
+    assert!(!out_dir.exists(), "precondition: the tree is missing");
+    let first = ParamWindow {
+        anchor_ns: bag.split_midpoint(0),
+        preroll_ns: SEC,
+        postroll_ns: SEC,
+        name: "parents",
+    };
+    let run = run_param_clip(&env, "parents", bag.file(), &out_dir, first);
+    assert_eq!(run.code(), CLEAN_EXIT_CODE, "log: {}", run.log);
+    assert_eq!(entry_names(&out_dir), vec![first.clip_id()]);
+
+    // Foreign entries an operator or another tool left there, of both shapes.
+    std::fs::write(out_dir.join("README.txt"), b"not clipper's").expect("writing a foreign file");
+    std::fs::create_dir(out_dir.join("incoming")).expect("creating a foreign directory");
+    std::fs::write(out_dir.join("incoming/held"), b"nor this").expect("writing under it");
+    let foreign = dir_bytes(&out_dir.join("incoming"));
+
+    let second = ParamWindow {
+        name: "alongside",
+        ..first
+    };
+    let run = run_param_clip(&env, "alongside", bag.file(), &out_dir, second);
+    assert_eq!(run.code(), CLEAN_EXIT_CODE, "log: {}", run.log);
+
+    let mut expected = vec![
+        "README.txt".to_string(),
+        "incoming".to_string(),
+        first.clip_id(),
+        second.clip_id(),
+    ];
+    expected.sort();
+    assert_eq!(
+        entry_names(&out_dir),
+        expected,
+        "the root gained a clip directory and nothing else — no staging area, no \
+         lock, no sidecar"
+    );
+    assert_eq!(
+        std::fs::read(out_dir.join("README.txt")).expect("the foreign file survives"),
+        b"not clipper's",
+        "a file that was already there is not touched"
+    );
+    assert_eq!(
+        dir_bytes(&out_dir.join("incoming")),
+        foreign,
+        "a directory that was already there is not touched"
+    );
+    assert_eq!(
+        complete_clips_in(&out_dir),
+        {
+            let mut ids = vec![first.clip_id(), second.clip_id()];
+            ids.sort();
+            ids
+        },
+        "both windows are complete clips, and the foreign entries are not clips"
+    );
+}
+
+/// T21 — the same recording as a single file and as the bag directory holding it
+/// cuts the same clip.
+///
+/// Which of the two an operator passes is a property of what they have on hand,
+/// never of what they get: the id, the file names, the message bytes and every
+/// field of the document but the source path are identical. The exception is the
+/// point — `source.path` is the recording each file was read from, and that is
+/// the same file either way, so even it agrees here.
+#[rstest]
+fn a_single_file_and_the_bag_directory_holding_it_cut_the_same_clip() {
+    if !require_e2e() {
+        return;
+    }
+    let env = TestEnv::new();
+    let bag = finished_recording(&env, Duration::from_secs(4), 0, 1);
+    let window = ParamWindow {
+        anchor_ns: bag.split_midpoint(0),
+        preroll_ns: SEC,
+        postroll_ns: SEC,
+        name: "same-shape",
+    };
+
+    let by_file = env.path("out-file");
+    let by_dir = env.path("out-dir");
+    let file_run = run_param_clip(&env, "by-file", bag.file(), &by_file, window);
+    let dir_run = run_param_clip(&env, "by-dir", &bag.dir, &by_dir, window);
+    assert_eq!(file_run.code(), CLEAN_EXIT_CODE, "log: {}", file_run.log);
+    assert_eq!(dir_run.code(), CLEAN_EXIT_CODE, "log: {}", dir_run.log);
+
+    let id = window.clip_id();
+    assert_eq!(entry_names(&by_file), vec![id.clone()]);
+    assert_eq!(entry_names(&by_dir), vec![id.clone()]);
+    assert_eq!(
+        entry_names(&by_file.join(&id)),
+        entry_names(&by_dir.join(&id)),
+        "the two inputs yield the same files inside the clip"
+    );
+    assert_eq!(
+        read_clip_dir(&by_file.join(&id)),
+        read_clip_dir(&by_dir.join(&id)),
+        "the two inputs yield the same messages"
+    );
+    assert_eq!(
+        clip::layout::read_metadata(&by_file.join(&id)).expect("reading the file run's document"),
+        clip::layout::read_metadata(&by_dir.join(&id)).expect("reading the dir run's document"),
+        "the two inputs yield the same document, source path included — it is \
+         the same recording that was read"
+    );
+}
+
+/// A finished `--all` recording carrying one trigger of its own per name, with
+/// recorded data on both sides of every window.
+///
+/// This is the input `clipper clip --trigger-source mcap` takes: a recording
+/// that states its own triggers, so a run over it cuts one clip per trigger with
+/// nothing on the command line to say which windows those are. Each publish
+/// costs the ros2 CLI's startup, which is also what spaces the triggers out.
+fn finished_recording_with_triggers(
+    env: &TestEnv,
+    names: &[&str],
+    preroll_ns: u64,
+    postroll_ns: u64,
+    payload_bytes: usize,
+) -> Finished {
+    // `--all` so the recorder captures the trigger topic; the triggers have to
+    // be in the recording for the run to find them there.
+    let mut recorder = env.start_recorder(CUTTABLE_PRESET, 0);
+    let mut source = env.start_bulk_source(SRC_TOPIC, SRC_RATE, payload_bytes);
+    env.wait_for_recording(Duration::from_secs(60));
+    // Data before the first window's preroll reaches back.
+    std::thread::sleep(Duration::from_nanos(preroll_ns) + Duration::from_secs(1));
+    for name in names {
+        env.publish_trigger_into_bag(name, preroll_ns, postroll_ns);
+    }
+    // ... and data past the last window's postroll, so no clip is short.
+    std::thread::sleep(Duration::from_nanos(postroll_ns) + Duration::from_secs(1));
+    source.stop(libc::SIGTERM, Duration::from_secs(10));
+    recorder.stop(libc::SIGINT, Duration::from_secs(30));
+
+    let bag = Finished::of(&env.record_dir());
+    assert_eq!(
+        recorded_trigger_anchors(bag.file()).len(),
+        names.len(),
+        "the recording must carry one trigger per name"
+    );
+    bag
+}
+
+/// The names the embedded-trigger scenarios publish into a recording. Distinct
+/// names so each trigger is its own clip whatever the stamps come out as.
+const EMBEDDED_TRIGGERS: [&str; 5] = [
+    "embedded-1",
+    "embedded-2",
+    "embedded-3",
+    "embedded-4",
+    "embedded-5",
+];
+
+/// T17 — a `clipper clip` run over a recording's own triggers, then the same run
+/// again: the second cuts nothing, skips every window with a warning each, exits
+/// zero, and changes no byte.
+///
+/// This is what makes a re-run a resume rather than a conflict to clear by hand.
+/// A finished recording and a trigger describe one window over one set of bytes,
+/// so a window whose directory exists has already been cut — and an idempotent
+/// pipeline that simply runs the job again needs no special case for it.
+#[rstest]
+fn a_clip_run_repeated_over_one_recording_skips_every_window_and_exits_zero() {
+    if !require_e2e() {
+        return;
+    }
+    let env = TestEnv::new();
+    let bag = finished_recording_with_triggers(&env, &EMBEDDED_TRIGGERS, SEC, SEC, SRC_PAYLOAD);
+    let n = EMBEDDED_TRIGGERS.len();
+    let out_dir = env.out_dir();
+
+    let first = env.run_clip(
+        "resume-1",
+        bag.file(),
+        &out_dir,
+        &["--trigger-source", "mcap"],
+    );
+    assert_eq!(first.code(), CLEAN_EXIT_CODE, "log: {}", first.log);
+    assert_eq!(
+        env.complete_clips().len(),
+        n,
+        "one complete clip per recorded trigger"
+    );
+    assert!(
+        first
+            .log
+            .contains(&format!("{n} clip(s) cut, 0 skipped as already there")),
+        "the first run cut every window: {}",
+        first.log
+    );
+    let published = env.out_dir_bytes();
+
+    let again = env.run_clip(
+        "resume-2",
+        bag.file(),
+        &out_dir,
+        &["--trigger-source", "mcap"],
+    );
+    assert_eq!(again.code(), CLEAN_EXIT_CODE, "log: {}", again.log);
+    assert!(
+        again
+            .log
+            .contains(&format!("0 clip(s) cut, {n} skipped as already there")),
+        "the re-run skipped every window: {}",
+        again.log
+    );
+    assert_eq!(
+        again
+            .log
+            .matches("is already there; skipping this window")
+            .count(),
+        n,
+        "each skip warns on its own line, naming its directory: {}",
+        again.log
+    );
+    assert_eq!(
+        env.out_dir_bytes(),
+        published,
+        "a re-run changes not one byte of what is already there"
+    );
+    env.assert_out_dir_holds_only_clips();
+}
+
+/// T18 — a run killed partway through is finished by running it again.
+///
+/// The kill is a supervisor's, a power cut's or an operator's; what it leaves is
+/// whatever the run had published, plus at most one directory the cut in flight
+/// had claimed. The re-run skips both — a taken id is taken whatever the
+/// directory holds — and cuts the windows that never got one, so the recording's
+/// remaining clips arrive without anything being cleared by hand. The residue
+/// stays residue: it is the evidence that something died, and repairing it would
+/// destroy the only trace.
+#[rstest]
+fn a_clip_run_killed_partway_is_finished_by_running_it_again() {
+    if !require_e2e() {
+        return;
+    }
+    let env = TestEnv::new();
+    // A payload heavy enough that each cut takes long enough to be interrupted
+    // between windows rather than all five finishing inside one poll.
+    let bag =
+        finished_recording_with_triggers(&env, &EMBEDDED_TRIGGERS, 2 * SEC, SEC, BULK_PAYLOAD);
+    let n = EMBEDDED_TRIGGERS.len();
+    let out_dir = env.out_dir();
+
+    let mut run = env.spawn_clip(
+        "killed",
+        bag.file(),
+        &out_dir,
+        &["--trigger-source", "mcap"],
+    );
+    // Kill it once it has published something but before it can have published
+    // everything: the first clip's document is the signal that the run is under
+    // way, and the remaining windows are what the re-run has to pick up.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while env.complete_clips().is_empty() && run.is_running() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the run published nothing to interrupt"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    run.signal_group(libc::SIGKILL);
+    run.wait_exit(Duration::from_secs(10))
+        .expect("SIGKILL must end the run");
+
+    let interrupted = env.complete_clips();
+    let all = env.published_clips();
+    assert!(
+        !interrupted.is_empty() && interrupted.len() < n,
+        "precondition: the kill must land partway, got {} of {n} complete",
+        interrupted.len()
+    );
+    let residue: Vec<String> = all
+        .iter()
+        .filter(|name| !interrupted.contains(name))
+        .cloned()
+        .collect();
+    let kept = env.out_dir_bytes();
+
+    let resumed = env.run_clip(
+        "resumed",
+        bag.file(),
+        &out_dir,
+        &["--trigger-source", "mcap"],
+    );
+    assert_eq!(resumed.code(), CLEAN_EXIT_CODE, "log: {}", resumed.log);
+    assert!(
+        resumed.log.contains("skipped as already there"),
+        "the re-run skipped what the killed run had claimed: {}",
+        resumed.log
+    );
+    assert_eq!(
+        env.published_clips().len(),
+        n,
+        "every recorded trigger now has its directory"
+    );
+    assert_eq!(
+        env.complete_clips().len(),
+        n - residue.len(),
+        "every window but the ones the kill left residue for is a complete clip"
+    );
+    for name in &residue {
+        assert!(
+            clip::layout::read_metadata(&out_dir.join(name)).is_err(),
+            "the residue of the killed cut is not repaired: {name}"
+        );
+    }
+    // What the killed run had published is untouched by the one that finished it.
+    let after = env.out_dir_bytes();
+    for (path, bytes) in &kept {
+        assert_eq!(
+            after.get(path),
+            Some(bytes),
+            "the interrupted run's output must survive the re-run: {}",
+            path.display()
+        );
+    }
+    env.assert_out_dir_holds_only_clips();
+}
+
+/// T12 — two `clipper clip` runs over one recording into one output directory at
+/// once are harmless to each other: both exit zero, every clip is complete, and
+/// together they produce exactly what one run produces.
+///
+/// No lock file and no coordination: each window claims its directory with one
+/// `mkdir`, the kernel picks a winner, and the loser skips. Which of the two
+/// processes cut any given clip is therefore not a fact about the output, which
+/// is the point — a scheduling accident that starts the job twice costs nothing
+/// and loses nothing.
+#[rstest]
+fn two_clip_runs_into_one_out_dir_together_produce_one_runs_output() {
+    if !require_e2e() {
+        return;
+    }
+    let env = TestEnv::new();
+    let bag = finished_recording_with_triggers(&env, &EMBEDDED_TRIGGERS, SEC, SEC, BULK_PAYLOAD);
+    let n = EMBEDDED_TRIGGERS.len();
+
+    let shared = env.path("out-shared");
+    let mut a = env.spawn_clip("race-a", bag.file(), &shared, &["--trigger-source", "mcap"]);
+    let mut b = env.spawn_clip("race-b", bag.file(), &shared, &["--trigger-source", "mcap"]);
+    for (tag, proc) in [("a", &mut a), ("b", &mut b)] {
+        let status = proc.wait_exit(Duration::from_secs(120)).unwrap_or_else(|| {
+            proc.dump_log();
+            panic!("the concurrent run {tag} did not finish");
+        });
+        assert_eq!(
+            status.code(),
+            Some(CLEAN_EXIT_CODE),
+            "a run that skipped what the other claimed is a normal run, got {status}"
+        );
+    }
+
+    // The reference: what one run alone leaves.
+    let alone = env.path("out-alone");
+    let single = env.run_clip("alone", bag.file(), &alone, &["--trigger-source", "mcap"]);
+    assert_eq!(single.code(), CLEAN_EXIT_CODE, "log: {}", single.log);
+
+    assert_eq!(
+        complete_clips_in(&shared),
+        complete_clips_in(&alone),
+        "the union of the two runs is one run's output"
+    );
+    assert_eq!(complete_clips_in(&shared).len(), n);
+    for id in complete_clips_in(&shared) {
+        assert_eq!(
+            read_clip_dir(&shared.join(&id)),
+            read_clip_dir(&alone.join(&id)),
+            "the racing runs' clip {id} holds what one run's does"
+        );
+    }
+    assert_eq!(
+        entry_names(&shared),
+        complete_clips_in(&shared),
+        "every directory the race left is a complete clip — a loser writes nothing"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The same trigger, twice
+//
+// A repeated trigger is only a *repeated* trigger where the anchor it resolves
+// to is reproducible, and under the deployed default — `--trigger-source ros`
+// on `--time-source log` — it is not: the anchor is `now_ns()` at the
+// subscription instant, so two publishes milliseconds apart resolve to two
+// anchors, two ids and two clips. That is correct, and it is why every scenario
+// below runs on `--time-source publish`, the one cell that anchors on the
+// trigger's own `trigger_time`. Two publishes carrying one `trigger_time` are
+// then one window with one id — and the id is a value the test chose, so it can
+// name the directory before the recorder creates it.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The recorder's clock domain for the scenarios that need a reproducible
+/// anchor, and the one its clips' ids are computed against.
+const REPEATABLE_SOURCE: &str = "publish";
+const REPEATABLE_TIME_SOURCE: clip::TimeSource = clip::TimeSource::Publish;
+
+/// The directory name the clip of a trigger published with
+/// [`TestEnv::fire_trigger_stamped`] will have, on that cell.
+fn stamped_clip_id(name: &str, anchor_ns: u64, preroll_ns: u64, postroll_ns: u64) -> String {
+    clip_id_of(
+        name,
+        anchor_ns,
+        preroll_ns,
+        postroll_ns,
+        REPEATABLE_TIME_SOURCE,
+        "tail",
+    )
+}
+
+/// A live recorder on the cell whose anchor a test can choose, with data
+/// already on disk.
+///
+/// The bring-up every scenario in this section shares: a continuous `ros2 bag
+/// record --all`, a source publishing into it, and a `clipper tail` on
+/// `--time-source publish`. It returns once the recording holds `data` of the
+/// source — measured on the recording's own extent, since the ros2 CLI starts
+/// publishing an unbounded moment after it is spawned — so a window anchored
+/// that far in the past lies over bytes that are already there.
+///
+/// `payload_bytes` is the source's message size, which decides how long a
+/// window's copy takes ([`TestEnv::start_bulk_source`]) and matters only to the
+/// scenarios that watch a cut while it runs.
+struct LiveTail {
+    /// Kept alive for the test's duration; the tests act on the extractor.
+    _recorder: Proc,
+    _source: Proc,
+    extractor: Proc,
+}
+
+fn live_tail(env: &TestEnv, data: Duration, payload_bytes: usize) -> LiveTail {
+    let recorder = env.start_recorder("fastwrite", 0);
+    let source = env.start_bulk_source(SRC_TOPIC, BULK_RATE, payload_bytes);
+    env.wait_for_recording(Duration::from_secs(60));
+    let extractor = env.start_extractor_src(30, REPEATABLE_SOURCE);
+    env.wait_for_recording_span(data, Duration::from_secs(90));
+    LiveTail {
+        _recorder: recorder,
+        _source: source,
+        extractor,
+    }
+}
+
+/// T9 — a trigger whose clip is already there is skipped: the warning names the
+/// directory, not a byte of it changes, and no second `Recorded` goes out.
+///
+/// A clip is written once. The rule is the directory's existence and nothing
+/// else, so a detector that fires the same request twice costs the disk one
+/// clip, and a subscriber counting announcements counts one event.
+#[rstest]
+fn a_trigger_whose_clip_is_already_there_is_skipped_and_announces_nothing() {
+    if !require_e2e() {
+        return;
+    }
+    let env = TestEnv::new();
+    let (preroll, postroll) = (2 * SEC, SEC);
+    let mut live = live_tail(&env, Duration::from_nanos(preroll), SRC_PAYLOAD);
+    let extractor = &mut live.extractor;
+
+    // A window entirely in the past, so the recording already covers its end and
+    // each handler goes straight to its claim.
+    let mut stream = env.start_recorded_stream("repeat");
+    let anchor = now_ns() - 3 * SEC;
+    env.fire_trigger_stamped("repeat", anchor, preroll, postroll);
+
+    let announced = wait_for_recorded_count(&mut stream, 1, Duration::from_secs(60));
+    let id = stamped_clip_id("repeat", anchor, preroll, postroll);
+    let clip_dir = env.out_dir().join(&id);
+    assert_eq!(
+        env.complete_clips(),
+        vec![id.clone()],
+        "the first trigger's clip is there and complete"
+    );
+    assert_eq!(
+        announced[0].filenames,
+        vec![clip_dir.display().to_string()],
+        "the announcement names the one directory the clip is"
+    );
+    let published = env.out_dir_bytes();
+
+    // The same request again: same trigger_time, same window, same id.
+    env.fire_trigger_stamped("repeat", anchor, preroll, postroll);
+    extractor.expect_log_count("trigger name=\"repeat\"", 2, Duration::from_secs(60));
+    extractor.expect_log(
+        "is already there; skipping this window",
+        Duration::from_secs(60),
+    );
+    assert!(
+        extractor
+            .log_text()
+            .contains(&clip_dir.display().to_string()),
+        "the warning names the directory an operator would have to remove"
+    );
+
+    // Give a second announcement every chance to arrive before denying it.
+    std::thread::sleep(Duration::from_secs(5));
+    assert_eq!(
+        env.published_clips(),
+        vec![id],
+        "the repeat left no second directory"
+    );
+    assert_eq!(
+        env.out_dir_bytes(),
+        published,
+        "the clip already there is not rewritten, not even identically"
+    );
+    assert_eq!(
+        recorded_so_far(&stream).len(),
+        1,
+        "a skipped window announces nothing — its warning is its whole trace"
+    );
+    env.assert_out_dir_holds_only_clips();
+    assert!(extractor.is_running(), "a skip is not a fault");
+}
+
+/// T10 — an incomplete directory is skipped exactly as a complete one is, and
+/// nothing about it is repaired.
+///
+/// What a killed cut leaves is a directory with no document, and it is evidence:
+/// a later trigger with that id neither overwrites it nor finishes it. So the
+/// claim's rule is the directory's existence and never what is inside it — and
+/// the residue an operator finds is the residue the crash left, not something
+/// clipper wrote on top of it.
+#[rstest]
+fn an_incomplete_clip_directory_is_skipped_and_never_repaired() {
+    if !require_e2e() {
+        return;
+    }
+    let env = TestEnv::new();
+    let (preroll, postroll) = (2 * SEC, SEC);
+    let mut live = live_tail(&env, Duration::from_nanos(preroll), SRC_PAYLOAD);
+    let extractor = &mut live.extractor;
+
+    // Crash residue in the shape a killed cut leaves: the directory, an MCAP
+    // file under the name a copy writes, and no document.
+    let anchor = now_ns() - 3 * SEC;
+    let id = stamped_clip_id("residue", anchor, preroll, postroll);
+    let clip_dir = env.out_dir().join(&id);
+    std::fs::create_dir_all(&clip_dir).expect("planting the residue directory");
+    std::fs::write(clip_dir.join(format!("{id}_0.mcap")), b"half a clip")
+        .expect("planting the residue file");
+    let residue = env.out_dir_bytes();
+
+    let stream = env.start_recorded_stream("residue");
+    env.fire_trigger_stamped("residue", anchor, preroll, postroll);
+    extractor.expect_log(
+        "is already there; skipping this window",
+        Duration::from_secs(60),
+    );
+    assert!(
+        extractor
+            .log_text()
+            .contains(&clip_dir.display().to_string()),
+        "the warning names the residue directory"
+    );
+
+    std::thread::sleep(Duration::from_secs(5));
+    assert_eq!(
+        env.out_dir_bytes(),
+        residue,
+        "the residue is left exactly as it was found — not repaired, not replaced"
+    );
+    assert!(
+        clip::layout::read_metadata(&clip_dir).is_err(),
+        "and it is still incomplete, so no consumer reads it as a clip"
+    );
+    assert!(
+        env.complete_clips().is_empty(),
+        "the skipped window produced no clip of its own"
+    );
+    assert!(recorded_so_far(&stream).is_empty(), "and announced nothing");
+    env.assert_out_dir_holds_only_clips();
+    assert!(extractor.is_running());
+}
+
+/// T11 — the same trigger twice within milliseconds yields exactly one clip and
+/// one announcement.
+///
+/// Two handlers reach the claim at once and the kernel picks the winner: one
+/// `mkdir` succeeds, the other sees the directory and skips. There is no lock
+/// file and no coordination, so what settles the race is the same operation that
+/// settles a repeat seconds apart — which is why the burst needs no separate
+/// rule and gets none.
+///
+/// A single `ros2 topic pub` publishes both copies (`-t 2`), because two
+/// processes could not be started milliseconds apart: each costs about a second
+/// of python startup, which is the very gap this case is about closing.
+#[rstest]
+fn the_same_trigger_twice_within_milliseconds_yields_one_clip() {
+    if !require_e2e() {
+        return;
+    }
+    let env = TestEnv::new();
+    let (preroll, postroll) = (2 * SEC, SEC);
+    let mut live = live_tail(&env, Duration::from_nanos(preroll), SRC_PAYLOAD);
+    let extractor = &mut live.extractor;
+
+    let stream = env.start_recorded_stream("twice");
+    let anchor = now_ns() - 3 * SEC;
+    // Two copies 20 ms apart, identical to the byte.
+    env.fire_trigger_burst("twice", anchor, preroll, postroll, 2, 50);
+
+    let id = stamped_clip_id("twice", anchor, preroll, postroll);
+    env.wait_for_complete_clips(1, Duration::from_secs(60));
+    std::thread::sleep(Duration::from_secs(5));
+
+    assert_eq!(
+        env.published_clips(),
+        vec![id],
+        "two copies of one request are one clip"
+    );
+    assert_eq!(
+        env.complete_clips().len(),
+        1,
+        "and it is complete — the loser wrote nothing into the winner's directory"
+    );
+    assert_eq!(
+        recorded_so_far(&stream).len(),
+        1,
+        "one clip, one announcement"
+    );
+    assert!(
+        extractor
+            .log_text()
+            .contains("is already there; skipping this window"),
+        "the loser said what happened to it"
+    );
+    env.assert_out_dir_holds_only_clips();
+    assert!(extractor.is_running());
+}
+
+/// T25 — sixteen windows open at once, each with its own id, each a complete
+/// clip with one `Recorded`.
+///
+/// Sixteen is the admission cap, so this is the burst the recorder is built to
+/// take without turning any trigger away — and the assertion that none was is
+/// the log *not* naming a rejection. The windows share one anchor and differ
+/// only in name, which is the point twice over: the ids differ because the name
+/// is one of the six fields hashed, and the handlers genuinely overlap because
+/// one anchor and one postroll park every one of them until the same instant.
+#[rstest]
+fn sixteen_windows_at_once_each_get_their_own_clip_and_announcement() {
+    if !require_e2e() {
+        return;
+    }
+    let env = TestEnv::new();
+    let (preroll, postroll) = (2 * SEC, 10 * SEC);
+    let mut live = live_tail(&env, Duration::from_nanos(preroll), SRC_PAYLOAD);
+    let extractor = &mut live.extractor;
+
+    let names: Vec<String> = (0..16).map(|i| format!("burst-{i:02}")).collect();
+    let mut stream = env.start_recorded_stream("sixteen");
+    // The window ends ten seconds out, so every handler is still parked on its
+    // postroll while the last of the sixteen publishes is still going out.
+    let anchor = now_ns();
+    env.fire_triggers_at_once(&names, anchor, preroll, postroll);
+
+    let clips = env.wait_for_complete_clips(16, Duration::from_secs(90));
+    let mut expected: Vec<String> = names
+        .iter()
+        .map(|name| stamped_clip_id(name, anchor, preroll, postroll))
+        .collect();
+    expected.sort();
+    assert_eq!(
+        clips, expected,
+        "sixteen distinct requests at one instant are sixteen distinct clips"
+    );
+
+    let announced = wait_for_recorded_count(&mut stream, 16, Duration::from_secs(60));
+    let mut announced_names: Vec<String> = announced.iter().map(|r| r.name.clone()).collect();
+    announced_names.sort();
+    assert_eq!(announced_names, names, "one announcement per clip");
+    for recorded in &announced {
+        assert_eq!(
+            recorded.filenames.len(),
+            1,
+            "each announcement names one directory"
+        );
+    }
+    assert!(
+        !extractor.log_text().contains("trigger rejected"),
+        "sixteen at once is the cap, not past it: no trigger may be turned away"
+    );
+    env.assert_out_dir_holds_only_clips();
+    assert!(extractor.is_running());
 }
