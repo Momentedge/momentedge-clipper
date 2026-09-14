@@ -523,6 +523,59 @@ this section is the rationale.
   value lives and why. Reaching for `fastwrite` in a new `clipper clip` scenario
   out of habit fails as a refusal rather than as a wrong assertion, which is the
   suite being right about the contract rather than a fixture being awkward.
+- **A window a test can name is what makes an exact `out_dir` assertion
+  possible.** Under `clipper clip --trigger-source param` and `clipper tail
+  --trigger-source ros --time-source publish` the anchor is a value the *caller*
+  supplies, so `harness::clip_id_of` computes a clip's directory name before the
+  run creates it. That is what lets a scenario say exactly what `out_dir` must
+  hold, plant crash residue under an id a trigger is about to claim, and express
+  "the same trigger again" at all. Under the deployed `ros` + `log` default the
+  anchor is clipper's own subscription instant, so two publishes of one request
+  resolve to two ids and two clips — correct, and the reason every skip and
+  resume scenario lives on the other two paths. A skip scenario written against
+  `ros` + `log` cannot work, and it fails looking like a clipper bug rather than
+  a test one.
+- **Catching a cut in the act takes one of two levers.** For `clipper clip`,
+  volume: `TestEnv::start_bulk_source` publishes about 2 MB/s (`BULK_RATE` 50 Hz
+  × `BULK_PAYLOAD` 40 kB), so a window's copy outlasts the 2 ms poll watching for
+  its directory by orders of magnitude. For a live handler, the postroll: a
+  handler claims its directory when its window *closes*, so a window closing
+  seconds from now puts the claim at an instant the test is already watching for.
+  Both buy a wide margin rather than a race, which is why a kill that lands after
+  the document is written fails saying the cut outran the watcher — a slow
+  machine, not a semantics regression.
+- **`assert_out_dir_holds_only_clips` tests the shape of every entry**, not
+  merely that it is a directory: each must also be *named by a clip id*
+  (`harness::is_clip_id` — the anchor, an underscore, four lower-case hex groups
+  of four). "Is a directory" alone is too weak a test, because a staging area is
+  a directory too and would pass it. Completeness is deliberately not asserted
+  there: a directory with no document is how a consumer tells crash residue from
+  a clip, so the helper has to tolerate one.
+- **Permission injection needs an ordinary user, and says so out loud.**
+  `harness::assert_permissions_bite` probes that an `r-x` directory really
+  refuses a `mkdir` before a scenario leans on it, and **fails** rather than
+  skips when it does not: uid 0 bypasses the mode bits these scenarios inject
+  their fault with, so the `mkdir` succeeds and the fault under test never
+  happens. A run that passes having injected nothing is worse than a red one, and
+  the known way to reach it is `act`, which runs the workflow in a container as
+  root. CI's `recorder` job is a plain GitHub runner, so it holds there.
+- **The `ROS_DOMAIN_ID` band is 1–101, and its width is load-bearing.**
+  `harness::unique_domain` is `1 + (pid + counter) % 101`: nextest gives each
+  test its own process, so the pid separates test processes and the counter
+  separates tests within one. Consecutive test processes get pids a handful
+  apart, so a band narrow enough for that modulus to wrap inside that distance
+  hands the same domain to tests running back to back — and a child outliving its
+  test by a moment then publishes into the next test's graph, which reads as an
+  announcement that test never triggered. A hundred domains puts the wrap far
+  beyond any run's pid spread. 1 keeps clear of the host's domain 0; 101 is the
+  top of the range whose DDS ports fit the default port plan.
+- **What it costs: 46 cases, about nine to ten minutes per distro leg in CI.**
+  The suite is serialized, so that is wall clock rather than load, and a dev box
+  doing anything else takes longer. Most of it is the live scenarios sleeping out
+  real trigger windows; the `clipper clip` cases are the cheap ones (0.3 s to
+  13 s) because they wait for nothing — no postroll, no coverage. Budget a case's
+  runtime before adding one: a live scenario costs whatever window it asks for,
+  and a `clipper clip` scenario over a fixture costs almost nothing.
 - **Determinism over realism, except where realism is the point.** The
   chunked-profile case stops the recorder cleanly so the footer (`ended`)
   releases the coverage wait instead of racing a chunk flush; every corruption

@@ -97,6 +97,24 @@ its own run, never reconstructing offsets or footers it did not scan
 incrementally. A trigger fired shortly after startup whose preroll reaches into a
 prior split that existed before launch gets no segment from that file.
 
+**The adopted recording's own triggers are re-delivered, and the `mcap`
+interface acts on them.** "No startup back-indexing" covers the recordings the
+iterator is seeded *past*, not the one that is adopted: that file is indexed from
+its first byte, with the trigger tap on for the pass, so every trigger the
+current split already holds reaches the interface again on every restart.
+Nothing is re-cut — each resolves to the id the earlier run used, and
+[the claim on that id is taken](../clip/CLAUDE.md#what-a-clip-is-on-disk-cliplayout),
+so the window is skipped with a warning and announced not at all. What it costs
+is admission: each re-delivered trigger occupies one of the sixteen handler slots
+until its two waits finish and the claim turns it away, so a restart against a
+split holding many triggers can delay a genuine trigger behind them. The e2e
+suite therefore asserts only the guarantee a supervisor rests on — that a restart
+leaves the output directory unchanged
+(`a_tail_restart_re_cuts_nothing_and_leaves_the_clips_it_finds`) — and pins
+neither behaviour, because whether the tap should skip what the adopted recording
+already held or the handler should test the claim before its waits is an open
+design call (beads `clipper-9oz`).
+
 A bag split (rosbag2 `--max-bag-size`/`--max-bag-duration`) is detected when a
 footer appears on disk, when a successor is yielded by the iterator while
 `current` is length-stable, or when the tailed inode vanishes or is replaced. In
