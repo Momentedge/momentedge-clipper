@@ -219,13 +219,26 @@ claimed by one atomic `mkdir` and nothing else may write into it, so a taken nam
 is a bug rather than a race, and failing loudly beats two writers interleaving
 bytes into one file.
 
-**There is no cleanup on a `StagedClip`.** A file staged into a clip directory
-that is never completed dies with that directory: [a cut that fails removes the
-whole thing](#what-a-clip-is-on-disk-cliplayout), which is the one rule that also
-covers a partially written clip, a panicking copy and a crash. The only local
-tidying the copy does is removing its own half-written file when `copy_window`
-fails, so that a `StagedClip` that exists always names a complete MCAP and
-`is_empty()` can be read off it.
+**A `StagedClip` is either placed or discarded, never merely forgotten.**
+`place` renames a file that contributed to its `<id>_N.mcap`; `discard` removes
+one that copied nothing in a window that produced data elsewhere. Both consume
+the value, so the pair is exhaustive — and a dropped file has to be *removed*
+rather than dropped from a `Vec`, because it is already on disk under its
+staging name and the directory this cut is about to complete must hold the files
+its document names, its document, and nothing else. A staging name left beside
+them would be noise in the one directory an operator points a sync tool at, and
+an entry no consumer has a rule for.
+
+**A clip directory that is never completed needs no cleanup at all**, which is
+why `discard` is best effort and returns no `Result`. [A cut that fails removes
+the whole directory](#what-a-clip-is-on-disk-cliplayout) — one rule covering a
+partially written clip, a panicking copy and a crash — so a staging file
+outlives its copy only inside a directory that *does* get completed, and there
+the worst a failed removal costs is a warning and one stray name beside a
+correct clip. Failing the cut over it would trade a good clip for a tidy
+directory. The only local tidying the copy itself does is removing its own
+half-written file when `copy_window` fails, so that a `StagedClip` that exists
+always names a complete MCAP and `is_empty()` can be read off it.
 
 Extraction degrades over localized damage and aborts on anything else.
 Skipped records and dropped chunks are counted in `ClipStats`

@@ -512,6 +512,17 @@ this section is the rationale.
   methods rather than fixture-on-fixture injection — rstest resolves a
   fixture fresh at each injection site, so fixtures sharing a `domain`
   dependency would each get a different domain.
+- **The two halves of the suite record under different storage profiles, and
+  have to.** A live scenario records the unchunked `fastwrite` profile, which is
+  what the tail is built to read while it grows. `clipper clip` plans its window
+  out of the *finished* recording's own summary, so it needs the chunked,
+  message-indexed shape and refuses an unchunked recording by name
+  (`clip::whole::IndexRefusal::Unchunked`, *"summary indexes no chunk"*) — a
+  `fastwrite` recording is exactly what the cutter cannot take. So every
+  `clipper clip` fixture records under `CUTTABLE_PRESET`, which is where that
+  value lives and why. Reaching for `fastwrite` in a new `clipper clip` scenario
+  out of habit fails as a refusal rather than as a wrong assertion, which is the
+  suite being right about the contract rather than a fixture being awkward.
 - **Determinism over realism, except where realism is the point.** The
   chunked-profile case stops the recorder cleanly so the footer (`ended`)
   releases the coverage wait instead of racing a chunk flush; every corruption
