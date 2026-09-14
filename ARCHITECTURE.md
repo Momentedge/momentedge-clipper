@@ -280,7 +280,7 @@ never see coverage regress.
 Each admitted trigger runs on its own `trigger-<ns>` thread, so overlapping
 windows are cut concurrently against the one shared tail. Waiting is the whole
 of what the live path adds: steps 1–2 and the announce are `tail::handler`'s,
-steps 3–5 are `clip::segment::cut_window` — the same cut a consumer runs against
+steps 3–6 are `clip::segment::cut_window` — the same cut a consumer runs against
 a recording nobody is writing. The window centres on the `anchor_ns` the
 interface resolved (see [The two interfaces](#the-two-interfaces)) and lives on
 the active `--time-source`:
@@ -293,30 +293,34 @@ the active `--time-source`:
    cut from whatever is on disk, with a warning — and the verdict travels into
    the cut as a `clip::manifest::WindowCoverage`, so the clip's document
    says whether the recording had reached the window end (`clip.short`).
-3. **Multi-file snapshot.** `plan_window(start_ns, end_ns, source)` — the tail's
+3. **Claim.** One atomic `mkdir` of `<out_dir>/<id>` — the first thing
+   `cut_window` does, before the plan — decides whether this window writes at
+   all. A directory that is already there means the id is taken, and the window
+   is skipped with a warning without planning or reading anything.
+4. **Multi-file snapshot.** `plan_window(start_ns, end_ns, source)` — the tail's
    implementation of `clip::index::WindowPlanner`, the one seam the cut path
    reaches a live collection through — produces a `Vec<WindowPlan>`, one per
    recording whose extents overlap the window on `source`, oldest first. Each
    plan pins its recording's `Arc<File>`, so a later prune or rollover cannot
-   pull the bytes out. Step 3 — the claim — runs before this, so a window whose
-   clip is already on disk is skipped without planning or reading anything.
-4. **Copy.** Enqueue one `StageJob` per plan on the FIFO staging channel and
+   pull the bytes out.
+5. **Copy.** Enqueue one `StageJob` per plan on the FIFO staging channel and
    block on each reply. Each job carries the `CutRequest` — the producer, the
    trigger, and the window derived from it — so the copy stamps each file with
    the clip's id. A worker copies each message whose stamp on `source` is in the
    window, into the directory claimed in step 3. A window covered by nothing
    still copies one empty file, so every trigger produces a valid (possibly
    empty) clip, and the clip's document says which kind of empty it is.
-5. **Name and complete.** Drop empty files when the window produced real data
+6. **Name and complete.** Drop empty files when the window produced real data
    elsewhere, keeping one when they are all empty, and name what is left
    `<id>_0.mcap`, `<id>_1.mcap`, … — the position among the files that
    contributed. Then write `clip_metadata.yaml` and fsync the directories: its
    presence is what makes the clip complete. A failure anywhere after the claim
    removes the whole directory. See [What a clip is on
    disk](#what-a-clip-is-on-disk).
-6. **Announce** one completion through the active interface, naming the clip's
+7. **Announce** one completion through the active interface, naming the clip's
    directory — only after the metadata file is durable, so an announced clip is
-   complete and crash-durable.
+   complete and crash-durable. A skipped window announces nothing: nothing was
+   recorded, and the warning is its whole trace.
 
 ## Cutting from a finished recording
 

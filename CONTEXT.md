@@ -65,9 +65,16 @@ clip is finished and safe to read or upload. A clip directory without it is
 being written, or is what a cut that died left behind.
 _Avoid_: finished, done, published
 
+**Clip id**:
+What a clip is called, and the name of its directory: the resolved anchor, then a
+digest of the six fields the trigger and the time source are. A function of the
+request and of nothing else, so the same request names the same clip on every
+machine and no trigger text reaches a path.
+_Avoid_: clip name, filename, hash
+
 **Recorded**:
-The completion announcement for a finished clip: its name, the one directory it
-is, and the window it was cut with.
+The completion announcement for a finished clip, echoing the trigger it answers
+and naming the one directory the clip is.
 _Avoid_: completion event, done message
 
 ### Time
@@ -117,8 +124,8 @@ _Avoid_: interface (that is the paired unit one of these selects), input, mode
 The paired trigger input and completion output, chosen as one unit — so the
 trigger source names both halves and there is no separate completion setting. The
 **ros** interface subscribes for triggers and publishes `Recorded`. The **mcap**
-interface lifts triggers out of the recording it already tails, and the clip's
-appearance in the output directory is the only completion signal. Cutting from a
+interface lifts triggers out of the recording it already tails, and a clip's
+metadata file appearing is the only completion signal. Cutting from a
 recording nobody is writing has a trigger source and no interface: there is no
 completion half to pair one with.
 _Avoid_: mode, transport, backend

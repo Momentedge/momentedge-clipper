@@ -35,20 +35,21 @@ check is logged at `error!` and ignored — no clip, no `Recorded`. The limits
   [the anchor matrix](#the-anchor-which-instant-the-window-centres-on)).
 
 For each finished clip, clipper publishes a `momentedge_msgs/Recorded` on
-`/events/momentedge/recorded`, echoing the trigger's `name`, `description`, and
-`trigger_time` and naming the clip in its `string[] filenames`. **`filenames`
-holds exactly one entry — the clip's directory** — however many MCAP files the
-clip took, so a subscriber opens one handle per clip and never learns the naming
-scheme inside it; which files are in there is the clip's own
+`/events/momentedge/recorded`, echoing the trigger's `name`, `description`,
+`trigger_time` and `preroll`, and naming the clip in its `string[] filenames`.
+**`filenames` holds exactly one entry — the clip's directory** — however many
+MCAP files the clip took, so a subscriber opens one handle per clip and never
+learns the naming scheme inside it; which files are in there is the clip's own
 [`clip_metadata.yaml`](clip-manifest.md) to say.
 
 The announcement goes out only once that `clip_metadata.yaml` is written and
-fsynced, so a `Recorded` always names a clip that is already complete by the rule
-below and already survives power loss.
+fsynced, so a `Recorded` always names a clip that is complete and already
+survives power loss.
 
-**Clip naming.** A clip is a **directory** named by its **id**,
-`<anchor_ns>_<hash>` — the resolved window anchor, then a digest of the whole
-trigger:
+**What the trigger decides about the clip's name.** A clip is a directory named
+by its **id**, `<anchor_ns>_<hash>`: the resolved window anchor, then a digest
+over the six fields the request is — the anchor, `name`, `description`,
+`preroll`, `postroll`, and the run's time source.
 
 ```
 ./clipped/1726300000000000000_fc43-6475-ade8-4730/
@@ -56,23 +57,25 @@ trigger:
   clip_metadata.yaml
 ```
 
-`filenames` holds that one directory, however many files the clip took. A window
-that falls inside a single recording produces one `<id>_0.mcap`; a window that
-straddles a rollover (a rosbag2 bag split or a recorder restart clipper observed
-while running) produces one file per source recording — `<id>_0.mcap`,
-`<id>_1.mcap`, … — tiling the window in time order. `clip_metadata.yaml` is
-written last and lists them; its presence is what makes the clip complete.
+Inside it, one `<id>_N.mcap` per source recording the window crossed — one file
+for a window inside a single recording, one per recording for a window that
+straddles a rollover — and `clip_metadata.yaml` written last. The layout in full
+is [What a clip carries](clip-manifest.md). Three things follow for whoever
+writes the triggers:
 
-A window whose clip directory is already there is **skipped** with a warning and
-announced not at all: a clip is written once. A second trigger for the same
-window, and a restarted recorder meeting its own earlier clips, both leave what
-is on disk exactly as it is.
-
-The id is derived from the anchor, the name, the description, the two rolls and
-the time source, so two detectors firing on one instant get their own clips and
-the same trigger always names the same clip. Its encoding is published, with a
-worked vector, in [What a clip carries](clip-manifest.md#the-clip-id) — which is
-also where to look to predict a clip's name before it exists.
+- **Two detectors firing on one instant get their own clips**, as long as
+  anything about the two requests differs — a different name, a different
+  description, a different roll. A change to any of the six yields a different
+  id, the description included.
+- **The same request always names the same clip**, on every machine and every
+  clipper version, so a producer can predict a clip's directory before it
+  exists. The encoding is a published contract, with a worked vector, in
+  [What a clip carries](clip-manifest.md#the-clip-id).
+- **A trigger resolving to an id already on disk is skipped** with a warning and
+  announced not at all: a clip is written once. A repeated trigger, and a
+  restarted recorder meeting its own earlier clips, both leave what is there
+  exactly as it is — see
+  [What `--out-dir` holds](operating.md#what---out-dir-holds).
 
 ## Two ways in: `ros` and `mcap`
 
@@ -94,14 +97,13 @@ Both cut identical clips; only the trigger and completion edges differ.
 
 **What "finished" means on disk is one rule, and it is the same under either
 source: a clip directory is complete when it holds `clip_metadata.yaml`, and not
-before.** That file is written after every `<id>_N.mcap` beside it is durable, and
-the directories are fsynced after it, so a consumer watching `--out-dir` keys on
-the document and never on an MCAP file turning up. A directory holding
-`<id>_0.mcap` and no `clip_metadata.yaml` is a cut still running, or what a cut
-that was killed left behind — a watcher looking for files would take either for a
-clip and upload half of one. Under `ros` the `Recorded` publish rides on the same
-rule and is simply an earlier notice of it; under `mcap` the document's appearance
-is the only signal there is.
+before.** Under `ros` the `Recorded` publish rides on that rule and is simply an
+earlier notice of it; under `mcap` the document's appearance is the only signal
+there is. Either way a consumer watching `--out-dir` keys on the document and
+never on an MCAP file turning up — a directory holding `<id>_0.mcap` and no
+document is a cut still running, or what a cut that was killed left behind, and
+a watcher looking for files would take either for a clip. What else that
+directory can hold is [Operating clipper](operating.md#what---out-dir-holds).
 
 `ros` is the source the `ros` cargo feature adds, so a
 [ROS-free build](../README.md#install) offers `mcap` alone and takes it by default, and

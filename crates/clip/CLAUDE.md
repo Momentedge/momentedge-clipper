@@ -401,8 +401,8 @@ read and wrote; it does not know who asked or what the planner offered. So:
 - `clip::manifest::Planned` is the window-level pair: `files`, the number of
   source recordings `cut_window` was given plans for, and `coverage`, a
   `WindowCoverage` the *caller* supplies — `Short` when the coverage wait timed
-  out. `cut_window` holds it; it no longer rides in a `StageJob`, because the
-  copy has nothing to write it into.
+  out. `cut_window` holds it, and it rides in no `StageJob`, because the copy
+  has nothing to write it into.
 - The copy's own half is one `cut::ClipStats` per file: `PlanSource::path`
   (which recording this file came from), the extents and bytes read, the messages
   copied, and the per-channel tallies. Those become one `sources` entry each.
@@ -444,7 +444,7 @@ planner for the window's plans, copies one file per plan through the worker pool
 drops the empty ones, numbers what is left, and writes the document last. Its
 caller is either a [trigger handler](../tail/CLAUDE.md#per-trigger-flow) over a
 growing recording or `clipper clip` over a finished one; `cut_window` cannot tell
-them apart and no longer needs to.
+them apart and has no reason to.
 
 **It is the one entry point that decides where a clip goes**, which is why a
 caller hands it an `out_dir` rather than a path. Everything under that directory

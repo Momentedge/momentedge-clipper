@@ -140,24 +140,28 @@ artifact/release steps are `!env.ACT`-gated, so act never publishes.
 
 ## Verify on the target (authoritative arm64)
 
-The deployment box is the Jetson (`momentedge@momentedge-desktop`, aarch64 Ubuntu
-22.04 / ROS2 Humble). Build there for a real arm64/Humble proof. The strong test is
-to install **both** debs into a clean state and run clipper sourcing **only**
-`/opt/ros/<distro>/setup.bash` (not the build overlay), proving the typesupport
-comes from the installed msgs package:
+The board to build and verify on is **`jetson@jetson.stfl.dev`** — a Jetson
+running aarch64 Ubuntu 24.04 with ROS 2 **jazzy**. Building there is the real
+arm64/jazzy proof; both debs build, install and smoke-test green on it. The
+strong test is to install **both** debs into a clean state and run clipper
+sourcing **only** `/opt/ros/jazzy/setup.bash` (not the build overlay), proving
+the typesupport comes from the installed msgs package:
 
 ```bash
-sudo dpkg --purge momentedge-clipper ros-humble-momentedge-msgs   # clean slate
-sudo apt install ./dist/ros-humble-momentedge-msgs_*.deb ./dist/momentedge-clipper_*.deb
+sudo dpkg --purge momentedge-clipper ros-jazzy-momentedge-msgs    # clean slate
+sudo apt install ./dist/ros-jazzy-momentedge-msgs_*.deb ./dist/momentedge-clipper_*.deb
 bin=/opt/momentedge-clipper/bin
 dpkg -L momentedge-clipper                                  # one executable, no symlink
 readelf -d "$bin/clipper" | grep -i runpath                 # expect: none
-source /opt/ros/humble/setup.bash
-ldd "$bin/clipper" | grep momentedge                        # => /opt/ros/humble/lib/...
+source /opt/ros/jazzy/setup.bash
+ldd "$bin/clipper" | grep momentedge                        # => /opt/ros/jazzy/lib/...
 "$bin/clipper" --help                                       # lists the modes
 "$bin/clipper" tail --help                                  # lists the recorder's flags
 RUST_LOG=info MOMENTEDGE_RECORD_DIR=$(mktemp -d) timeout -s INT 6 "$bin/clipper" tail
 ```
+
+The humble half of the release matrix has no board here; CI's native arm64
+runners are what cover it.
 
 Success: `ldd` resolves the typesupport from `/opt/ros/<distro>/lib` (the apt
 package, not the build overlay or a baked rpath), and the recorder logs
@@ -168,10 +172,14 @@ the two in step.
 
 ## Gotchas (each cost real time)
 
-- **Jetson `apt-get update` is blocked.** A wrapper refuses it to protect the
-  L4T/BSP on the Seeed carrier (escape: `sudo /usr/bin/apt-get.real` — do **not** use
-  it on the production board). `apt-get install` works from the existing package
-  cache, so install `debhelper dpkg-dev` without an update.
+- **`apt-get update` depends on which Jetson you are on.** On
+  `jetson@jetson.stfl.dev` it works normally — install the build prerequisites
+  the ordinary way. A Jetson on a Seeed carrier is the other case: a wrapper
+  refuses `apt-get update` there to protect the L4T/BSP, and `apt-get install`
+  still works from the existing package cache, so `debhelper dpkg-dev` install
+  without one. The escape (`sudo /usr/bin/apt-get.real`) exists but must not be
+  used on a production board — bypassing the wrapper is what it is there to
+  prevent. Check which board you have before assuming either.
 - **bloom needs rosdep + debhelper + fakeroot.** `sudo rosdep init` (once) +
   `rosdep update` populate the keys bloom resolves from `package.xml`
   (`ament_cmake`, `rosidl_default_generators`, `builtin_interfaces`,

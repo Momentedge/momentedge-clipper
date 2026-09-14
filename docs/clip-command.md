@@ -135,10 +135,10 @@ The run says so and moves on:
 ```console
 $ clipper clip ./record/rosbag2_0.mcap --out-dir ./clipped \
     --trigger-time 1738000000000000000 --preroll 5000000000 --postroll 5000000000
-WARN  clipper > clip ./clipped/1738000000000000000_5761-7fa4-ab83-75dc is already
-there; skipping this window. A clip is written once: an id that is taken means this
-window has been cut, or a cut of it died leaving the directory behind. Remove it to
-cut the window again
+WARN  clip::segment > clip ./clipped/1738000000000000000_5761-7fa4-ab83-75dc is
+already there; skipping this window. A clip is written once: an id that is taken means
+this window has been cut, or a cut of it died leaving the directory behind. Remove it
+to cut the window again
 $ echo $?
 0
 ```

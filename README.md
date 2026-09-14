@@ -93,8 +93,8 @@ ros2 topic pub --once /events/momentedge/trigger momentedge_msgs/msg/Trigger \
 A clip directory lands in `./clipped`, named by its **clip id** — the window's
 anchor and a digest of the trigger that asked for it, so two detectors firing on
 one instant never collide and no trigger text reaches a path. It holds one MCAP
-file per source recording the window crossed, and the metadata file that says it
-is complete and what it is:
+file per source recording the window crossed, and the metadata file that says
+what it is:
 
 ```console
 $ ls ./clipped/1738000000000000000_35a7-60a7-01fc-8561/
@@ -109,14 +109,19 @@ clip:
 producer:
   name: clipper
   mode: tail
+  version: 0.1.3
+  url: https://github.com/Momentedge/momentedge-clipper
 trigger:
   name: clip1
-  description: ''
-  anchor_ns: 1738000000000000000
 ```
 
-Each `.mcap` in it is an ordinary, standalone MCAP: open it in Foxglove, replay
-it with `ros2 bag play`, inspect it with `ros2 bag info`.
+**`clip_metadata.yaml` is written last, and its presence is what "complete"
+means** — a directory without it is a cut still running, or the residue of one
+that was killed. Nothing else is ever written into `./clipped`, so a sync tool
+needs no exclude list, and a clip already there is never cut twice.
+
+Each `.mcap` in the directory is an ordinary, standalone MCAP: open it in
+Foxglove, replay it with `ros2 bag play`, inspect it with `ros2 bag info`.
 
 `trigger_time: 0` means "anchor on the instant clipper receives this" — the
 default. To anchor on an instant of your own choosing instead, see
@@ -221,9 +226,14 @@ clipper clip ./record --out-dir ./clipped --trigger-source mcap
   its own run, so a recording already on disk when it started contributes
   nothing to a trigger fired afterwards. Cut those with `clipper clip` instead.
 - **It does not manage retention.** The continuous recording grows until you
-  stop or split it, and clipper never prunes the file it is tailing. It will
-  unlink *expired, already-rolled-over* recordings if you ask
-  (`--delete-old-files`), and nothing else.
+  stop or split it, and clipper never prunes the file it is tailing, nor
+  anything in `--out-dir`. It will unlink *expired, already-rolled-over*
+  recordings if you ask (`--delete-old-files`), and nothing else.
+- **It never overwrites or repairs a clip.** A clip directory that is already
+  there is skipped, whatever it holds, so the residue a killed cut leaves — a
+  directory with no `clip_metadata.yaml` — stays until you remove it, and that
+  window cannot be re-cut until you do. See
+  [Operating clipper](docs/operating.md#what---out-dir-holds).
 - **It handles 16 triggers at once.** A trigger arriving while all 16 slots are
   busy is rejected with a logged error and produces no clip and no `Recorded`.
   Automation waiting on that announcement should treat its absence as a dropped

@@ -16,7 +16,7 @@ The Nix flake is for **development** (the dev shell, and the per-distro
 `nix build .#clipper` as a build check), CI, and one shipping artefact:
 `nix build .#clipper-ros-free`, the recorder without ROS. The device deploys as a
 native build on the target instead — see the `packaging` skill and
-[ARCHITECTURE.md § Deployment](ARCHITECTURE.md#deployment).
+[ARCHITECTURE.md § Deployment](../../../ARCHITECTURE.md#deployment).
 
 ## Dev shell and toolchain
 
