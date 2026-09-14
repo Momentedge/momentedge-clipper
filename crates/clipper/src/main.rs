@@ -3143,7 +3143,7 @@ mod tests {
         );
         assert!(
             !out_dir.exists(),
-            "a refusal writes nothing, not even the staging directory"
+            "a refusal writes nothing, not even the output directory"
         );
 
         // What the operator actually sees: `main` boxes the error and returns
@@ -3201,7 +3201,7 @@ mod tests {
         );
         assert!(
             !out_dir.exists(),
-            "a refusal writes nothing, not even the staging directory"
+            "a refusal writes nothing, not even the output directory"
         );
 
         std::fs::remove_dir_all(root)?;
@@ -3394,7 +3394,7 @@ mod tests {
         );
         assert!(
             !out_dir.exists(),
-            "a refusal writes nothing, not even the staging directory"
+            "a refusal writes nothing, not even the output directory"
         );
 
         std::fs::remove_dir_all(root)?;
