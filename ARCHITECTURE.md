@@ -208,7 +208,9 @@ watch:
 - **Schema/channel registry** — one owned `Schema`/`Channel` per channel ID,
   used by extraction to register channels in the output writer. Chunked
   recordings carry these inside chunks, so chunks are decompressed during the
-  tail; the default unchunked `fastwrite` profile skips that cost.
+  tail; an unchunked recording skips that cost. `fastwrite` is the one
+  `ros2 bag record` preset that turns chunking off — rosbag2's own default,
+  `none`, is chunked, as are both `zstd_*` presets.
 - **Coverage watch** (`Watch<Coverage>`) — a collection-wide high-water per
   source: the maximum `log_time` (`high_water_ns`) and the maximum `publish_time`
   (`publish_high_water_ns`). A trigger handler blocks on the high-water of the
@@ -660,9 +662,12 @@ tally on every refusal after. The mechanism is the
 does about it is [Operating clipper](docs/operating.md).
 
 **Detection limit:** the leniency only catches damage loud enough to break
-parsing or a CRC. The default `fastwrite` profile is unchunked and carries no
-CRCs, so corruption inside a message *body* that leaves the framing intact is
-invisible to every MCAP reader and is copied into clips as-is.
+parsing or a CRC. `fastwrite` disables both chunking and CRCs, so a recording
+written under it — the preset
+[`examples/continuous`](examples/continuous/README.md) selects for minimal tail
+latency — offers a reader nothing to check a message body against: corruption
+inside a *body* that leaves the framing intact is invisible to every MCAP reader
+and is copied into clips as-is.
 
 ## Time base
 

@@ -84,8 +84,10 @@ reach:
   succeeds on conformant files; an inverted (invalid) file degrades the
   channel to schemaless rather than erroring. Chunked recordings carry these
   records *inside* chunks, so chunks are decompressed during the tail
-  (zstd, lz4 and uncompressed chunks all work — mcap's default features);
-  the default fastwrite profile is unchunked and skips that cost entirely.
+  (zstd, lz4 and uncompressed chunks all work — mcap's default features); an
+  unchunked recording skips that cost entirely. `fastwrite` is the one
+  `ros2 bag record` preset that turns chunking off — rosbag2's own default,
+  `none`, is chunked, as are both `zstd_*` presets.
 
 Per top-level `Message` record only the 22-byte fixed header is read, in one
 read (channel id, sequence, `log_time`, `publish_time`); bodies are first
@@ -275,10 +277,14 @@ apart from a full disk or an output failure — different faults, different
 remedies, and only this one permanent for the recording it names.
 
 **Detection limit:** the leniency applies to damage loud enough to break
-parsing or a CRC. The default fastwrite profile is unchunked and carries no
-CRCs, so corruption inside a message *body* that leaves the framing and the
-22-byte message header intact is invisible to every MCAP reader and is copied
-into clips as-is — only a CDR decode downstream would notice.
+parsing or a CRC. `fastwrite` disables both chunking and CRCs, so a recording
+written under it — the preset
+[`examples/continuous`](../../examples/continuous/README.md) selects for minimal
+tail latency, and the one the live e2e suite records its tail scenarios with —
+offers a reader nothing to check a message body against: corruption inside a
+*body* that leaves the framing and the 22-byte message header intact is
+invisible to every MCAP reader and is copied into clips as-is — only a CDR
+decode downstream would notice.
 
 ## A clip is named by its id (`clip::id`)
 
