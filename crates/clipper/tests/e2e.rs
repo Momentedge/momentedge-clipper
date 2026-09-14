@@ -2309,6 +2309,30 @@ fn a_single_file_and_the_bag_directory_holding_it_cut_the_same_clip() {
 /// that states its own triggers, so a run over it cuts one clip per trigger with
 /// nothing on the command line to say which windows those are. Each publish
 /// costs the ros2 CLI's startup, which is also what spaces the triggers out.
+///
+/// **The data on both sides of every window is asserted, and that is the whole
+/// value of the fixture.** A window landing past the recorded data cuts a clip
+/// that is empty *and complete*, and every downstream assertion about
+/// completeness, about byte equality and about which windows were skipped
+/// passes over one of those exactly as it passes over a real clip. So the
+/// bracketing is checked against the finished recording's own stamps before the
+/// fixture hands it over: a source that began too late, or stopped too early,
+/// fails here naming the fixture, rather than downstream in four tests that go
+/// green having proved nothing about the copy.
+///
+/// **The waits around the triggers are wall clock, and here they have to be.**
+/// The data a window covers must be on disk before that window's trigger is
+/// published, and [`TestEnv::wait_for_recording_span`] — the instrument for
+/// exactly that — reads a growing recording's top-level message records, which
+/// the chunked profile `clipper clip` requires does not have: its messages sit
+/// inside chunks the writer flushes by accumulated size, which at this source's
+/// rate is far beyond any wait a test would make. A recording that can be read
+/// while it grows is unreadable by the cutter, and the one the cutter takes
+/// says nothing about itself until it is closed. What is left is to make the
+/// sleeps honest: they are counted from a topic that is provably carrying
+/// messages ([`TestEnv::wait_for_source_publishing`]) rather than from a CLI
+/// that was merely spawned, and the postcondition checks what they were meant
+/// to buy.
 fn finished_recording_with_triggers(
     env: &TestEnv,
     names: &[&str],
@@ -2321,23 +2345,116 @@ fn finished_recording_with_triggers(
     let mut recorder = env.start_recorder(CUTTABLE_PRESET, 0);
     let mut source = env.start_bulk_source(SRC_TOPIC, SRC_RATE, payload_bytes);
     env.wait_for_recording(Duration::from_secs(60));
+    env.wait_for_source_publishing(SRC_TOPIC, Duration::from_secs(60));
     // Data before the first window's preroll reaches back.
-    std::thread::sleep(Duration::from_nanos(preroll_ns) + Duration::from_secs(1));
+    std::thread::sleep(Duration::from_nanos(preroll_ns) + WINDOW_DATA_MARGIN);
     for name in names {
         env.publish_trigger_into_bag(name, preroll_ns, postroll_ns);
     }
     // ... and data past the last window's postroll, so no clip is short.
-    std::thread::sleep(Duration::from_nanos(postroll_ns) + Duration::from_secs(1));
+    std::thread::sleep(Duration::from_nanos(postroll_ns) + WINDOW_DATA_MARGIN);
     source.stop(libc::SIGTERM, Duration::from_secs(10));
     recorder.stop(libc::SIGINT, Duration::from_secs(30));
 
     let bag = Finished::of(&env.record_dir());
+    let anchors = recorded_trigger_anchors(bag.file());
     assert_eq!(
-        recorded_trigger_anchors(bag.file()).len(),
+        anchors.len(),
         names.len(),
         "the recording must carry one trigger per name"
     );
+    assert_source_data_brackets(&bag, &anchors, preroll_ns, postroll_ns);
     bag
+}
+
+/// The slack [`finished_recording_with_triggers`] adds to each of its two
+/// waits, on top of the preroll or postroll that wait has to cover.
+///
+/// A window is anchored on its trigger record's own stamp, which lands
+/// somewhere inside the publish that follows the first wait, so the margin is
+/// what covers the preroll wherever in that publish the anchor falls. A second
+/// is ample against a suite whose live scenarios sleep out whole windows.
+const WINDOW_DATA_MARGIN: Duration = Duration::from_secs(1);
+
+/// Every window the recording's own triggers describe lies inside the source
+/// data the recording holds.
+///
+/// The promise [`finished_recording_with_triggers`] makes, read back off the
+/// finished recording: the earliest window starts at or after the first source
+/// message,
+/// and the latest ends at or before the last. Measured on `SRC_TOPIC` alone,
+/// because the recording is `--all` and carries its own trigger records — and a
+/// trigger record sits at the anchor of the very window it describes, so it is
+/// always inside it. Counting a recording's messages, or a clip's, therefore
+/// says nothing about whether there was any *data* in the window.
+fn assert_source_data_brackets(bag: &Finished, anchors: &[u64], preroll_ns: u64, postroll_ns: u64) {
+    let stamps = source_stamps(bag.file());
+    let (first, last) = (
+        *stamps.first().expect("the recording holds source data"),
+        *stamps.last().expect("the recording holds source data"),
+    );
+    let start = anchors.first().expect("at least one trigger") - preroll_ns;
+    let end = anchors.last().expect("at least one trigger") + postroll_ns;
+    assert!(
+        first <= start,
+        "the recording's first {SRC_TOPIC} message is {} ns inside the earliest \
+         window — the source began publishing too late for that window's preroll \
+         to reach data, and the clips cut from it would be empty and complete",
+        first - start
+    );
+    assert!(
+        last >= end,
+        "the recording's last {SRC_TOPIC} message is {} ns before the latest \
+         window closes — the source stopped publishing too early for that \
+         window's postroll to reach data",
+        end - last
+    );
+}
+
+/// Every `SRC_TOPIC` message's `log_time` in a finished recording, ascending —
+/// the recording's own account of when the test's data was captured, with the
+/// ambient topics an `--all` recorder also takes left out.
+fn source_stamps(path: &Path) -> Vec<u64> {
+    let mut stamps: Vec<u64> = read_clip(path)
+        .into_iter()
+        .filter(|(topic, _)| topic == SRC_TOPIC)
+        .map(|(_, log_time)| log_time)
+        .collect();
+    stamps.sort_unstable();
+    stamps
+}
+
+/// Every clip named in `ids` carries source data on both sides of its anchor.
+///
+/// The assertion that keeps an embedded-trigger scenario from passing
+/// vacuously. Its recording is `--all`, so the trigger record that anchored a
+/// window is itself inside that window and is copied into the clip: *every*
+/// clip holds a message whatever else happened, and asserting that one does
+/// proves nothing about the cut. What a cut has to be shown to have carried is
+/// the source topic — on both sides of the anchor, since the preroll and the
+/// postroll each select their own half of the window and a clip missing either
+/// has lost data the recording was built to hold.
+fn assert_clips_hold_source_data(out_dir: &Path, ids: &[String]) {
+    assert!(!ids.is_empty(), "no clips to check for their data");
+    for id in ids {
+        let dir = out_dir.join(id);
+        let anchor = anchor_from_clip(&dir);
+        let stamps: Vec<u64> = read_clip_dir(&dir)
+            .into_iter()
+            .filter(|(topic, _)| topic == SRC_TOPIC)
+            .map(|(_, log_time)| log_time)
+            .collect();
+        assert!(
+            stamps.iter().any(|&at| at < anchor),
+            "clip {id} carries no {SRC_TOPIC} message before its anchor {anchor}: \
+             its preroll copied no data, so the clip is complete and says nothing"
+        );
+        assert!(
+            stamps.iter().any(|&at| at > anchor),
+            "clip {id} carries no {SRC_TOPIC} message after its anchor {anchor}: \
+             its postroll copied no data"
+        );
+    }
 }
 
 /// The names the embedded-trigger scenarios publish into a recording. Distinct
@@ -2387,6 +2504,9 @@ fn a_clip_run_repeated_over_one_recording_skips_every_window_and_exits_zero() {
         "the first run cut every window: {}",
         first.log
     );
+    // The bytes the re-run must not change are a window's worth of data, not an
+    // empty clip that would compare equal to itself just as well.
+    assert_clips_hold_source_data(&out_dir, &env.complete_clips());
     let published = env.out_dir_bytes();
 
     let again = env.run_clip(
@@ -2505,6 +2625,9 @@ fn a_clip_run_killed_partway_is_finished_by_running_it_again() {
             "the residue of the killed cut is not repaired: {name}"
         );
     }
+    // Every window the two runs between them completed is a real cut — the
+    // resume finished the job rather than filling the directory with empties.
+    assert_clips_hold_source_data(&out_dir, &env.complete_clips());
     // What the killed run had published is untouched by the one that finished it.
     let after = env.out_dir_bytes();
     for (path, bytes) in &kept {
@@ -2574,6 +2697,9 @@ fn two_clip_runs_into_one_out_dir_together_produce_one_runs_output() {
         complete_clips_in(&shared),
         "every directory the race left is a complete clip — a loser writes nothing"
     );
+    // What the two runs agreed on is a window's data, not two empty directories
+    // that would agree just as readily.
+    assert_clips_hold_source_data(&shared, &complete_clips_in(&shared));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3261,6 +3387,9 @@ fn a_clip_run_stops_at_the_first_failed_window_and_keeps_what_it_published() {
             path.display()
         );
     }
+    // Both halves of the job cut real windows: what the run kept across the
+    // fault and what the re-run added carry the data their windows covered.
+    assert_clips_hold_source_data(&out_dir, &env.complete_clips());
     env.assert_out_dir_holds_only_clips();
 }
 

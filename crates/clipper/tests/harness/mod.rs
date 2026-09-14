@@ -575,6 +575,43 @@ impl TestEnv {
         self.spawn("source", cmd)
     }
 
+    /// Block until `topic` is carrying messages: one `ros2 topic echo --once`,
+    /// whose exit *is* the signal that a message arrived. The type is
+    /// [`Self::start_bulk_source`]'s, since awaiting that source is what this
+    /// is for.
+    ///
+    /// What it bounds is the unbounded half of a source's bring-up. `ros2 topic
+    /// pub` starts publishing some moment after it is spawned — a python
+    /// interpreter plus DDS discovery, growing with machine load — so wall
+    /// clock counted from the spawn buys an unknown amount of recorded data,
+    /// and a test that needs a window's worth of it before it triggers is
+    /// guessing. Counted from here the same sleep buys what it says.
+    ///
+    /// A recording that can be read while it grows needs none of this:
+    /// [`Self::wait_for_recording_span`] reads the data straight off its
+    /// stamps, which is stronger, since it measures the recording rather than
+    /// the graph. This is for the chunked recordings `clipper clip` requires,
+    /// which state nothing about themselves until they are closed.
+    pub(crate) fn wait_for_source_publishing(&self, topic: &str, timeout: Duration) {
+        let mut cmd = self.command("ros2");
+        cmd.args([
+            "topic",
+            "echo",
+            "--no-daemon",
+            "--once",
+            topic,
+            "std_msgs/msg/String",
+        ]);
+        let tag = topic.trim_start_matches('/').replace('/', "-");
+        let mut proc = self.spawn(&format!("await-{tag}"), cmd);
+        let status = proc.wait_exit(timeout).unwrap_or_else(|| {
+            proc.dump_log();
+            dump_file(&self.log_dir().join("source.log"));
+            panic!("nothing was published on {topic} within {timeout:?}");
+        });
+        assert!(status.success(), "awaiting {topic} failed: {status}");
+    }
+
     /// The binary under test in its `tail` mode, configured purely via
     /// `MOMENTEDGE_*` env onto this test's temp tree — the mode is the one
     /// argument on the command line. Blocks until its "up" line is logged.
@@ -664,9 +701,9 @@ impl TestEnv {
     }
 
     /// A `ros2 topic echo --once` capturing the next `Recorded` announcement
-    /// into its log. Started (and given a discovery head start) BEFORE the
-    /// trigger fires, so the announcement publisher is already matched by the
-    /// time it publishes.
+    /// into its log. Started BEFORE the trigger fires and given
+    /// [`RECORDED_ECHO_HEAD_START`], so the announcement publisher is already
+    /// matched by the time it publishes.
     pub(crate) fn start_recorded_listener(&self, tag: &str) -> Proc {
         let mut cmd = self.command("ros2");
         cmd.args([
@@ -678,10 +715,7 @@ impl TestEnv {
             "momentedge_msgs/msg/Recorded",
         ]);
         let proc = self.spawn(&format!("recorded-{tag}"), cmd);
-        // No readiness signal exists for the echo's subscription; the python
-        // CLI needs a moment to create it. The announcement follows the
-        // trigger by at least its postroll, which dwarfs this head start.
-        std::thread::sleep(Duration::from_secs(2));
+        std::thread::sleep(RECORDED_ECHO_HEAD_START);
         proc
     }
 
@@ -827,7 +861,7 @@ impl TestEnv {
     /// read it back. For a chunked recording the trigger is only visible after a
     /// flush (e.g. the recorder is stopped later in the test), so receipt cannot
     /// be confirmed inline — the caller confirms end to end via
-    /// [`Self::wait_for_clip_matching`]. Publishes exactly once (`--once`, `-w 1` for the
+    /// [`Self::wait_for_clip_named`]. Publishes exactly once (`--once`, `-w 1` for the
     /// recorder subscriber); a republish would write a second trigger record and
     /// cut a duplicate clip. `trigger_time` is zero: the MCAP interface anchors on
     /// the trigger record's own stamp and rejects a non-zero `trigger_time`.
@@ -1110,8 +1144,10 @@ impl TestEnv {
 
     /// A `ros2 topic echo` (no `--once`) capturing **every** `Recorded`
     /// announcement into its log, for a test expecting several — or expecting
-    /// none after one it already saw. Given the same discovery head start
-    /// [`Self::start_recorded_listener`] takes.
+    /// none after one it already saw. Given the same
+    /// [`RECORDED_ECHO_HEAD_START`] its one-shot sibling takes, and sound for
+    /// the same reason: the first announcement it has to catch still follows a
+    /// trigger this test has not fired yet.
     pub(crate) fn start_recorded_stream(&self, tag: &str) -> Proc {
         let mut cmd = self.command("ros2");
         cmd.args([
@@ -1122,10 +1158,27 @@ impl TestEnv {
             "momentedge_msgs/msg/Recorded",
         ]);
         let proc = self.spawn(&format!("recorded-{tag}"), cmd);
-        std::thread::sleep(Duration::from_secs(2));
+        std::thread::sleep(RECORDED_ECHO_HEAD_START);
         proc
     }
 }
+
+/// How long a `ros2 topic echo` on the `Recorded` topic is given to create its
+/// subscription before the test fires the trigger whose announcement it must
+/// catch.
+///
+/// **A fixed wait, because the echo publishes no readiness signal**: it prints
+/// nothing until a message arrives, so there is no line to block on and no
+/// third party to ask — `ros2 topic info` would be another python CLI startup
+/// racing the same discovery. What makes the fixed wait sound here is that it
+/// is not racing the thing it guards. The announcement the echo must catch
+/// follows a trigger the test has not published yet, by at least that trigger's
+/// postroll plus the cut — seconds, where the subscription costs the python
+/// CLI a fraction of one. The margin is an order of magnitude, not a coin
+/// flip, and a wait that did lose would lose *loudly*: the announcement is
+/// awaited by an assertion, so a missed subscription is a red test rather than
+/// a quiet pass.
+const RECORDED_ECHO_HEAD_START: Duration = Duration::from_secs(2);
 
 /// What one `clipper clip` run came to: the exit status is the verdict a caller
 /// branches on, and the log is the account a human reads.
@@ -1884,11 +1937,6 @@ pub(crate) fn clip_holds_payload(path: &Path, needle: &[u8]) -> bool {
         })
 }
 
-/// Read a finished clip back as `(topic, log_time, publish_time)` triples — the
-/// two-stamp form the capture-time windowing e2e asserts on, where the
-/// discriminator is which stamp `--time-source` applied the window to. Like
-/// [`read_clip`], `MessageStream` insists on a complete summary/footer/magic, so
-/// this doubles as the completeness check on the clip.
 /// A whole clip read back as its `(topic, log_time, publish_time)` triples:
 /// every file of the directory, concatenated in file order — the two-stamp form
 /// of [`read_clip_dir`].
@@ -1899,6 +1947,11 @@ pub(crate) fn read_clip_dir_stamps(dir: &Path) -> Vec<(String, u64, u64)> {
         .collect()
 }
 
+/// Read a finished clip back as `(topic, log_time, publish_time)` triples — the
+/// two-stamp form the capture-time windowing e2e asserts on, where the
+/// discriminator is which stamp `--time-source` applied the window to. Like
+/// [`read_clip`], `MessageStream` insists on a complete summary/footer/magic, so
+/// this doubles as the completeness check on the clip.
 pub(crate) fn read_clip_stamps(path: &Path) -> Vec<(String, u64, u64)> {
     let buf = std::fs::read(path)
         .unwrap_or_else(|e| panic!("reading announced clip {}: {e}", path.display()));
@@ -1946,7 +1999,6 @@ pub(crate) fn clip_trigger_window(dir: &Path) -> Option<(u64, u64)> {
     None
 }
 
-/// Every message in the clip lies inside the inclusive trigger window.
 /// Assert the announced clip carries its document, and that the document agrees
 /// with the clip's own name and contents.
 ///
@@ -1998,6 +2050,7 @@ pub(crate) fn assert_clip_metadata(dir: &Path, mode: &str, preroll_ns: u64, post
     }
 }
 
+/// Every message in the clip lies inside the inclusive trigger window.
 pub(crate) fn assert_clip_within_window(msgs: &[(String, u64)], start_ns: u64, end_ns: u64) {
     for (topic, log_time) in msgs {
         assert!(
