@@ -1647,6 +1647,23 @@ fn finished_recording(env: &TestEnv, span: Duration, split_secs: u64, splits: us
     stop_and_read(env, &mut recorder, &mut source, span)
 }
 
+/// [`finished_recording`] over a source publishing volume rather than message
+/// count — roughly 2 MB/s, so a few seconds of recording is tens of megabytes
+/// for a window to copy.
+///
+/// That is what makes a cut long enough to be caught in the act: every scenario
+/// about what a *half-finished* clip looks like — a kill mid-copy, an observer
+/// sampling the directory — needs the copy to last longer than the poll that
+/// watches it, and a copy is bounded by the bytes it moves rather than by the
+/// messages it counts.
+fn finished_bulk_recording(env: &TestEnv, span: Duration) -> Finished {
+    let mut recorder = env.start_recorder_topics(&[SRC_TOPIC], CUTTABLE_PRESET, 0);
+    let mut source = env.start_bulk_source(SRC_TOPIC, BULK_RATE, BULK_PAYLOAD);
+    env.wait_for_recording(Duration::from_secs(60));
+    std::thread::sleep(span);
+    stop_and_read(env, &mut recorder, &mut source, span)
+}
+
 /// The rate and payload a bulk source publishes at: together about 2 MB/s, which
 /// the ros2 CLI sustains and `ros2 bag record` writes through.
 const BULK_RATE: u32 = 50;
@@ -2864,6 +2881,532 @@ fn sixteen_windows_at_once_each_get_their_own_clip_and_announcement() {
         !extractor.log_text().contains("trigger rejected"),
         "sixteen at once is the cap, not past it: no trigger may be turned away"
     );
+    env.assert_out_dir_holds_only_clips();
+    assert!(extractor.is_running());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Failure, crash and restart
+//
+// What these scenarios need is a cut slow enough to be observed while it runs,
+// and that is what [`finished_bulk_recording`] and [`TestEnv::start_bulk_source`]
+// are for: a window over tens of megabytes takes long enough that a poll at a
+// few milliseconds catches the directory in its claimed-but-incomplete state
+// with a wide margin. Where a live recorder is involved the postroll does the
+// scheduling instead — a handler claims its directory when its window closes,
+// so a window that closes seconds from now puts the claim at an instant the
+// test is already watching for.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Block until `dir` exists, or the run that should be creating it has ended.
+fn wait_for_claim(dir: &Path, run: &mut Proc, timeout: Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    while !dir.exists() {
+        assert!(
+            run.is_running(),
+            "the run ended without leaving {} to catch it at",
+            dir.display()
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no clip directory was claimed within {timeout:?}"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// T7 — a cut killed after it claims its directory and before it writes the
+/// document leaves exactly that: a directory, no document.
+///
+/// Which is the whole of what makes the completion rule safe. There is no
+/// teardown step and there could not be one — a SIGKILL runs nothing — so the
+/// guarantee has to come from the write order, and what a killed cut leaves has
+/// to be something no consumer reads as a clip. It is, because the document is
+/// written last and is the only thing "complete" means.
+///
+/// The window is over tens of megabytes so the copy lasts far longer than the
+/// poll that catches it; a kill landing after the document would mean the cut
+/// outran the watcher, and the assertion says so rather than reading as a
+/// semantics regression.
+#[rstest]
+fn a_cut_killed_after_its_claim_leaves_a_directory_without_its_document() {
+    if !require_e2e() {
+        return;
+    }
+    let env = TestEnv::new();
+    let bag = finished_bulk_recording(&env, Duration::from_secs(10));
+    let (first, last) = bag.span();
+    // A window over the whole recording: every byte of it has to be copied.
+    let window = ParamWindow {
+        anchor_ns: last,
+        preroll_ns: last - first + SEC,
+        postroll_ns: SEC,
+        name: "killed-mid-cut",
+    };
+    let out_dir = env.out_dir();
+    let clip_dir = out_dir.join(window.clip_id());
+
+    let mut run = spawn_param_clip(&env, "mid-cut", bag.file(), &out_dir, window);
+    wait_for_claim(&clip_dir, &mut run, Duration::from_secs(60));
+    run.signal_group(libc::SIGKILL);
+    run.wait_exit(Duration::from_secs(10))
+        .expect("SIGKILL must end the run");
+
+    assert!(
+        clip_dir.is_dir(),
+        "the killed cut's directory stays: it is the evidence something died"
+    );
+    assert!(
+        clip::layout::read_metadata(&clip_dir).is_err(),
+        "a cut killed before it finished has no document — if this fails the \
+         kill landed after the copy, and the window needs more bytes to copy"
+    );
+    assert!(
+        env.complete_clips().is_empty(),
+        "so nothing in the output directory reads as a clip"
+    );
+    assert_eq!(
+        env.published_clips(),
+        vec![window.clip_id()],
+        "and the directory is named by the id the window claimed"
+    );
+    env.assert_out_dir_holds_only_clips();
+}
+
+/// T15 — a recorder killed mid-cut, then restarted: the residue stays, the next
+/// trigger works, and the same trigger is skipped.
+///
+/// The three facts a supervisor loop rests on. A restart cannot re-cut what it
+/// finds, because it cannot tell a clip it is about to overwrite from evidence
+/// it is about to destroy — so it treats a taken id as taken, whatever the
+/// directory holds. And that has to cost nothing else: the restarted recorder
+/// is a working recorder, which the new trigger is there to show.
+///
+/// The kill is scheduled by the postroll rather than raced for: a handler claims
+/// its directory when its window closes, so a window closing several seconds out
+/// puts the claim well after the publish has been confirmed and the watch has
+/// started.
+#[rstest]
+fn a_recorder_killed_mid_cut_leaves_residue_its_restart_neither_repairs_nor_re_cuts() {
+    if !require_e2e() {
+        return;
+    }
+    let env = TestEnv::new();
+    // A preroll reaching back over every recorded byte, so the copy is long, and
+    // a postroll putting the claim several seconds after the trigger.
+    let (preroll, postroll) = (30 * SEC, 6 * SEC);
+    let mut live = live_tail(&env, Duration::from_secs(8), BULK_PAYLOAD);
+    let extractor = &mut live.extractor;
+
+    let anchor = now_ns();
+    let id = stamped_clip_id("mid-cut", anchor, preroll, postroll);
+    let clip_dir = env.out_dir().join(&id);
+    env.fire_trigger_stamped("mid-cut", anchor, preroll, postroll);
+    wait_for_claim(&clip_dir, extractor, Duration::from_secs(60));
+    extractor.signal_group(libc::SIGKILL);
+    extractor
+        .wait_exit(Duration::from_secs(10))
+        .expect("SIGKILL must end the recorder");
+
+    assert!(
+        clip::layout::read_metadata(&clip_dir).is_err(),
+        "the killed cut left a directory with no document — if this fails the \
+         kill landed after the copy, and the window needs more bytes to copy"
+    );
+    let residue = env.out_dir_bytes();
+
+    // The restart. Nothing on disk is re-cut or repaired by it.
+    let mut restarted = env.start_extractor_src(30, REPEATABLE_SOURCE);
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(
+        env.out_dir_bytes(),
+        residue,
+        "a restart re-cuts nothing and repairs nothing it finds"
+    );
+
+    // A new trigger: the restarted recorder is a working recorder.
+    let mut stream = env.start_recorded_stream("after-restart");
+    let fresh_anchor = now_ns() - 3 * SEC;
+    let (fresh_preroll, fresh_postroll) = (2 * SEC, SEC);
+    env.fire_trigger_stamped("after-kill", fresh_anchor, fresh_preroll, fresh_postroll);
+    let fresh_id = stamped_clip_id("after-kill", fresh_anchor, fresh_preroll, fresh_postroll);
+    wait_for_recorded_count(&mut stream, 1, Duration::from_secs(60));
+    assert_eq!(
+        env.complete_clips(),
+        vec![fresh_id],
+        "the restarted recorder cuts the clips it is asked for"
+    );
+
+    // And the trigger the kill interrupted, asked again: its id is taken.
+    env.fire_trigger_stamped("mid-cut", anchor, preroll, postroll);
+    restarted.expect_log(
+        "is already there; skipping this window",
+        Duration::from_secs(60),
+    );
+    assert!(
+        restarted
+            .log_text()
+            .contains(&clip_dir.display().to_string()),
+        "the warning names the residue directory"
+    );
+    std::thread::sleep(Duration::from_secs(5));
+    for (path, bytes) in &residue {
+        assert_eq!(
+            env.out_dir_bytes().get(path),
+            Some(bytes),
+            "the residue survives the repeat untouched: {}",
+            path.display()
+        );
+    }
+    assert_eq!(
+        recorded_so_far(&stream).len(),
+        1,
+        "the skipped repeat announced nothing"
+    );
+    env.assert_out_dir_holds_only_clips();
+    assert!(restarted.is_running());
+}
+
+/// T14 — an output directory that cannot be written to fails the cut, leaves no
+/// directory behind, announces nothing, does not take the recorder down, and
+/// costs nothing once it is writable again.
+///
+/// A device whose disk goes read-only must not lose its recorder: a trigger it
+/// cannot answer is one trigger's worth of loss, named in the log, and the next
+/// one after the repair succeeds. That the id is free again afterwards is the
+/// consequence of a failed cut taking its directory with it — a claim that
+/// survived a failure would make the fault permanent for that window.
+///
+/// **The fault is injected before the claim rather than after it**, because
+/// after is not reachable from outside: the claim and the first write are one
+/// `mkdir` apart, microseconds no poll can land inside. What the two orderings
+/// share is everything observable here — no directory, no announcement, a
+/// recorder still up, and a repeat that works once the cause is gone — and the
+/// ordering itself is pinned by `clip::layout`'s own tests, where the failure
+/// can be injected exactly.
+///
+/// **It needs an ordinary user.** uid 0 ignores the permission bits this writes,
+/// so the scenario would pass having injected no fault at all;
+/// [`assert_permissions_bite`] fails the run rather than let that happen. CI's
+/// recorder job is a plain GitHub runner, so this holds there; a container run
+/// as root (`act`) is where it would not.
+#[rstest]
+fn an_unwritable_out_dir_costs_one_clip_and_not_the_recorder() {
+    if !require_e2e() {
+        return;
+    }
+    assert_permissions_bite();
+    let env = TestEnv::new();
+    let (preroll, postroll) = (2 * SEC, SEC);
+    let mut live = live_tail(&env, Duration::from_nanos(preroll), SRC_PAYLOAD);
+    let extractor = &mut live.extractor;
+
+    // The recorder created its output directory at startup; take the write
+    // permission away from it.
+    let out_dir = env.out_dir();
+    set_writable(&out_dir, false);
+
+    let mut stream = env.start_recorded_stream("unwritable");
+    let anchor = now_ns() - 3 * SEC;
+    let id = stamped_clip_id("unwritable", anchor, preroll, postroll);
+    env.fire_trigger_stamped("unwritable", anchor, preroll, postroll);
+
+    extractor.expect_log("trigger handling failed", Duration::from_secs(60));
+    assert!(
+        extractor.log_text().contains(&format!(
+            "claiming clip directory {}",
+            out_dir.join(&id).display()
+        )),
+        "the failure names the directory it could not write"
+    );
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(
+        !out_dir.join(&id).exists(),
+        "a failed cut leaves no directory, so the id is free for the next try"
+    );
+    assert!(
+        recorded_so_far(&stream).is_empty(),
+        "nothing was recorded, so nothing is announced"
+    );
+    assert!(
+        extractor.is_running(),
+        "a write fault costs a clip, never the recorder"
+    );
+
+    // The cause removed, the same request succeeds.
+    set_writable(&out_dir, true);
+    env.fire_trigger_stamped("unwritable", anchor, preroll, postroll);
+    extractor.expect_log_count("trigger name=\"unwritable\"", 2, Duration::from_secs(60));
+    let announced = wait_for_recorded_count(&mut stream, 1, Duration::from_secs(60));
+    assert_eq!(announced[0].name, "unwritable");
+    assert_eq!(
+        env.complete_clips(),
+        vec![id.clone()],
+        "the window the fault cost is cut on the next identical trigger"
+    );
+    assert_clip_metadata(&out_dir.join(&id), "tail", preroll, postroll);
+    env.assert_out_dir_holds_only_clips();
+}
+
+/// T19 — `clipper clip` stops at the first window it cannot cut: exit 1, the
+/// clips it had already published stay, the windows after it are never
+/// attempted, and a re-run after the repair finishes the job.
+///
+/// A disk or input problem outlives the window that met it, so going on would
+/// raise it once per remaining trigger; stopping puts the reason in the run's
+/// last line instead of the arithmetic. What makes stopping safe rather than
+/// destructive is the resume: nothing published is unmade, and the re-run skips
+/// exactly what is there.
+///
+/// The fault is the output directory losing its write permission partway through
+/// the run — see
+/// [`an_unwritable_out_dir_costs_one_clip_and_not_the_recorder`] for why an
+/// ordinary user is required, and for what a root runner would do to it.
+#[rstest]
+fn a_clip_run_stops_at_the_first_failed_window_and_keeps_what_it_published() {
+    if !require_e2e() {
+        return;
+    }
+    assert_permissions_bite();
+    let env = TestEnv::new();
+    let bag =
+        finished_recording_with_triggers(&env, &EMBEDDED_TRIGGERS, 2 * SEC, SEC, BULK_PAYLOAD);
+    let n = EMBEDDED_TRIGGERS.len();
+    let out_dir = env.out_dir();
+
+    let mut run = env.spawn_clip(
+        "stopped",
+        bag.file(),
+        &out_dir,
+        &["--trigger-source", "mcap"],
+    );
+    // Take the write permission away once the run has published something, so
+    // the window it fails at is not its first and there is output to keep.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while env.complete_clips().is_empty() {
+        assert!(
+            run.is_running(),
+            "the run finished before the fault could be injected — every window \
+             was cut, so there is no stop to observe"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the run published nothing"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    set_writable(&out_dir, false);
+
+    let status = run.wait_exit(Duration::from_secs(120)).unwrap_or_else(|| {
+        set_writable(&out_dir, true);
+        run.dump_log();
+        panic!("the stopped run never exited");
+    });
+    let log = run.log_text();
+    set_writable(&out_dir, true);
+
+    assert_eq!(
+        status.code(),
+        Some(FATAL_EXIT_CODE),
+        "a window that fails ends the run with {FATAL_EXIT_CODE} for its caller, got {status}"
+    );
+    assert!(
+        log.contains("stopped the run"),
+        "the last line names the window that stopped it: {log}"
+    );
+    assert!(
+        log.contains("no later window was attempted"),
+        "and says the windows after it were not tried: {log}"
+    );
+
+    let kept = env.complete_clips();
+    assert!(
+        !kept.is_empty() && kept.len() < n,
+        "the run published some but not all of the {n} windows, got {}",
+        kept.len()
+    );
+    assert_eq!(
+        env.published_clips(),
+        kept,
+        "the failed window took its own directory with it, so every directory \
+         left is a complete clip"
+    );
+    let published = env.out_dir_bytes();
+
+    // The cause removed, the re-run finishes the job.
+    let resumed = env.run_clip(
+        "resumed",
+        bag.file(),
+        &out_dir,
+        &["--trigger-source", "mcap"],
+    );
+    assert_eq!(resumed.code(), CLEAN_EXIT_CODE, "log: {}", resumed.log);
+    assert!(
+        resumed
+            .log
+            .contains(&format!("{} skipped as already there", kept.len())),
+        "the re-run skipped exactly what the stopped run had published: {}",
+        resumed.log
+    );
+    assert_eq!(
+        env.complete_clips().len(),
+        n,
+        "and cut the rest, so every recorded trigger now has its clip"
+    );
+    for (path, bytes) in &published {
+        assert_eq!(
+            env.out_dir_bytes().get(path),
+            Some(bytes),
+            "the stopped run's clips survive the re-run: {}",
+            path.display()
+        );
+    }
+    env.assert_out_dir_holds_only_clips();
+}
+
+/// T23 — a `clipper tail` restart re-cuts nothing: the clips on disk are not
+/// touched, and no second clip appears for a trigger the previous run answered.
+///
+/// This is what makes a supervisor loop safe. A restarted recorder must never
+/// destroy evidence, and what guarantees that is the claim: the id of a window
+/// already cut is taken, so the window is skipped whatever the recorder makes of
+/// the trigger behind it. That the restarted recorder is *live* rather than
+/// merely quiet is the second half — a trigger written after it came up is cut
+/// normally.
+///
+/// **What the restart does with the recording's existing trigger is deliberately
+/// not asserted here, because it is not what a supervisor depends on and the
+/// code and its documentation disagree about it.** `tail::Tailer::with_trigger_tap`
+/// says a trigger already on disk before clipper started never fires; that holds
+/// for the recordings the discovery iterator is seeded past, but the *newest*
+/// one is adopted and indexed from its first byte with the tap on, so its
+/// triggers are re-delivered on every restart and each is answered by a skip.
+/// Asserting either behaviour would pin a disagreement rather than the
+/// guarantee; the guarantee is that the output directory does not change, and
+/// that is what is asserted.
+#[rstest]
+fn a_tail_restart_re_cuts_nothing_and_leaves_the_clips_it_finds() {
+    if !require_e2e() {
+        return;
+    }
+    let env = TestEnv::new();
+    let _recorder = env.start_recorder("fastwrite", 0);
+    let _source = env.start_source(SRC_TOPIC, SRC_RATE);
+    env.wait_for_recording(Duration::from_secs(60));
+    let mut extractor = env.start_extractor_mcap(15);
+    let (preroll, postroll) = (2 * SEC, 2 * SEC);
+    env.wait_for_recording_span(Duration::from_nanos(preroll), Duration::from_secs(60));
+
+    env.fire_trigger_into_bag("before-restart", preroll, postroll);
+    let first = env.wait_for_clip_named("before-restart", Duration::from_secs(60));
+    let published = env.out_dir_bytes();
+    let before = env.published_clips();
+
+    // A clean stop, then a restart against the same recording and the same
+    // output directory.
+    let stopped = extractor.stop(libc::SIGINT, Duration::from_secs(30));
+    assert_eq!(
+        stopped.code(),
+        Some(CLEAN_EXIT_CODE),
+        "a requested stop is the orderly one, got {stopped}"
+    );
+    let mut restarted = env.start_extractor_mcap(15);
+    std::thread::sleep(Duration::from_secs(5));
+
+    assert_eq!(
+        env.published_clips(),
+        before,
+        "the restart cut no clip of its own"
+    );
+    assert_eq!(
+        env.out_dir_bytes(),
+        published,
+        "and changed not a byte of the clip that was already there"
+    );
+    assert_eq!(
+        env.complete_clips().len(),
+        1,
+        "the window the previous run answered has exactly one clip, still"
+    );
+    assert!(
+        !restarted.log_text().contains(" written: "),
+        "and the restart wrote no clip file: whatever it made of the trigger \
+         already in the recording, it cut nothing"
+    );
+
+    // The second half: a trigger written after the restart is cut normally.
+    env.fire_trigger_into_bag("after-restart", preroll, postroll);
+    let second = env.wait_for_clip_named("after-restart", Duration::from_secs(60));
+    assert_ne!(first, second, "the new trigger is its own clip");
+    assert_eq!(env.complete_clips().len(), 2);
+    env.assert_out_dir_holds_only_clips();
+    assert!(restarted.is_running());
+}
+
+/// T24 — the observer on the mcap interface completes on the document and never
+/// on a file appearing.
+///
+/// Under `--trigger-source mcap` nothing is published, so what watches for
+/// finished clips is whatever syncs the output directory — and what clipper owes
+/// it is an ordering rather than a message. This samples that directory while a
+/// cut runs and catches it in the state the two rules disagree about: the clip's
+/// directory is there and carries MCAP bytes, and `read_metadata` still refuses
+/// it. A consumer keying on a file would have uploaded a clip that was still
+/// being written; the one keying on the document waits, and when it stops
+/// waiting every file the document names is a complete MCAP.
+#[rstest]
+fn the_mcap_observer_completes_on_the_document_and_never_on_a_file() {
+    if !require_e2e() {
+        return;
+    }
+    let env = TestEnv::new();
+    let _recorder = env.start_recorder("fastwrite", 0);
+    let _source = env.start_bulk_source(SRC_TOPIC, BULK_RATE, BULK_PAYLOAD);
+    env.wait_for_recording(Duration::from_secs(60));
+    let mut extractor = env.start_extractor_mcap(30);
+    // A preroll over every recorded byte, so the copy lasts long enough to be
+    // sampled mid-flight.
+    let (preroll, postroll) = (30 * SEC, 2 * SEC);
+    env.wait_for_recording_span(Duration::from_secs(8), Duration::from_secs(90));
+    env.fire_trigger_into_bag("observed", preroll, postroll);
+
+    // Sample the directory the way a sync tool would, until a clip is complete.
+    let mut caught_half_written = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(90);
+    loop {
+        for name in env.published_clips() {
+            let dir = env.out_dir().join(&name);
+            let holds_mcap_bytes = entry_names(&dir).iter().any(|f| {
+                Path::new(f)
+                    .extension()
+                    .is_some_and(|ext| ext == "mcap" || ext == "part")
+            });
+            if holds_mcap_bytes && clip::layout::read_metadata(&dir).is_err() {
+                caught_half_written = true;
+            }
+        }
+        if !env.complete_clips().is_empty() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no clip was completed to sample"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    assert!(
+        caught_half_written,
+        "the cut never showed a directory carrying MCAP bytes without its \
+         document — if this fails the copy outran the sampler, and the window \
+         needs more bytes to copy"
+    );
+    let clip = env.wait_for_clip_named("observed", Duration::from_secs(60));
+    // The moment the document answers, every file it names is a whole MCAP:
+    // `read_clip_dir` parses each through its summary, footer and closing magic.
+    let msgs = read_clip_dir(&clip);
+    assert!(!msgs.is_empty(), "the completed clip holds the window");
+    assert_clip_metadata(&clip, "tail", preroll, postroll);
     env.assert_out_dir_holds_only_clips();
     assert!(extractor.is_running());
 }

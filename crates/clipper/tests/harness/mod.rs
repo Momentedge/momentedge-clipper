@@ -1289,6 +1289,45 @@ pub(crate) fn clip_id_of(
     .to_string()
 }
 
+/// Make `path` read-only (`r-x`) or writable again (`rwx`) for its owner — the
+/// output-directory write fault, injected the way an operator's own mistake
+/// would arrive.
+///
+/// Only meaningful for a process that is not root: the kernel does not consult
+/// these bits for uid 0. [`assert_permissions_bite`] is the precondition that
+/// says so out loud rather than letting the scenario pass vacuously.
+pub(crate) fn set_writable(path: &Path, writable: bool) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let mode = if writable { 0o700 } else { 0o500 };
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .unwrap_or_else(|e| panic!("setting the mode of {} to {mode:o}: {e}", path.display()));
+}
+
+/// Fail unless a read-only directory actually refuses a write.
+///
+/// A permission-injection scenario run as root proves nothing: `mkdir` inside an
+/// `r-x` directory simply succeeds and the fault under test never happens. The
+/// suite runs as an ordinary user everywhere it is supposed to run (CI's
+/// `recorder` job is a plain GitHub runner), so this is a loud failure rather
+/// than a skip — a run where it does not hold is misconfigured, and a
+/// misconfigured "enabled" run must fail rather than quietly pass. The known way
+/// to reach it is `act`, which runs the workflow in a container as root.
+pub(crate) fn assert_permissions_bite() {
+    let probe = tempfile::Builder::new()
+        .prefix("clipper-e2e-perm-")
+        .tempdir()
+        .expect("creating the permission probe dir");
+    set_writable(probe.path(), false);
+    let refused = std::fs::create_dir(probe.path().join("probe")).is_err();
+    set_writable(probe.path(), true);
+    assert!(
+        refused,
+        "a read-only directory did not refuse a mkdir — this suite must run as an \
+         ordinary user, and uid 0 bypasses the permission bits this scenario \
+         injects its fault with"
+    );
+}
+
 /// Whether `name` is the directory name of a clip anchored at `anchor`: that
 /// clip's id — the anchor, an underscore, and the digest's sixteen lower-case
 /// hex characters in four groups of four.
