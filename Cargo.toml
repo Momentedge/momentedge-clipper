@@ -82,6 +82,12 @@ serde_json = "1"
 # rather than scanned by hand. `serde_norway` is the maintained continuation of
 # the deprecated `serde_yaml`.
 serde_norway = "0.9"
+# SHA-256 behind a clip's id (`clip::id`). The digest is a published contract —
+# an id in a report has to stay valid across versions — so it is a named
+# dependency on the standard implementation rather than a hash of this
+# workspace's own devising, and `DefaultHasher` is unusable for it outright
+# (std makes no stability promise about what it produces).
+sha2 = "0.10"
 
 # One lint policy for every member, inherited with `[lints] workspace = true`.
 # Cargo cannot override a workspace lint per member, so anything a member keeps

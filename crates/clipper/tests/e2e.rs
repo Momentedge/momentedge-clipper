@@ -117,15 +117,29 @@ fn trigger_produces_clip_and_announcement(
 
     let recorded = wait_for_recorded(&mut listener, Duration::from_secs(grace_secs + 40));
 
-    // The announcement echoes the trigger and names the clip on the resolved
-    // anchor (clipper's subscription instant, encoded in the filename).
+    // The announcement echoes the trigger and names the clip by its id, which
+    // opens with the resolved anchor (clipper's subscription instant) and
+    // carries none of the trigger's text.
     assert_eq!(recorded.name, "e2e-clip");
-    let anchor = anchor_from_clip(Path::new(recorded.only()));
-    let expected = env.out_dir().join(format!("{anchor}_e2e-clip.mcap"));
+    let clip = Path::new(recorded.only());
+    let anchor = anchor_from_clip(clip);
     assert_eq!(
-        Path::new(recorded.only()),
-        expected,
-        "announced filename must be <out_dir>/<anchor_ns>_<name>.mcap"
+        clip.parent(),
+        Some(env.out_dir().as_path()),
+        "the announced clip is in out_dir: {}",
+        clip.display()
+    );
+    let name = clip
+        .file_name()
+        .expect("the clip has a name")
+        .to_string_lossy();
+    assert!(
+        is_clip_name(&name, anchor),
+        "announced filename must be <out_dir>/<anchor_ns>_<hash>.mcap, got {name}"
+    );
+    assert!(
+        !name.contains("e2e-clip"),
+        "no trigger text reaches the clip's name: {name}"
     );
 
     // Final-path visibility: the announced file already exists, is a
@@ -229,9 +243,9 @@ fn mcap_interface_reads_trigger_from_the_recording() {
     // No Recorded on the mcap interface — wait for the clip itself to appear in
     // out_dir. The MCAP interface anchors the window on the trigger record's own
     // log_time (the default --time-source), not the publisher's trigger_time, so
-    // the clip's `<anchor_ns>_<name>.mcap` name carries the record's log_time
-    // (which sits a hair after `trigger_ns`); locate it by name suffix.
-    let clip = env.wait_for_clip_matching("_mcap-clip.mcap", Duration::from_secs(60));
+    // the clip's `<anchor_ns>_<hash>.mcap` name opens with the record's log_time
+    // (which sits a hair after `trigger_ns`); locate it by what it says it is.
+    let clip = env.wait_for_clip_named("mcap-clip", Duration::from_secs(60));
     let anchor = anchor_from_clip(&clip);
 
     // The clip is a complete MCAP, holds only in-window data, and includes the
@@ -294,7 +308,7 @@ fn mcap_interface_reads_a_chunk_interior_trigger() {
     // No Recorded on the mcap interface — wait for the clip itself to appear.
     // The anchor is the trigger record's own log_time (default --time-source),
     // encoded in the clip name; locate the clip by name suffix.
-    let clip = env.wait_for_clip_matching("_mcap-chunk.mcap", Duration::from_secs(60));
+    let clip = env.wait_for_clip_named("mcap-chunk", Duration::from_secs(60));
     let anchor = anchor_from_clip(&clip);
 
     let msgs = read_clip(&clip);
@@ -362,7 +376,7 @@ fn time_source_selects_the_window_clock_domain(
     // also keeps discovery from picking it up mid-write).
     std::fs::rename(&staged, &recording).expect("publishing the synthetic recording");
 
-    let clip = env.wait_for_clip_matching("_ts.mcap", Duration::from_secs(60));
+    let clip = env.wait_for_clip_named("ts", Duration::from_secs(60));
     let mut got: Vec<u64> = read_clip(&clip)
         .into_iter()
         .filter(|(topic, _)| topic == SRC_TOPIC)
@@ -421,8 +435,7 @@ fn live_writer_capture_time_windowing(#[case] time_source: &str) {
     // No Recorded on the mcap interface — wait for the clip itself. Its name
     // carries the resolved anchor (the trigger record's log_time or publish_time
     // per --time-source); the writer names its trigger "custom-mcap-writer-example".
-    let clip =
-        env.wait_for_clip_matching("_custom-mcap-writer-example.mcap", Duration::from_secs(60));
+    let clip = env.wait_for_clip_named("custom-mcap-writer-example", Duration::from_secs(60));
     let anchor = anchor_from_clip(&clip);
     let (ws, we) = (anchor - half_window_ns, anchor + half_window_ns);
 
@@ -517,7 +530,7 @@ fn copper_sink_recording_produces_clip() {
     // app names its first Trigger "periodic-1"; the clip name carries the
     // resolved anchor (the Trigger record's own log_time under the default
     // --time-source log). Locate it by name suffix.
-    let clip = env.wait_for_clip_matching("_periodic-1.mcap", Duration::from_secs(60));
+    let clip = env.wait_for_clip_named("periodic-1", Duration::from_secs(60));
     let anchor = anchor_from_clip(&clip);
     // The window bounds live in the producer's trigger JSON, and clipper anchors
     // on the trigger record's own stamp so that record is inside its own window
@@ -915,19 +928,30 @@ fn window_straddling_an_in_run_split_recovers_both_sides() {
          got {:?}",
         recorded.filenames,
     );
-    // Every segment is published under the `<anchor_ns>_<name>_NN.mcap` naming
-    // (the anchor is clipper's subscription instant, encoded in the name) and is
-    // a complete, in-window MCAP.
+    // Every segment is published under the `<id>_NN.mcap` naming — one id for
+    // the window, one number per source file — and is a complete, in-window
+    // MCAP.
+    let id = Path::new(&recorded.filenames[0])
+        .file_stem()
+        .expect("segment has a file name")
+        .to_string_lossy()
+        .into_owned();
+    let (id, _) = id.rsplit_once('_').expect("a segment name ends in _NN");
     let anchor = anchor_from_clip(Path::new(&recorded.filenames[0]));
-    for f in &recorded.filenames {
+    assert!(
+        is_clip_name(&format!("{id}.mcap"), anchor),
+        "the segments share one clip id: {id}"
+    );
+    for (n, f) in recorded.filenames.iter().enumerate() {
         let name = Path::new(f)
             .file_name()
             .expect("segment has a file name")
             .to_string_lossy()
             .into_owned();
-        assert!(
-            name.starts_with(&format!("{anchor}_straddle_")),
-            "segment {name} must carry the <anchor_ns>_<name>_NN naming"
+        assert_eq!(
+            name,
+            format!("{id}_{n:02}.mcap"),
+            "segment {name} must carry the <id>_NN naming"
         );
     }
     let msgs = read_all(&recorded);
@@ -1302,7 +1326,7 @@ fn corrupt_tail_framing_damage_live() {
     // clip can only carry a message the scan had indexed, so every record
     // ahead of that one in the file is behind the scan as well.
     env.fire_trigger("probe", 60 * SEC, SEC);
-    let probe = env.wait_for_clip_matching("_probe.mcap", Duration::from_secs(60));
+    let probe = env.wait_for_clip_named("probe", Duration::from_secs(60));
     let indexed_through = read_clip(&probe)
         .iter()
         .map(|(_, log_time)| *log_time)

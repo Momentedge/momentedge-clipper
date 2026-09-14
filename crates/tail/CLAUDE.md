@@ -226,8 +226,8 @@ ignored: no handler runs, no clip is extracted, and no completion is announced.
 5. **Publish** (`cut_window`). Empty segments are dropped when the window
    produced real data elsewhere (one is kept if all are empty). The count
    determines naming, which is why the workers stage but never publish: a
-   single segment keeps the bare `<anchor_ns>_<name>.mcap`; multiple segments
-   get `<base>_00.mcap`, `<base>_01.mcap`, … Each is atomically published into
+   single segment keeps the bare `<id>.mcap`; multiple segments get
+   `<id>_00.mcap`, `<id>_01.mcap`, … Each is atomically published into
    `out_dir` via `hard_link` + unlink. **The name itself is not this crate's**:
    `record_clip` hands `cut_window` the output *directory* and
    `clip::config::Mode::Tail` — which subcommand is cutting, and nothing more —

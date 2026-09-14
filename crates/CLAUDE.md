@@ -28,8 +28,9 @@ format layer and its recording index (`clip::index`, and `clip::whole` for a
 recording that is already finished), the copy that cuts a window out of one
 (`clip::cut`), the neutral trigger and completion contract (`clip::trigger`,
 `clip::decode`), the segment assembly that turns one window into published clips
-(`clip::segment`), the record each of those clips carries saying what it is
-(`clip::manifest`), which of the recording's topics a clip is cut from
+(`clip::segment`), the id each clip is named by (`clip::id`), the record each of
+those clips carries saying what it is (`clip::manifest`), which of the
+recording's topics a clip is cut from
 (`clip::select`), and the layered configuration file that decides those topics
 and every other setting (`clip::config`).
 

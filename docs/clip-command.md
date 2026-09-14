@@ -56,9 +56,9 @@ Five things follow from the input being finished:
 A recorder that ran for hours left a directory of splits, and `<recording>` takes
 that directory as readily as it takes one file. The splits are read as one
 time-ordered collection, so a window straddling a split is cut whole: it yields
-one segment per *contributing* recording, named `<anchor-ns>_<name>_00.mcap`,
-`_01.mcap` and so on — the same set the recorder writes when a window straddles a
-rollover. A segment's number is its position among the segments that hold data,
+one segment per *contributing* recording, named `<id>_00.mcap`, `_01.mcap` and
+so on, where `<id>` is the clip's [id](clip-manifest.md#the-clip-id) — the same
+set the recorder writes when a window straddles a rollover. A segment's number is its position among the segments that hold data,
 so a window over three splits whose middle recording contributes nothing yields
 `_00` and `_01`, where `_01` holds the third recording's data.
 
@@ -125,10 +125,10 @@ no clip, no suffixed sibling, nothing left in the staging directory:
 ```console
 $ clipper clip ./record/rosbag2_0.mcap --out-dir ./clipped \
     --trigger-time 1738000000000000000 --preroll 5000000000 --postroll 5000000000
-Error: ./clipped/1738000000000000000_clip.mcap already exists: this window has been
-cut into this output directory before, and cutting it again writes a second copy of
-the same clip rather than new data. Move or delete it, or cut into a different
-output directory, to cut this window again
+Error: ./clipped/1738000000000000000_5761-7fa4-ab83-75dc.mcap already exists: this
+window has been cut into this output directory before, and cutting it again writes a
+second copy of the same clip rather than new data. Move or delete it, or cut into a
+different output directory, to cut this window again
 ```
 
 The check is one read of the output directory, made before the window is planned,
@@ -140,11 +140,10 @@ refuses the run. There is no flag to override it: to cut the window again, move
 or delete the clip, or point `--out-dir` somewhere else.
 
 This is where `clipper clip` and `clipper tail` differ on purpose. On the vehicle
-a clip name that is already taken means a *second* trigger asked for the same
-instant and name, and that clip is data no re-run can produce again, so the
-recorder publishes it beside the first as `<name>_1.mcap`. A cut from a finished
-recording is replayable, so the same name means the same bytes, and a second file
-would be a duplicate.
+an id that is already taken means a *second* trigger asked for the same clip, and
+that clip is data no re-run can produce again, so the recorder publishes it
+beside the first as `<id>_1.mcap`. A cut from a finished recording is replayable,
+so the same id means the same bytes, and a second file would be a duplicate.
 
 Nothing machine-readable is printed. The result is the output directory's
 contents when the process exits, each clip carrying its own manifest, and the
@@ -176,8 +175,8 @@ reads out of the recording it is still following, with the same decoder: `json`
 decodes in every build, `cdr` needs the `ros` cargo feature. That is what one key
 across both subcommands buys — the trigger stream that cut clips on the vehicle
 cuts the same clips from the bag afterwards. A trigger this run cannot use — an
-undecodable payload, or a name that cannot be embedded in a clip pathname — costs
-that trigger its clip and no more; the run logs it and cuts the rest.
+undecodable payload, or a name past the 128-byte bound — costs that trigger its
+clip and no more; the run logs it and cuts the rest.
 
 Both ways of stating the trigger wrongly are refused while the command line is
 being read, with the flag at fault named and nothing written: `param` without one

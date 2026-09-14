@@ -9,8 +9,9 @@
 //! (`base_name`). It then snapshots the plans once, hands each to the FIFO
 //! staging pool ([`spawn_stage_workers`]) that runs the bulk copies off the
 //! caller's thread, and names the results only when the segment count is known —
-//! a bare `<base>.mcap` for a window inside one recording, one `<base>_NN.mcap`
-//! per source file for one that straddled a rollover.
+//! a bare `<id>.mcap` for a window inside one recording, one `<id>_NN.mcap` per
+//! source file for one that straddled a rollover — where the id is the
+//! [`ClipId`] of the window that asked for it.
 //!
 //! **What a name the output directory already holds costs follows from the
 //! caller's [`Mode`]**, decided here rather than by each binary, and it is the
@@ -33,6 +34,7 @@ use anyhow::Context as _;
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 
 use crate::config::Mode;
+use crate::id::ClipId;
 use crate::index::{WindowPlan, WindowPlanner};
 use crate::manifest::{CutRequest, Planned, WindowCoverage};
 use crate::select::ChannelSelection;
@@ -185,18 +187,13 @@ fn publication(mode: Mode) -> Publication {
 }
 
 /// The file name every clip of one window is published under, before a segment
-/// number is appended to it: `<anchor_ns>_<name>.mcap`, the resolved anchor on
-/// the run's time source and the trigger's name made safe to sit in a path.
+/// number is appended to it: the window's [`ClipId`] and the MCAP extension.
 ///
 /// **The one place a clip's name is computed.** Both subcommands hand
 /// [`cut_window`] an output directory, so neither formats a path of its own and
 /// a rename is one edit rather than two that can disagree.
 pub(crate) fn base_name(request: &CutRequest) -> String {
-    format!(
-        "{}_{}.mcap",
-        request.anchor_ns(),
-        sanitize(&request.trigger().name)
-    )
+    format!("{}.mcap", ClipId::of(request))
 }
 
 /// A clip this window would have written is already in the output directory,
@@ -235,7 +232,7 @@ pub struct ClipExists {
 /// elsewhere, but one segment is always kept so an all-empty window (a rollover
 /// gap, all relevant files pruned, or nothing recorded yet) still yields a valid
 /// clip. Segments are named only once the count is known: a single segment keeps
-/// the bare `<base>.mcap`, several get one `<base>_NN.mcap` per file. Every
+/// the bare `<id>.mcap`, several get one `<id>_NN.mcap` per file. Every
 /// returned [`cut::ClipStats`] names a durable file, so the caller may announce
 /// them all.
 ///
@@ -455,27 +452,6 @@ fn is_numbered_sibling(name: &str, prefix: &str, ext: &str) -> bool {
         .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// Make a trigger name safe to embed in a filename: keep alphanumerics, `-`,
-/// `_` and `.`; everything else (notably `/`) becomes `_`.
-#[must_use]
-pub fn sanitize(name: &str) -> String {
-    let s: String = name
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if s.is_empty() {
-        "unnamed".to_string()
-    } else {
-        s
-    }
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -600,40 +576,39 @@ mod tests {
         out_dir.join(format!("{stem}{suffix}.mcap"))
     }
 
-    /// A clip is named by the window that asked for it — the resolved anchor and
-    /// the trigger's name — and that computation lives here rather than in
+    /// A clip is named by its id, and that computation lives here rather than in
     /// either binary.
+    ///
+    /// The second name is the property the id buys: a trigger whose text would
+    /// be hostile in a path produces the same shape of name as any other,
+    /// because none of that text reaches it. [`crate::id`] is where the id's own
+    /// contract is pinned.
     #[test]
-    fn a_clip_is_named_by_its_anchor_and_its_trigger() {
+    fn a_clip_is_named_by_its_id() {
         let named = |name: &str| {
             base_name(&CutRequest::new(
                 crate::testing::TEST_PRODUCER,
                 crate::Trigger {
                     name: name.to_string(),
-                    description: String::new(),
+                    description: "hard brake over 0.8 g".to_string(),
                     trigger_time: crate::Stamp { sec: 0, nanosec: 0 },
-                    preroll: 100,
-                    postroll: 100,
+                    preroll: 5_000_000_000,
+                    postroll: 5_000_000_000,
                 },
                 1_726_300_000_000_000_000,
                 TimeSource::Log,
             ))
         };
-        assert_eq!(named("brake-event"), "1726300000000000000_brake-event.mcap");
         assert_eq!(
-            named("../escape"),
-            "1726300000000000000_.._escape.mcap",
-            "a name is sanitized where the clip is named, never at the caller"
+            named("brake-event"),
+            "1726300000000000000_fc43-6475-ade8-4730.mcap"
         );
-    }
-
-    #[test]
-    fn sanitize_replaces_separators_and_whitespace() {
-        // The slash replacement is the safety property: a trigger name can
-        // never introduce a path component into <trigger_ns>_<name>.mcap.
-        assert_eq!(sanitize("a/b c"), "a_b_c");
-        assert_eq!(sanitize("../escape"), ".._escape");
-        assert_eq!(sanitize(""), "unnamed");
+        assert_eq!(
+            named("../escape").matches('_').count(),
+            1,
+            "a name that would escape the output directory shapes no part of              the clip's own: {}",
+            named("../escape")
+        );
     }
 
     /// Two concurrent cuts of one window, on a single staging worker: the copies
@@ -1526,9 +1501,10 @@ mod tests {
 
         let planner = indexed(&[&split0, &split1])?;
         let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
+        let request = log_request(1_500, 5_500, TimeSource::Log);
         let stats = cut_window(
             &planner,
-            &log_request(1_500, 5_500, TimeSource::Log),
+            &request,
             WindowCoverage::Covered,
             &root,
             Mode::Tail,
@@ -1536,6 +1512,7 @@ mod tests {
         )?;
         assert_eq!(stats.len(), 2, "a straddling window yields two segments");
 
+        let id = ClipId::of(&request).to_string();
         let mut sources = Vec::new();
         for seg in &stats {
             let m = read_manifest(&seg.out_path)?.expect("every segment carries a manifest");
@@ -1546,6 +1523,14 @@ mod tests {
             assert_eq!(m["window.start_ns"], "1500");
             assert_eq!(m["window.end_ns"], "5500");
             assert_eq!(m["clip.messages"], "1");
+            assert_eq!(
+                m["clip.id"], id,
+                "both segments are the same clip and say so"
+            );
+            assert!(
+                file_name(&seg.out_path).starts_with(&id),
+                "a segment's file name opens with the id its record states"
+            );
             sources.push(m["source.path"].clone());
         }
         sources.sort();
@@ -1553,6 +1538,47 @@ mod tests {
             sources,
             vec![split0.display().to_string(), split1.display().to_string()],
             "each segment names the split it was cut from"
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// A clip states the id it is named by, so a file carried away from the
+    /// directory it was published into still says which clip it is.
+    ///
+    /// A window inside one recording is where the two are the same string: the
+    /// manifest's `clip.id` is the file's stem. (A straddling window's segments
+    /// each add their own `_NN`, which the test above pins.)
+    #[test]
+    fn a_clip_is_named_by_the_id_its_manifest_states() -> anyhow::Result<()> {
+        let root = test_dir("clip-id")?;
+        let rec = root.join("rec.mcap");
+        write_recording(&rec, false, &[("/t", 100), ("/t", 200)])?;
+
+        let planner = indexed(&[&rec])?;
+        let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
+        let request = log_request(0, 300, TimeSource::Log);
+        let stats = cut_window(
+            &planner,
+            &request,
+            WindowCoverage::Covered,
+            &root,
+            Mode::Tail,
+            &stage_tx,
+        )?;
+
+        let clip = &stats[0].out_path;
+        let m = read_manifest(clip)?.expect("every clip carries a manifest");
+        assert_eq!(
+            m["clip.id"],
+            ClipId::of(&request).to_string(),
+            "the record states the window's id"
+        );
+        assert_eq!(
+            clip.file_stem().unwrap_or_default().to_string_lossy(),
+            m["clip.id"],
+            "and the clip is written under it"
         );
 
         std::fs::remove_dir_all(root)?;

@@ -53,7 +53,7 @@ clipper is a standalone application that sits beside a continuous
         ▼                                              │
      clipper ◀──────────────── tails (keeps the file open) ──────────┘
         │
-        ├── copies [anchor − preroll, anchor + postroll] ──▶ ./clipped/<anchor_ns>_<name>.mcap
+        ├── copies [anchor − preroll, anchor + postroll] ──▶ ./clipped/<anchor_ns>_<hash>.mcap
         │
         └── announces ──▶ /events/momentedge/recorded   (momentedge_msgs/Recorded, lists every file written)
 ```
@@ -86,15 +86,19 @@ ros2 topic pub --once /events/momentedge/trigger momentedge_msgs/msg/Trigger \
   "{name: clip1, trigger_time: {sec: 0, nanosec: 0}, preroll: 5000000000, postroll: 5000000000}"
 ```
 
-A standalone MCAP lands in `./clipped`, and it can tell you what it is:
+A standalone MCAP lands in `./clipped`, named by its **clip id** — the window's
+anchor and a digest of the trigger that asked for it, so two detectors firing on
+one instant never collide and no trigger text reaches a path. It can tell you
+what it is:
 
 ```console
-$ mcap get metadata --name momentedge.clip ./clipped/1738000000000000000_clip1.mcap
+$ mcap get metadata --name momentedge.clip ./clipped/1738000000000000000_35a7-60a7-01fc-8561.mcap
 {
   "trigger.name":     "clip1",
   "trigger.anchor_ns": "1738000000000000000",
   "window.start_ns":  "1737999995000000000",
   "window.end_ns":    "1738000005000000000",
+  "clip.id":          "1738000000000000000_35a7-60a7-01fc-8561",
   "clip.messages":    "4211",
   "clip.short":       "false",
   ...
@@ -225,7 +229,7 @@ clipper clip ./record --out-dir ./clipped --trigger-source mcap
 | [Configuration](docs/configuration.md) | every flag, environment variable and TOML key, and which layer wins |
 | [Triggers and time](docs/triggers-and-time.md) | the `Trigger` message, the two places a trigger comes from, and which clock a window lives on |
 | [`clipper clip`](docs/clip-command.md) | cutting from a finished recording: bag directories, refusals, re-runs |
-| [What a clip carries](docs/clip-manifest.md) | the `momentedge.clip` manifest inside every clip |
+| [What a clip carries](docs/clip-manifest.md) | the `momentedge.clip` manifest inside every clip, and how a clip's id is derived |
 | [Operating clipper](docs/operating.md) | shutdown, logs, retention, a recording that stops producing clips, overload, and tuning under load |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | how it works inside: threads, tailing, atomic publication, recovery |
 | [`examples/`](examples/README.md) | setup guides — continuous recording, split bags, `ros2 launch`, and ROS-free MCAP writers |

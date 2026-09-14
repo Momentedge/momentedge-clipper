@@ -27,8 +27,8 @@ ros2 bag record (scripts/record.sh) ──▶ ./record/<bag>_0.mcap   (one growi
 clipper ◀── trigger ── EITHER /events/momentedge/trigger (ros interface)
         │              OR read out of the tailed ./record/*.mcap (mcap interface)
         │ cuts [anchor-preroll, anchor+postroll]  (anchor resolved per cell)
-        │   one recording  → ./clipped/<anchor_ns>_<name>.mcap
-        │   rollover split → ./clipped/<anchor_ns>_<name>_00.mcap + _01.mcap …
+        │   one recording  → ./clipped/<anchor_ns>_<hash>.mcap
+        │   rollover split → ./clipped/<anchor_ns>_<hash>_00.mcap + _01.mcap …
         └──▶ completion: ros → /events/momentedge/recorded (filenames[] lists
              every segment); mcap → the clip's atomic move into ./clipped is
              the only signal (no Recorded published)
@@ -61,7 +61,7 @@ carries (`Stamp::from_ns`) and the anchor the window centres on — and hands it
 the same [`clip::segment::cut_window`](../clip/CLAUDE.md#segment-assembly-and-publication-clipsegment),
 along with `--out-dir` and `config::Mode::Clip` — the output *directory* and
 which subcommand is cutting, never a path. The cut itself is therefore unchanged,
-and so are the manifest, the `<anchor_ns>_<name>.mcap` name `clip` derives and
+and so are the manifest, the `<anchor_ns>_<hash>.mcap` name `clip` derives and
 the atomic publication. `--trigger-name` passes the same `validate_name` gate a
 name arriving on a topic does, so a name accepted by one mode is accepted by the
 other.
@@ -98,9 +98,10 @@ name, so the accepted values and the help text cannot drift.
 
 **A trigger nobody can use costs that trigger its clip and no more**, the
 isolation the recorder's interface gives an undecodable trigger: an unreadable
-payload or a recorded name that cannot be embedded in a clip pathname is logged
-and skipped, and the run cuts the rest. An unsafe name in the operator's own
-`--trigger-name` is the opposite — a command line to fix — and ends the run. A
+payload or a recorded name the message contract refuses (`validate_name`, a
+length bound and nothing else) is logged and skipped, and the run cuts the rest.
+The same name in the operator's own `--trigger-name` is the opposite — a command
+line to fix — and ends the run. A
 run left with nothing to cut writes nothing, not even the output directory, and
 exits zero.
 
@@ -143,8 +144,9 @@ is the verdict. No ROS is involved anywhere on this path, so a default (ROS-free
 **The anchor seam.** The interface resolves each trigger's [`Anchor`] (in
 `interface.rs`) — the instant the window centres on, plus whether it came from
 `trigger_time` — and passes it to the driver's `fire` callback, which hands
-`anchor.ns` to `handle_trigger` for both the window bounds and the output name
-`<anchor_ns>_<name>.mcap`. The four `clipper tail --trigger-source` ×
+`anchor.ns` to `handle_trigger` for both the window bounds and the clip's id,
+which the name `<anchor_ns>_<hash>.mcap` is the rendering of. The four
+`clipper tail --trigger-source` ×
 `--time-source` cells resolve it:
 
 |                             | `--time-source log`            | `--time-source publish`      |
@@ -180,11 +182,13 @@ in `main.rs`; each value exactly at its bound is accepted:
   hostile record stamp) would wedge a handler. `ros`+`log` resolves the anchor to
   `now` and always passes; the guard bites on a `ros`+`publish` `trigger_time` and
   on a tail record's own stamp.
-- **A `name` that is empty, past `MAX_TRIGGER_NAME_LEN` (128 B), or unsafe in the
-  clip pathname** (`validate_name`: no path separator, NUL, leading dot, or `..`).
-  `clip`'s own `sanitize` still maps stray characters to `_` where it builds the
-  clip's name; the structural hazards are refused whole here rather than silently
-  rewritten.
+- **A `name` past `MAX_TRIGGER_NAME_LEN` (128 B)** (`validate_name`). That is
+  the whole of the name rule, and the bound is a *message* bound rather than a
+  path one: the name is free text copied into every clip's manifest and echoed in
+  every `Recorded`, and nothing else. A clip is named by
+  [its id](../clip/CLAUDE.md#a-clip-is-named-by-its-id-clipid), a digest, so `/`,
+  `..`, a leading dot, a NUL, unicode and the empty string shape no path and
+  there is nothing to refuse them for.
 
 [`Anchor`]: src/interface.rs
 

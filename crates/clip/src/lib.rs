@@ -26,6 +26,9 @@
 //!   one segment per contributing split.
 //! - [`cut`] — the copy: raw message bytes out of the planned extents into a new
 //!   MCAP, finished with a manifest record, a summary and a footer.
+//! - [`id`] — what a clip is called: the id [`segment`] names it by and every
+//!   manifest carries, derived from the six fields of the request that asked for
+//!   it, under a canonical encoding that is a published contract.
 //! - [`manifest`] — what a clip says about itself: the metadata record every cut
 //!   writes, naming the producer, the trigger, the window, the source recording
 //!   and what each channel contributed.
@@ -59,6 +62,7 @@ pub mod config;
 pub mod cut;
 pub mod decode;
 pub mod embedded;
+pub mod id;
 pub mod index;
 pub mod manifest;
 pub mod segment;
@@ -71,6 +75,7 @@ pub mod trigger;
 pub mod whole;
 
 pub use config::Layered;
+pub use id::ClipId;
 pub use index::{
     ChannelDef, Extent, PlanSource, RecordingIndex, ScanDelta, ScanProgress, ScanSeed, SchemaDef,
     Span, Stamps, TimeBounds, WindowPlan, WindowPlanner,

@@ -13,7 +13,7 @@ A trigger is a `momentedge_msgs/Trigger` message:
 
 | Field | Type | Meaning |
 |---|---|---|
-| `name` | `string` | trigger identifier; becomes part of the clip filename |
+| `name` | `string` | trigger identifier; free text, recorded in the clip's [manifest](clip-manifest.md) and echoed in `Recorded` |
 | `description` | `string` | optional free-form context |
 | `trigger_time` | `builtin_interfaces/Time` | publish-domain anchor; read only under `--trigger-source ros --time-source publish` (see [the anchor matrix](#the-anchor-which-instant-the-window-centres-on)), must be `0` in every other cell |
 | `preroll` | `uint64` | nanoseconds before the anchor to keep |
@@ -27,8 +27,9 @@ check is logged at `error!` and ignored — no clip, no `Recorded`. The limits
 - The resolved **anchor** — at most **30 minutes** past the current clock. The
   anchor drives the window's wait, so a far-future one (a producer clock fault or
   a hostile record stamp) is refused rather than parking a handler for that long.
-- `name` — non-empty, at most **128 bytes**, and safe to embed in the clip
-  pathname: no path separator, NUL, leading `.`, or `..`.
+- `name` — at most **128 bytes**. That is the whole of it: the name reaches the
+  clip's manifest and the `Recorded` echo and never a path, so `/`, `..`, a
+  leading dot, unicode and the empty string are all ordinary names.
 - `trigger_time` — `0` except in the one cell that reads it (`--trigger-source
   ros --time-source publish`); non-zero elsewhere is rejected (see
   [the anchor matrix](#the-anchor-which-instant-the-window-centres-on)).
@@ -38,12 +39,24 @@ For each finished clip, clipper publishes a `momentedge_msgs/Recorded` on
 `trigger_time` and listing every file written in its `string[] filenames`. Every
 path it names is already complete and crash-durable on disk.
 
-**Clip naming.** A window that falls inside a single recording produces one
-file, `<anchor_ns>_<name>.mcap`, where `<anchor_ns>` is the resolved window
-anchor. A window that straddles a rollover (a rosbag2 bag split or a recorder
-restart clipper observed while running) produces one segment per source file —
-`<anchor_ns>_<name>_00.mcap`, `_01.mcap`, … — tiling the window in time order,
-all listed in `filenames`.
+**Clip naming.** A clip is named by its **id**, `<anchor_ns>_<hash>` — the
+resolved window anchor, then a digest of the whole trigger:
+
+```
+./clipped/1726300000000000000_fc43-6475-ade8-4730.mcap
+```
+
+A window that falls inside a single recording produces that one file. A window
+that straddles a rollover (a rosbag2 bag split or a recorder restart clipper
+observed while running) produces one segment per source file —
+`<id>_00.mcap`, `_01.mcap`, … — tiling the window in time order, all listed in
+`filenames`.
+
+The id is derived from the anchor, the name, the description, the two rolls and
+the time source, so two detectors firing on one instant get their own clips and
+the same trigger always names the same clip. Its encoding is published, with a
+worked vector, in [What a clip carries](clip-manifest.md#the-clip-id) — which is
+also where to look to predict a clip's name before it exists.
 
 ## Two ways in: `ros` and `mcap`
 

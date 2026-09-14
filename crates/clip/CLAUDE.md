@@ -3,8 +3,9 @@
 What every consumer of a recording shares: the MCAP format layer and its
 recording index, the copy that cuts a window out of one, the neutral trigger and
 completion contract, the segment assembly that turns one window into published
-clips, the manifest each of those clips carries, the channel selection that says
-which topics it holds, and the layered configuration file behind both.
+clips, the id each clip is named by, the manifest each of them carries, the
+channel selection that says which topics it holds, and the layered configuration
+file behind both.
 
 **No ROS anywhere by default**, and no async runtime. Cutting a window out of a
 recording nobody is writing links this crate alone — no successor to find, no
@@ -278,6 +279,35 @@ CRCs, so corruption inside a message *body* that leaves the framing and the
 22-byte message header intact is invisible to every MCAP reader and is copied
 into clips as-is — only a CDR decode downstream would notice.
 
+## A clip is named by its id (`clip::id`)
+
+`ClipId::of(&CutRequest)` is what a clip is called: `<anchor_ns>_<hash>`, the
+resolved anchor followed by the first 8 bytes of SHA-256 over a canonical
+encoding of the six fields a request *is* — the anchor, `name`, `description`,
+`preroll`, `postroll`, and the time source — rendered as four lower-case hex
+groups of four. `segment::base_name` appends `.mcap` to it and
+`manifest`'s `clip.id` states it, both from that one function, so the filename
+and the record cannot disagree.
+
+**The encoding is a published contract**, stated with a worked vector in
+[What a clip carries](../../docs/clip-manifest.md#the-clip-id) and pinned by
+`the_published_vector_encodes_and_hashes_to_its_documented_id`. An id quoted in
+an incident report has to stay valid across versions, so that test failing is
+the point: changing the field order, a separator, the tag or how a value is
+rendered is a new id space and must be a new `ENCODING_TAG`, never the same bytes
+meaning something else. The two free-text fields are **byte-length-prefixed**
+rather than delimited — the newline after each is decoration — so no pair of
+distinct triggers can encode alike however their text is split.
+
+**What the id buys is that no trigger text reaches a path.** A `name` holding
+`/`, `..`, a leading dot, unicode or nothing at all is hashed like any other, so
+there is no sanitizer and nothing for the recorder's admission gate to refuse on
+those grounds; what is left of `validate_name` is the recorder's own length bound
+on a free-text message field. The cost is that a clip's name no longer says what
+it is about, which is what `clip.id` and `trigger.name` in the manifest are for —
+and why the e2e suite finds a clip by reading manifests rather than by matching a
+filename.
+
 ## Every clip carries its manifest (`clip::manifest`)
 
 A clip leaves the output directory and is read somewhere with neither the
@@ -289,6 +319,12 @@ consumer does with them are in the
 from. The name is namespaced because a recording `ros2 bag record` wrote carries
 its *own* metadata record under the bare name `rosbag2` — a manifest under that
 name would be found by whichever record a tool read first.
+
+`clip.id` is the one key that is *derived* rather than carried: it is
+[`ClipId::of`](#a-clip-is-named-by-its-id-clipid) over the same `CutRequest` the
+`trigger.*` and `window.*` keys are written from, and over the same request
+`segment` names the file from. One computation over one value is what makes the
+key and the filename unable to drift.
 
 **Written between the last message and `finish`.** `copy_window` walks the
 extents, then calls `ClipWriter::write_manifest`, then `Writer::finish()`. That
@@ -359,9 +395,8 @@ from it, both of which used to be a binary's to get right and are now impossible
 to get differently right in two places:
 
 - **The name is `segment::base_name`'s**, one private function over the
-  `CutRequest`: `<anchor_ns>_<name>.mcap`, the resolved anchor and the trigger's
-  name put through `sanitize`. Neither binary formats a clip path, so the scheme
-  moves in one edit.
+  `CutRequest`: the window's [id](#a-clip-is-named-by-its-id-clipid) and the mcap
+  extension. Neither binary formats a clip path, so the scheme moves in one edit.
 - **What a taken name costs is read off the caller's `clip::config::Mode`**
   (`segment::publication`, an exhaustive match, so a subcommand added to that
   enum is a compile error until it says what a collision means to it). The

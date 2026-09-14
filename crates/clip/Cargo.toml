@@ -56,6 +56,9 @@ serde_norway.workspace = true
 # operator's file may carry comments, and rather than YAML so the parser is one
 # a Rust workspace already builds.
 toml = "1"
+# The digest a clip's id is derived from (`clip::id`): SHA-256 over the
+# canonical encoding of the six trigger fields the id is a function of.
+sha2.workspace = true
 # The two regular-expression forms of the topic selection (`clip::select`).
 # Linear-time matching with no backtracking, so a pattern out of a configuration
 # file cannot cost the recorder a topic match it never finishes.

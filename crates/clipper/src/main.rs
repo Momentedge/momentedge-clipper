@@ -13,10 +13,10 @@
 //! postroll]`: the [`handler`] waits until the wall clock passes the window end,
 //! waits until the tail's coverage reaches it (the recording provably holds the
 //! window), then bulk-copies the in-window messages out of the planned extents
-//! into a clip at `./clipped/<trigger_ns>_<name>.mcap` (see [`clip`] — a
-//! raw-bytes copy, no CDR decode, finished with a proper summary + footer,
-//! assembled in a capturing dir and moved atomically into place so observers
-//! never see a footer-less file).
+//! into a clip named by its [id](clip::ClipId),
+//! `./clipped/<anchor_ns>_<hash>.mcap` (see [`clip`] — a raw-bytes copy, no CDR
+//! decode, finished with a proper summary + footer, assembled in a capturing dir
+//! and moved atomically into place so observers never see a footer-less file).
 //!
 //! Where triggers come from is `--trigger-source`, and how completion is
 //! signalled follows from it: the two are one seam, the [`interface`], with one
@@ -1651,15 +1651,16 @@ fn embedded_triggers(recording: &std::path::Path) -> anyhow::Result<Vec<Anchored
     Ok(triggers)
 }
 
-/// The triggers of `triggers` whose names may reach the filesystem, or the fault
-/// that ends the run.
+/// The triggers of `triggers` whose names the message contract accepts, or the
+/// fault that ends the run.
 ///
-/// A trigger name is embedded in the clip's pathname, so it passes the gate
-/// every trigger passes, whichever source it arrived from ([`validate_name`]).
-/// What an unsafe one costs differs with who wrote it: a name the operator typed
-/// is a command line to fix and ends the run, while one the recording carried
-/// costs that trigger its clip and no more — the same isolation an undecodable
-/// trigger gets.
+/// A trigger's name passes the same gate here it passes arriving on a topic,
+/// whichever source it came from ([`validate_name`]), so a trigger a recorder
+/// would have refused is refused when the recording is cut offline too. What a
+/// refused one costs differs with who wrote it: a name the operator typed is a
+/// command line to fix and ends the run, while one the recording carried costs
+/// that trigger its clip and no more — the same isolation an undecodable trigger
+/// gets.
 fn with_usable_names(
     cfg: &ClipConfig,
     triggers: Vec<AnchoredTrigger>,
@@ -1875,9 +1876,10 @@ const MAX_ROLL_NS: u64 = 1_800_000_000_000; // 30 * 60 * 1e9
 /// `ros` feature can present.
 const MAX_ANCHOR_FUTURE_SKEW_NS: u64 = 1_800_000_000_000; // 30 * 60 * 1e9
 
-/// The largest trigger `name`, in bytes. The name is embedded in the clip
-/// pathname `<anchor_ns>_<name>.mcap`, so it is bounded and kept filename-safe
-/// (see [`validate_name`]).
+/// The largest trigger `name`, in bytes. The name is free text a requester
+/// chose, copied into every clip's manifest and echoed in every `Recorded`, so
+/// it is bounded to keep one malformed message from filling either (see
+/// [`validate_name`]).
 const MAX_TRIGGER_NAME_LEN: usize = 128;
 
 /// The trigger-admission gate: whether a resolved trigger is cut into a clip, or
@@ -1902,8 +1904,7 @@ const MAX_TRIGGER_NAME_LEN: usize = 128;
 ///   The anchor — not `trigger_time` specifically — is the guarded value, since
 ///   it is what parks a handler through its postroll sleep whatever cell resolved
 ///   it.
-/// - **A `name` that is empty, past [`MAX_TRIGGER_NAME_LEN`], or unsafe to embed
-///   in the clip pathname** (see [`validate_name`]).
+/// - **A `name` past [`MAX_TRIGGER_NAME_LEN`]** (see [`validate_name`]).
 fn validate_trigger(trig: &Trigger, anchor: Anchor, now_ns: u64) -> Result<(), String> {
     if !anchor.from_trigger_time && trig.trigger_time.ns() != 0 {
         return Err(format!(
@@ -1939,30 +1940,19 @@ fn validate_trigger(trig: &Trigger, anchor: Anchor, now_ns: u64) -> Result<(), S
     Ok(())
 }
 
-/// Reject a trigger `name` that cannot be safely embedded in the clip pathname
-/// `<anchor_ns>_<name>.mcap`. [`clip::segment::sanitize`] maps stray characters to `_`
-/// at clip creation, but structural hazards — an empty name, a path separator or
-/// NUL, a leading dot (a hidden file), or an embedded `..` (a parent-directory
-/// escape) — are refused whole here rather than silently rewritten, so a
-/// malformed request never reaches the filesystem in a surprising shape.
+/// Reject a trigger `name` the message contract does not accept.
+///
+/// **What the name can and cannot do is the whole of why this is one rule.** The
+/// name never reaches a path: a clip is named by its [`clip::ClipId`], which is a
+/// digest, so a name holding `/`, `..`, a leading dot, unicode or nothing at all
+/// shapes no file name and there is nothing to sanitize or refuse it for. What is
+/// left is the resource bound every free-text field of a message needs: the name
+/// is copied into every clip's manifest and echoed in every `Recorded`, and
+/// [`MAX_TRIGGER_NAME_LEN`] is what keeps one malformed message from filling
+/// them.
 fn validate_name(name: &str) -> Result<(), &'static str> {
-    if name.is_empty() {
-        return Err("is empty");
-    }
     if name.len() > MAX_TRIGGER_NAME_LEN {
         return Err("exceeds the name length limit");
-    }
-    if name.contains('\0') {
-        return Err("contains a NUL byte");
-    }
-    if name.contains('/') || name.contains('\\') {
-        return Err("contains a path separator");
-    }
-    if name.starts_with('.') {
-        return Err("starts with a dot");
-    }
-    if name.contains("..") {
-        return Err("contains '..'");
     }
     Ok(())
 }
@@ -2272,6 +2262,65 @@ mod tests {
         program: PROGRAM,
         mode: CLIP_MODE,
     };
+
+    /// The id `clipper clip` names one trigger's clip by, computed the way the
+    /// run computes it. `CLIP_TIME_SOURCE` is the sixth field every clip cut
+    /// here is hashed with, since the subcommand takes no clock-domain flag.
+    ///
+    /// The id's own contract — the encoding and a published vector — is pinned
+    /// in `clip::id`; a test using this says which trigger it means, not what
+    /// the id of it is.
+    fn clip_id(
+        anchor_ns: u64,
+        name: &str,
+        description: &str,
+        preroll: u64,
+        postroll: u64,
+    ) -> String {
+        clip::ClipId::of(&clip::CutRequest::new(
+            CLIP_PRODUCER,
+            Trigger {
+                name: name.to_string(),
+                description: description.to_string(),
+                trigger_time: clip::Stamp::from_ns(anchor_ns),
+                preroll,
+                postroll,
+            },
+            anchor_ns,
+            CLIP_TIME_SOURCE,
+        ))
+        .to_string()
+    }
+
+    /// Every clip under `out_dir`, grouped by the name of the trigger that asked
+    /// for it and sorted within each group.
+    ///
+    /// A clip is named by its id, so which trigger a clip answers is something
+    /// the clip *states* rather than something a filename spells: a test looking
+    /// for "the clip of the `brake` trigger" reads the manifests, exactly as a
+    /// consumer would.
+    fn clips_by_trigger(
+        out_dir: &Path,
+    ) -> anyhow::Result<std::collections::BTreeMap<String, Vec<PathBuf>>> {
+        let mut clips: std::collections::BTreeMap<String, Vec<PathBuf>> =
+            std::collections::BTreeMap::new();
+        for entry in std::fs::read_dir(out_dir)? {
+            let path = entry?.path();
+            if path.extension().is_none_or(|ext| ext != "mcap") {
+                continue;
+            }
+            let manifest =
+                clip::manifest::read_manifest(&path)?.context("every clip carries a manifest")?;
+            clips
+                .entry(manifest["trigger.name"].clone())
+                .or_default()
+                .push(path);
+        }
+        for paths in clips.values_mut() {
+            paths.sort();
+        }
+        Ok(clips)
+    }
 
     /// The recorder's `Config` out of an argv naming the `tail` mode.
     fn parse_from<I, T>(argv: I) -> Result<Config, clap::Error>
@@ -2749,7 +2798,10 @@ mod tests {
         };
         clip_mode(cfg, producer, clip::ChannelSelection::default())?;
 
-        let clip_path = out_dir.join("3000_brake.mcap");
+        let clip_path = out_dir.join(format!(
+            "{}.mcap",
+            clip_id(3_000, "brake", "hard brake", 1_500, 500)
+        ));
         assert_eq!(
             clip::testing::read_clip(&clip_path)?,
             vec![("/t".to_string(), 2_000), ("/t".to_string(), 3_000)],
@@ -2761,6 +2813,14 @@ mod tests {
         assert_eq!(
             m["producer.mode"], "clip",
             "a clip cut here is told from a recorder's without opening the recording"
+        );
+        assert_eq!(
+            m["clip.id"],
+            clip_path
+                .file_stem()
+                .expect("the clip has a name")
+                .to_string_lossy(),
+            "the clip states the id it is written under"
         );
         assert_eq!(m["trigger.name"], "brake");
         assert_eq!(m["trigger.description"], "hard brake");
@@ -2810,8 +2870,8 @@ mod tests {
         )?;
         let elapsed = began.elapsed();
 
-        let clip_path = out_dir.join(format!("{base}_late.mcap"));
-        let m = clip::manifest::read_manifest(&clip_path)?.expect("every clip carries a manifest");
+        let clip_path = &clips_by_trigger(&out_dir)?["late"][0];
+        let m = clip::manifest::read_manifest(clip_path)?.expect("every clip carries a manifest");
         assert_eq!(m["clip.messages"], "2");
         assert_eq!(
             m["clip.short"], "true",
@@ -2826,11 +2886,10 @@ mod tests {
         Ok(())
     }
 
-    /// A trigger name that cannot be safely embedded in the clip pathname is
-    /// refused here exactly as it is when it arrives on a topic, and nothing is
-    /// written.
+    /// A trigger name the message contract refuses is refused here exactly as it
+    /// is when it arrives on a topic, and nothing is written.
     #[test]
-    fn clip_mode_refuses_an_unsafe_trigger_name() -> anyhow::Result<()> {
+    fn clip_mode_refuses_a_trigger_name_the_contract_rejects() -> anyhow::Result<()> {
         let root = clip::testing::test_dir("clip-badname")?;
         let rec = root.join("rec.mcap");
         clip::testing::write_recording(&rec, true, &[("/t", 1_000)])?;
@@ -2839,7 +2898,7 @@ mod tests {
         let err = clip_mode(
             ClipConfig {
                 trigger_time: Some(1_000),
-                trigger_name: Some("../escape".to_string()),
+                trigger_name: Some("a".repeat(MAX_TRIGGER_NAME_LEN + 1)),
                 ..param_clip_cfg(&rec, &out_dir)
             },
             CLIP_PRODUCER,
@@ -2853,6 +2912,49 @@ mod tests {
         assert!(
             !out_dir.exists(),
             "a refused command line writes nothing at all"
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// A trigger name that would be hostile in a path cuts an ordinary clip.
+    ///
+    /// The name reaches the manifest and nothing else: a clip is named by its
+    /// id, so `..` in a name is text like any other and cannot climb out of
+    /// `--out-dir`, add a path component, or hide the clip behind a leading dot.
+    #[test]
+    fn a_trigger_name_that_could_break_a_path_cuts_an_ordinary_clip() -> anyhow::Result<()> {
+        let root = clip::testing::test_dir("clip-pathy-name")?;
+        let rec = root.join("rec.mcap");
+        clip::testing::write_recording(&rec, true, &[("/t", 1_000)])?;
+        let out_dir = root.join("clipped");
+
+        clip_mode(
+            ClipConfig {
+                trigger_time: Some(1_000),
+                preroll: Some(500),
+                postroll: Some(500),
+                trigger_name: Some("../../escape".to_string()),
+                ..param_clip_cfg(&rec, &out_dir)
+            },
+            CLIP_PRODUCER,
+            clip::ChannelSelection::default(),
+        )?;
+
+        let clips = clips_by_trigger(&out_dir)?;
+        assert_eq!(
+            clips["../../escape"],
+            vec![out_dir.join(format!(
+                "{}.mcap",
+                clip_id(1_000, "../../escape", "", 500, 500)
+            ))],
+            "the clip is named by its id, and the name only reaches the manifest"
+        );
+        assert_eq!(
+            clip_data(&clips["../../escape"][0])?,
+            vec![1_000],
+            "and it is an ordinary clip of the window that was asked for"
         );
 
         std::fs::remove_dir_all(root)?;
@@ -3010,38 +3112,36 @@ mod tests {
             clip::ChannelSelection::default(),
         )?;
 
-        let mut written: Vec<String> = std::fs::read_dir(&out_dir)?
-            .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
-            .collect::<anyhow::Result<Vec<_>>>()?
-            .into_iter()
-            .filter(|name| name.ends_with(".mcap"))
-            .collect();
-        written.sort();
+        let id = clip_id(3_000, "brake", "", 1_500, 500);
+        let segments = clips_by_trigger(&out_dir)?;
         assert_eq!(
-            written,
-            vec!["3000_brake_00.mcap", "3000_brake_01.mcap"],
+            segments["brake"]
+                .iter()
+                .map(|p| p.file_name().unwrap_or_default().to_string_lossy())
+                .collect::<Vec<_>>(),
+            vec![format!("{id}_00.mcap"), format!("{id}_01.mcap")],
             "one segment per contributing recording, numbered in collection order"
         );
 
         // The window [1500, 3500] straddles the split; the segments together
         // are the two messages inside it, in recording order.
-        assert_eq!(clip_data(&out_dir.join("3000_brake_00.mcap"))?, vec![2_000]);
-        assert_eq!(clip_data(&out_dir.join("3000_brake_01.mcap"))?, vec![3_000]);
+        let segments = &segments["brake"];
+        assert_eq!(clip_data(&segments[0])?, vec![2_000]);
+        assert_eq!(clip_data(&segments[1])?, vec![3_000]);
 
-        let manifest = |name: &str| -> anyhow::Result<_> {
-            clip::manifest::read_manifest(&out_dir.join(name))?
-                .context("every clip carries a manifest")
+        let manifest = |path: &Path| -> anyhow::Result<_> {
+            clip::manifest::read_manifest(path)?.context("every clip carries a manifest")
         };
         assert_eq!(
-            manifest("3000_brake_00.mcap")?["source.path"],
+            manifest(&segments[0])?["source.path"],
             first.display().to_string()
         );
         assert_eq!(
-            manifest("3000_brake_01.mcap")?["source.path"],
+            manifest(&segments[1])?["source.path"],
             second.display().to_string()
         );
         assert_eq!(
-            manifest("3000_brake_00.mcap")?["source.files_planned"],
+            manifest(&segments[0])?["source.files_planned"],
             "2",
             "the clip states how many recordings of the collection the window crossed"
         );
@@ -3133,7 +3233,10 @@ mod tests {
         };
 
         cut_it()?;
-        let clip_path = out_dir.join("1500_brake.mcap");
+        let clip_path = out_dir.join(format!(
+            "{}.mcap",
+            clip_id(1_500, "brake", "", 1_000, 1_000)
+        ));
         assert_eq!(
             clip::testing::read_clip(&clip_path)?,
             vec![("/t".to_string(), 1_000), ("/t".to_string(), 2_000)],
@@ -3159,7 +3262,14 @@ mod tests {
         published.sort();
         assert_eq!(
             published,
-            vec![".capturing".to_string(), "1500_brake.mcap".to_string()],
+            vec![
+                ".capturing".to_string(),
+                clip_path
+                    .file_name()
+                    .expect("the clip has a name")
+                    .to_string_lossy()
+                    .into_owned()
+            ],
             "the refused run publishes nothing, least of all a suffixed sibling"
         );
         assert_eq!(
@@ -3583,28 +3693,34 @@ mod tests {
             clip::ChannelSelection::default(),
         )?;
 
-        // One clip per trigger, each named by its own trigger's log time.
-        let mut written: Vec<String> = std::fs::read_dir(&out_dir)?
-            .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
-            .collect::<anyhow::Result<Vec<_>>>()?
-            .into_iter()
-            .filter(|name| name.ends_with(".mcap"))
-            .collect();
-        written.sort();
-        assert_eq!(written, vec!["2500_first.mcap", "4200_second.mcap"]);
+        // One clip per trigger, each named by its own id — which opens with its
+        // own trigger's log time, the anchor the window centres on.
+        let clips = clips_by_trigger(&out_dir)?;
+        assert_eq!(clips.keys().collect::<Vec<_>>(), vec!["first", "second"]);
+        assert_eq!(
+            [&clips["first"][0], &clips["second"][0]].map(|p| p
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()),
+            [
+                format!(
+                    "{}.mcap",
+                    clip_id(2_500, "first", "first happened", 1_000, 500)
+                ),
+                format!(
+                    "{}.mcap",
+                    clip_id(4_200, "second", "second happened", 300, 1_000)
+                ),
+            ]
+        );
 
         // Each window is its own trigger's, both bounds inclusive:
         // [2500-1000, 2500+500] and [4200-300, 4200+1000].
-        assert_eq!(
-            clip_data(&out_dir.join("2500_first.mcap"))?,
-            vec![2_000, 3_000]
-        );
-        assert_eq!(
-            clip_data(&out_dir.join("4200_second.mcap"))?,
-            vec![4_000, 5_000]
-        );
+        assert_eq!(clip_data(&clips["first"][0])?, vec![2_000, 3_000]);
+        assert_eq!(clip_data(&clips["second"][0])?, vec![4_000, 5_000]);
 
-        let first = clip::manifest::read_manifest(&out_dir.join("2500_first.mcap"))?
+        let first = clip::manifest::read_manifest(&clips["first"][0])?
             .expect("every clip carries a manifest");
         assert_eq!(first["trigger.name"], "first");
         assert_eq!(first["trigger.description"], "first happened");
@@ -3664,22 +3780,16 @@ mod tests {
             clip::ChannelSelection::default(),
         )?;
 
-        let mut written: Vec<String> = std::fs::read_dir(&out_dir)?
-            .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
-            .collect::<anyhow::Result<Vec<_>>>()?
-            .into_iter()
-            .filter(|name| name.ends_with(".mcap"))
-            .collect();
-        written.sort();
+        let clips = clips_by_trigger(&out_dir)?;
         assert_eq!(
-            written,
-            vec!["2000_first.mcap", "6000_second.mcap"],
+            clips.keys().collect::<Vec<_>>(),
+            vec!["first", "second"],
             "one clip per trigger, whichever recording of the collection carried it"
         );
         // Each window sits inside the recording its trigger was written to, so
         // each clip is one segment and holds that recording's messages.
-        assert_eq!(clip_data(&out_dir.join("2000_first.mcap"))?, vec![2_000]);
-        assert_eq!(clip_data(&out_dir.join("6000_second.mcap"))?, vec![6_000]);
+        assert_eq!(clip_data(&clips["first"][0])?, vec![2_000]);
+        assert_eq!(clip_data(&clips["second"][0])?, vec![6_000]);
 
         std::fs::remove_dir_all(root)?;
         Ok(())
@@ -3729,18 +3839,21 @@ mod tests {
             clip::ChannelSelection::default(),
         )?;
 
-        let clip_name = "3000_brake.mcap";
-        let recorded_manifest = clip::manifest::read_manifest(&from_recording.join(clip_name))?
+        let clip_name = format!(
+            "{}.mcap",
+            clip_id(3_000, "brake", "brake happened", 1_500, 500)
+        );
+        let recorded_manifest = clip::manifest::read_manifest(&from_recording.join(&clip_name))?
             .expect("every clip carries a manifest");
-        let flagged_manifest = clip::manifest::read_manifest(&from_flags.join(clip_name))?
+        let flagged_manifest = clip::manifest::read_manifest(&from_flags.join(&clip_name))?
             .expect("every clip carries a manifest");
         assert_eq!(
             recorded_manifest, flagged_manifest,
             "the same trigger states the same clip, whichever source stated it"
         );
         assert_eq!(
-            clip_data(&from_recording.join(clip_name))?,
-            clip_data(&from_flags.join(clip_name))?,
+            clip_data(&from_recording.join(&clip_name))?,
+            clip_data(&from_flags.join(&clip_name))?,
         );
 
         std::fs::remove_dir_all(root)?;
@@ -3812,7 +3925,7 @@ mod tests {
             clip::ChannelSelection::default(),
         )?;
         assert_eq!(
-            clip_data(&out_dir.join("1500_window.mcap"))?,
+            clip_data(&clips_by_trigger(&out_dir)?["window"][0])?,
             vec![1_000, 2_000],
             "a param run reads the chunks its window needs and no others"
         );
@@ -3839,21 +3952,22 @@ mod tests {
         Ok(())
     }
 
-    /// A recorded trigger whose name cannot be embedded in a clip pathname
-    /// costs that trigger its clip and no more — the same isolation an
-    /// undecodable trigger gets, and the opposite of what an operator's own
-    /// `--trigger-name` gets.
+    /// A recorded trigger whose name the message contract refuses costs that
+    /// trigger its clip and no more — the same isolation an undecodable trigger
+    /// gets, and the opposite of what an operator's own `--trigger-name` gets.
     #[test]
-    fn an_unsafe_embedded_trigger_name_skips_only_that_trigger() -> anyhow::Result<()> {
+    fn an_embedded_trigger_name_the_contract_rejects_skips_only_that_trigger() -> anyhow::Result<()>
+    {
         let root = clip::testing::test_dir("clip-badembedded")?;
         let rec = root.join("rec.mcap");
+        let too_long = "a".repeat(MAX_TRIGGER_NAME_LEN + 1);
         clip::testing::write_recording_with_triggers(
             &rec,
             FIXTURE_TRIGGER_TOPIC,
             &[
                 &[recorded(1_000), recorded(2_000)],
                 &[
-                    embedded(2_500, "../escape", 1_000, 500),
+                    embedded(2_500, &too_long, 1_000, 500),
                     embedded(2_600, "good", 1_000, 500),
                 ],
             ],
@@ -3872,16 +3986,10 @@ mod tests {
             clip::ChannelSelection::default(),
         )?;
 
-        let written: Vec<String> = std::fs::read_dir(&out_dir)?
-            .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
-            .collect::<anyhow::Result<Vec<_>>>()?
-            .into_iter()
-            .filter(|name| name.ends_with(".mcap"))
-            .collect();
         assert_eq!(
-            written,
-            vec!["2600_good.mcap"],
-            "the safe trigger still gets its clip, and the unsafe one none"
+            clips_by_trigger(&out_dir)?.into_keys().collect::<Vec<_>>(),
+            vec!["good".to_string()],
+            "the accepted trigger still gets its clip, and the refused one none"
         );
 
         std::fs::remove_dir_all(root)?;
@@ -4342,7 +4450,7 @@ mod tests {
     /// and rejected when over-length, empty, or carrying a filename hazard (a
     /// path separator, NUL, leading dot, or embedded `..`).
     #[test]
-    fn validate_rejects_unsafe_and_oversized_names() {
+    fn validate_bounds_the_name_and_asks_nothing_else_of_it() {
         let with_name = |name: &str| {
             let mut t = valid_trigger();
             t.name = name.to_string();
@@ -4358,17 +4466,25 @@ mod tests {
             with_name(&"a".repeat(MAX_TRIGGER_NAME_LEN + 1)).is_err(),
             "a name one byte over the limit is rejected"
         );
-        assert!(with_name("").is_err(), "an empty name is rejected");
-        assert!(with_name("a/b").is_err(), "a path separator is rejected");
-        assert!(with_name("a\\b").is_err(), "a backslash is rejected");
-        assert!(with_name("a\0b").is_err(), "a NUL byte is rejected");
-        assert!(with_name(".hidden").is_err(), "a leading dot is rejected");
-        assert!(with_name("..").is_err(), "'..' is rejected");
-        assert!(
-            with_name("../escape").is_err(),
-            "path traversal is rejected"
-        );
-        assert!(with_name("a..b").is_err(), "an embedded '..' is rejected");
+
+        // A clip is named by its id, so none of these can shape a path and none
+        // of them is a reason to drop a trigger a requester meant.
+        for name in [
+            "",
+            "a/b",
+            "a\\b",
+            "a\0b",
+            ".hidden",
+            "..",
+            "../escape",
+            "a..b",
+            "ブレーキ",
+        ] {
+            assert!(
+                with_name(name).is_ok(),
+                "{name:?} is an ordinary name: nothing about it reaches the filesystem"
+            );
+        }
     }
 
     // ---- the layered configuration file -------------------------------------
@@ -5464,14 +5580,14 @@ mod tests {
             selection,
         )?;
 
-        let clip_path = out_dir.join("1000_sel.mcap");
+        let clip_path = &clips_by_trigger(&out_dir)?["sel"][0];
         assert_eq!(
-            clip::testing::read_clip(&clip_path)?,
+            clip::testing::read_clip(clip_path)?,
             vec![("/imu/data".to_string(), 1_000)],
             "only the selected topic is cut"
         );
         let manifest =
-            clip::manifest::read_manifest(&clip_path)?.expect("every clip carries a manifest");
+            clip::manifest::read_manifest(clip_path)?.expect("every clip carries a manifest");
         assert_eq!(
             manifest
                 .keys()

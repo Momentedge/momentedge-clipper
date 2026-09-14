@@ -802,40 +802,69 @@ impl TestEnv {
         assert!(status.success(), "trigger publish {name} failed: {status}");
     }
 
-    /// Poll `out_dir` for a finished clip whose file name ends with `suffix`,
-    /// returning its path. A clip is named `<anchor_ns>_<name>.mcap`, where the
-    /// anchor is the window centre the interface resolved — the trigger record's
-    /// own stamp under `--trigger-source mcap`, not the publisher's `trigger_time`. A
-    /// test that does not know the exact anchor locates the clip by its
-    /// `_<name>.mcap` suffix.
-    pub(crate) fn wait_for_clip_matching(&self, suffix: &str, timeout: Duration) -> PathBuf {
+    /// Poll `out_dir` for a finished clip whose trigger was named `name`,
+    /// returning its path.
+    ///
+    /// A clip is named `<anchor_ns>_<hash>.mcap` — an id derived from the whole
+    /// trigger, carrying none of its text — so which trigger a clip answers is
+    /// something the clip states and not something its path spells. The
+    /// manifest's `trigger.name` is where it states it, which is also how a real
+    /// consumer would find the clip of one event.
+    pub(crate) fn wait_for_clip_named(&self, name: &str, timeout: Duration) -> PathBuf {
         let deadline = Instant::now() + timeout;
         loop {
             if let Ok(entries) = std::fs::read_dir(self.out_dir()) {
                 for entry in entries.flatten() {
                     let path = entry.path();
-                    if path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .is_some_and(|n| n.ends_with(suffix))
-                    {
+                    if path.extension().is_none_or(|ext| ext != "mcap") {
+                        continue;
+                    }
+                    let names_it = clip::manifest::read_manifest(&path)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|m| m.get("trigger.name").is_some_and(|n| n == name));
+                    if names_it {
                         return path;
                     }
                 }
             }
             assert!(
                 Instant::now() < deadline,
-                "no clip ending in {suffix:?} appeared in out_dir within {timeout:?}"
+                "no clip of the trigger named {name:?} appeared in out_dir within {timeout:?}"
             );
             std::thread::sleep(Duration::from_millis(100));
         }
     }
 }
 
-/// The anchor nanoseconds a clip file name encodes: `<anchor_ns>_<name>.mcap`.
-/// The window a clip was cut with is `[anchor - preroll, anchor + postroll]`, so
-/// a test that located the clip by name recovers the anchor to assert its
-/// window.
+/// Whether `name` is the file name of a clip anchored at `anchor`: that clip's
+/// id — the anchor, an underscore, and the digest's sixteen lower-case hex
+/// characters in four groups of four — plus the mcap extension.
+///
+/// The shape is what the tests assert, never the digest: the id's own contract
+/// is pinned by `clip::id`'s published vector, and an e2e run's anchor is
+/// clipper's own clock, so its hash is not a value a test can know in advance.
+pub(crate) fn is_clip_name(name: &str, anchor: u64) -> bool {
+    let Some(hash) = name
+        .strip_prefix(&format!("{anchor}_"))
+        .and_then(|rest| rest.strip_suffix(".mcap"))
+    else {
+        return false;
+    };
+    let groups: Vec<&str> = hash.split('-').collect();
+    groups.len() == 4
+        && groups.iter().all(|group| {
+            group.len() == 4
+                && group
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        })
+}
+
+/// The anchor nanoseconds a clip file name opens with: a clip is named by its
+/// id, `<anchor_ns>_<hash>.mcap`, and the anchor leads it. The window a clip was
+/// cut with is `[anchor - preroll, anchor + postroll]`, so a test that located
+/// the clip recovers the anchor from its name to assert its window.
 pub(crate) fn anchor_from_clip(path: &Path) -> u64 {
     path.file_name()
         .and_then(|n| n.to_str())
@@ -845,7 +874,7 @@ pub(crate) fn anchor_from_clip(path: &Path) -> u64 {
 }
 
 /// The inclusive `[start, end]` window a cut announced, read back from its first
-/// segment's `<anchor>_<name>.mcap` name. Under `--trigger-source ros --time-source
+/// segment's `<anchor_ns>_<hash>.mcap` name. Under `--trigger-source ros --time-source
 /// log` the anchor is clipper's own subscription instant — not the test's
 /// pre-publish `now()`, which the `ros2 topic pub` startup precedes by around a
 /// second — so window assertions recover the anchor from the announced clip
@@ -1272,6 +1301,13 @@ pub(crate) fn assert_clip_manifest(path: &Path, preroll_ns: u64, postroll_ns: u6
     );
     let anchor = anchor_from_clip(path);
     assert_eq!(manifest["trigger.anchor_ns"], anchor.to_string());
+    assert_eq!(
+        manifest["clip.id"],
+        path.file_stem()
+            .expect("a published clip has a name")
+            .to_string_lossy(),
+        "the clip is named by the id its record states"
+    );
     assert_eq!(manifest["trigger.preroll_ns"], preroll_ns.to_string());
     assert_eq!(manifest["trigger.postroll_ns"], postroll_ns.to_string());
     assert_eq!(

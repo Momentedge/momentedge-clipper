@@ -77,8 +77,9 @@ e2e-tests the feature half.
 | `src/bag.rs` | What the operator pointed at: one recording, or a bag directory's splits in recording order — the recorder's `metadata.yaml` where it wrote one, modification time where it did not — plus the per-topic counts that cross-check the collection |
 | `src/whole.rs` | The same index for a recording that is already finished, taken from its own summary: one extent per chunk index, the registry and time bounds off the summary, served through the same `WindowPlanner`. A bag directory is indexed split by split and planned as one collection |
 | `src/cut.rs` | Window extraction: read planned extents, assemble and atomically publish a standalone MCAP clip |
+| `src/id.rs` | A clip's id — the anchor and a digest of the six fields of the request behind it — under a canonical encoding that is a published contract |
 | `src/manifest.rs` | What a clip says about itself: the `momentedge.clip` metadata record, the `CutRequest` a caller names a window with, and the reader that pulls the record back out |
-| `src/segment.rs` | One window to durable clips: plan, stage a segment per source recording over a worker pool, drop the empties, publish |
+| `src/segment.rs` | One window to durable clips, and the one entry point that decides where a clip goes: name it under the caller's output directory, plan, stage a segment per source recording over a worker pool, drop the empties, publish |
 | `src/select.rs` | Which of a recording's topics a clip is cut from: the include and exclude lists, their two regular-expression forms, and the two rules no configuration reaches |
 | `src/config.rs` | The layered configuration file: a system TOML file under a per-run one, merged per key into the defaults the CLI parser takes, plus the topic selection they describe |
 | `src/trigger.rs` | The neutral contract: `Trigger`, `Stamp`, `TriggerRecord`, `Completion`, the `Announce` trait, `now_ns` — plus the `Completion` → `Recorded` conversion under `ros` |
@@ -302,8 +303,10 @@ the active `--time-source`:
    stages one empty plan, so every trigger produces a valid (possibly empty)
    clip, and its manifest says which kind of empty it is.
 5. **Publish.** Drop empty segments when the window produced real data elsewhere.
-   One segment keeps the bare `<anchor_ns>_<name>.mcap`; multiple get
-   `_00`/`_01`/… suffixes. Each is published into `out_dir` atomically.
+   One segment keeps the bare `<id>.mcap`; multiple get `_00`/`_01`/… suffixes.
+   Each is published into `out_dir` atomically. The id is the clip's own and is
+   derived from the request — see [Every clip is named by its
+   id](#every-clip-is-named-by-its-id).
 6. **Announce** one completion through the active interface — only after every
    segment is in `out_dir` and fsynced, so every announced path is crash-durable.
 
@@ -400,8 +403,7 @@ so a trigger reaches its clip whichever recording of the run was being written
 when it fired. Each
 record is decoded by its `message_encoding` through the same `clip::decode` the
 live interface uses, and a trigger the run cannot use (an undecodable payload, a
-name that cannot be embedded in a clip pathname) costs that trigger its clip and
-no more. A recording holding no trigger cuts nothing, writes nothing and exits
+name past the length bound) costs that trigger its clip and no more. A recording holding no trigger cuts nothing, writes nothing and exits
 zero. Both ways of stating the trigger wrongly — `param` without a flag it needs,
 `mcap` alongside any `--trigger-*` flag — are refused during argument parsing,
 because the requirement turns on another flag's *value* and clap's derive can
@@ -410,7 +412,7 @@ only key on presence.
 The mode takes no `--time-source`: `log_time` is the clock a summary states and
 the only one a completeness claim over a finished recording can be made on, so
 passing the flag is a parse error. Everything else about the clip — the manifest,
-the `<anchor_ns>_<name>.mcap` name, the staged-then-linked publication — is the
+the `<id>.mcap` name, the staged-then-linked publication — is the
 shared path, and `producer.mode` reads `clip` rather than `tail` so a reader
 tells the two apart without opening the recording. No ROS is involved, so the
 ROS-free build cuts these clips as well as the device build does.
@@ -444,6 +446,33 @@ without walking the file — and its counters are the copy's final ones rather
 than a guess. See [What a clip carries](docs/clip-manifest.md) for the
 keys; [`crates/clip/CLAUDE.md`](crates/clip/CLAUDE.md) for how the two halves
 reach the writer.
+
+### Every clip is named by its id
+
+A clip's **id** is `<anchor_ns>_<hash>`: the resolved anchor on the run's time
+source, then the first 8 bytes of SHA-256 over a canonical encoding of the six
+fields a request is — the anchor, the trigger's `name` and `description`, the two
+rolls, and the time source — written as four lower-case hex groups of four.
+
+```
+./clipped/1726300000000000000_fc43-6475-ade8-4730.mcap
+```
+
+`clip::segment::cut_window` is the only thing that computes it: both subcommands
+hand it an output *directory*, never a path, so one function decides where every
+clip in every run goes. Every clip's manifest states the same value as `clip.id`,
+derived from the same request, so a file separated from the directory it was
+written into still says which clip it belongs to.
+
+Three properties follow. The same request yields the same id on every machine and
+every version, so an id quoted in a report stays valid — which is why the
+encoding is a published contract with a worked vector in [What a clip
+carries](docs/clip-manifest.md#the-clip-id) and a test pinning it. A change to
+any of the six fields, the description included, yields a different id, so two
+detectors firing on one instant get their own clips. And no trigger text reaches
+a path, so a `name` holding `/`, `..`, unicode or nothing at all cannot shape one
+— there is nothing to sanitize, and the recorder's admission gate bounds the
+name's length only because it is free text copied into every manifest.
 
 Publication is **two-staged** so `out_dir` only ever holds finished clips:
 

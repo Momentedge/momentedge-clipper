@@ -13,6 +13,12 @@
 //! readable by any MCAP tool — `mcap get metadata --name momentedge.clip` prints
 //! it as it stands — without a second encoding to agree on.
 //!
+//! **The id is derived, never carried.** `clip.id` is [`ClipId::of`] over the
+//! same [`CutRequest`] the `trigger.*` and `window.*` keys are written from, and
+//! it is also what [`crate::segment`] names the file. One computation over one
+//! value is what makes the key and the filename unable to disagree: a clip
+//! separated from its directory can still be grouped by the id it states.
+//!
 //! **Where the halves come from.** The copy knows what it read and wrote; it
 //! does not know who asked, or what the planner offered it. So a manifest is
 //! assembled from two sides: a [`CutRequest`] the caller builds once per window
@@ -41,6 +47,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use crate::TimeSource;
+use crate::id::ClipId;
 use crate::index::op;
 use crate::trigger::Trigger;
 
@@ -319,6 +326,7 @@ impl ClipManifest<'_> {
         put("source.extents_read", self.extents_read.to_string());
         put("source.bytes_read", self.bytes_read.to_string());
 
+        put("clip.id", ClipId::of(request).to_string());
         put("clip.messages", self.messages.to_string());
         put("clip.short", self.planned.coverage.short().to_string());
 
@@ -491,6 +499,10 @@ mod tests {
         };
 
         let entries = manifest.entries();
+        // The id's own contract — the encoding and a published vector — is
+        // pinned in `clip::id`; what this test states is that the record
+        // carries it, not what it is.
+        let id = ClipId::of(&request).to_string();
         let expected = [
             ("manifest.version", "1"),
             ("producer.name", "clipper"),
@@ -509,6 +521,7 @@ mod tests {
             ("source.path", "/rec/bag_0.mcap"),
             ("source.extents_read", "4"),
             ("source.bytes_read", "8192"),
+            ("clip.id", id.as_str()),
             ("clip.messages", "7"),
             ("clip.short", "false"),
             ("channel.3.messages", "7"),
