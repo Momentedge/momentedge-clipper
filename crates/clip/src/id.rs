@@ -198,8 +198,15 @@ mod tests {
     /// records. Reproduce it by hand with
     ///
     /// ```text
-    /// printf 'momentedge.clip.id/1\n1726300000000000000\n11\nbrake-event\n21\nhard brake over 0.8 g\n5000000000\n5000000000\nlog\n' | sha256sum
+    /// printf 'momentedge.clip.id/1\n1726300000000000000\n11\nbrake-event\n21\nhard brake over 0.8 g\n5000000000\n3000000000\nlog\n' | sha256sum
     /// ```
+    ///
+    /// **Every line of the vector is distinct**, which is what lets it catch a
+    /// reordering rather than only a rewording: two lines carrying one value —
+    /// a preroll and a postroll that agree, say — encode the same bytes with
+    /// those lines exchanged, so a swap of them would pass a vector built from
+    /// them while moving every id a real trigger produces. The last assertion
+    /// holds that property of the vector itself.
     #[test]
     fn the_published_vector_encodes_and_hashes_to_its_documented_id() {
         let published = request(
@@ -207,12 +214,13 @@ mod tests {
             "brake-event",
             "hard brake over 0.8 g",
             5_000_000_000,
-            5_000_000_000,
+            3_000_000_000,
             TimeSource::Log,
         );
 
+        let encoding = canonical_encoding(&published);
         assert_eq!(
-            canonical_encoding(&published),
+            encoding,
             "momentedge.clip.id/1\n\
              1726300000000000000\n\
              11\n\
@@ -220,17 +228,28 @@ mod tests {
              21\n\
              hard brake over 0.8 g\n\
              5000000000\n\
-             5000000000\n\
+             3000000000\n\
              log\n",
             "the documented encoding, line for line"
         );
         assert_eq!(
             ClipId::of(&published).to_string(),
-            "1726300000000000000_fc43-6475-ade8-4730",
+            "1726300000000000000_896d-8713-9fb1-f609",
             "the documented id: the leading 8 bytes of the digest \
-             fc436475ade84730780c870fb500412fe9d0ee985bbebdbff8ce54ce6f2222dd, \
+             896d87139fb1f609aaeea772f8c860d7c274672ed821d1e204aefc3ae2a0fa2c, \
              in four groups of four hex characters"
         );
+
+        let lines: Vec<&str> = encoding.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            assert!(
+                lines.iter().skip(i + 1).all(|later| later != line),
+                "no two lines of the vector may carry the same text, or a \
+                 transposition of them would encode identically and this test \
+                 would pin nothing about their order; line {} is `{line}`",
+                i + 1
+            );
+        }
     }
 
     /// The id is a function of the request: the same one twice is the same clip,

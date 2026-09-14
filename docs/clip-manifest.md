@@ -228,23 +228,31 @@ log | publish
 
 ### A worked vector
 
-A trigger named `brake-event`, described `hard brake over 0.8 g`, with five
-seconds of roll each way, anchored at `1726300000000000000` on `log`:
+A trigger named `brake-event`, described `hard brake over 0.8 g`, anchored at
+`1726300000000000000` on `log`, with five seconds of preroll and three of
+postroll:
 
 ```console
-$ printf 'momentedge.clip.id/1\n1726300000000000000\n11\nbrake-event\n21\nhard brake over 0.8 g\n5000000000\n5000000000\nlog\n' | sha256sum
-fc436475ade84730780c870fb500412fe9d0ee985bbebdbff8ce54ce6f2222dd  -
+$ printf 'momentedge.clip.id/1\n1726300000000000000\n11\nbrake-event\n21\nhard brake over 0.8 g\n5000000000\n3000000000\nlog\n' | sha256sum
+896d87139fb1f609aaeea772f8c860d7c274672ed821d1e204aefc3ae2a0fa2c  -
 ```
 
-The leading 16 characters, in groups of four, are the hash — so the clip's
-directory is
+The leading 16 characters, in groups of four, are the hash — so this trigger's
+clip directory is
 
 ```
-1726300000000000000_fc43-6475-ade8-4730
+1726300000000000000_896d-8713-9fb1-f609
 ```
 
-That vector is pinned by a test, so the encoding cannot drift without a
-deliberate edit.
+It shares its anchor with the clip at the top of this page and not its id: that
+one's postroll is five seconds, and a change to any of the six fields is a
+different clip.
+
+Every number in this vector differs from every other, which is deliberate. Two
+lines carrying one value — a preroll and a postroll that agree — encode the same
+bytes when they are exchanged, so a vector built from them would go on matching
+an encoding that had swapped the two while every real id moved. The vector is
+pinned by a test, so the encoding cannot drift without a deliberate edit.
 
 ## An empty clip still explains itself
 

@@ -306,6 +306,15 @@ meaning something else. The two free-text fields are **byte-length-prefixed**
 rather than delimited — the newline after each is decoration — so no pair of
 distinct triggers can encode alike however their text is split.
 
+**Every line of the published vector carries a different value**, and that is a
+property of the vector rather than a coincidence of the example. Two lines
+holding one number — a preroll and a postroll of five seconds each — encode the
+same bytes when they are exchanged, so a vector built from them would go on
+matching an encoding whose fields had been reordered while every id a real
+trigger produces moved. `every_field_of_the_request_moves_the_id` does not
+cover the gap, since a swap moves the id too. The vector test asserts the
+distinctness itself, so an edit that reintroduces the blind spot fails there.
+
 **What the id buys is that no trigger text reaches a path.** A `name` holding
 `/`, `..`, a leading dot, unicode or nothing at all is hashed like any other, so
 there is no sanitizer and nothing for the recorder's admission gate to refuse on
