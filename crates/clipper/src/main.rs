@@ -345,8 +345,8 @@ Where triggers come from and completions go: `ros` or `mcap`.
 `ros` (the default) subscribes to the trigger topic on a ROS node and publishes \
 `Recorded` on completion. `mcap` takes the triggers the recording itself carries \
 (decoding each by its `message_encoding`) and signals completion on disk alone, \
-by the clip_metadata.yaml a finished clip directory under `out_dir` carries — it \
-runs ROS-free, with no node, subscription, or publish. The source is also the \
+by the `clip_metadata.yaml` a finished clip directory under `out_dir` carries — \
+it runs ROS-free, with no node, subscription, or publish. The source is also the \
 completion half: exactly one of the two is active per run, and there is no third \
 combination to select.";
 #[cfg(not(feature = "ros"))]
@@ -355,7 +355,7 @@ Where triggers come from and completions go: `mcap`.
 
 `mcap` takes the triggers the recording itself carries (decoding each by its \
 `message_encoding`) and signals completion on disk alone, by the \
-clip_metadata.yaml a finished clip directory under `out_dir` carries — it runs \
+`clip_metadata.yaml` a finished clip directory under `out_dir` carries — it runs \
 ROS-free, with no node, subscription, or publish. It is the only source this \
 binary has: `ros`, which subscribes to the trigger topic on a ROS node and \
 publishes `Recorded`, is compiled in by the `ros` cargo feature, and this build \
@@ -3883,8 +3883,7 @@ mod tests {
     /// announcer that pairing implies. `ros` answers each clip with a `Recorded`
     /// publish; `mcap` has the clip's `clip_metadata.yaml` appearing in `out_dir`
     /// as its only signal, so its announcer is the no-op one. There is no
-    /// separate announcer setting —
-    /// these two cells are the whole matrix.
+    /// separate announcer setting — these two cells are the whole matrix.
     #[test]
     fn each_tail_trigger_source_carries_the_announcer_its_interface_implies() {
         assert_eq!(McapInterface::SOURCE, TriggerSource::Mcap);
