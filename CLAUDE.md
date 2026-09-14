@@ -14,14 +14,21 @@ own their angle, and this file does not repeat them:
   [`clip-command.md`](docs/clip-command.md) (`clipper clip` over a finished
   recording), [`clip-manifest.md`](docs/clip-manifest.md) (the clip directory and
   record), [`operating.md`](docs/operating.md) (shutdown, logs, retention, a
-  recording that stops producing clips, overload, tuning). These are for *humans
+  recording that stops producing clips, overload, tuning),
+  [`install.md`](docs/install.md) (the release `.deb`s, the two cargo builds, the
+  nix package, a native build on the target, the distro matrix),
+  [`performance.md`](docs/performance.md) (what leaving clipper running costs on
+  the board it is deployed to, measured). These are for *humans
   looking something up* — the agent view of the same code is the `CLAUDE.md`
   files below.
 - **[ARCHITECTURE.md](ARCHITECTURE.md)** — the technical overview: thread model,
   tailing, what a clip is on disk, recovery, the `ros`/`mcap` seam, deployment.
 - **[CONTEXT.md](CONTEXT.md)** — the domain glossary, and the word for each thing
   every other file here uses: recording, producer, extent, coverage; trigger,
-  window, anchor; trigger source and interface. Above all it separates the
+  window, anchor; clip, document and complete; trigger source and interface.
+  **Document** is the one to reach for first — a producer writes a recording's
+  own `metadata.yaml`, so "the metadata file" names that and never a clip's
+  `clip_metadata.yaml`. Above all it separates the
   several distinct instants a message can be said to have happened at, which are
   easy to conflate and expensive to conflate. Read it before writing about time.
 - **[crates/CLAUDE.md](crates/CLAUDE.md)** — what the three crates share: the
