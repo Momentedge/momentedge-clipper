@@ -228,12 +228,14 @@ ignored: no handler runs, no clip is extracted, and no completion is announced.
    determines naming, which is why the workers stage but never publish: a
    single segment keeps the bare `<anchor_ns>_<name>.mcap`; multiple segments
    get `<base>_00.mcap`, `<base>_01.mcap`, … Each is atomically published into
-   `out_dir` via `hard_link` + unlink. The recorder cuts under
-   `clip::segment::Publication::Suffix`: a name an earlier clip already holds
-   means a *second* trigger asked for it, so its clip lands beside the first as
-   `<name>_1.mcap` rather than being dropped. (`clipper clip` passes `Refuse`
-   instead — see
-   [`clipper clip`](../clipper/CLAUDE.md#clipper-clip-one-window-one-finished-recording).)
+   `out_dir` via `hard_link` + unlink. **The name itself is not this crate's**:
+   `record_clip` hands `cut_window` the output *directory* and
+   `clip::config::Mode::Tail` — which subcommand is cutting, and nothing more —
+   and [`clip` decides both the name and what a taken one
+   costs](../clip/CLAUDE.md#segment-assembly-and-publication-clipsegment). For
+   the tail that is a `_1` sibling: a name an earlier clip already holds means a
+   *second* trigger asked for it, so its clip lands beside the first rather than
+   being dropped.
 6. **Announce** (`handle_trigger`) a single `Completion` (the trigger echo plus
    all segment paths) through the active interface's announcer — only after
    every segment is in `out_dir` and fsynced, so every announced path is already

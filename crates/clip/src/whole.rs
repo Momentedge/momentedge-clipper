@@ -787,9 +787,10 @@ mod tests {
     use anyhow::{Context, Result};
 
     use super::*;
+    use crate::config::Mode;
     use crate::cut;
-    use crate::manifest::{WindowCoverage, read_manifest};
-    use crate::segment::{Publication, cut_window, spawn_stage_workers};
+    use crate::manifest::{CutRequest, WindowCoverage, read_manifest};
+    use crate::segment::{cut_window, spawn_stage_workers};
     use crate::select::{ChannelSelection, Spec};
     use crate::testing::{index_file, scan_to_end, test_dir, window_request, write_bag_metadata};
     use crate::trigger::now_ns;
@@ -982,16 +983,16 @@ mod tests {
             &WholeFileIndex::open(&rec)?,
             &request,
             WindowCoverage::Covered,
-            &root.join("summary.mcap"),
-            Publication::Suffix,
+            &root.join("summary"),
+            Mode::Clip,
             &stage_tx,
         )?;
         let from_scan = cut_window(
             &scanned(&rec)?,
             &request,
             WindowCoverage::Covered,
-            &root.join("scan.mcap"),
-            Publication::Suffix,
+            &root.join("scan"),
+            Mode::Clip,
             &stage_tx,
         )?;
 
@@ -1073,16 +1074,16 @@ mod tests {
             &WholeFileIndex::open(&rec)?,
             &request,
             WindowCoverage::Covered,
-            &root.join("summary.mcap"),
-            Publication::Suffix,
+            &root.join("summary"),
+            Mode::Clip,
             &stage_tx,
         )?;
         let from_scan = cut_window(
             &scanned(&rec)?,
             &request,
             WindowCoverage::Covered,
-            &root.join("scan.mcap"),
-            Publication::Suffix,
+            &root.join("scan"),
+            Mode::Clip,
             &stage_tx,
         )?;
 
@@ -1231,8 +1232,8 @@ mod tests {
             &WholeFileIndex::open(&gutted)?,
             &Arc::new(window_request(0, 1_000, TimeSource::Log)),
             WindowCoverage::Covered,
-            &out_dir.join("clip.mcap"),
-            Publication::Suffix,
+            &out_dir,
+            Mode::Clip,
             &stage_tx,
         )
         .unwrap_err();
@@ -1307,8 +1308,8 @@ mod tests {
             &index,
             &request,
             WindowCoverage::Short,
-            &root.join("clip.mcap"),
-            Publication::Suffix,
+            &root.join("clip"),
+            Mode::Clip,
             &stage_tx,
         )?;
         let elapsed = began.elapsed();
@@ -1932,8 +1933,8 @@ mod tests {
             &index,
             &Arc::new(window_request(4_500, 5_500, TimeSource::Publish)),
             WindowCoverage::Covered,
-            &root.join("clip.mcap"),
-            Publication::Suffix,
+            &root.join("clip"),
+            Mode::Clip,
             &stage_tx,
         )?;
         assert_eq!(
@@ -2007,6 +2008,17 @@ mod tests {
             .collect()
     }
 
+    /// The stem every clip of `request`'s window is published under — the name
+    /// `cut_window` derives from the request, without its extension — so a
+    /// segment-name assertion states the `_NN` it is about and not the naming
+    /// scheme it is indifferent to.
+    fn published_stem(request: &CutRequest) -> String {
+        crate::segment::base_name(request)
+            .strip_suffix(".mcap")
+            .expect("a clip is named with the mcap extension")
+            .to_string()
+    }
+
     /// A window straddling a split is cut into one segment per contributing
     /// recording, and the segments together are the window.
     ///
@@ -2048,14 +2060,15 @@ mod tests {
             &index,
             &request,
             WindowCoverage::Covered,
-            &root.join("clip.mcap"),
-            Publication::Suffix,
+            &root.join("clip"),
+            Mode::Clip,
             &stage_tx,
         )?;
 
+        let stem = published_stem(&request);
         assert_eq!(
             segment_names(&segments),
-            vec!["clip_00.mcap", "clip_01.mcap"],
+            vec![format!("{stem}_00.mcap"), format!("{stem}_01.mcap")],
             "one segment per contributing recording, numbered in collection order"
         );
         assert_eq!(source_of(&segments[0].out_path)?, first);
@@ -2092,8 +2105,8 @@ mod tests {
             &WholeFileIndex::open(&single_rec)?,
             &request,
             WindowCoverage::Covered,
-            &root.join("unsplit.mcap"),
-            Publication::Suffix,
+            &root.join("unsplit"),
+            Mode::Clip,
             &stage_tx,
         )?;
         assert_eq!(single.len(), 1, "one recording, one segment");
@@ -2145,18 +2158,20 @@ mod tests {
             ..Spec::default()
         })?;
         let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION, selection);
+        let request = Arc::new(window_request(0, 1_000, TimeSource::Log));
         let segments = cut_window(
             &WholeFileIndex::open(&bag)?,
-            &Arc::new(window_request(0, 1_000, TimeSource::Log)),
+            &request,
             WindowCoverage::Covered,
-            &root.join("clip.mcap"),
-            Publication::Suffix,
+            &root.join("clip"),
+            Mode::Clip,
             &stage_tx,
         )?;
 
+        let stem = published_stem(&request);
         assert_eq!(
             segment_names(&segments),
-            vec!["clip_00.mcap", "clip_01.mcap"],
+            vec![format!("{stem}_00.mcap"), format!("{stem}_01.mcap")],
             "two segments out of three recordings, numbered from zero"
         );
         assert_eq!(
@@ -2216,8 +2231,8 @@ mod tests {
             &WholeFileIndex::open(&bag)?,
             &request,
             WindowCoverage::Covered,
-            &root.join("stated.mcap"),
-            Publication::Suffix,
+            &root.join("stated"),
+            Mode::Clip,
             &stage_tx,
         )?;
         assert_eq!(
@@ -2234,8 +2249,8 @@ mod tests {
             &WholeFileIndex::open(&bag)?,
             &request,
             WindowCoverage::Covered,
-            &root.join("mtime.mcap"),
-            Publication::Suffix,
+            &root.join("mtime"),
+            Mode::Clip,
             &stage_tx,
         )?;
         assert_eq!(

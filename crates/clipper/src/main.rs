@@ -1724,8 +1724,9 @@ fn with_usable_names(
 /// the one recording in it that failed. clipper runs no repair itself;
 /// recovering and re-indexing a recording are the operator's.
 ///
-/// **A clip that is already there is refused too**
-/// ([`clip::segment::Publication::Refuse`]). A finished recording and a trigger
+/// **A clip that is already there is refused too**, which is what
+/// [`clip::segment::cut_window`] makes of a taken name under
+/// [`config::Mode::Clip`]. A finished recording and a trigger
 /// describe one window and one copy of its bytes, so a re-run over both writes
 /// the clip that is already in the output directory: the run names it, exits
 /// non-zero, and stages nothing, rather than publishing a second copy beside it
@@ -1839,16 +1840,15 @@ fn cut_one(
         request.end_ns(),
     );
 
-    let base_out_path = cfg.out_dir.join(format!(
-        "{anchor_ns}_{}.mcap",
-        segment::sanitize(&trigger.name)
-    ));
     let segments = segment::cut_window(
         index,
         &request,
         coverage,
-        &base_out_path,
-        segment::Publication::Refuse,
+        &cfg.out_dir,
+        // Cutting from a recording with an end is what this subcommand is, so
+        // the cut is told that and nothing more: what a clip already in the
+        // output directory costs a replayable input is `clip`'s to decide.
+        config::Mode::Clip,
         stage_tx,
     )?;
 

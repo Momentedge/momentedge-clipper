@@ -1,19 +1,23 @@
-//! One window over a planned recording becomes durable clips: plan the window,
-//! stage one segment per source file through a worker pool, drop the empties,
-//! and publish each atomically.
+//! One window over a planned recording becomes durable clips: decide where the
+//! clip goes, plan the window, stage one segment per source file through a
+//! worker pool, drop the empties, and publish each atomically.
 //!
-//! [`cut_window`] is the whole of it, over any [`WindowPlanner`]: it snapshots
-//! the plans once, hands each to the FIFO staging pool
-//! ([`spawn_stage_workers`]) that runs the bulk copies off the caller's thread,
-//! and names the results only when the segment count is known — a bare
-//! `<base>.mcap` for a window inside one recording, one `<base>_NN.mcap` per
-//! source file for one that straddled a rollover.
+//! [`cut_window`] is the whole of it, over any [`WindowPlanner`], and it is the
+//! **one entry point that decides a clip's location**: a caller hands it the
+//! window and the output directory, never a path, so the name every clip in
+//! every output directory carries is computed in one place
+//! (`base_name`). It then snapshots the plans once, hands each to the FIFO
+//! staging pool ([`spawn_stage_workers`]) that runs the bulk copies off the
+//! caller's thread, and names the results only when the segment count is known —
+//! a bare `<base>.mcap` for a window inside one recording, one `<base>_NN.mcap`
+//! per source file for one that straddled a rollover.
 //!
-//! What a name the output directory already holds costs is the caller's
-//! ([`Publication`]), and it is the one thing decided before anything is staged:
-//! a recorder following a live recording publishes beside the earlier clip,
-//! while a cut from a finished recording — which would copy the same bytes into
-//! the same name a second time — refuses the whole window instead.
+//! **What a name the output directory already holds costs follows from the
+//! caller's [`Mode`]**, decided here rather than by each binary, and it is the
+//! one thing settled before anything is staged: `clipper tail` follows a live
+//! recording and publishes beside the earlier clip, while `clipper clip` cuts
+//! from a finished one — which would copy the same bytes into the same name a
+//! second time — and refuses the whole window instead.
 //!
 //! The module is deliberately free of any notion of where the window came from
 //! or who is told about it. Nothing here decides a window's bounds, waits for
@@ -28,6 +32,7 @@ use std::thread;
 use anyhow::Context as _;
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 
+use crate::config::Mode;
 use crate::index::{WindowPlan, WindowPlanner};
 use crate::manifest::{CutRequest, Planned, WindowCoverage};
 use crate::select::ChannelSelection;
@@ -144,20 +149,20 @@ fn stage_jobs(
 /// What a cut does about a clip the output directory already holds under a name
 /// this window could publish under.
 ///
-/// The two callers of this path want opposite things from the same collision,
-/// because their inputs differ. On a vehicle a taken name means a *second*
-/// trigger asked for the same instant and name, and dropping its clip loses data
-/// that will never come back — so the recorder publishes beside the earlier
-/// clip. A cut from a finished recording is replayable: the same recording and
-/// the same trigger describe the same window and copy the same bytes, so a taken
-/// name means this cut has already been made, and a second file would be a
-/// duplicate rather than data. It refuses instead.
+/// The two subcommands want opposite things from the same collision, because
+/// their inputs differ. On a vehicle a taken name means a *second* trigger asked
+/// for the same window, and dropping its clip loses data that will never come
+/// back — so the recorder publishes beside the earlier clip. A cut from a
+/// finished recording is replayable: the same recording and the same trigger
+/// describe the same window and copy the same bytes, so a taken name means this
+/// cut has already been made, and a second file would be a duplicate rather than
+/// data. It refuses instead.
 ///
-/// The policy is per cut rather than fixed for the staging pool because it is a
-/// property of the input — whether it can be cut again — not of the output the
-/// pool's codec and channel selection describe.
+/// It is private because it is nobody's to choose: a caller says which
+/// subcommand it is ([`Mode`]) and [`publication`] answers what a collision
+/// costs, so the two halves of the policy cannot drift apart in two binaries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Publication {
+enum Publication {
     /// Publish beside the existing clip, under the `_<n>`-suffixed sibling
     /// [`cut::publish_clip`] resolves the collision to.
     Suffix,
@@ -166,8 +171,36 @@ pub enum Publication {
     Refuse,
 }
 
+/// What a clip already in the output directory costs the subcommand that is
+/// cutting: the live recorder's second trigger is data, and a re-run over a
+/// finished recording is a duplicate ([`Publication`]).
+///
+/// An exhaustive match with no catch-all, so a subcommand added to [`Mode`] is a
+/// compile error here until it says what a taken name means to it.
+fn publication(mode: Mode) -> Publication {
+    match mode {
+        Mode::Tail => Publication::Suffix,
+        Mode::Clip => Publication::Refuse,
+    }
+}
+
+/// The file name every clip of one window is published under, before a segment
+/// number is appended to it: `<anchor_ns>_<name>.mcap`, the resolved anchor on
+/// the run's time source and the trigger's name made safe to sit in a path.
+///
+/// **The one place a clip's name is computed.** Both subcommands hand
+/// [`cut_window`] an output directory, so neither formats a path of its own and
+/// a rename is one edit rather than two that can disagree.
+pub(crate) fn base_name(request: &CutRequest) -> String {
+    format!(
+        "{}_{}.mcap",
+        request.anchor_ns(),
+        sanitize(&request.trigger().name)
+    )
+}
+
 /// A clip this window would have written is already in the output directory,
-/// under [`Publication::Refuse`].
+/// under the refusal policy `clipper clip` cuts with.
 ///
 /// The window it names is refused whole: the check runs before the plan is
 /// taken, so no segment of it is staged, published, or left half-written, and a
@@ -187,9 +220,13 @@ pub struct ClipExists {
     pub existing: PathBuf,
 }
 
-/// Cut one window out of the recordings a [`WindowPlanner`] serves: take one
-/// multi-file snapshot, stage one segment per source recording, and publish
-/// each of them.
+/// Cut one window out of the recordings a [`WindowPlanner`] serves into
+/// `out_dir`: name the clip, take one multi-file snapshot, stage one segment per
+/// source recording, and publish each of them.
+///
+/// **This is where a clip's location is decided.** A caller supplies the output
+/// directory and the window; the name under it is `base_name`'s, so no caller
+/// formats a clip path and the naming scheme lives in one place.
 ///
 /// A window inside one recording yields a single segment; one straddling a
 /// rollover (a bag split or a restart the planner indexed while running) yields
@@ -210,9 +247,10 @@ pub struct ClipExists {
 /// it did: every segment's manifest repeats it, so a clip that ends early says
 /// whether the recording had got there yet.
 ///
-/// `publication` is what a name the output directory already holds costs: a
-/// `_<n>` sibling beside the earlier clip, or a refusal of the whole window
-/// before anything is staged ([`Publication`]).
+/// `mode` is the subcommand that is cutting, and the only thing it decides here
+/// is what a clip the output directory already holds costs (`publication`) — a
+/// `_<n>` sibling beside the earlier clip for `clipper tail`, a refusal of the
+/// whole window before anything is staged for `clipper clip`.
 #[expect(
     clippy::similar_names,
     reason = "`plans` and `planned` are the domain's own two words: the per-file \
@@ -222,27 +260,29 @@ pub struct ClipExists {
 #[expect(
     clippy::too_many_arguments,
     reason = "six inputs from six owners: the planner, the window, the caller's \
-              coverage verdict, the output base name, the collision policy, and \
-              the pool handle. No two of them are chosen together, so a parameter \
-              struct would be a tuple with a name on it"
+              coverage verdict, the output directory, the subcommand cutting, \
+              and the pool handle. No two of them are chosen together, so a \
+              parameter struct would be a tuple with a name on it"
 )]
 pub fn cut_window(
     planner: &dyn WindowPlanner,
     request: &Arc<CutRequest>,
     coverage: WindowCoverage,
-    base_out_path: &Path,
-    publication: Publication,
+    out_dir: &Path,
+    mode: Mode,
     stage_tx: &Sender<StageJob>,
 ) -> anyhow::Result<Vec<cut::ClipStats>> {
+    let base_out_path = out_dir.join(base_name(request));
+
     // 0. The publication policy, applied before anything else happens: under
     //    `Refuse` a clip already published under any name this window could take
     //    ends the cut here — before a plan is taken, before a byte is staged —
     //    so the refusal creates nothing in the output directory or its capturing
     //    area, and a window whose other segment names are still free is refused
     //    whole rather than half-written.
-    match publication {
+    match publication(mode) {
         Publication::Refuse => {
-            if let Some(existing) = existing_clip(base_out_path).with_context(|| {
+            if let Some(existing) = existing_clip(&base_out_path).with_context(|| {
                 format!(
                     "reading the output directory for {}",
                     base_out_path.display()
@@ -279,7 +319,7 @@ pub fn cut_window(
             WindowPlan::empty(),
             request,
             planned,
-            base_out_path,
+            &base_out_path,
         )?]
     } else {
         let mut v = Vec::with_capacity(plans.len());
@@ -289,7 +329,7 @@ pub fn cut_window(
                 plan,
                 request,
                 planned,
-                base_out_path,
+                &base_out_path,
             )?);
         }
         v
@@ -311,7 +351,7 @@ pub fn cut_window(
     let mut stats = Vec::with_capacity(n);
     for (i, mut clip) in staged.into_iter().enumerate() {
         if n > 1 {
-            clip.set_final_name(segment_name(base_out_path, i));
+            clip.set_final_name(segment_name(&base_out_path, i));
         }
         stats.push(cut::publish_clip(clip)?);
     }
@@ -537,6 +577,56 @@ mod tests {
         Ok(std::fs::read_dir(out_dir.join(".capturing"))?.count())
     }
 
+    /// A published clip's file name, for comparing against [`published`].
+    fn file_name(clip: &Path) -> String {
+        clip.file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// The path [`cut_window`] publishes `request`'s clip at under `out_dir`,
+    /// with `suffix` between the name and the extension: `""` for a window
+    /// inside one recording, `"_00"` for the first segment of a straddling one,
+    /// `"_1"` for the sibling a second cut of the same window takes.
+    ///
+    /// The scheme is the cut's, so a test asserting a published path states the
+    /// suffix it is about and reads the rest back from the code that decides it.
+    fn clip_at(out_dir: &Path, request: &CutRequest, suffix: &str) -> PathBuf {
+        let base = base_name(request);
+        let stem = base
+            .strip_suffix(".mcap")
+            .expect("a clip is named with the mcap extension");
+        out_dir.join(format!("{stem}{suffix}.mcap"))
+    }
+
+    /// A clip is named by the window that asked for it — the resolved anchor and
+    /// the trigger's name — and that computation lives here rather than in
+    /// either binary.
+    #[test]
+    fn a_clip_is_named_by_its_anchor_and_its_trigger() {
+        let named = |name: &str| {
+            base_name(&CutRequest::new(
+                crate::testing::TEST_PRODUCER,
+                crate::Trigger {
+                    name: name.to_string(),
+                    description: String::new(),
+                    trigger_time: crate::Stamp { sec: 0, nanosec: 0 },
+                    preroll: 100,
+                    postroll: 100,
+                },
+                1_726_300_000_000_000_000,
+                TimeSource::Log,
+            ))
+        };
+        assert_eq!(named("brake-event"), "1726300000000000000_brake-event.mcap");
+        assert_eq!(
+            named("../escape"),
+            "1726300000000000000_.._escape.mcap",
+            "a name is sanitized where the clip is named, never at the caller"
+        );
+    }
+
     #[test]
     fn sanitize_replaces_separators_and_whitespace() {
         // The slash replacement is the safety property: a trigger name can
@@ -546,8 +636,17 @@ mod tests {
         assert_eq!(sanitize(""), "unnamed");
     }
 
+    /// Two concurrent cuts of one window, on a single staging worker: the copies
+    /// serialize FIFO, the second writer lands on a `_1` sibling at publish, and
+    /// both clips come out complete.
+    ///
+    /// One window is what makes this the race worth pinning: [`cut_window`]
+    /// derives the clip's name from the window, so two windows that agree on it
+    /// are exactly the pair that aim at one file, and two writers must never
+    /// share one. Neither window straddles a rollover, so each is a single
+    /// segment.
     #[test]
-    fn concurrent_overlapping_windows_serialize_and_take_distinct_paths() -> anyhow::Result<()> {
+    fn concurrent_cuts_of_one_window_serialize_and_take_distinct_paths() -> anyhow::Result<()> {
         let root = test_dir("overlap")?;
         let rec = root.join("rec.mcap");
         write_recording(
@@ -558,28 +657,25 @@ mod tests {
 
         let planner = Arc::new(indexed(&[&rec])?);
 
-        // Two overlapping windows racing for the same out path and a single
-        // staging worker: the copies serialize FIFO, the second writer lands on
-        // a `_1` sibling at publish, and both clips come out complete. Neither
-        // window straddles a rollover, so each is a single segment.
         let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
-        let out = root.join("clip.mcap");
-        let cut = |start_ns: u64, end_ns: u64| {
+        let request = log_request(100, 300, TimeSource::Log);
+        let cut = || {
             let planner = planner.clone();
             let stage_tx = stage_tx.clone();
-            let out = out.clone();
+            let request = request.clone();
+            let root = root.clone();
             std::thread::spawn(move || {
                 cut_window(
                     planner.as_ref(),
-                    &log_request(start_ns, end_ns, TimeSource::Log),
+                    &request,
                     WindowCoverage::Covered,
-                    &out,
-                    Publication::Suffix,
+                    &root,
+                    Mode::Tail,
                     &stage_tx,
                 )
             })
         };
-        let (ha, hb) = (cut(100, 300), cut(200, 400));
+        let (ha, hb) = (cut(), cut());
         let a = ha.join().unwrap()?;
         let b = hb.join().unwrap()?;
         assert_eq!((a.len(), b.len()), (1, 1), "each window is one segment");
@@ -589,24 +685,24 @@ mod tests {
             a.out_path, b.out_path,
             "two writers must never share a file"
         );
+        let base = root.join(base_name(&request));
+        let sibling = base.with_file_name(format!(
+            "{}_1.mcap",
+            base.file_stem().unwrap_or_default().to_string_lossy()
+        ));
         let mut paths = vec![a.out_path.clone(), b.out_path.clone()];
         paths.sort();
-        assert_eq!(paths, vec![out, root.join("clip_1.mcap")]);
-        assert_eq!(
-            read_clip(&a.out_path)?,
-            vec![
-                ("/t".to_string(), 100),
-                ("/t".to_string(), 200),
-                ("/t".to_string(), 300),
-            ]
-        );
+        assert_eq!(paths, vec![base, sibling]);
+        let window = vec![
+            ("/t".to_string(), 100),
+            ("/t".to_string(), 200),
+            ("/t".to_string(), 300),
+        ];
+        assert_eq!(read_clip(&a.out_path)?, window);
         assert_eq!(
             read_clip(&b.out_path)?,
-            vec![
-                ("/t".to_string(), 200),
-                ("/t".to_string(), 300),
-                ("/t".to_string(), 400),
-            ]
+            window,
+            "one window, so the two clips hold the same messages in two files"
         );
 
         std::fs::remove_dir_all(root)?;
@@ -679,32 +775,27 @@ mod tests {
         let planner = indexed(&[&split0, &split1])?;
 
         let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
-        let base = root.join("clip.mcap");
+        let request = log_request(1_500, 5_500, TimeSource::Log);
         let stats = cut_window(
             &planner,
-            &log_request(1_500, 5_500, TimeSource::Log),
+            &request,
             WindowCoverage::Covered,
-            &base,
-            Publication::Suffix,
+            &root,
+            Mode::Tail,
             &stage_tx,
         )?;
 
         assert_eq!(stats.len(), 2, "a straddling window yields two segments");
+        let (first, second) = (
+            clip_at(&root, &request, "_00"),
+            clip_at(&root, &request, "_01"),
+        );
         let mut paths: Vec<_> = stats.iter().map(|s| s.out_path.clone()).collect();
         paths.sort();
-        assert_eq!(
-            paths,
-            vec![root.join("clip_00.mcap"), root.join("clip_01.mcap")]
-        );
+        assert_eq!(paths, vec![first.clone(), second.clone()]);
         // The segments tile the window: split0's tail, then split1's head.
-        assert_eq!(
-            read_clip(&root.join("clip_00.mcap"))?,
-            vec![("/t".to_string(), 2_000)]
-        );
-        assert_eq!(
-            read_clip(&root.join("clip_01.mcap"))?,
-            vec![("/t".to_string(), 5_000)]
-        );
+        assert_eq!(read_clip(&first)?, vec![("/t".to_string(), 2_000)]);
+        assert_eq!(read_clip(&second)?, vec![("/t".to_string(), 5_000)]);
 
         std::fs::remove_dir_all(root)?;
         Ok(())
@@ -788,14 +879,15 @@ mod tests {
 
         let planner = indexed(&[&rec])?;
         let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
-        let base = out_dir.join("clip.mcap");
+        let request = log_request(0, 300, TimeSource::Log);
+        let base = clip_at(&out_dir, &request, "");
 
         let first = cut_window(
             &planner,
-            &log_request(0, 300, TimeSource::Log),
+            &request,
             WindowCoverage::Covered,
-            &base,
-            Publication::Refuse,
+            &out_dir,
+            Mode::Clip,
             &stage_tx,
         )?;
         assert_eq!(first.len(), 1);
@@ -807,10 +899,10 @@ mod tests {
         // runs at all.
         let err = cut_window(
             &Unplannable,
-            &log_request(0, 300, TimeSource::Log),
+            &request,
             WindowCoverage::Covered,
-            &base,
-            Publication::Refuse,
+            &out_dir,
+            Mode::Clip,
             &stage_tx,
         )
         .unwrap_err();
@@ -821,7 +913,7 @@ mod tests {
         );
         assert_eq!(
             published(&out_dir)?,
-            vec!["clip.mcap".to_string()],
+            vec![file_name(&base)],
             "the refused run publishes nothing, least of all a suffixed sibling"
         );
         assert_eq!(
@@ -837,7 +929,7 @@ mod tests {
     /// The device policy over the same collision, which the cloud one must not
     /// have changed: a second cut of the same window publishes beside the first.
     ///
-    /// The two runs are the same call but for the [`Publication`] argument, so
+    /// The two runs are the same call but for the [`Mode`] the caller names, so
     /// this is the rival the refusal has to be told apart from.
     #[test]
     fn cut_window_publishes_beside_a_window_already_there_when_suffixing() -> anyhow::Result<()> {
@@ -849,23 +941,27 @@ mod tests {
 
         let planner = indexed(&[&rec])?;
         let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
-        let base = out_dir.join("clip.mcap");
+        let request = log_request(0, 300, TimeSource::Log);
+        let (base, sibling) = (
+            clip_at(&out_dir, &request, ""),
+            clip_at(&out_dir, &request, "_1"),
+        );
         let cut_it = || {
             cut_window(
                 &planner,
-                &log_request(0, 300, TimeSource::Log),
+                &request,
                 WindowCoverage::Covered,
-                &base,
-                Publication::Suffix,
+                &out_dir,
+                Mode::Tail,
                 &stage_tx,
             )
         };
 
         assert_eq!(cut_it()?[0].out_path, base);
-        assert_eq!(cut_it()?[0].out_path, out_dir.join("clip_1.mcap"));
+        assert_eq!(cut_it()?[0].out_path, sibling);
         assert_eq!(
             published(&out_dir)?,
-            vec!["clip.mcap".to_string(), "clip_1.mcap".to_string()],
+            vec![file_name(&base), file_name(&sibling)],
             "a second live trigger's clip is data, and lands beside the first"
         );
 
@@ -876,10 +972,10 @@ mod tests {
     /// A window that would straddle a rollover is refused whole when only one
     /// of the segments it would write is already there.
     ///
-    /// `clip_00.mcap` exists and `clip_01.mcap` does not, so a check made per
-    /// segment as each is published would write the second half of a clip whose
-    /// first half it refused. The check runs once, before staging, and neither
-    /// segment is written.
+    /// The window's `_00` segment exists and its `_01` does not, so a check made
+    /// per segment as each is published would write the second half of a clip
+    /// whose first half it refused. The check runs once, before staging, and
+    /// neither segment is written.
     #[test]
     fn cut_window_refuses_a_multi_segment_window_whole() -> anyhow::Result<()> {
         let root = test_dir("refuse-segment")?;
@@ -889,30 +985,32 @@ mod tests {
         write_recording(&split1, false, &[("/t", 5_000), ("/t", 6_000)])?;
         let out_dir = root.join("clipped");
         cut::reset_capturing_dir(&out_dir)?;
+        let request = log_request(1_500, 5_500, TimeSource::Log);
         // The window's first segment, left behind by an earlier run; its second
         // segment's name is free.
-        std::fs::write(out_dir.join("clip_00.mcap"), b"an earlier segment")?;
+        let earlier = clip_at(&out_dir, &request, "_00");
+        std::fs::write(&earlier, b"an earlier segment")?;
 
         let planner = indexed(&[&split0, &split1])?;
         let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
         let err = cut_window(
             &planner,
-            &log_request(1_500, 5_500, TimeSource::Log),
+            &request,
             WindowCoverage::Covered,
-            &out_dir.join("clip.mcap"),
-            Publication::Refuse,
+            &out_dir,
+            Mode::Clip,
             &stage_tx,
         )
         .unwrap_err();
 
         assert_eq!(
             err.downcast_ref::<ClipExists>().map(|e| e.existing.clone()),
-            Some(out_dir.join("clip_00.mcap")),
+            Some(earlier.clone()),
             "the refusal names the segment that is already there: {err:#}"
         );
         assert_eq!(
             published(&out_dir)?,
-            vec!["clip_00.mcap".to_string()],
+            vec![file_name(&earlier)],
             "the free segment name stays free: the window is refused whole"
         );
         assert_eq!(staged(&out_dir)?, 0, "nothing was staged either");
@@ -937,13 +1035,12 @@ mod tests {
         let planner = indexed(&[&split0, &split1])?;
 
         let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
-        let base = root.join("clip.mcap");
         let stats = cut_window(
             &planner,
             &log_request(500, 600, TimeSource::Log),
             WindowCoverage::Covered,
-            &base,
-            Publication::Suffix,
+            &root,
+            Mode::Tail,
             &stage_tx,
         )?;
 
@@ -975,13 +1072,12 @@ mod tests {
         let planner = indexed(&[&split0, &split1])?;
 
         let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
-        let base = root.join("clip.mcap");
         let stats = cut_window(
             &planner,
             &log_request(1_500, 5_500, TimeSource::Log),
             WindowCoverage::Covered,
-            &base,
-            Publication::Suffix,
+            &root,
+            Mode::Tail,
             &stage_tx,
         )?;
 
@@ -1059,12 +1155,13 @@ mod tests {
             path: junk.clone(),
             file: Arc::new(File::open(&junk)?),
         });
+        let bad = root.join("bad");
         let err = cut_window(
             &doomed,
             &log_request(0, u64::MAX, TimeSource::Log),
             WindowCoverage::Covered,
-            &root.join("bad.mcap"),
-            Publication::Suffix,
+            &bad,
+            Mode::Tail,
             &stage_tx,
         )
         .unwrap_err();
@@ -1072,7 +1169,7 @@ mod tests {
             format!("{err:#}").contains("framing inconsistent"),
             "the stage's own error reaches the caller: {err:#}"
         );
-        assert!(!root.join("bad.mcap").exists(), "no clip is published");
+        assert!(published(&bad)?.is_empty(), "no clip is published");
 
         // The same pool, immediately afterwards: a well-formed window still cuts.
         let planner = indexed(&[&rec])?;
@@ -1080,8 +1177,8 @@ mod tests {
             &planner,
             &log_request(0, 1_000, TimeSource::Log),
             WindowCoverage::Covered,
-            &root.join("good.mcap"),
-            Publication::Suffix,
+            &root.join("good"),
+            Mode::Tail,
             &stage_tx,
         )?;
         assert_eq!(stats.len(), 1);
@@ -1157,12 +1254,13 @@ mod tests {
             path: src.clone(),
             file: Arc::new(File::open(&src)?),
         });
+        let boom = root.join("boom");
         let err = cut_window(
             &doomed,
             &log_request(0, u64::MAX, TimeSource::Log),
             WindowCoverage::Covered,
-            &root.join("boom.mcap"),
-            Publication::Suffix,
+            &boom,
+            Mode::Tail,
             &stage_tx,
         )
         .unwrap_err();
@@ -1171,7 +1269,7 @@ mod tests {
             text.contains("staging panicked"),
             "the panic is reported as an error, not lost with the thread: {text}"
         );
-        assert!(!root.join("boom.mcap").exists(), "no clip is published");
+        assert!(published(&boom)?.is_empty(), "no clip is published");
 
         // The same pool, after a worker caught a panic: a well-formed window
         // still cuts. Without the catch this call never returns.
@@ -1180,8 +1278,8 @@ mod tests {
             &planner,
             &log_request(0, 1_000, TimeSource::Log),
             WindowCoverage::Covered,
-            &root.join("good.mcap"),
-            Publication::Suffix,
+            &root.join("good"),
+            Mode::Tail,
             &stage_tx,
         )?;
         assert_eq!(
@@ -1245,8 +1343,8 @@ mod tests {
             &apart_planner,
             &log_request(900, 1_500, TimeSource::Publish),
             WindowCoverage::Covered,
-            &root.join("apart-publish.mcap"),
-            Publication::Suffix,
+            &root.join("apart-publish"),
+            Mode::Tail,
             &stage_tx,
         )?;
         assert_eq!(
@@ -1266,8 +1364,8 @@ mod tests {
             &apart_planner,
             &log_request(900, 1_500, TimeSource::Log),
             WindowCoverage::Covered,
-            &root.join("apart-log.mcap"),
-            Publication::Suffix,
+            &root.join("apart-log"),
+            Mode::Tail,
             &stage_tx,
         )?;
         assert_eq!(
@@ -1290,8 +1388,8 @@ mod tests {
             &planner,
             &log_request(180, 320, TimeSource::Log),
             WindowCoverage::Covered,
-            &root.join("log.mcap"),
-            Publication::Suffix,
+            &root.join("log"),
+            Mode::Tail,
             &stage_tx,
         )?;
         let mut log_times: Vec<u64> = read_clip(&on_log[0].out_path)?
@@ -1305,8 +1403,8 @@ mod tests {
             &planner,
             &log_request(180, 320, TimeSource::Publish),
             WindowCoverage::Covered,
-            &root.join("publish.mcap"),
-            Publication::Suffix,
+            &root.join("publish"),
+            Mode::Tail,
             &stage_tx,
         )?;
         assert_eq!(
@@ -1341,8 +1439,8 @@ mod tests {
             &Indexes(Vec::new()),
             &log_request(500, 600, TimeSource::Log),
             WindowCoverage::Short,
-            &root.join("nothing.mcap"),
-            Publication::Suffix,
+            &root.join("nothing"),
+            Mode::Tail,
             &stage_tx,
         )?;
 
@@ -1358,8 +1456,8 @@ mod tests {
             &indexed(&[&split0, &split1])?,
             &log_request(2_500, 4_500, TimeSource::Log),
             WindowCoverage::Covered,
-            &root.join("gap.mcap"),
-            Publication::Suffix,
+            &root.join("gap"),
+            Mode::Tail,
             &stage_tx,
         )?;
 
@@ -1372,8 +1470,8 @@ mod tests {
             &indexed(&[&quiet])?,
             &log_request(400, 500, TimeSource::Log),
             WindowCoverage::Covered,
-            &root.join("unmatched.mcap"),
-            Publication::Suffix,
+            &root.join("unmatched"),
+            Mode::Tail,
             &stage_tx,
         )?;
 
@@ -1432,8 +1530,8 @@ mod tests {
             &planner,
             &log_request(1_500, 5_500, TimeSource::Log),
             WindowCoverage::Covered,
-            &root.join("clip.mcap"),
-            Publication::Suffix,
+            &root,
+            Mode::Tail,
             &stage_tx,
         )?;
         assert_eq!(stats.len(), 2, "a straddling window yields two segments");

@@ -29,6 +29,7 @@ use std::thread;
 use std::time::Duration;
 
 use clip::TimeSource;
+use clip::config::Mode;
 use clip::cut::FramingDesync;
 use clip::index::EXTENT_CAP_BYTES;
 use clip::manifest::{CutRequest, Producer, WindowCoverage};
@@ -108,11 +109,7 @@ pub fn handle_trigger<A: Announce>(
         trig.postroll
     );
 
-    let base_out_path = out_dir.join(format!(
-        "{anchor_ns}_{}.mcap",
-        segment::sanitize(&trig.name)
-    ));
-    let segments = record_clip(&tailer, &request, &base_out_path, grace, &extract_tx)
+    let segments = record_clip(&tailer, &request, out_dir, grace, &extract_tx)
         .map_err(|e| report_refusal(&faults, e))?;
 
     clip::cut::report_clips(&segments);
@@ -190,7 +187,8 @@ fn report_refusal(faults: &CutFaults, err: anyhow::Error) -> anyhow::Error {
 
 /// The live half of one trigger's cut: wait out the postroll wall floor, wait
 /// for the tail's collection-wide coverage to reach the window end (bounded by
-/// `grace`), then hand the window to [`clip::segment::cut_window`].
+/// `grace`), then hand the window and `out_dir` to
+/// [`clip::segment::cut_window`], which decides what the clip under it is called.
 ///
 /// The two waits are the only reason this function exists. A window may reach
 /// past the last byte on disk, and cutting one before the data lands would
@@ -205,7 +203,7 @@ fn report_refusal(faults: &CutFaults, err: anyhow::Error) -> anyhow::Error {
 fn record_clip(
     tailer: &Arc<Tailer>,
     request: &Arc<CutRequest>,
-    base_out_path: &Path,
+    out_dir: &Path,
     grace: Duration,
     extract_tx: &Sender<StageJob>,
 ) -> anyhow::Result<Vec<clip::cut::ClipStats>> {
@@ -248,11 +246,11 @@ fn record_clip(
         tailer.as_ref(),
         request,
         covered,
-        base_out_path,
-        // A colliding name on a vehicle is a second trigger, and its clip is
-        // data no re-run can produce again: it is published beside the first,
-        // never dropped.
-        segment::Publication::Suffix,
+        out_dir,
+        // Following a recording still being written is what this crate is, so
+        // the cut is told that and nothing more: what a clip already in the
+        // output directory costs a live recorder is `clip`'s to decide.
+        Mode::Tail,
         extract_tx,
     )
 }
@@ -310,7 +308,7 @@ mod tests {
         let stats = record_clip(
             &tailer,
             &window((0, 1_000), TimeSource::Log),
-            &root.join("clip.mcap"),
+            &root,
             Duration::from_millis(50),
             &extract_tx,
         )?;
@@ -344,21 +342,31 @@ mod tests {
 
         let extract_tx =
             segment::spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
-        let base = root.join("clip.mcap");
+        let out_dir = root.join("out");
         let cut = || {
             record_clip(
                 &tailer,
                 &window((100, 900), TimeSource::Log),
-                &base,
+                &out_dir,
                 Duration::from_secs(10),
                 &extract_tx,
             )
         };
 
-        assert_eq!(cut()?[0].out_path, base, "the first trigger takes the name");
+        let first = cut()?[0].out_path.clone();
+        assert_eq!(
+            first.parent(),
+            Some(out_dir.as_path()),
+            "the cut names the clip under the output directory it was given"
+        );
+        let stem = first
+            .file_stem()
+            .expect("a published clip has a name")
+            .to_string_lossy()
+            .into_owned();
         assert_eq!(
             cut()?[0].out_path,
-            root.join("clip_1.mcap"),
+            out_dir.join(format!("{stem}_1.mcap")),
             "the second trigger's clip lands beside the first, never dropped"
         );
 
@@ -389,7 +397,7 @@ mod tests {
         let stats = record_clip(
             &tailer,
             &window((100, 1_000), TimeSource::Log),
-            &root.join("clip.mcap"),
+            &root,
             Duration::from_secs(10),
             &extract_tx,
         )?;
@@ -426,7 +434,7 @@ mod tests {
         let stats = record_clip(
             &tailer,
             &window((now.saturating_sub(1_000_000_000), end_ns), TimeSource::Log),
-            &root.join("clip.mcap"),
+            &root,
             Duration::from_secs(10),
             &extract_tx,
         )?;
@@ -464,7 +472,7 @@ mod tests {
         let stats = record_clip(
             &tailer,
             &window((50, 1_000_000), TimeSource::Log),
-            &root.join("clip.mcap"),
+            &root,
             grace,
             &extract_tx,
         )?;
@@ -505,7 +513,7 @@ mod tests {
         let stats = record_clip(
             &tailer,
             &window((0, 1_000), TimeSource::Log),
-            &root.join("clip.mcap"),
+            &root,
             Duration::from_secs(30),
             &extract_tx,
         )?;
@@ -718,7 +726,7 @@ mod tests {
         let stats = record_clip(
             &tailer,
             &window((900, 1_500), TimeSource::Publish),
-            &root.join("clip.mcap"),
+            &root,
             Duration::from_secs(10),
             &extract_tx,
         )?;
@@ -764,7 +772,7 @@ mod tests {
         let covered = record_clip(
             &tailer,
             &window((0, 200), TimeSource::Log),
-            &root.join("covered.mcap"),
+            &root.join("covered"),
             Duration::from_secs(10),
             &extract_tx,
         )?;
@@ -777,7 +785,7 @@ mod tests {
         let short = record_clip(
             &tailer,
             &window((0, 1_000_000), TimeSource::Log),
-            &root.join("short.mcap"),
+            &root.join("short"),
             Duration::from_millis(100),
             &extract_tx,
         )?;

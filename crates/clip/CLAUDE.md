@@ -228,8 +228,9 @@ stages — or a failed publish — strands nothing in `.capturing` and never
 reaches `out_dir`. The capturing-dir name may carry its own `_<n>` suffix to
 avoid colliding with a concurrent stage, independent of the final name a
 duplicate trigger resolves to at publish — and whether the final name is allowed
-to take a suffix at all is the cut's `clip::segment::Publication`, the recorder's
-`Suffix` against `clipper clip`'s `Refuse`. The one leftover `Drop` cannot
+to take a suffix at all is [the cut's own
+answer](#segment-assembly-and-publication-clipsegment) to the subcommand that
+asked, the recorder's `Suffix` against `clipper clip`'s `Refuse`. The one leftover `Drop` cannot
 reclaim is a crash *between* the publish link and the staged-file unlink, which
 strands a stale link in `.capturing` (harmless — only `out_dir` is observed);
 `clip::cut::reset_capturing_dir`, called once from `main` at startup, deletes
@@ -344,11 +345,34 @@ record, never a walk — and is what the tests assert through.
 
 `cut_window` is the whole of what turns one window into published clips, and it
 is the same code whichever index found the window: it takes a `&dyn
-WindowPlanner`, asks it for the window's plans, stages one clip per plan through
-the worker pool, drops the empty ones, names what is left, and publishes each
-atomically. Its caller is either a [trigger
-handler](../tail/CLAUDE.md#per-trigger-flow) over a growing recording or
-`clipper clip` over a finished one; `cut_window` cannot tell them apart.
+WindowPlanner`, names the clip under the output directory it was given, asks the
+planner for the window's plans, stages one clip per plan through the worker pool,
+drops the empty ones, numbers what is left, and publishes each atomically. Its
+caller is either a [trigger handler](../tail/CLAUDE.md#per-trigger-flow) over a
+growing recording or `clipper clip` over a finished one; `cut_window` cannot tell
+them apart except through the one value they do state — which subcommand they
+are.
+
+**It is the one entry point that decides where a clip goes**, and that is the
+whole reason a caller hands it an `out_dir` rather than a path. Two things follow
+from it, both of which used to be a binary's to get right and are now impossible
+to get differently right in two places:
+
+- **The name is `segment::base_name`'s**, one private function over the
+  `CutRequest`: `<anchor_ns>_<name>.mcap`, the resolved anchor and the trigger's
+  name put through `sanitize`. Neither binary formats a clip path, so the scheme
+  moves in one edit.
+- **What a taken name costs is read off the caller's `clip::config::Mode`**
+  (`segment::publication`, an exhaustive match, so a subcommand added to that
+  enum is a compile error until it says what a collision means to it). The
+  recorder says `Mode::Tail` and gets `Publication::Suffix`; `clipper clip` says
+  `Mode::Clip` and gets `Publication::Refuse`. `Publication` itself is private:
+  the policy is nobody's to pass in, and the two halves of it cannot drift.
+
+`Mode` is `clip::config`'s because [the configuration
+file](#the-configuration-file-clipconfig) needs the same two subcommands named
+before argv is parsed; the cut reads it for the one question above and nothing
+else.
 
 **Staging worker pool.** `clip::segment::spawn_stage_workers` starts
 `extract_parallelism` threads (at least one) sharing one unbounded FIFO channel,
@@ -378,9 +402,8 @@ silently holding the wrong messages;
 recording through both domains and pins them together.
 
 **A clip already in `out_dir` is the other refusal** (`clip::segment::ClipExists`).
-`clipper clip` cuts under `Publication::Refuse`, the recorder under
-`Publication::Suffix`, and the two halves of that policy are the same collision
-answered for different inputs: a live trigger colliding with an earlier clip's
+The two arms of `Publication` are the same collision answered for different
+inputs: a live trigger colliding with an earlier clip's
 name is a *second* trigger whose data no re-run can produce again, while a cut
 from a finished recording is replayable, so the same name means the same bytes
 and a second file is a duplicate. `cut_window` applies the policy as its first

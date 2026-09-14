@@ -58,11 +58,13 @@ is `clip_mode` in `src/main.rs`. It builds the same `CutRequest` a
 [trigger handler](../tail/CLAUDE.md#per-trigger-flow) builds — the trigger's five
 values are spelled as flags, and `--trigger-time` is both the `Stamp` the trigger
 carries (`Stamp::from_ns`) and the anchor the window centres on — and hands it to
-the same [`clip::segment::cut_window`](../clip/CLAUDE.md#segment-assembly-and-publication-clipsegment).
-The cut itself is therefore unchanged, and so are the manifest, the
-`<anchor_ns>_<name>.mcap` name and the atomic publication. `--trigger-name`
-passes the same `validate_name` gate a name arriving on a topic does, so a name
-accepted by one mode is accepted by the other.
+the same [`clip::segment::cut_window`](../clip/CLAUDE.md#segment-assembly-and-publication-clipsegment),
+along with `--out-dir` and `config::Mode::Clip` — the output *directory* and
+which subcommand is cutting, never a path. The cut itself is therefore unchanged,
+and so are the manifest, the `<anchor_ns>_<name>.mcap` name `clip` derives and
+the atomic publication. `--trigger-name` passes the same `validate_name` gate a
+name arriving on a topic does, so a name accepted by one mode is accepted by the
+other.
 
 **Where the triggers come from is `--trigger-source`** (`TriggerSource`), the
 same key over the same value set the recorder takes, and exactly one source is
@@ -180,8 +182,9 @@ in `main.rs`; each value exactly at its bound is accepted:
   on a tail record's own stamp.
 - **A `name` that is empty, past `MAX_TRIGGER_NAME_LEN` (128 B), or unsafe in the
   clip pathname** (`validate_name`: no path separator, NUL, leading dot, or `..`).
-  `clip::segment::sanitize` still maps stray characters to `_` at clip creation; the
-  structural hazards are refused whole here rather than silently rewritten.
+  `clip`'s own `sanitize` still maps stray characters to `_` where it builds the
+  clip's name; the structural hazards are refused whole here rather than silently
+  rewritten.
 
 [`Anchor`]: src/interface.rs
 

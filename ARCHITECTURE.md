@@ -364,10 +364,11 @@ byte as it was found: clipper never rewrites, recovers or re-indexes a recording
 **A clip that is already there is refused too.** A finished recording and a
 trigger describe one window and one copy of its bytes, so a second run over both
 would write the clip that is already in the output directory. It names that clip
-and exits 1 instead — `clip::segment::Publication::Refuse`, checked before
-the window is planned, so the refused run stages nothing and publishes nothing.
-The recorder takes the other half of the same policy (`Publication::Suffix`), and
-the two differ because their inputs do: on a vehicle a taken name means a
+and exits 1 instead — the refusal `clip::segment::cut_window` answers a taken
+name with for this subcommand, checked before the window is planned, so the
+refused run stages nothing and publishes nothing. The recorder gets the other
+half of the same policy out of the same code, and the two differ because their
+inputs do: on a vehicle a taken name means a
 *second* trigger, whose clip is data no re-run can produce again, so it is
 published beside the first. The check asks whether the window's base name or any
 `<base>_NN.mcap` beside it exists, because a window's segment count is settled
@@ -456,9 +457,10 @@ Publication is **two-staged** so `out_dir` only ever holds finished clips:
    an early return or panic between the stages strands nothing.
 
 Whether a name the output directory already holds is worth a `_<n>` sibling at
-all is the caller's, stated as a `clip::segment::Publication` at each cut: the
-recorder suffixes, and a cut from a finished recording refuses the window before
-staging (see [Cutting from a finished recording](#cutting-from-a-finished-recording)).
+all follows from the subcommand: each cut tells `clip::segment::cut_window` which
+one it is, and `clip` answers. The recorder suffixes, and a cut from a finished
+recording refuses the window before staging (see [Cutting from a finished
+recording](#cutting-from-a-finished-recording)).
 
 `.capturing/` is a *subdirectory* of `out_dir` so the two always share a
 filesystem and the move is a true atomic link. `reset_capturing_dir()`, called
