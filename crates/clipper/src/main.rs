@@ -61,13 +61,14 @@
 //!
 //! **The other mode is `clipper clip`** ([`clip_mode`]): one clip out of one
 //! finished recording, named by a trigger on the command line, then exit. It
-//! shares everything below the trigger — the window plan, the copy, the
-//! manifest, atomic publication — and differs in the two things a finished input
-//! makes meaningless. The recording is indexed from its own summary
+//! shares everything below the trigger — the window plan, the copy, the clip
+//! directory and the document that completes it — and differs in the two things
+//! a finished input makes meaningless. The recording is indexed from its own summary
 //! ([`clip::whole::WholeFileIndex`]) rather than by a scan that keeps resuming,
 //! and neither wait above runs: there is no later data to wait for, so a window
-//! reaching past the recording's end is simply short and the clip's manifest
-//! says so. A run's result is the output directory's contents when the process
+//! reaching past the recording's end is simply short and the clip's document
+//! says so. A window whose clip is already there is skipped there too, which is
+//! what makes a re-run over one recording a resume. A run's result is the output directory's contents when the process
 //! exits, and the exit status is the verdict.
 //!
 //! Configuration resolves through four layers over each setting's built-in
@@ -317,8 +318,9 @@ const TAIL_DEFAULT_TRIGGER_SOURCE: TriggerSource = TriggerSource::Mcap;
 const CLIP_DEFAULT_TRIGGER_SOURCE: TriggerSource = TriggerSource::Param;
 
 /// The trigger name a `param` run takes when `--trigger-name` is absent. A name
-/// is not optional — it goes in the clip's filename and its manifest — so the
-/// one flag a caller may leave out has a value spelled here rather than at the
+/// is not optional — it is one of the six fields the clip's id is a function of,
+/// so a run with no name and a run named `clip` are different clips — so the one
+/// flag a caller may leave out has a value spelled here rather than at the
 /// argument, which carries no clap default (a default would be
 /// indistinguishable from a name the caller typed, and `mcap` refuses the flag
 /// on exactly that distinction).
@@ -506,8 +508,8 @@ enum Mode {
     Clip(ClipConfig),
 }
 
-/// The program name every clip's manifest carries under `producer.name`: this
-/// binary, as an operator invokes it.
+/// The program name every clip's `clip_metadata.yaml` carries under
+/// `producer.name`: this binary, as an operator invokes it.
 const PROGRAM: &str = "clipper";
 
 /// clap's names for [`Mode::Tail`] and [`Mode::Clip`] — the word an operator
@@ -743,13 +745,13 @@ struct ClipConfig {
     /// The trigger's name, which also names the clip file
     /// (`--trigger-source param` only; defaults to `clip`).
     ///
-    /// Carried into the clip's manifest under `trigger.name` and embedded in the
-    /// output filename, so it is bounded and kept filename-safe the same way a
-    /// name arriving on a topic is.
+    /// Carried into the clip's document under `trigger.name`, and one of the
+    /// six fields the clip's id hashes, so it is bounded the same way a name
+    /// arriving on a topic is. No part of it reaches a path.
     #[arg(long)]
     trigger_name: Option<String>,
 
-    /// The trigger's description, carried into the clip's manifest
+    /// The trigger's description, carried into the clip's document
     /// (`--trigger-source param` only; defaults to empty).
     #[arg(long)]
     trigger_description: Option<String>,
@@ -1715,7 +1717,7 @@ fn with_usable_names(
 /// passes the window end, then blocks until the tail's coverage reaches it,
 /// because a window may reach past the last byte on disk. This input has an end:
 /// there is nothing to wait for, so a window reaching past it is simply short,
-/// and the manifest says so ([`clip::manifest::WindowCoverage`]).
+/// and the clip's document says so ([`clip::manifest::WindowCoverage`]).
 ///
 /// **A recording it cannot index is refused by name**, from that same footer
 /// and summary, before anything is created: [`clip::whole::IndexRefusal`] is
@@ -1870,7 +1872,7 @@ const MAX_ROLL_NS: u64 = 1_800_000_000_000; // 30 * 60 * 1e9
 const MAX_ANCHOR_FUTURE_SKEW_NS: u64 = 1_800_000_000_000; // 30 * 60 * 1e9
 
 /// The largest trigger `name`, in bytes. The name is free text a requester
-/// chose, copied into every clip's manifest and echoed in every `Recorded`, so
+/// chose, copied into every clip's document and echoed in every `Recorded`, so
 /// it is bounded to keep one malformed message from filling either (see
 /// [`validate_name`]).
 const MAX_TRIGGER_NAME_LEN: usize = 128;
@@ -1940,7 +1942,7 @@ fn validate_trigger(trig: &Trigger, anchor: Anchor, now_ns: u64) -> Result<(), S
 /// digest, so a name holding `/`, `..`, a leading dot, unicode or nothing at all
 /// shapes no file name and there is nothing to sanitize or refuse it for. What is
 /// left is the resource bound every free-text field of a message needs: the name
-/// is copied into every clip's manifest and echoed in every `Recorded`, and
+/// is copied into every clip's document and echoed in every `Recorded`, and
 /// [`MAX_TRIGGER_NAME_LEN`] is what keeps one malformed message from filling
 /// them.
 fn validate_name(name: &str) -> Result<(), &'static str> {
@@ -2928,9 +2930,10 @@ mod tests {
 
     /// A trigger name that would be hostile in a path cuts an ordinary clip.
     ///
-    /// The name reaches the manifest and nothing else: a clip is named by its
-    /// id, so `..` in a name is text like any other and cannot climb out of
-    /// `--out-dir`, add a path component, or hide the clip behind a leading dot.
+    /// The name reaches the clip's document and nothing else: a clip is named
+    /// by its id, so `..` in a name is text like any other and cannot climb out
+    /// of `--out-dir`, add a path component, or hide the clip behind a leading
+    /// dot.
     #[test]
     fn a_trigger_name_that_could_break_a_path_cuts_an_ordinary_clip() -> anyhow::Result<()> {
         let root = clip::testing::test_dir("clip-pathy-name")?;
@@ -3824,8 +3827,8 @@ mod tests {
     }
 
     /// A clip cut from a command-line trigger and one cut from the equivalent
-    /// trigger inside the recording carry the same trigger record — the whole
-    /// manifest, key for key, since the two runs differ in nothing else.
+    /// trigger inside the recording say the same thing — the whole document,
+    /// field for field, since the two runs differ in nothing else.
     #[test]
     fn a_param_clip_and_an_equivalent_embedded_one_agree() -> anyhow::Result<()> {
         let root = clip::testing::test_dir("clip-agree")?;
