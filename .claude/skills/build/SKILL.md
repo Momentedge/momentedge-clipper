@@ -16,7 +16,7 @@ The Nix flake is for **development** (the dev shell, and the per-distro
 `nix build .#clipper` as a build check), CI, and one shipping artefact:
 `nix build .#clipper-ros-free`, the recorder without ROS. The device deploys as a
 native build on the target instead — see the `packaging` skill and
-[ARCHITECTURE.md § Deployment](ARCHITECTURE.md#deployment).
+[ARCHITECTURE.md § Deployment](../../../ARCHITECTURE.md#deployment).
 
 ## Dev shell and toolchain
 
@@ -354,9 +354,11 @@ prebuilt binary, to skip the wait. As a workspace member it builds into whatever
 target dir is active, so the per-distro loop below compiles it once per leg (into
 that leg's `target/e2e-$d`) alongside the rest of the crates.
 
-Each test runs in its own `ROS_DOMAIN_ID` (band 80–101) with its own temp dirs,
-so a recorder already on domain 0 is unaffected. Expect a few minutes of wall
-clock (the tests sleep out real trigger windows). Run across the working distros
+Each test runs in its own `ROS_DOMAIN_ID` (band 1–101) with its own temp dirs,
+so a recorder already on domain 0 is unaffected. The suite is 46 cases and runs
+serialized: about nine to ten minutes per distro leg in CI, longer on a dev box
+doing anything else, because the live tests sleep out real trigger
+windows. Run across the working distros
 with a per-distro target dir (the r2r artifacts link that distro's `rcl`/`rmw`
 and must not collide), from the repo root and spelled absolute — nextest runs
 each test with its cwd at `crates/clipper/`, so a relative `CARGO_TARGET_DIR`

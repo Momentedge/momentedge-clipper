@@ -6,7 +6,7 @@
 //! topic echo` listener for `Recorded` announcements — and creates no ROS node
 //! of its own, keeping the test free of process-global DDS state.
 //!
-//! Isolation: every test gets its own `ROS_DOMAIN_ID` (band 80–101, clear of
+//! Isolation: every test gets its own `ROS_DOMAIN_ID` (band 1–101, clear of
 //! the host's domain 0) and its own temp tree (`record/`, `triggered/`,
 //! `logs/`). Teardown: every child is spawned into its own process group and
 //! [`Proc`]'s `Drop` SIGTERMs then SIGKILLs that group, so a panicking test
@@ -19,6 +19,7 @@
 //! dependency would receive two *different* domains. One `TestEnv` per test
 //! carries the shared identity instead.
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -28,6 +29,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub(crate) const TRIGGER_TOPIC: &str = "/events/momentedge/trigger";
 pub(crate) const RECORDED_TOPIC: &str = "/events/momentedge/recorded";
+
+/// The `description` every trigger this harness publishes carries.
+///
+/// It is one of the six fields a clip's id hashes, so a test that computes an id
+/// ahead of the run and the publish that produces it must agree on it to the
+/// byte — which is why it is a constant rather than a literal in each.
+pub(crate) const TRIGGER_DESCRIPTION: &str = "e2e";
 
 /// Gate for the whole suite. Unset `CLIPPER_E2E` means skip-and-pass, so
 /// plain `cargo test` / `cargo llvm-cov` stay green without ROS. Set, a
@@ -71,6 +79,17 @@ fn wait_for_file_contains(path: &Path, needle: &str, timeout: Duration) -> bool 
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// Print a child's log file for post-mortem, the way [`Proc::dump_log`] does —
+/// for the waits that hold a path rather than the [`Proc`] that wrote it.
+fn dump_file(path: &Path) {
+    eprintln!(
+        "--- {} ---\n{}\n--- end {} ---",
+        path.display(),
+        std::fs::read_to_string(path).unwrap_or_default(),
+        path.display(),
+    );
 }
 
 /// Nanoseconds since the Unix epoch on the system clock — the time base the
@@ -201,14 +220,37 @@ pub(crate) fn cu_mcap_record_bin() -> PathBuf {
     bin
 }
 
+/// The `ros2 bag record` arguments that restrict a recording to `topics`.
+///
+/// The spelling differs across distros: humble takes the topics positionally and
+/// has no `--topics` flag, while lyrical dropped the positional form and requires
+/// `--topics`; jazzy accepts both but warns the positional form is deprecated.
+/// The distro is fixed at build time via the `ros_distro` cfg (see build.rs), so
+/// this dispatch costs nothing at run time and needs no environment variable set.
+fn topic_selection<'a>(topics: &[&'a str]) -> Vec<&'a str> {
+    let mut selection: Vec<&str> = Vec::new();
+    #[cfg(not(ros_distro = "humble"))]
+    selection.push("--topics");
+    selection.extend_from_slice(topics);
+    selection
+}
+
 /// A `ROS_DOMAIN_ID` unique to this test: nextest runs each test in its own
 /// process, so a plain counter would restart identically everywhere — the PID
-/// disambiguates across test processes, the counter within one. Band 80–101
+/// disambiguates across test processes, the counter within one. Band 1–101
 /// keeps clear of the host's domain 0 and stays inside the range whose DDS
 /// ports all fit the default port plan.
+///
+/// **The band is as wide as that range allows, and that is what keeps
+/// neighbouring tests apart.** Consecutive test processes get PIDs a handful
+/// apart, so a band narrow enough for the modulus to wrap within that distance
+/// hands the same domain to tests that run back to back — and a child of one
+/// that outlives its test by a moment then publishes into the next one's graph,
+/// which reads as an announcement the next test never triggered. A hundred
+/// domains puts that wrap far beyond any run's PID spread.
 fn unique_domain() -> u32 {
     static SEQ: AtomicU32 = AtomicU32::new(0);
-    80 + (std::process::id() + SEQ.fetch_add(1, Ordering::Relaxed)) % 22
+    1 + (std::process::id() + SEQ.fetch_add(1, Ordering::Relaxed)) % 101
 }
 
 /// One test's isolated world: a unique DDS domain and a temp tree holding the
@@ -255,6 +297,13 @@ impl TestEnv {
         self.root.path().join("logs")
     }
 
+    /// A path inside this test's temp tree, for a run that needs an output
+    /// directory of its own — two `clipper clip` runs to compare, or a
+    /// `--out-dir` whose parents do not exist yet. Nothing is created.
+    pub(crate) fn path(&self, relative: &str) -> PathBuf {
+        self.root.path().join(relative)
+    }
+
     /// Base command in this test's world: the test domain and the temp root
     /// as working directory (so the extractor finds no stray TOML config).
     fn command(&self, program: impl AsRef<std::ffi::OsStr>) -> Command {
@@ -297,19 +346,29 @@ impl TestEnv {
     /// [`Self::start_recorder`] restricted to exactly `topics`, for tests that
     /// must keep ambient topics (`/rosout`, the trigger) out of the recording.
     pub(crate) fn start_recorder_topics(&self, topics: &[&str], preset: &str, cache: u64) -> Proc {
-        // `ros2 bag record`'s topic-list spelling differs across distros: humble
-        // takes the topics positionally and has no `--topics` flag, while lyrical
-        // dropped the positional form and requires `--topics`; jazzy accepts both
-        // but warns the positional form is deprecated. The distro is fixed at
-        // build time via the `ros_distro` cfg (see build.rs), so this dispatch
-        // costs nothing at run time and needs no environment variable set.
-        let mut selection: Vec<&str> = Vec::new();
-        #[cfg(not(ros_distro = "humble"))]
-        selection.push("--topics");
-        selection.extend_from_slice(topics);
         // A topic-restricted recorder does not subscribe to the trigger topic,
         // so the extractor is the sole trigger subscriber (`fire_trigger` -w 1).
-        self.spawn_recorder(&selection, preset, cache, false, 0)
+        self.spawn_recorder(&topic_selection(topics), preset, cache, false, 0)
+    }
+
+    /// [`Self::start_recorder_topics`] rolling the bag over every
+    /// `max_bag_duration_secs` — a split recording whose every message is the
+    /// test's own, so a window over it can be reasoned about message for
+    /// message.
+    pub(crate) fn start_recorder_topics_split(
+        &self,
+        topics: &[&str],
+        preset: &str,
+        cache: u64,
+        max_bag_duration_secs: u64,
+    ) -> Proc {
+        self.spawn_recorder(
+            &topic_selection(topics),
+            preset,
+            cache,
+            false,
+            max_bag_duration_secs,
+        )
     }
 
     /// [`Self::start_recorder`] that rolls the bag over every
@@ -491,7 +550,18 @@ impl TestEnv {
     /// A steady message stream so the bag has content and the tail's coverage
     /// high-water advances. Runs until dropped.
     pub(crate) fn start_source(&self, topic: &str, rate: u32) -> Proc {
-        let payload = "clipper-e2e-payload ".repeat(10);
+        self.start_bulk_source(topic, rate, 200)
+    }
+
+    /// [`Self::start_source`] publishing a payload of roughly `payload_bytes`.
+    ///
+    /// For the tests whose subject is how long a cut *takes*: a window's copy is
+    /// bounded by the bytes it moves, not by the messages it counts, so a
+    /// recording that carries volume is what makes a cut long enough to be
+    /// caught in the act — killed mid-copy, or observed half-written.
+    pub(crate) fn start_bulk_source(&self, topic: &str, rate: u32, payload_bytes: usize) -> Proc {
+        const UNIT: &str = "clipper-e2e-payload ";
+        let payload = UNIT.repeat(payload_bytes.div_ceil(UNIT.len()));
         let mut cmd = self.command("ros2");
         cmd.args([
             "topic",
@@ -503,6 +573,43 @@ impl TestEnv {
             &format!("{{data: {payload}}}"),
         ]);
         self.spawn("source", cmd)
+    }
+
+    /// Block until `topic` is carrying messages: one `ros2 topic echo --once`,
+    /// whose exit *is* the signal that a message arrived. The type is
+    /// [`Self::start_bulk_source`]'s, since awaiting that source is what this
+    /// is for.
+    ///
+    /// What it bounds is the unbounded half of a source's bring-up. `ros2 topic
+    /// pub` starts publishing some moment after it is spawned — a python
+    /// interpreter plus DDS discovery, growing with machine load — so wall
+    /// clock counted from the spawn buys an unknown amount of recorded data,
+    /// and a test that needs a window's worth of it before it triggers is
+    /// guessing. Counted from here the same sleep buys what it says.
+    ///
+    /// A recording that can be read while it grows needs none of this:
+    /// [`Self::wait_for_recording_span`] reads the data straight off its
+    /// stamps, which is stronger, since it measures the recording rather than
+    /// the graph. This is for the chunked recordings `clipper clip` requires,
+    /// which state nothing about themselves until they are closed.
+    pub(crate) fn wait_for_source_publishing(&self, topic: &str, timeout: Duration) {
+        let mut cmd = self.command("ros2");
+        cmd.args([
+            "topic",
+            "echo",
+            "--no-daemon",
+            "--once",
+            topic,
+            "std_msgs/msg/String",
+        ]);
+        let tag = topic.trim_start_matches('/').replace('/', "-");
+        let mut proc = self.spawn(&format!("await-{tag}"), cmd);
+        let status = proc.wait_exit(timeout).unwrap_or_else(|| {
+            proc.dump_log();
+            dump_file(&self.log_dir().join("source.log"));
+            panic!("nothing was published on {topic} within {timeout:?}");
+        });
+        assert!(status.success(), "awaiting {topic} failed: {status}");
     }
 
     /// The binary under test in its `tail` mode, configured purely via
@@ -594,9 +701,9 @@ impl TestEnv {
     }
 
     /// A `ros2 topic echo --once` capturing the next `Recorded` announcement
-    /// into its log. Started (and given a discovery head start) BEFORE the
-    /// trigger fires, so the announcement publisher is already matched by the
-    /// time it publishes.
+    /// into its log. Started BEFORE the trigger fires and given
+    /// [`RECORDED_ECHO_HEAD_START`], so the announcement publisher is already
+    /// matched by the time it publishes.
     pub(crate) fn start_recorded_listener(&self, tag: &str) -> Proc {
         let mut cmd = self.command("ros2");
         cmd.args([
@@ -608,10 +715,7 @@ impl TestEnv {
             "momentedge_msgs/msg/Recorded",
         ]);
         let proc = self.spawn(&format!("recorded-{tag}"), cmd);
-        // No readiness signal exists for the echo's subscription; the python
-        // CLI needs a moment to create it. The announcement follows the
-        // trigger by at least its postroll, which dwarfs this head start.
-        std::thread::sleep(Duration::from_secs(2));
+        std::thread::sleep(RECORDED_ECHO_HEAD_START);
         proc
     }
 
@@ -655,18 +759,8 @@ impl TestEnv {
         preroll_ns: u64,
         postroll_ns: u64,
     ) {
-        let sec = (trigger_time_ns / 1_000_000_000) as i64;
-        let nanosec = trigger_time_ns % 1_000_000_000;
-        let yaml = format!(
-            "{{name: {name}, description: e2e, \
-             trigger_time: {{sec: {sec}, nanosec: {nanosec}}}, \
-             preroll: {preroll_ns}, postroll: {postroll_ns}}}"
-        );
-        let waiters = if self.records_trigger_topic.load(Ordering::Relaxed) {
-            "2"
-        } else {
-            "1"
-        };
+        let yaml = trigger_yaml(name, trigger_time_ns, preroll_ns, postroll_ns);
+        let waiters = self.trigger_waiters();
         let extractor_log = self.log_dir().join("extractor.log");
         let needle = format!("trigger name=\"{name}\"");
         let deadline = Instant::now() + Duration::from_secs(60);
@@ -703,45 +797,39 @@ impl TestEnv {
         }
     }
 
-    /// Every clip published into `out_dir`, by name. The staging directory is
-    /// not one of them, so a test that counts what a run produced counts
-    /// finished clips alone.
+    /// Every clip in `out_dir`, by directory name. A clip is a directory named
+    /// by its id, so this is what a run produced.
     pub(crate) fn published_clips(&self) -> Vec<String> {
-        let Ok(entries) = std::fs::read_dir(self.out_dir()) else {
-            return Vec::new();
-        };
-        let mut names: Vec<String> = entries
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|x| x == "mcap"))
-            .map(|p| {
-                p.file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned()
-            })
-            .collect();
-        names.sort();
-        names
+        entry_names(&self.out_dir())
     }
 
-    /// `out_dir/.capturing` must exist (the extractor ran) and hold nothing
-    /// (no finished clip ever lingers there).
-    pub(crate) fn assert_capturing_drained(&self) {
-        let capturing = self.out_dir().join(".capturing");
-        assert!(
-            capturing.is_dir(),
-            "the extractor creates {}",
-            capturing.display()
-        );
-        let leftover: Vec<_> = std::fs::read_dir(&capturing)
-            .expect("reading .capturing")
+    /// The root of `out_dir` holds clip directories and nothing else.
+    ///
+    /// This is the contract an operator points a sync tool at: no staging area,
+    /// no lock file, no sidecar, so there is no exclude list to keep in step
+    /// with clipper. Every entry must be a directory *and* be named by a clip id
+    /// — a directory alone is too weak a test, since the staging area a clip is
+    /// no longer written through was itself a directory. Completeness is not
+    /// asserted here: a run killed mid-cut leaves a directory with no metadata
+    /// file in it, which is exactly how a consumer tells crash residue from a
+    /// clip.
+    pub(crate) fn assert_out_dir_holds_only_clips(&self) {
+        let out_dir = self.out_dir();
+        let stray: Vec<_> = std::fs::read_dir(&out_dir)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", out_dir.display()))
             .flatten()
             .map(|e| e.path())
+            .filter(|p| {
+                !p.is_dir()
+                    || !p
+                        .file_name()
+                        .is_some_and(|n| is_clip_id(&n.to_string_lossy()))
+            })
             .collect();
         assert!(
-            leftover.is_empty(),
-            ".capturing must hold no finished clip, found: {leftover:?}"
+            stray.is_empty(),
+            "{} must hold clip directories and nothing else, found: {stray:?}",
+            out_dir.display()
         );
     }
 
@@ -762,27 +850,23 @@ impl TestEnv {
         // tests publish with `publish_trigger_into_bag` and confirm via the clip.
         let extractor_log = self.log_dir().join("extractor.log");
         let needle = format!("trigger name=\"{name}\"");
-        assert!(
-            wait_for_file_contains(&extractor_log, &needle, Duration::from_secs(30)),
-            "clipper never logged receipt of the in-bag trigger {name:?}; see {}",
-            extractor_log.display(),
-        );
+        if !wait_for_file_contains(&extractor_log, &needle, Duration::from_secs(30)) {
+            dump_file(&extractor_log);
+            dump_file(&self.log_dir().join("recorder.log"));
+            panic!("clipper never logged receipt of the in-bag trigger {name:?}");
+        }
     }
 
     /// Publish one `Trigger` into the recording without waiting for clipper to
     /// read it back. For a chunked recording the trigger is only visible after a
     /// flush (e.g. the recorder is stopped later in the test), so receipt cannot
     /// be confirmed inline — the caller confirms end to end via
-    /// [`Self::wait_for_clip_matching`]. Publishes exactly once (`--once`, `-w 1` for the
+    /// [`Self::wait_for_clip_named`]. Publishes exactly once (`--once`, `-w 1` for the
     /// recorder subscriber); a republish would write a second trigger record and
     /// cut a duplicate clip. `trigger_time` is zero: the MCAP interface anchors on
     /// the trigger record's own stamp and rejects a non-zero `trigger_time`.
     pub(crate) fn publish_trigger_into_bag(&self, name: &str, preroll_ns: u64, postroll_ns: u64) {
-        let yaml = format!(
-            "{{name: {name}, description: e2e, \
-             trigger_time: {{sec: 0, nanosec: 0}}, \
-             preroll: {preroll_ns}, postroll: {postroll_ns}}}"
-        );
+        let yaml = trigger_yaml(name, 0, preroll_ns, postroll_ns);
         let mut cmd = self.command("ros2");
         cmd.args([
             "topic",
@@ -802,40 +886,546 @@ impl TestEnv {
         assert!(status.success(), "trigger publish {name} failed: {status}");
     }
 
-    /// Poll `out_dir` for a finished clip whose file name ends with `suffix`,
-    /// returning its path. A clip is named `<anchor_ns>_<name>.mcap`, where the
-    /// anchor is the window centre the interface resolved — the trigger record's
-    /// own stamp under `--trigger-source mcap`, not the publisher's `trigger_time`. A
-    /// test that does not know the exact anchor locates the clip by its
-    /// `_<name>.mcap` suffix.
-    pub(crate) fn wait_for_clip_matching(&self, suffix: &str, timeout: Duration) -> PathBuf {
+    /// Poll `out_dir` for a complete clip whose trigger was named `name`,
+    /// returning its directory.
+    ///
+    /// A clip is a directory named `<anchor_ns>_<hash>` — an id derived from the
+    /// whole trigger, carrying none of its text — so which trigger a clip
+    /// answers is something the clip states and not something its path spells.
+    /// `clip_metadata.yaml` is where it states it, and its presence is also what
+    /// makes the clip complete, so this waits for exactly what a real consumer
+    /// would wait for.
+    pub(crate) fn wait_for_clip_named(&self, name: &str, timeout: Duration) -> PathBuf {
         let deadline = Instant::now() + timeout;
         loop {
             if let Ok(entries) = std::fs::read_dir(self.out_dir()) {
                 for entry in entries.flatten() {
                     let path = entry.path();
-                    if path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .is_some_and(|n| n.ends_with(suffix))
-                    {
+                    let names_it =
+                        clip::layout::read_metadata(&path).is_ok_and(|m| m.trigger.name == name);
+                    if names_it {
                         return path;
                     }
                 }
             }
-            assert!(
-                Instant::now() < deadline,
-                "no clip ending in {suffix:?} appeared in out_dir within {timeout:?}"
-            );
+            if Instant::now() >= deadline {
+                dump_file(&self.log_dir().join("extractor.log"));
+                panic!(
+                    "no clip of the trigger named {name:?} appeared in out_dir within \
+                     {timeout:?}; it holds {:?}",
+                    self.published_clips(),
+                );
+            }
             std::thread::sleep(Duration::from_millis(100));
         }
     }
+
+    /// Every **complete** clip in `out_dir`, by directory name, sorted.
+    ///
+    /// The completion rule an upload pipeline follows: a directory counts only
+    /// once `clip::layout::read_metadata` answers for it, so a cut still running
+    /// and the residue of one that was killed are both absent from this list
+    /// while [`Self::published_clips`] still shows them. The difference between
+    /// the two lists is exactly what "incomplete" means on disk.
+    pub(crate) fn complete_clips(&self) -> Vec<String> {
+        complete_clips_in(&self.out_dir())
+    }
+
+    /// Block until `out_dir` holds at least `count` complete clips, and return
+    /// them. A run's clips appear in completion order and no order is
+    /// guaranteed, so a test that wants several waits on the count rather than
+    /// on any one name.
+    pub(crate) fn wait_for_complete_clips(&self, count: usize, timeout: Duration) -> Vec<String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let clips = self.complete_clips();
+            if clips.len() >= count {
+                return clips;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "only {} of {count} clips were complete in {} within {timeout:?}; \
+                 the directory holds {:?}",
+                clips.len(),
+                self.out_dir().display(),
+                self.published_clips(),
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Every file under `out_dir` as `relative path -> bytes`.
+    ///
+    /// What "not a byte changed" is asserted with: a re-run that skips every
+    /// window, a restart that re-cuts nothing, and a trigger whose id is taken
+    /// all have to leave the clips already on disk exactly as they were, and
+    /// comparing two of these states it over the whole tree rather than over a
+    /// name list.
+    pub(crate) fn out_dir_bytes(&self) -> BTreeMap<PathBuf, Vec<u8>> {
+        dir_bytes(&self.out_dir())
+    }
+
+    /// Spawn `clipper clip <recording> --out-dir <out_dir> <args…>` — the
+    /// cutter mode, against a recording nobody is writing. ROS-free on every
+    /// path, so nothing here needs the ros2 CLI.
+    pub(crate) fn spawn_clip(
+        &self,
+        tag: &str,
+        recording: &Path,
+        out_dir: &Path,
+        args: &[&str],
+    ) -> Proc {
+        let mut cmd = self.command(env!("CARGO_BIN_EXE_clipper"));
+        cmd.arg("clip")
+            .arg(recording)
+            .arg("--out-dir")
+            .arg(out_dir)
+            .args(args);
+        self.spawn(&format!("clip-{tag}"), cmd)
+    }
+
+    /// [`Self::spawn_clip`] run to completion: the exit status is the run's
+    /// verdict and the log is its account of what it did.
+    pub(crate) fn run_clip(
+        &self,
+        tag: &str,
+        recording: &Path,
+        out_dir: &Path,
+        args: &[&str],
+    ) -> ClipRun {
+        ClipRun::of(&mut self.spawn_clip(tag, recording, out_dir, args))
+    }
+
+    /// Publish one `Trigger` `times` times back to back at `rate_hz`, without
+    /// waiting for a receipt between them — the "same trigger twice within
+    /// milliseconds" burst a one-shot publish per message cannot produce (each
+    /// `ros2 topic pub` costs about a second of python startup).
+    ///
+    /// One process publishes every copy, so the copies are identical to the
+    /// byte and land within a publish period of each other. Under
+    /// `--trigger-source ros --time-source publish` — the one cell that anchors
+    /// on the payload's own `trigger_time` — identical copies resolve to
+    /// identical anchors and therefore to one id, which is what makes a burst a
+    /// race between handlers rather than a series of distinct windows.
+    pub(crate) fn fire_trigger_burst(
+        &self,
+        name: &str,
+        trigger_time_ns: u64,
+        preroll_ns: u64,
+        postroll_ns: u64,
+        times: usize,
+        rate_hz: u32,
+    ) {
+        let waiters = self.trigger_waiters();
+        let mut cmd = self.command("ros2");
+        cmd.args([
+            "topic",
+            "pub",
+            "-t",
+            &times.to_string(),
+            "-r",
+            &rate_hz.to_string(),
+            "-w",
+            waiters,
+            TRIGGER_TOPIC,
+            "momentedge_msgs/msg/Trigger",
+            &trigger_yaml(name, trigger_time_ns, preroll_ns, postroll_ns),
+        ]);
+        let mut proc = self.spawn(&format!("trigger-burst-{name}"), cmd);
+        let status = proc.wait_exit(Duration::from_secs(60)).unwrap_or_else(|| {
+            proc.dump_log();
+            panic!("the trigger burst {name} did not complete");
+        });
+        assert!(
+            status.success(),
+            "the trigger burst {name} failed: {status}"
+        );
+        // Every copy reached the recorder: it logs the trigger the moment the
+        // subscription hands it over, so the count settles the delivery of the
+        // whole burst rather than of its first message.
+        let extractor_log = self.log_dir().join("extractor.log");
+        let needle = format!("trigger name=\"{name}\"");
+        assert!(
+            wait_for_file_count(&extractor_log, &needle, times, Duration::from_secs(30)),
+            "the recorder logged fewer than {times} receipts of {name:?}; see {}",
+            extractor_log.display(),
+        );
+    }
+
+    /// Publish one `Trigger` per name **at once**, every copy sharing the given
+    /// `trigger_time`, and block until the recorder has logged receipt of each.
+    ///
+    /// The publishes run as concurrent processes rather than one after another
+    /// because the point is a burst the recorder must hold several handlers open
+    /// for: firing them in series would spend a python CLI startup between each
+    /// and let the earlier windows close before the later ones opened. Distinct
+    /// names give distinct ids at one anchor, so the burst is N clips and not a
+    /// race for one. They are spawned a few tens of milliseconds apart — a
+    /// rounding error against any window this drives, and enough that sixteen
+    /// DDS participants do not all discover each other in the same instant.
+    ///
+    /// **A trigger the recorder did not log is published again.** `-w` makes a
+    /// publisher wait for its subscribers to match, but matching is settled on
+    /// the reader's side too, so a first sample can still be dropped — and under
+    /// a burst this wide that goes from rare to occasional. Re-firing is safe
+    /// rather than merely convenient: the id is a function of the request, so a
+    /// copy that *did* arrive leaves a directory the repeat skips, and a copy
+    /// that did not is the clip this recovers.
+    pub(crate) fn fire_triggers_at_once(
+        &self,
+        names: &[String],
+        trigger_time_ns: u64,
+        preroll_ns: u64,
+        postroll_ns: u64,
+    ) {
+        let waiters = self.trigger_waiters();
+        let extractor_log = self.log_dir().join("extractor.log");
+        let received = |log: &str, name: &str| log.contains(&format!("trigger name=\"{name}\""));
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let mut pending: Vec<&String> = names.iter().collect();
+
+        while !pending.is_empty() {
+            let mut procs: Vec<Proc> = Vec::with_capacity(pending.len());
+            for name in &pending {
+                let mut cmd = self.command("ros2");
+                cmd.args([
+                    "topic",
+                    "pub",
+                    "--once",
+                    "-w",
+                    waiters,
+                    TRIGGER_TOPIC,
+                    "momentedge_msgs/msg/Trigger",
+                    &trigger_yaml(name, trigger_time_ns, preroll_ns, postroll_ns),
+                ]);
+                procs.push(self.spawn(&format!("trigger-{name}"), cmd));
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            for proc in &mut procs {
+                let status = proc.wait_exit(Duration::from_secs(60)).unwrap_or_else(|| {
+                    proc.dump_log();
+                    panic!("a trigger of the burst did not complete");
+                });
+                assert!(status.success(), "a trigger of the burst failed: {status}");
+            }
+
+            // Whichever of them the recorder logged are done with; the rest are
+            // published again.
+            let batch = Instant::now() + Duration::from_secs(20);
+            loop {
+                let log = std::fs::read_to_string(&extractor_log).unwrap_or_default();
+                pending.retain(|name| !received(&log, name));
+                if pending.is_empty() || Instant::now() >= batch {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            if !pending.is_empty() {
+                assert!(
+                    Instant::now() < deadline,
+                    "the recorder never logged receipt of {pending:?}; see {}",
+                    extractor_log.display(),
+                );
+            }
+        }
+    }
+
+    /// How many matched subscriptions a trigger publish waits for: the recorder
+    /// under test always, plus the `ros2 bag record` when it is recording the
+    /// trigger topic too. See [`Self::fire_trigger_stamped`] for why waiting for
+    /// every one of them is what keeps a one-shot publish from being lost.
+    fn trigger_waiters(&self) -> &'static str {
+        if self.records_trigger_topic.load(Ordering::Relaxed) {
+            "2"
+        } else {
+            "1"
+        }
+    }
+
+    /// A `ros2 topic echo` (no `--once`) capturing **every** `Recorded`
+    /// announcement into its log, for a test expecting several — or expecting
+    /// none after one it already saw. Given the same
+    /// [`RECORDED_ECHO_HEAD_START`] its one-shot sibling takes, and sound for
+    /// the same reason: the first announcement it has to catch still follows a
+    /// trigger this test has not fired yet.
+    pub(crate) fn start_recorded_stream(&self, tag: &str) -> Proc {
+        let mut cmd = self.command("ros2");
+        cmd.args([
+            "topic",
+            "echo",
+            "--no-daemon",
+            RECORDED_TOPIC,
+            "momentedge_msgs/msg/Recorded",
+        ]);
+        let proc = self.spawn(&format!("recorded-{tag}"), cmd);
+        std::thread::sleep(RECORDED_ECHO_HEAD_START);
+        proc
+    }
 }
 
-/// The anchor nanoseconds a clip file name encodes: `<anchor_ns>_<name>.mcap`.
-/// The window a clip was cut with is `[anchor - preroll, anchor + postroll]`, so
-/// a test that located the clip by name recovers the anchor to assert its
-/// window.
+/// How long a `ros2 topic echo` on the `Recorded` topic is given to create its
+/// subscription before the test fires the trigger whose announcement it must
+/// catch.
+///
+/// **A fixed wait, because the echo publishes no readiness signal**: it prints
+/// nothing until a message arrives, so there is no line to block on and no
+/// third party to ask — `ros2 topic info` would be another python CLI startup
+/// racing the same discovery. What makes the fixed wait sound here is that it
+/// is not racing the thing it guards. The announcement the echo must catch
+/// follows a trigger the test has not published yet, by at least that trigger's
+/// postroll plus the cut — seconds, where the subscription costs the python
+/// CLI a fraction of one. The margin is an order of magnitude, not a coin
+/// flip, and a wait that did lose would lose *loudly*: the announcement is
+/// awaited by an assertion, so a missed subscription is a red test rather than
+/// a quiet pass.
+const RECORDED_ECHO_HEAD_START: Duration = Duration::from_secs(2);
+
+/// What one `clipper clip` run came to: the exit status is the verdict a caller
+/// branches on, and the log is the account a human reads.
+pub(crate) struct ClipRun {
+    pub status: ExitStatus,
+    pub log: String,
+}
+
+impl ClipRun {
+    /// Wait for a spawned `clipper clip` to finish and take its verdict — so a
+    /// run a test started itself, to watch it while it went, is read back the
+    /// same way one it simply ran is.
+    pub(crate) fn of(proc: &mut Proc) -> Self {
+        let status = proc.wait_exit(Duration::from_secs(120)).unwrap_or_else(|| {
+            proc.dump_log();
+            panic!("clipper clip did not finish");
+        });
+        ClipRun {
+            status,
+            log: proc.log_text(),
+        }
+    }
+
+    /// The run's exit code, or a panic naming the signal that ended it —
+    /// `clipper clip` owns its statuses, so a signal death is a different
+    /// failure and must never pass for one of them.
+    pub(crate) fn code(&self) -> i32 {
+        self.status.code().unwrap_or_else(|| {
+            panic!(
+                "clipper clip was killed rather than exiting: {}",
+                self.status
+            )
+        })
+    }
+}
+
+/// Every entry of a directory, by name, sorted — an empty list where the
+/// directory does not exist, since "clipper wrote nothing here" and "clipper
+/// created nothing here" are the same answer to a caller listing its output.
+pub(crate) fn entry_names(dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Every **complete** clip directly under `dir`, by name, sorted — the list a
+/// consumer that filters on the document sees. See [`TestEnv::complete_clips`].
+pub(crate) fn complete_clips_in(dir: &Path) -> Vec<String> {
+    entry_names(dir)
+        .into_iter()
+        .filter(|name| clip::layout::read_metadata(&dir.join(name)).is_ok())
+        .collect()
+}
+
+/// Every file under `dir`, recursively, as `relative path -> bytes`.
+///
+/// What "not a byte changed" is asserted with: a re-run that skips every
+/// window, a restart that re-cuts nothing, and a trigger whose id is taken all
+/// have to leave the clips already on disk exactly as they were, and comparing
+/// two of these states it over the whole tree rather than over a name list.
+pub(crate) fn dir_bytes(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    fn walk(dir: &Path, base: &Path, into: &mut BTreeMap<PathBuf, Vec<u8>>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, base, into);
+            } else if let Ok(bytes) = std::fs::read(&path) {
+                into.insert(
+                    path.strip_prefix(base).unwrap_or(&path).to_path_buf(),
+                    bytes,
+                );
+            }
+        }
+    }
+    let mut tree = BTreeMap::new();
+    walk(dir, dir, &mut tree);
+    tree
+}
+
+/// The YAML one `momentedge_msgs/Trigger` is published as.
+///
+/// The one place the message's field order and its fixed
+/// [`TRIGGER_DESCRIPTION`] are spelled, so every publish this harness makes
+/// hashes to an id a test can compute the same way.
+fn trigger_yaml(name: &str, trigger_time_ns: u64, preroll_ns: u64, postroll_ns: u64) -> String {
+    let sec = (trigger_time_ns / 1_000_000_000) as i64;
+    let nanosec = trigger_time_ns % 1_000_000_000;
+    format!(
+        "{{name: {name}, description: {TRIGGER_DESCRIPTION}, \
+         trigger_time: {{sec: {sec}, nanosec: {nanosec}}}, \
+         preroll: {preroll_ns}, postroll: {postroll_ns}}}"
+    )
+}
+
+/// Poll `path` until it contains `needle` at least `count` times, or `timeout`
+/// elapses — [`wait_for_file_contains`] for a line a burst repeats.
+fn wait_for_file_count(path: &Path, needle: &str, count: usize, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .matches(needle)
+            .count()
+            >= count
+        {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The directory name the clip of this trigger will have, computed the way
+/// clipper computes it (`clip::ClipId`).
+///
+/// A live run's anchor is normally clipper's own clock, which no test can know
+/// in advance — but `--trigger-source ros --time-source publish` anchors on the
+/// trigger's own `trigger_time`, and `clipper clip --trigger-source param` on
+/// `--trigger-time`, so on those two paths the whole id is a function of values
+/// the test chose. That is what lets a test claim an id before the run does, or
+/// name the directory it expects the run to leave behind.
+pub(crate) fn clip_id_of(
+    name: &str,
+    anchor_ns: u64,
+    preroll_ns: u64,
+    postroll_ns: u64,
+    time_source: clip::TimeSource,
+    mode: &'static str,
+) -> String {
+    let trigger = clip::Trigger {
+        name: name.to_string(),
+        description: TRIGGER_DESCRIPTION.to_string(),
+        trigger_time: clip::Stamp {
+            sec: (anchor_ns / 1_000_000_000) as i32,
+            nanosec: (anchor_ns % 1_000_000_000) as u32,
+        },
+        preroll: preroll_ns,
+        postroll: postroll_ns,
+    };
+    let producer = clip::Producer {
+        program: "clipper",
+        mode,
+    };
+    clip::ClipId::of(&clip::CutRequest::new(
+        producer,
+        trigger,
+        anchor_ns,
+        time_source,
+    ))
+    .to_string()
+}
+
+/// Make `path` read-only (`r-x`) or writable again (`rwx`) for its owner — the
+/// output-directory write fault, injected the way an operator's own mistake
+/// would arrive.
+///
+/// Only meaningful for a process that is not root: the kernel does not consult
+/// these bits for uid 0. [`assert_permissions_bite`] is the precondition that
+/// says so out loud rather than letting the scenario pass vacuously.
+pub(crate) fn set_writable(path: &Path, writable: bool) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let mode = if writable { 0o700 } else { 0o500 };
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .unwrap_or_else(|e| panic!("setting the mode of {} to {mode:o}: {e}", path.display()));
+}
+
+/// Fail unless a read-only directory actually refuses a write.
+///
+/// A permission-injection scenario run as root proves nothing: `mkdir` inside an
+/// `r-x` directory simply succeeds and the fault under test never happens. The
+/// suite runs as an ordinary user everywhere it is supposed to run (CI's
+/// `recorder` job is a plain GitHub runner), so this is a loud failure rather
+/// than a skip — a run where it does not hold is misconfigured, and a
+/// misconfigured "enabled" run must fail rather than quietly pass. The known way
+/// to reach it is `act`, which runs the workflow in a container as root.
+pub(crate) fn assert_permissions_bite() {
+    let probe = tempfile::Builder::new()
+        .prefix("clipper-e2e-perm-")
+        .tempdir()
+        .expect("creating the permission probe dir");
+    set_writable(probe.path(), false);
+    let refused = std::fs::create_dir(probe.path().join("probe")).is_err();
+    set_writable(probe.path(), true);
+    assert!(
+        refused,
+        "a read-only directory did not refuse a mkdir — this suite must run as an \
+         ordinary user, and uid 0 bypasses the permission bits this scenario \
+         injects its fault with"
+    );
+}
+
+/// Whether `name` is the directory name of a clip anchored at `anchor`: that
+/// clip's id — the anchor, an underscore, and the digest's sixteen lower-case
+/// hex characters in four groups of four.
+///
+/// The shape is what the tests assert, never the digest: the id's own contract
+/// is pinned by `clip::id`'s published vector, and an e2e run's anchor is
+/// clipper's own clock, so its hash is not a value a test can know in advance.
+pub(crate) fn is_clip_name(name: &str, anchor: u64) -> bool {
+    name.strip_prefix(&format!("{anchor}_"))
+        .is_some_and(is_clip_hash)
+}
+
+/// Whether `name` has the shape of a clip's id at all: decimal anchor
+/// nanoseconds, an underscore, and the digest's four hex groups.
+///
+/// The anchor-free half of [`is_clip_name`], for the places where the shape is
+/// the claim and the anchor is not known — above all
+/// [`TestEnv::assert_out_dir_holds_only_clips`], which has to reject an entry
+/// that is a directory but is not a clip.
+pub(crate) fn is_clip_id(name: &str) -> bool {
+    match name.split_once('_') {
+        Some((anchor, hash)) => {
+            !anchor.is_empty() && anchor.bytes().all(|b| b.is_ascii_digit()) && is_clip_hash(hash)
+        }
+        None => false,
+    }
+}
+
+/// The digest half of an id: sixteen lower-case hex characters in four groups
+/// of four.
+fn is_clip_hash(hash: &str) -> bool {
+    let groups: Vec<&str> = hash.split('-').collect();
+    groups.len() == 4
+        && groups.iter().all(|group| {
+            group.len() == 4
+                && group
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        })
+}
+
+/// The anchor nanoseconds a clip directory's name opens with: a clip is named by
+/// its id, `<anchor_ns>_<hash>`, and the anchor leads it. The window a clip was
+/// cut with is `[anchor - preroll, anchor + postroll]`, so a test that located
+/// the clip recovers the anchor from its name to assert its window.
 pub(crate) fn anchor_from_clip(path: &Path) -> u64 {
     path.file_name()
         .and_then(|n| n.to_str())
@@ -844,8 +1434,8 @@ pub(crate) fn anchor_from_clip(path: &Path) -> u64 {
         .unwrap_or_else(|| panic!("clip name has no leading anchor: {}", path.display()))
 }
 
-/// The inclusive `[start, end]` window a cut announced, read back from its first
-/// segment's `<anchor>_<name>.mcap` name. Under `--trigger-source ros --time-source
+/// The inclusive `[start, end]` window a cut announced, read back from the
+/// `<anchor_ns>_<hash>` name of the clip directory it named. Under `--trigger-source ros --time-source
 /// log` the anchor is clipper's own subscription instant — not the test's
 /// pre-publish `now()`, which the `ros2 topic pub` startup precedes by around a
 /// second — so window assertions recover the anchor from the announced clip
@@ -885,7 +1475,6 @@ pub(crate) fn write_time_source_recording(
     preroll_ns: u64,
     postroll_ns: u64,
 ) {
-    use std::collections::BTreeMap;
     use std::io::BufWriter;
 
     let file = File::create(path).expect("creating synthetic recording");
@@ -937,6 +1526,49 @@ pub(crate) fn write_time_source_recording(
         )
         .expect("writing trigger message");
     writer.finish().expect("finishing synthetic recording");
+}
+
+/// Write a finished, chunked MCAP holding one message on `topic` per
+/// `log_times` entry (with `publish_time` equal to it).
+///
+/// A recording with stamps a test chose outright, for the one shape a real
+/// `ros2 bag record` cannot be made to produce: a *middle* recording of a
+/// collection whose extent spans a window while none of its messages fall
+/// inside it. A recorder's splits partition time, so a window overlapping the
+/// split before and the split after necessarily contains everything between —
+/// see [`write_time_source_recording`] for the suite's other synthetic
+/// recording and the same reasoning.
+pub(crate) fn write_plain_recording(path: &Path, topic: &str, log_times: &[u64]) {
+    use std::io::BufWriter;
+
+    let file = File::create(path).unwrap_or_else(|e| panic!("creating {}: {e}", path.display()));
+    // Chunked and summarised, with a message index per chunk: that is the shape
+    // `clip::whole` plans a window from, and an unchunked recording — the shape
+    // the *live* tail reads — is refused by name.
+    let mut writer = mcap::WriteOptions::new()
+        .compression(None)
+        .create(BufWriter::new(file))
+        .expect("opening mcap writer");
+    let schema = writer
+        .add_schema("std_msgs/msg/String", "ros2msg", b"string data")
+        .expect("adding schema");
+    let channel = writer
+        .add_channel(schema, topic, "cdr", &BTreeMap::new())
+        .expect("adding channel");
+    for (seq, log_time) in log_times.iter().enumerate() {
+        writer
+            .write_to_known_channel(
+                &mcap::records::MessageHeader {
+                    channel_id: channel,
+                    sequence: seq as u32,
+                    log_time: *log_time,
+                    publish_time: *log_time,
+                },
+                b"payload",
+            )
+            .expect("writing message");
+    }
+    writer.finish().expect("finishing the recording");
 }
 
 /// A child process in its own process group, killed group-wide on drop.
@@ -1157,6 +1789,92 @@ pub(crate) fn try_wait_for_recorded(listener: &mut Proc, timeout: Duration) -> O
     parse_recorded(&listener.log_text())
 }
 
+/// Every announcement a [`TestEnv::start_recorded_stream`] listener has echoed
+/// so far, in arrival order. `ros2 topic echo` terminates each message with a
+/// `---` line, so the log splits into one chunk per complete announcement and a
+/// trailing partial one is simply not yet a message.
+pub(crate) fn recorded_so_far(listener: &Proc) -> Vec<Recorded> {
+    let log = listener.log_text();
+    let mut announcements = Vec::new();
+    let mut chunk = String::new();
+    for line in log.lines() {
+        if line.trim_end() == "---" {
+            if let Some(recorded) = parse_recorded(&chunk) {
+                announcements.push(recorded);
+            }
+            chunk.clear();
+        } else {
+            chunk.push_str(line);
+            chunk.push('\n');
+        }
+    }
+    announcements
+}
+
+/// Block until a [`TestEnv::start_recorded_stream`] listener has echoed `count`
+/// announcements, and return them.
+pub(crate) fn wait_for_recorded_count(
+    listener: &mut Proc,
+    count: usize,
+    timeout: Duration,
+) -> Vec<Recorded> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let announcements = recorded_so_far(listener);
+        if announcements.len() >= count {
+            return announcements;
+        }
+        if Instant::now() >= deadline {
+            listener.dump_log();
+            panic!(
+                "only {} of {count} Recorded announcements arrived within {timeout:?}",
+                announcements.len()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The `log_time` of every trigger record a finished recording carries,
+/// ascending.
+///
+/// The anchors a `--trigger-source mcap` run resolves — that source windows on
+/// the record's own stamp — so this is how many clips such a run will cut, and
+/// on which instants, read from the recording rather than guessed from when the
+/// harness published.
+pub(crate) fn recorded_trigger_anchors(path: &Path) -> Vec<u64> {
+    let buf =
+        std::fs::read(path).unwrap_or_else(|e| panic!("reading recording {}: {e}", path.display()));
+    let mut anchors: Vec<u64> = mcap::MessageStream::new(&buf)
+        .unwrap_or_else(|e| panic!("{} is not a complete MCAP: {e}", path.display()))
+        .map(|msg| msg.expect("recording message parses"))
+        .filter(|msg| msg.channel.topic == TRIGGER_TOPIC)
+        .map(|msg| msg.log_time)
+        .collect();
+    anchors.sort_unstable();
+    anchors
+}
+
+/// The names of every `Metadata` record an MCAP file carries, read off its
+/// summary's metadata index.
+///
+/// What a clip's file is allowed to say about itself: exactly one record, under
+/// `clip::manifest::MANIFEST_NAME`. Reading the *names* rather than the one
+/// record's body is what lets a test assert there is nothing else in there —
+/// the rosbag2 metadata a recording carries must not be copied through.
+pub(crate) fn metadata_record_names(path: &Path) -> Vec<String> {
+    let buf =
+        std::fs::read(path).unwrap_or_else(|e| panic!("reading clip file {}: {e}", path.display()));
+    let summary = mcap::Summary::read(&buf)
+        .unwrap_or_else(|e| panic!("reading the summary of {}: {e}", path.display()))
+        .unwrap_or_else(|| panic!("{} carries no summary", path.display()));
+    summary
+        .metadata_indexes
+        .iter()
+        .map(|index| index.name.clone())
+        .collect()
+}
+
 /// Read a finished clip back as `(topic, log_time)` pairs. `MessageStream`
 /// insists on a complete summary/footer/magic, so this doubles as the
 /// completeness check on every announced file.
@@ -1179,10 +1897,28 @@ pub(crate) fn read_clip(path: &Path) -> Vec<(String, u64)> {
         .collect()
 }
 
-/// Whether any message in the clip carries `needle` in its serialized payload.
-/// The cut copies message bytes through without decoding them, so a run of
-/// bytes overwritten in the recording reappears here verbatim — which is how a
-/// test proves a damaged record was copied rather than skipped.
+/// The MCAP files of a complete clip directory, in the order its document names
+/// them — which is also their `_0`, `_1`, … order.
+pub(crate) fn clip_files(dir: &Path) -> Vec<PathBuf> {
+    clip::layout::read_metadata(dir)
+        .unwrap_or_else(|e| panic!("reading the document of {}: {e}", dir.display()))
+        .sources
+        .iter()
+        .map(|source| dir.join(&source.file))
+        .collect()
+}
+
+/// A whole clip read back as its `(topic, log_time)` pairs: every file of the
+/// directory, concatenated in file order. A window straddling a rollover is one
+/// clip in several files, so what it holds is their union.
+pub(crate) fn read_clip_dir(dir: &Path) -> Vec<(String, u64)> {
+    clip_files(dir).iter().flat_map(|f| read_clip(f)).collect()
+}
+
+/// Whether any message in one file of a clip carries `needle` in its serialized
+/// payload. The cut copies message bytes through without decoding them, so a run
+/// of bytes overwritten in the recording reappears here verbatim — which is how
+/// a test proves a damaged record was copied rather than skipped.
 pub(crate) fn clip_holds_payload(path: &Path, needle: &[u8]) -> bool {
     let buf = std::fs::read(path)
         .unwrap_or_else(|e| panic!("reading announced clip {}: {e}", path.display()));
@@ -1199,6 +1935,16 @@ pub(crate) fn clip_holds_payload(path: &Path, needle: &[u8]) -> bool {
             });
             msg.data.windows(needle.len()).any(|w| w == needle)
         })
+}
+
+/// A whole clip read back as its `(topic, log_time, publish_time)` triples:
+/// every file of the directory, concatenated in file order — the two-stamp form
+/// of [`read_clip_dir`].
+pub(crate) fn read_clip_dir_stamps(dir: &Path) -> Vec<(String, u64, u64)> {
+    clip_files(dir)
+        .iter()
+        .flat_map(|f| read_clip_stamps(f))
+        .collect()
 }
 
 /// Read a finished clip back as `(topic, log_time, publish_time)` triples — the
@@ -1232,63 +1978,79 @@ pub(crate) fn read_clip_stamps(path: &Path) -> Vec<(String, u64, u64)> {
 /// inside its own window and is copied into the clip; `None` if it is not there
 /// (or the payload lacks the fields). Lets a window assertion tether to the
 /// Producer's real bounds instead of a hardcoded copy.
-pub(crate) fn clip_trigger_window(path: &Path) -> Option<(u64, u64)> {
-    let buf =
-        std::fs::read(path).unwrap_or_else(|e| panic!("reading clip {}: {e}", path.display()));
-    for msg in mcap::MessageStream::new(&buf).expect("clip is a complete MCAP") {
-        let msg = msg.expect("clip message parses");
-        if msg.channel.topic == TRIGGER_TOPIC {
-            let payload: serde_json::Value = serde_json::from_slice(&msg.data).ok()?;
-            let preroll = payload.get("preroll")?.as_u64()?;
-            let postroll = payload.get("postroll")?.as_u64()?;
-            return Some((preroll, postroll));
+///
+/// A clip is a directory of one file per contributing recording, and which of
+/// them the trigger record landed in depends on where the window fell, so every
+/// file is searched.
+pub(crate) fn clip_trigger_window(dir: &Path) -> Option<(u64, u64)> {
+    for file in clip_files(dir) {
+        let buf = std::fs::read(&file)
+            .unwrap_or_else(|e| panic!("reading clip file {}: {e}", file.display()));
+        for msg in mcap::MessageStream::new(&buf).expect("clip file is a complete MCAP") {
+            let msg = msg.expect("clip message parses");
+            if msg.channel.topic == TRIGGER_TOPIC {
+                let payload: serde_json::Value = serde_json::from_slice(&msg.data).ok()?;
+                let preroll = payload.get("preroll")?.as_u64()?;
+                let postroll = payload.get("postroll")?.as_u64()?;
+                return Some((preroll, postroll));
+            }
         }
     }
     None
 }
 
-/// Every message in the clip lies inside the inclusive trigger window.
-/// Assert the announced clip carries its manifest and that the manifest agrees
+/// Assert the announced clip carries its document, and that the document agrees
 /// with the clip's own name and contents.
 ///
-/// The unit tests pin the record's keys; what only a live run can show is that
-/// the deployed binary stamps clips with the subcommand it was actually invoked
-/// as, and that the window the record states is the window the announced
-/// filename's anchor implies. Both interfaces go through the same cut, so
-/// calling this from a `ros` test and an `mcap` test covers every clip the
-/// recorder writes.
-pub(crate) fn assert_clip_manifest(path: &Path, preroll_ns: u64, postroll_ns: u64) {
-    let manifest = clip::manifest::read_manifest(path)
-        .unwrap_or_else(|e| panic!("reading the manifest of {}: {e}", path.display()))
-        .unwrap_or_else(|| panic!("clip {} carries no manifest", path.display()));
+/// The unit tests pin the document's fields; what only a live run can show is
+/// that the deployed binary stamps clips with the subcommand it was actually
+/// invoked as — `mode`, `tail` or `clip` — and that the window the document
+/// states is the window the announced directory's anchor implies. Both
+/// interfaces and both subcommands go through the same cut, so calling this from
+/// a `ros` test, an `mcap` test and a `clipper clip` test covers every clip
+/// clipper writes.
+pub(crate) fn assert_clip_metadata(dir: &Path, mode: &str, preroll_ns: u64, postroll_ns: u64) {
+    let metadata = clip::layout::read_metadata(dir)
+        .unwrap_or_else(|e| panic!("reading the document of {}: {e}", dir.display()));
+    assert_eq!(metadata.version, clip::manifest::METADATA_VERSION);
+    assert_eq!(metadata.producer.name, "clipper");
     assert_eq!(
-        manifest["manifest.version"],
-        clip::manifest::MANIFEST_VERSION
+        metadata.producer.mode, mode,
+        "the document names the subcommand the binary ran"
     );
-    assert_eq!(manifest["producer.name"], "clipper");
+    let anchor = anchor_from_clip(dir);
+    assert_eq!(metadata.trigger.anchor_ns, anchor);
     assert_eq!(
-        manifest["producer.mode"], "tail",
-        "the record names the subcommand the binary ran"
+        metadata.clip.id,
+        dir.file_name()
+            .expect("a clip directory has a name")
+            .to_string_lossy(),
+        "the clip's directory is named by the id its document states"
     );
-    let anchor = anchor_from_clip(path);
-    assert_eq!(manifest["trigger.anchor_ns"], anchor.to_string());
-    assert_eq!(manifest["trigger.preroll_ns"], preroll_ns.to_string());
-    assert_eq!(manifest["trigger.postroll_ns"], postroll_ns.to_string());
+    assert_eq!(metadata.trigger.preroll_ns, preroll_ns);
+    assert_eq!(metadata.trigger.postroll_ns, postroll_ns);
+    assert_eq!(metadata.window.start_ns, anchor.saturating_sub(preroll_ns));
+    assert_eq!(metadata.window.end_ns, anchor.saturating_add(postroll_ns));
     assert_eq!(
-        manifest["window.start_ns"],
-        anchor.saturating_sub(preroll_ns).to_string()
+        metadata.clip.messages as usize,
+        read_clip_dir(dir).len(),
+        "the document counts the messages the clip actually holds"
     );
-    assert_eq!(
-        manifest["window.end_ns"],
-        anchor.saturating_add(postroll_ns).to_string()
-    );
-    assert_eq!(
-        manifest["clip.messages"],
-        read_clip(path).len().to_string(),
-        "the record counts the messages the clip actually holds"
-    );
+    for (n, source) in metadata.sources.iter().enumerate() {
+        assert_eq!(
+            source.file,
+            format!("{}_{n}.mcap", metadata.clip.id),
+            "every file of a clip is <id>_N.mcap, numbered from 0"
+        );
+        assert!(
+            dir.join(&source.file).is_file(),
+            "the document names a file that is there: {}",
+            source.file
+        );
+    }
 }
 
+/// Every message in the clip lies inside the inclusive trigger window.
 pub(crate) fn assert_clip_within_window(msgs: &[(String, u64)], start_ns: u64, end_ns: u64) {
     for (topic, log_time) in msgs {
         assert!(
@@ -1359,6 +2121,23 @@ pub(crate) fn message_records(path: &Path) -> Vec<(RecordSpan, u64)> {
             (span, log_time)
         })
         .collect()
+}
+
+/// Every message's `log_time` in a **finished** recording, ascending.
+///
+/// The counterpart of [`partial_recording_stamps`] for a recording that has
+/// been closed: the walk there is over top-level records, which a chunked
+/// recording keeps its messages out of — and chunked is the only shape
+/// `clipper clip` takes, since an unchunked recording carries no message index
+/// to plan a window from. So a growing recording is read with that one and a
+/// stopped one with this.
+pub(crate) fn finished_recording_stamps(path: &Path) -> Vec<u64> {
+    let mut stamps: Vec<u64> = read_clip(path)
+        .into_iter()
+        .map(|(_, log_time)| log_time)
+        .collect();
+    stamps.sort_unstable();
+    stamps
 }
 
 /// The `log_time` of every complete top-level `Message` record of a possibly

@@ -3,10 +3,16 @@
 //!
 //! [`handle_trigger`] knows nothing of ROS or wire encodings. It takes a neutral
 //! [`Trigger`], waits out the postroll and the tail's coverage, hands the window
-//! to [`clip::segment::cut_window`] — which stages one clip segment per source
-//! recording and publishes them — and reports the result through an [`Announce`]
-//! its caller supplies: a ROS `Recorded` publish, or nothing at all when the
-//! clip's arrival in the output directory is the signal.
+//! to [`clip::segment::cut_window`] — which claims the clip's directory, copies
+//! one file per source recording into it and completes it — and reports the
+//! result through an [`Announce`] its caller supplies: a ROS `Recorded` publish,
+//! or nothing at all when the clip directory's own metadata file is the signal.
+//!
+//! **A window whose clip is already there is skipped**, and that is not an
+//! error: a second trigger for one window, or a restart meeting its own earlier
+//! clips, writes nothing and announces nothing. The cut says which happened
+//! ([`clip::segment::CutOutcome`]), so this cannot announce a clip it did not
+//! cut.
 //!
 //! **The two waits are the whole of what this module is.** Everything past them
 //! — planning the window, staging, dropping empty segments, publishing — is
@@ -32,7 +38,7 @@ use clip::TimeSource;
 use clip::cut::FramingDesync;
 use clip::index::EXTENT_CAP_BYTES;
 use clip::manifest::{CutRequest, Producer, WindowCoverage};
-use clip::segment::{self, StageJob};
+use clip::segment::{self, CutOutcome, StageJob};
 use clip::trigger::{Announce, Completion, Trigger, now_ns};
 use crossbeam_channel::Sender;
 use log::{error, info, warn};
@@ -40,14 +46,14 @@ use log::{error, info, warn};
 use crate::faults::CutFaults;
 use crate::tailer::Tailer;
 
-/// Run one trigger's wait-then-stage-then-announce flow. A window that stays in
-/// one recording yields one clip; one that straddles a rollover yields one
-/// segment per source file (`<base>_NN.mcap`). The single [`Completion`]
-/// announces every segment in `filenames`.
+/// Run one trigger's wait-then-cut-then-announce flow. The clip is one directory
+/// under `out_dir` holding one `<id>_N.mcap` per contributing source recording;
+/// the single [`Completion`] names that directory in `filenames`. A window whose
+/// directory is already there is skipped, and announces nothing.
 ///
 /// Generic over the [`Announce`] the active interface supplies: the ROS
-/// interface publishes a `Recorded`, the MCAP interface does nothing (the clip's
-/// atomic move into `out_dir` is the signal). The handler is otherwise identical
+/// interface publishes a `Recorded`, the MCAP interface does nothing (the clip
+/// directory's metadata file is the signal). The handler is otherwise identical
 /// either way — it knows only the neutral [`Trigger`]/[`Completion`] contract.
 ///
 /// `out_dir`, `grace`, and `time_source` are the only configuration this half
@@ -56,10 +62,10 @@ use crate::tailer::Tailer;
 /// the interface × time-source anchor matrix (the ROS interface from the
 /// subscription instant under `log` or `trigger_time` under `publish`, the MCAP
 /// interface from the trigger record's own stamp on the active `time_source`);
-/// the same instant names the output clip. `time_source` is the clock domain the window lives in — it
+/// the same instant leads the clip's id, which names its directory. `time_source` is the clock domain the window lives in — it
 /// selects which extents are read, which messages fall inside, and which
 /// coverage the wait blocks on. `producer` is the binary and mode each clip's
-/// manifest names as having cut it; the driver supplies it because only the
+/// document names as having cut it; the driver supplies it because only the
 /// binary knows which of its subcommands is running. `faults` is the
 /// recorder-wide tally of clips refused because a recording's bytes changed
 /// under the tail, shared by every handler so `report_refusal` announces that
@@ -92,7 +98,7 @@ pub fn handle_trigger<A: Announce>(
 ) -> anyhow::Result<()> {
     // The request is the window: `CutRequest` derives the bounds from the
     // trigger, so the window logged here, the window every message is tested
-    // against, and the window each segment's manifest states are one value.
+    // against, and the window the clip's document states are one value.
     let request = Arc::new(CutRequest::new(
         producer,
         trig.clone(),
@@ -108,29 +114,29 @@ pub fn handle_trigger<A: Announce>(
         trig.postroll
     );
 
-    let base_out_path = out_dir.join(format!(
-        "{anchor_ns}_{}.mcap",
-        segment::sanitize(&trig.name)
-    ));
-    let segments = record_clip(&tailer, &request, &base_out_path, grace, &extract_tx)
+    let outcome = record_clip(&tailer, &request, out_dir, grace, &extract_tx)
         .map_err(|e| report_refusal(&faults, e))?;
+    // A skipped window wrote nothing, so there is nothing to announce: the
+    // warning the cut already logged, naming the directory, is its whole trace.
+    let CutOutcome::Cut(clip) = outcome else {
+        return Ok(());
+    };
 
-    clip::cut::report_clips(&segments);
-    let filenames: Vec<String> = segments
-        .iter()
-        .map(|stats| stats.out_path.to_string_lossy().into_owned())
-        .collect();
-    if segments.len() > 1 {
+    clip::cut::report_clips(&clip.files);
+    if clip.files.len() > 1 {
         info!(
-            "trigger name={:?} spanned a rollover into {} segments: {filenames:?}",
+            "trigger name={:?} spanned a rollover into {} files in {}",
             trig.name,
-            segments.len(),
+            clip.files.len(),
+            clip.dir.display(),
         );
     }
 
+    // One entry: the clip is the directory, so a subscriber opens one handle per
+    // clip rather than learning how its files are named.
     announce.announce(&Completion {
         name: trig.name,
-        filenames,
+        filenames: vec![clip.dir.to_string_lossy().into_owned()],
         description: trig.description,
         trigger_time: trig.trigger_time,
         preroll: trig.preroll,
@@ -190,25 +196,26 @@ fn report_refusal(faults: &CutFaults, err: anyhow::Error) -> anyhow::Error {
 
 /// The live half of one trigger's cut: wait out the postroll wall floor, wait
 /// for the tail's collection-wide coverage to reach the window end (bounded by
-/// `grace`), then hand the window to [`clip::segment::cut_window`].
+/// `grace`), then hand the window and `out_dir` to
+/// [`clip::segment::cut_window`], which decides where the clip under it goes.
 ///
 /// The two waits are the only reason this function exists. A window may reach
 /// past the last byte on disk, and cutting one before the data lands would
 /// silently truncate the clip; everything after the waits is the same shared
 /// code a consumer cutting from a finished recording runs, and it does not wait
-/// at all. Every returned [`clip::cut::ClipStats`] names a durable file, so the
-/// caller may announce them all.
+/// at all. A returned [`clip::segment::Clip`] is complete on disk — its metadata
+/// file written and its directory fsynced — so the caller may announce it.
 ///
 /// The coverage wait's verdict is not just a log line: it is the one thing a
 /// finished clip cannot show from its own contents, so it travels into the cut
-/// as a [`WindowCoverage`] and every segment's manifest reports it.
+/// as a [`WindowCoverage`] and the clip's document reports it.
 fn record_clip(
     tailer: &Arc<Tailer>,
     request: &Arc<CutRequest>,
-    base_out_path: &Path,
+    out_dir: &Path,
     grace: Duration,
     extract_tx: &Sender<StageJob>,
-) -> anyhow::Result<Vec<clip::cut::ClipStats>> {
+) -> anyhow::Result<CutOutcome> {
     // The watch the tailer itself feeds, so the wait cannot be pointed at a
     // different collection's coverage than the plan is taken from.
     let coverage = tailer.coverage();
@@ -239,22 +246,12 @@ fn record_clip(
         WindowCoverage::Short
     };
 
-    // The data is as complete as it is going to get: plan, stage a segment per
-    // source recording, drop the empties and publish. The tailer is the window
-    // planner — it serves plans out of its live collection, each pinning its own
-    // recording's `Arc<File>` so a prune or rollover after this cannot pull the
-    // bytes out from under the copy.
-    segment::cut_window(
-        tailer.as_ref(),
-        request,
-        covered,
-        base_out_path,
-        // A colliding name on a vehicle is a second trigger, and its clip is
-        // data no re-run can produce again: it is published beside the first,
-        // never dropped.
-        segment::Publication::Suffix,
-        extract_tx,
-    )
+    // The data is as complete as it is going to get: claim the clip's directory,
+    // plan, copy one file per source recording, drop the empties and complete
+    // it. The tailer is the window planner — it serves plans out of its live
+    // collection, each pinning its own recording's `Arc<File>` so a prune or
+    // rollover after this cannot pull the bytes out from under the copy.
+    segment::cut_window(tailer.as_ref(), request, covered, out_dir, extract_tx)
 }
 
 #[cfg(test)]
@@ -265,6 +262,7 @@ mod tests {
         clippy::indexing_slicing,
         clippy::assert_is_empty,
         clippy::too_many_arguments,
+        clippy::too_many_lines,
         reason = "a failed unwrap or a panicking index is a failing test, and \
                   `assert!(x.is_empty())` names the claim better than the \
                   empty-array `assert_eq!` the lint asks for, \
@@ -273,9 +271,12 @@ mod tests {
                   construction — splitting one would scatter the case it states"
     )]
 
+    use std::path::PathBuf;
+
     use clip::ChannelSelection;
     use clip::index::op;
-    use clip::manifest::read_manifest;
+    use clip::layout::read_metadata;
+    use clip::segment::Clip;
     use clip::testing::{
         TEST_PRODUCER, channel_body, desync_record_framing, message_body_pub, raw_record,
         read_clip, test_dir, window_request, write_raw, write_recording,
@@ -296,6 +297,26 @@ mod tests {
     /// recorder uses by default.
     const TEST_COMPRESSION: Option<mcap::Compression> = Some(mcap::Compression::Zstd);
 
+    /// The clip a cut wrote, or a failure naming what it did instead. A test
+    /// about the waits cuts into an output directory of its own, so a skip means
+    /// the test set itself up wrong.
+    fn cut(outcome: CutOutcome) -> Clip {
+        match outcome {
+            CutOutcome::Cut(clip) => clip,
+            CutOutcome::Skipped(dir) => panic!("expected a clip, got a skip of {}", dir.display()),
+        }
+    }
+
+    /// The directory a cut skipped, or a failure naming what it did instead.
+    fn skipped(outcome: CutOutcome) -> PathBuf {
+        match outcome {
+            CutOutcome::Skipped(dir) => dir,
+            CutOutcome::Cut(clip) => {
+                panic!("expected a skip, got the clip {}", clip.dir.display())
+            }
+        }
+    }
+
     #[test]
     fn record_clip_grace_timeout_cuts_what_is_on_disk() -> anyhow::Result<()> {
         let root = test_dir("grace")?;
@@ -307,32 +328,35 @@ mod tests {
         // sleep), but coverage never reaches it — no recording was ever
         // discovered. The grace timeout must fire and cut a valid empty clip
         // instead of hanging or erroring.
-        let stats = record_clip(
+        let stats = cut(record_clip(
             &tailer,
             &window((0, 1_000), TimeSource::Log),
-            &root.join("clip.mcap"),
+            &root,
             Duration::from_millis(50),
             &extract_tx,
-        )?;
+        )?);
 
-        assert_eq!(stats.len(), 1, "no recording yields a single empty segment");
-        assert_eq!(stats[0].messages_copied, 0);
-        assert!(read_clip(&stats[0].out_path)?.is_empty());
+        assert_eq!(
+            stats.files.len(),
+            1,
+            "no recording yields a single empty file"
+        );
+        assert_eq!(stats.files[0].messages_copied, 0);
+        assert!(read_clip(&stats.files[0].out_path)?.is_empty());
 
         std::fs::remove_dir_all(root)?;
         Ok(())
     }
 
-    /// A second trigger naming the same instant and name as one already cut
-    /// publishes beside the first rather than being refused.
+    /// A second trigger for a window already cut is skipped, and the clip that
+    /// is there is left exactly as it was.
     ///
-    /// On a vehicle a colliding clip name is a *second* trigger, and its clip is
-    /// data no re-run can produce again, so the live path takes the `_<n>`
-    /// sibling. Cutting the same window out of a recording nobody is writing is
-    /// replayable and refuses instead; the two policies are
-    /// [`clip::segment::Publication`], and this pins the one the recorder picks.
+    /// A repeated trigger is the ordinary case on a vehicle — a detector that
+    /// fires twice on one event resolves to one window and one id — and a clip
+    /// is written once. The directory's existence is the whole rule: the second
+    /// cut's `mkdir` loses, so it never plans, never copies and never announces.
     #[test]
-    fn record_clip_publishes_a_duplicate_trigger_beside_the_first() -> anyhow::Result<()> {
+    fn record_clip_skips_a_trigger_whose_clip_is_already_there() -> anyhow::Result<()> {
         let root = test_dir("dup-trigger")?;
         let rec = root.join("rec.mcap");
         write_recording(&rec, false, &[("/t", 100), ("/t", 900)])?;
@@ -344,22 +368,39 @@ mod tests {
 
         let extract_tx =
             segment::spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
-        let base = root.join("clip.mcap");
-        let cut = || {
+        let out_dir = root.join("out");
+        let record = || {
             record_clip(
                 &tailer,
                 &window((100, 900), TimeSource::Log),
-                &base,
+                &out_dir,
                 Duration::from_secs(10),
                 &extract_tx,
             )
         };
 
-        assert_eq!(cut()?[0].out_path, base, "the first trigger takes the name");
+        let first = cut(record()?);
         assert_eq!(
-            cut()?[0].out_path,
-            root.join("clip_1.mcap"),
-            "the second trigger's clip lands beside the first, never dropped"
+            first.dir.parent(),
+            Some(out_dir.as_path()),
+            "the cut puts the clip's directory under the output directory it was given"
+        );
+        let before = std::fs::read(&first.files[0].out_path)?;
+
+        assert_eq!(
+            skipped(record()?),
+            first.dir,
+            "the second trigger for the same window writes nothing"
+        );
+        assert_eq!(
+            std::fs::read_dir(&out_dir)?.count(),
+            1,
+            "and the output directory still holds exactly the one clip"
+        );
+        assert_eq!(
+            std::fs::read(&first.files[0].out_path)?,
+            before,
+            "not a byte of which changed"
         );
 
         std::fs::remove_dir_all(root)?;
@@ -386,18 +427,18 @@ mod tests {
 
         let extract_tx =
             segment::spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
-        let stats = record_clip(
+        let stats = cut(record_clip(
             &tailer,
             &window((100, 1_000), TimeSource::Log),
-            &root.join("clip.mcap"),
+            &root,
             Duration::from_secs(10),
             &extract_tx,
-        )?;
+        )?);
 
-        assert_eq!(stats.len(), 1);
-        assert_eq!(stats[0].messages_copied, 2);
+        assert_eq!(stats.files.len(), 1);
+        assert_eq!(stats.files[0].messages_copied, 2);
         assert_eq!(
-            read_clip(&stats[0].out_path)?,
+            read_clip(&stats.files[0].out_path)?,
             vec![("/t".to_string(), 100), ("/t".to_string(), 900)]
         );
 
@@ -423,20 +464,23 @@ mod tests {
             segment::spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
         let end_ns = now + 150_000_000; // 150 ms past the trigger stamp
         let started = std::time::Instant::now();
-        let stats = record_clip(
+        let stats = cut(record_clip(
             &tailer,
             &window((now.saturating_sub(1_000_000_000), end_ns), TimeSource::Log),
-            &root.join("clip.mcap"),
+            &root,
             Duration::from_secs(10),
             &extract_tx,
-        )?;
+        )?);
 
         assert!(
             started.elapsed() >= Duration::from_millis(50),
             "the cut must wait for the wall clock to pass the window end"
         );
-        assert_eq!(stats.len(), 1);
-        assert_eq!(stats[0].messages_copied, 1, "the future message is outside");
+        assert_eq!(stats.files.len(), 1);
+        assert_eq!(
+            stats.files[0].messages_copied, 1,
+            "the future message is outside"
+        );
 
         std::fs::remove_dir_all(root)?;
         Ok(())
@@ -461,13 +505,13 @@ mod tests {
             segment::spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
         let grace = Duration::from_millis(200);
         let started = std::time::Instant::now();
-        let stats = record_clip(
+        let stats = cut(record_clip(
             &tailer,
             &window((50, 1_000_000), TimeSource::Log),
-            &root.join("clip.mcap"),
+            &root,
             grace,
             &extract_tx,
-        )?;
+        )?);
 
         assert!(
             started.elapsed() >= grace,
@@ -477,8 +521,8 @@ mod tests {
             started.elapsed() < Duration::from_secs(5),
             "the grace is the bound — it does not hang"
         );
-        assert_eq!(stats.len(), 1);
-        assert_eq!(stats[0].messages_copied, 2);
+        assert_eq!(stats.files.len(), 1);
+        assert_eq!(stats.files[0].messages_copied, 2);
 
         std::fs::remove_dir_all(root)?;
         Ok(())
@@ -502,21 +546,21 @@ mod tests {
         let extract_tx =
             segment::spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
         let started = std::time::Instant::now();
-        let stats = record_clip(
+        let stats = cut(record_clip(
             &tailer,
             &window((0, 1_000), TimeSource::Log),
-            &root.join("clip.mcap"),
+            &root,
             Duration::from_secs(30),
             &extract_tx,
-        )?;
+        )?);
 
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "high_water == end satisfies the wait (>=, not >)"
         );
-        assert_eq!(stats.len(), 1);
+        assert_eq!(stats.files.len(), 1);
         assert_eq!(
-            stats[0].messages_copied, 2,
+            stats.files[0].messages_copied, 2,
             "the boundary message is inside"
         );
 
@@ -524,20 +568,104 @@ mod tests {
         Ok(())
     }
 
+    /// One announcement as a subscriber saw it: the [`Completion`] itself, and
+    /// whether the clip it named was already complete — its metadata file on
+    /// disk — at the instant `announce` was called.
+    ///
+    /// The second field is why the announcer captures rather than the test
+    /// asserting afterwards. "A completion goes out only after the metadata file
+    /// is durable" is an *ordering* claim, and by the time `handle_trigger` has
+    /// returned the file is there whichever order the two happened in — so an
+    /// assertion made then holds equally for a handler that announced first, and
+    /// proves nothing.
+    #[derive(Clone, Debug)]
+    struct Announced {
+        completion: Completion,
+        complete_on_arrival: bool,
+    }
+
     /// A capturing [`Announce`] that records every completion it is handed, so a
-    /// test can assert what `handle_trigger` announced.
+    /// test can assert what `handle_trigger` announced — and when.
     #[derive(Clone)]
-    struct CapturingAnnouncer(Arc<std::sync::Mutex<Vec<Completion>>>);
-    impl Announce for CapturingAnnouncer {
-        fn announce(&self, completion: &Completion) {
-            self.0.lock().unwrap().push(completion.clone());
+    struct CapturingAnnouncer(Arc<std::sync::Mutex<Vec<Announced>>>);
+
+    impl CapturingAnnouncer {
+        fn new() -> Self {
+            CapturingAnnouncer(Arc::new(std::sync::Mutex::new(Vec::new())))
+        }
+
+        /// Everything it has been handed, in the order it arrived.
+        fn announced(&self) -> Vec<Announced> {
+            self.0.lock().unwrap().clone()
         }
     }
 
-    /// End to end through the public handler entry point: `handle_trigger` turns a
-    /// neutral [`Trigger`] into a clip on disk and announces one [`Completion`]
-    /// naming it. Exercises the whole flow the interfaces share — window math,
-    /// staging, naming, and the announce hand-off — independent of ROS/encoding.
+    impl Announce for CapturingAnnouncer {
+        fn announce(&self, completion: &Completion) {
+            // Read the clip's directory the way a subscriber would: out of the
+            // announcement's one `filenames` entry.
+            let complete_on_arrival = completion
+                .filenames
+                .first()
+                .is_some_and(|dir| clip::layout::metadata_path(Path::new(dir)).is_file());
+            self.0.lock().unwrap().push(Announced {
+                completion: completion.clone(),
+                complete_on_arrival,
+            });
+        }
+    }
+
+    /// The trigger a window `[start_ns, end_ns]` is cut for, through the public
+    /// entry point, returning what the handler made of it. The same `name` and
+    /// window twice is the same trigger twice — one `CutRequest`, one id, and so
+    /// the second call is the skip path.
+    fn fire(
+        tailer: &Arc<Tailer>,
+        extract_tx: &Sender<StageJob>,
+        faults: &Arc<CutFaults>,
+        out_dir: &Path,
+        announce: &CapturingAnnouncer,
+        name: &str,
+        (start_ns, end_ns): (u64, u64),
+    ) -> anyhow::Result<()> {
+        let half = (end_ns - start_ns) / 2;
+        let anchor_ns = start_ns + half;
+        handle_trigger(
+            Trigger {
+                name: name.to_string(),
+                description: String::new(),
+                trigger_time: clip::trigger::Stamp { sec: 0, nanosec: 0 },
+                preroll: half,
+                postroll: half,
+            },
+            anchor_ns,
+            out_dir,
+            Duration::from_millis(100),
+            tailer.clone(),
+            extract_tx.clone(),
+            faults.clone(),
+            announce.clone(),
+            TimeSource::Log,
+            TEST_PRODUCER,
+        )
+    }
+
+    /// End to end through the public handler entry point: `handle_trigger` turns
+    /// a neutral [`Trigger`] into a clip on disk and announces one
+    /// [`Completion`] naming it. Exercises the whole flow the interfaces share —
+    /// window math, the claim, the copy, naming, and the announce hand-off —
+    /// independent of ROS/encoding.
+    ///
+    /// Three things about that announcement, which together are what a
+    /// subscriber may rely on:
+    ///
+    /// - it names the clip's **directory**, one entry however many files the
+    ///   clip took, so a subscriber opens one handle per clip and never learns
+    ///   the naming scheme inside it;
+    /// - the clip is **already complete when it arrives** — its metadata file is
+    ///   on disk, checked inside `announce` rather than after the fact, so a
+    ///   handler that announced ahead of the document would fail here;
+    /// - and the directory it names holds exactly the in-window messages.
     #[test]
     fn handle_trigger_cuts_a_clip_and_announces_it() -> anyhow::Result<()> {
         let root = test_dir("handle-trigger")?;
@@ -547,7 +675,6 @@ mod tests {
         // already satisfied and the cut does not wait out the grace.
         write_recording(&rec, false, &[("/t", 100), ("/t", 900), ("/t", 2_000)])?;
 
-        clip::cut::reset_capturing_dir(&out_dir)?;
         let (tailer, _) = Tailer::new();
         let file = Arc::new(std::fs::File::open(&rec)?);
         tailer.attach(file.clone());
@@ -555,8 +682,7 @@ mod tests {
         let extract_tx =
             segment::spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
 
-        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let announcer = CapturingAnnouncer(captured.clone());
+        let announcer = CapturingAnnouncer::new();
 
         let trig = Trigger {
             name: "evt".to_string(),
@@ -579,23 +705,33 @@ mod tests {
             tailer,
             extract_tx,
             Arc::new(CutFaults::new()),
-            announcer,
+            announcer.clone(),
             TimeSource::Log,
             TEST_PRODUCER,
         )?;
 
-        let done = captured.lock().unwrap();
+        let done = announcer.announced();
         assert_eq!(done.len(), 1, "exactly one completion is announced");
-        assert_eq!(done[0].name, "evt");
+        assert_eq!(done[0].completion.name, "evt");
         assert_eq!(
-            done[0].filenames.len(),
+            done[0].completion.filenames.len(),
             1,
-            "one segment — window in one file"
+            "one entry: the clip is its directory"
         );
-        let clip_path = std::path::Path::new(&done[0].filenames[0]);
-        assert!(clip_path.is_file(), "the announced clip exists on disk");
+        assert!(
+            done[0].complete_on_arrival,
+            "the clip's metadata file is already on disk when the completion goes out"
+        );
+        let clip_dir = PathBuf::from(&done[0].completion.filenames[0]);
+        assert!(clip_dir.is_dir(), "the announced clip exists on disk");
+        let metadata = read_metadata(&clip_dir)?;
         assert_eq!(
-            read_clip(clip_path)?,
+            metadata.sources.len(),
+            1,
+            "one file — the window fell inside one recording"
+        );
+        assert_eq!(
+            read_clip(&clip_dir.join(&metadata.sources[0].file))?,
             vec![("/t".to_string(), 100), ("/t".to_string(), 900)],
             "the clip holds exactly the in-window messages"
         );
@@ -604,14 +740,15 @@ mod tests {
         Ok(())
     }
 
-    /// `handle_trigger` with a window spanning two source recordings logs the
-    /// rollover info line (lines 144-149) and announces a `Completion` carrying
-    /// both segment filenames. Models the same two-file setup as
-    /// `record_clip_recovers_across_a_rollover_into_two_segments` but drives
-    /// the full `handle_trigger` entry point so the per-segment `info!` loop
-    /// and the `segments.len() > 1` branch are both exercised.
+    /// `handle_trigger` over a window spanning two source recordings announces
+    /// the one directory, and the two files are inside it.
+    ///
+    /// The announcement is one entry whatever the window straddled — that is the
+    /// point of the clip being a directory — so what a subscriber has to handle
+    /// does not change with the recorder's split schedule. The clip's document
+    /// is where the two files are enumerated.
     #[test]
-    fn handle_trigger_announces_two_segments_across_a_rollover() -> anyhow::Result<()> {
+    fn handle_trigger_announces_one_directory_across_a_rollover() -> anyhow::Result<()> {
         let root = test_dir("ht-rollover")?;
         let out_dir = root.join("out");
         let split0 = root.join("rec_0.mcap");
@@ -621,7 +758,6 @@ mod tests {
         write_recording(&split0, false, &[("/t", 1_000), ("/t", 2_000)])?;
         write_recording(&split1, false, &[("/t", 5_000), ("/t", 6_000)])?;
 
-        clip::cut::reset_capturing_dir(&out_dir)?;
         let (tailer, _) = Tailer::new();
         tailer.index_recording(&split0);
         tailer.index_recording(&split1);
@@ -629,8 +765,7 @@ mod tests {
 
         let extract_tx =
             segment::spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
-        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let announcer = CapturingAnnouncer(captured.clone());
+        let announcer = CapturingAnnouncer::new();
 
         // trigger_time = 3_500 ns, preroll = 2_000 ns, postroll = 2_000 ns
         // → window [1_500, 5_500]
@@ -654,28 +789,99 @@ mod tests {
             tailer,
             extract_tx,
             Arc::new(CutFaults::new()),
-            announcer,
+            announcer.clone(),
             TimeSource::Log,
             TEST_PRODUCER,
         )?;
 
-        let done = captured.lock().unwrap();
+        let done = announcer.announced();
         assert_eq!(done.len(), 1, "one completion per trigger");
-        assert_eq!(done[0].name, "rollover");
+        assert_eq!(done[0].completion.name, "rollover");
         assert_eq!(
-            done[0].filenames.len(),
-            2,
-            "a rollover window must announce two segments"
+            done[0].completion.filenames.len(),
+            1,
+            "a rollover window still announces one clip: its directory"
         );
-        // Both announced paths must exist on disk and be valid clips.
-        for name in &done[0].filenames {
-            let p = std::path::Path::new(name);
-            assert!(p.is_file(), "announced segment {name} must be on disk");
+        assert!(
+            done[0].complete_on_arrival,
+            "and it is complete on arrival however many files it took"
+        );
+        let clip_dir = PathBuf::from(&done[0].completion.filenames[0]);
+        let metadata = read_metadata(&clip_dir)?;
+        assert_eq!(
+            metadata.sources.len(),
+            2,
+            "and the document enumerates the two files it took"
+        );
+        for source in &metadata.sources {
+            let file = clip_dir.join(&source.file);
+            assert!(file.is_file(), "{} must be on disk", file.display());
             assert!(
-                !read_clip(p)?.is_empty(),
-                "each segment must hold at least one message"
+                !read_clip(&file)?.is_empty(),
+                "each file must hold at least one message"
             );
         }
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// **A skipped window announces nothing.** The same trigger twice resolves to
+    /// one window, one id and one clip, and the second pass through
+    /// `handle_trigger` writes nothing and tells nobody: nothing was recorded, so
+    /// there is no completion to make, and the warning the cut logged naming the
+    /// directory is the skip's whole trace.
+    ///
+    /// Its sibling `record_clip_skips_a_trigger_whose_clip_is_already_there` is
+    /// the same case one layer down, where the [`CutOutcome`] names the skip and
+    /// the bytes already on disk are shown to be untouched. This is the half only
+    /// the public entry point can see — what a subscriber is told — and the one
+    /// that would break if the announcement moved out from under the `Cut` arm.
+    #[test]
+    fn handle_trigger_announces_nothing_for_a_window_already_cut() -> anyhow::Result<()> {
+        let root = test_dir("ht-skip")?;
+        let out_dir = root.join("out");
+        let rec = root.join("rec.mcap");
+        write_recording(&rec, false, &[("/t", 100), ("/t", 900)])?;
+
+        let (tailer, _) = Tailer::new();
+        let file = Arc::new(std::fs::File::open(&rec)?);
+        tailer.attach(file.clone());
+        scan_to_end(&tailer, &file, 8)?;
+        let extract_tx =
+            segment::spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
+        let faults = Arc::new(CutFaults::new());
+        let announcer = CapturingAnnouncer::new();
+
+        for _ in 0..2 {
+            fire(
+                &tailer,
+                &extract_tx,
+                &faults,
+                &out_dir,
+                &announcer,
+                "evt",
+                (100, 900),
+            )?;
+        }
+
+        let done = announcer.announced();
+        assert_eq!(
+            done.len(),
+            1,
+            "the repeated trigger is answered with silence, not a second completion"
+        );
+        assert!(done[0].complete_on_arrival);
+        assert_eq!(
+            PathBuf::from(&done[0].completion.filenames[0]).parent(),
+            Some(out_dir.as_path()),
+            "and the one completion names the clip under the output directory"
+        );
+        assert_eq!(
+            std::fs::read_dir(&out_dir)?.count(),
+            1,
+            "which is the only thing in it"
+        );
 
         std::fs::remove_dir_all(root)?;
         Ok(())
@@ -715,17 +921,17 @@ mod tests {
         // satisfies the coverage wait, and only the message published at 1_000
         // (log_time 100) falls inside — the log high-water (200) is nowhere near
         // 1_500, so a log-domain wait would have timed out on the grace instead.
-        let stats = record_clip(
+        let stats = cut(record_clip(
             &tailer,
             &window((900, 1_500), TimeSource::Publish),
-            &root.join("clip.mcap"),
+            &root,
             Duration::from_secs(10),
             &extract_tx,
-        )?;
-        assert_eq!(stats.len(), 1);
-        assert_eq!(stats[0].messages_copied, 1);
+        )?);
+        assert_eq!(stats.files.len(), 1);
+        assert_eq!(stats.files[0].messages_copied, 1);
         assert_eq!(
-            read_clip(&stats[0].out_path)?,
+            read_clip(&stats.files[0].out_path)?,
             vec![("/t".to_string(), 100)],
             "the publish window holds the message published at 1_000"
         );
@@ -737,11 +943,11 @@ mod tests {
     /// The coverage wait's verdict reaches the clip: a window the recording
     /// never reached is marked short, and one it did reach is not.
     ///
-    /// This is the manifest's one caller-supplied fact, and the only one a clip
+    /// This is the document's one caller-supplied fact, and the only one a clip
     /// cannot show from its own contents — both clips here end at the last
     /// message on disk and look identical. The two arms run against the same
     /// recording and differ only in the window, so nothing but the wait's
-    /// outcome can be what moves the key.
+    /// outcome can be what moves the field.
     #[test]
     fn the_coverage_wait_marks_the_clip_short_or_not() -> anyhow::Result<()> {
         let root = test_dir("short")?;
@@ -754,35 +960,33 @@ mod tests {
         scan_to_end(&tailer, &file, 8)?;
         let extract_tx =
             segment::spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
-        let short_key = |stats: &clip::cut::ClipStats| -> anyhow::Result<String> {
-            Ok(read_manifest(&stats.out_path)?.expect("every clip carries a manifest")["clip.short"]
-                .clone())
-        };
+        let is_short =
+            |clip: &Clip| -> anyhow::Result<bool> { Ok(read_metadata(&clip.dir)?.clip.short) };
 
         // The window ends at 200, exactly the recording's high-water: the wait
         // releases and the clip is complete.
-        let covered = record_clip(
+        let covered = cut(record_clip(
             &tailer,
             &window((0, 200), TimeSource::Log),
-            &root.join("covered.mcap"),
+            &root.join("covered"),
             Duration::from_secs(10),
             &extract_tx,
-        )?;
-        assert_eq!(covered[0].messages_copied, 2);
-        assert_eq!(short_key(&covered[0])?, "false");
+        )?);
+        assert_eq!(covered.files[0].messages_copied, 2);
+        assert!(!is_short(&covered)?);
 
         // The same recording, a window ending past everything it holds: the wait
         // burns its (short) grace and the clip is cut anyway, holding the same
-        // two messages — the manifest is the only thing that says so.
-        let short = record_clip(
+        // two messages — the document is the only thing that says so.
+        let short = cut(record_clip(
             &tailer,
             &window((0, 1_000_000), TimeSource::Log),
-            &root.join("short.mcap"),
+            &root.join("short"),
             Duration::from_millis(100),
             &extract_tx,
-        )?;
-        assert_eq!(short[0].messages_copied, 2);
-        assert_eq!(short_key(&short[0])?, "true");
+        )?);
+        assert_eq!(short.files[0].messages_copied, 2);
+        assert!(is_short(&short)?);
 
         std::fs::remove_dir_all(root)?;
         Ok(())
@@ -816,38 +1020,6 @@ mod tests {
     const OVER_DAMAGE: (u64, u64) = (900, 3_100);
     const CLEAN_WINDOW: (u64, u64) = (50, 250);
 
-    /// The trigger a window `[start_ns, end_ns]` is cut for, through the public
-    /// entry point, returning what the handler made of it.
-    fn fire(
-        tailer: &Arc<Tailer>,
-        extract_tx: &Sender<StageJob>,
-        faults: &Arc<CutFaults>,
-        out_dir: &Path,
-        name: &str,
-        (start_ns, end_ns): (u64, u64),
-    ) -> anyhow::Result<()> {
-        let half = (end_ns - start_ns) / 2;
-        let anchor_ns = start_ns + half;
-        handle_trigger(
-            Trigger {
-                name: name.to_string(),
-                description: String::new(),
-                trigger_time: clip::trigger::Stamp { sec: 0, nanosec: 0 },
-                preroll: half,
-                postroll: half,
-            },
-            anchor_ns,
-            out_dir,
-            Duration::from_millis(100),
-            tailer.clone(),
-            extract_tx.clone(),
-            faults.clone(),
-            CapturingAnnouncer(Arc::new(std::sync::Mutex::new(Vec::new()))),
-            TimeSource::Log,
-            TEST_PRODUCER,
-        )
-    }
-
     /// The escalation contract, driven through the handler over real damaged
     /// bytes: the first clip a recording's desync costs says so as clip **1**,
     /// and the cost of every later one is a number that climbs.
@@ -859,7 +1031,6 @@ mod tests {
     fn a_recordings_refusals_are_counted_and_the_count_climbs() -> anyhow::Result<()> {
         let root = test_dir("refusal-count")?;
         let out_dir = root.join("out");
-        clip::cut::reset_capturing_dir(&out_dir)?;
         let tailer = damaged_recording(
             &root,
             &[("rec.mcap", &[("/t", 100), ("/t", 200), ("/t", 300)])],
@@ -868,6 +1039,7 @@ mod tests {
         let extract_tx =
             segment::spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
         let faults = Arc::new(CutFaults::new());
+        let announcer = CapturingAnnouncer::new();
 
         for expected in 1..=3u64 {
             let err = fire(
@@ -875,6 +1047,7 @@ mod tests {
                 &extract_tx,
                 &faults,
                 &out_dir,
+                &announcer,
                 "over-damage",
                 (0, 400),
             )
@@ -889,9 +1062,14 @@ mod tests {
                 "the refusal still names the fault itself: {text}"
             );
         }
+        assert_eq!(
+            std::fs::read_dir(&out_dir)?.count(),
+            0,
+            "a refused cut leaves nothing behind: its clip directory goes with it"
+        );
         assert!(
-            std::fs::read_dir(&out_dir)?.count() <= 1,
-            "a refused cut publishes nothing but the capturing dir"
+            announcer.announced().is_empty(),
+            "and nothing is announced: a completion names a clip, and there is none"
         );
 
         std::fs::remove_dir_all(root)?;
@@ -912,7 +1090,6 @@ mod tests {
     fn a_successful_cut_does_not_reset_the_tally() -> anyhow::Result<()> {
         let root = test_dir("refusal-no-reset")?;
         let out_dir = root.join("out");
-        clip::cut::reset_capturing_dir(&out_dir)?;
         // Two recordings: one clean, one damaged, disjoint in time so each
         // window plans exactly one of them.
         let tailer = damaged_recording(
@@ -929,11 +1106,13 @@ mod tests {
         let extract_tx =
             segment::spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
         let faults = Arc::new(CutFaults::new());
+        let announcer = CapturingAnnouncer::new();
         let err = fire(
             &tailer,
             &extract_tx,
             &faults,
             &out_dir,
+            &announcer,
             "first",
             OVER_DAMAGE,
         )
@@ -945,6 +1124,7 @@ mod tests {
             &extract_tx,
             &faults,
             &out_dir,
+            &announcer,
             "between",
             CLEAN_WINDOW,
         )
@@ -955,6 +1135,7 @@ mod tests {
             &extract_tx,
             &faults,
             &out_dir,
+            &announcer,
             "second",
             OVER_DAMAGE,
         )
@@ -1014,7 +1195,6 @@ mod tests {
         let rec = root.join("rec.mcap");
         write_recording(&rec, false, &[("/t", 100), ("/t", 900), ("/t", 2_000)])?;
 
-        clip::cut::reset_capturing_dir(&out_dir)?;
         let (tailer, _) = Tailer::new();
         let file = Arc::new(std::fs::File::open(&rec)?);
         tailer.attach(file.clone());
@@ -1022,7 +1202,7 @@ mod tests {
         let extract_tx =
             segment::spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
 
-        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let announcer = CapturingAnnouncer::new();
         let trig = Trigger {
             name: "evt".to_string(),
             description: "why this clip exists".to_string(),
@@ -1042,28 +1222,29 @@ mod tests {
             tailer,
             extract_tx,
             Arc::new(CutFaults::new()),
-            CapturingAnnouncer(captured.clone()),
+            announcer.clone(),
             TimeSource::Log,
             TEST_PRODUCER,
         )?;
 
-        let done = captured.lock().unwrap();
-        let clip_path = std::path::Path::new(&done[0].filenames[0]);
-        let manifest = read_manifest(clip_path)?.expect("the clip carries a manifest");
-        assert_eq!(manifest["producer.name"], TEST_PRODUCER.program);
-        assert_eq!(manifest["producer.mode"], TEST_PRODUCER.mode);
-        assert_eq!(manifest["trigger.name"], "evt");
-        assert_eq!(manifest["trigger.description"], "why this clip exists");
-        assert_eq!(manifest["trigger.anchor_ns"], "500");
-        assert_eq!(manifest["trigger.preroll_ns"], "500");
-        assert_eq!(manifest["trigger.postroll_ns"], "500");
+        let done = announcer.announced();
+        let clip_dir = PathBuf::from(&done[0].completion.filenames[0]);
+        let metadata = read_metadata(&clip_dir)?;
+        assert_eq!(metadata.producer.name, TEST_PRODUCER.program);
+        assert_eq!(metadata.producer.mode, TEST_PRODUCER.mode);
+        assert_eq!(metadata.trigger.name, "evt");
+        assert_eq!(metadata.trigger.description, "why this clip exists");
+        assert_eq!(metadata.trigger.anchor_ns, 500);
+        assert_eq!(metadata.trigger.preroll_ns, 500);
+        assert_eq!(metadata.trigger.postroll_ns, 500);
         // The window the handler resolved from that trigger, and the messages it
         // actually took: [500 - 500, 500 + 500].
-        assert_eq!(manifest["window.start_ns"], "0");
-        assert_eq!(manifest["window.end_ns"], "1000");
-        assert_eq!(manifest["clip.messages"], "2");
+        assert_eq!(metadata.window.start_ns, 0);
+        assert_eq!(metadata.window.end_ns, 1_000);
+        assert_eq!(metadata.clip.messages, 2);
+        assert_eq!(metadata.sources.len(), 1);
         assert_eq!(
-            read_clip(clip_path)?,
+            read_clip(&clip_dir.join(&metadata.sources[0].file))?,
             vec![("/t".to_string(), 100), ("/t".to_string(), 900)]
         );
 

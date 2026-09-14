@@ -22,19 +22,23 @@ clipper clip ./record/rosbag2_0.mcap \
 clipper clip ./record --out-dir ./clipped --trigger-source mcap
 ```
 
-Each clip lands at `<out-dir>/<anchor-ns>_<trigger-name>.mcap` and is the same
-file the recorder would have written from the same recording and window — the
-window plan, the byte copy, the [manifest](clip-manifest.md) and the atomic
-publication are all the shared path. The five `--trigger-*` arguments are the
-fields of a `momentedge_msgs/Trigger`, so the clip states the same trigger a clip
-cut from a live topic does; only `producer.mode` differs, reading `clip` rather
-than `tail`.
+Each clip lands at `<out-dir>/<clip-id>/` and is the same clip the recorder would
+have written from the same recording and window — the window plan, the byte copy,
+the [layout and its document](clip-manifest.md) are all the shared path. The
+five `--trigger-*` arguments are the fields of a `momentedge_msgs/Trigger`, so
+the clip states the same trigger a clip cut from a live topic does; only
+`producer.mode` differs, reading `clip` rather than `tail`.
 
-Five things follow from the input being finished:
+`--out-dir` is created with parents when missing, never required to be empty, and
+never cleared: the only thing a run ever adds to its root is a clip directory. A
+run clipper accepted creates it whether or not it has a window to put in it, so
+the directory is there afterwards even when the recording carried no trigger.
+
+Six things follow from the input being finished:
 
 - **Nothing waits.** No postroll sleep, no wait for coverage. A window reaching
-  past the end of the recording is simply short, and the clip's `clip.short` key
-  says so.
+  past the end of the recording is simply short, and the clip's `clip.short`
+  field says so.
 - **There is no clock-domain flag.** A recording's summary states its message
   times on `log_time` alone, so that is the clock the window lives on. Passing
   `--time-source` is a parse error.
@@ -46,21 +50,28 @@ Five things follow from the input being finished:
   else.
 - **A recording it cannot index is refused by name**, from that same footer and
   summary, before anything is written — see below.
-- **A clip that is already there is refused too.** The same recording and the
-  same trigger describe the same window, so a re-run would write the clip that is
-  already in `--out-dir`. It names that clip and exits 1 instead — see
-  [below](#when-a-clip-is-already-there).
+- **A clip that is already there is skipped.** The same recording and the same
+  trigger describe the same window, so a window whose clip directory is already
+  in `--out-dir` has already been cut. It is left alone with a warning and the
+  run goes on — see [below](#when-a-clip-is-already-there).
+- **A window that fails stops the run**, with exit 1 and the clips published
+  before it left where they are. The recorder cannot stop — it has to be there
+  for the next trigger — but a run over a recording with an end can, and a fault
+  the disk or the input will raise again is worth reporting before it repeats
+  once per remaining trigger — see [below](#when-a-window-fails).
 
 ## A bag directory is one collection
 
 A recorder that ran for hours left a directory of splits, and `<recording>` takes
 that directory as readily as it takes one file. The splits are read as one
-time-ordered collection, so a window straddling a split is cut whole: it yields
-one segment per *contributing* recording, named `<anchor-ns>_<name>_00.mcap`,
-`_01.mcap` and so on — the same set the recorder writes when a window straddles a
-rollover. A segment's number is its position among the segments that hold data,
-so a window over three splits whose middle recording contributes nothing yields
-`_00` and `_01`, where `_01` holds the third recording's data.
+time-ordered collection, so a window straddling a split is cut whole: its
+directory holds one file per *contributing* recording, named `<id>_0.mcap`,
+`<id>_1.mcap` and so on, where `<id>` is the clip's
+[id](clip-manifest.md#the-clip-id) — the same shape the recorder writes when a
+window straddles a rollover. A file's number is its position among the files that
+hold data, so a window over three splits whose middle recording contributes
+nothing yields `_0` and `_1`, where `_1` holds the third recording's data and the
+clip's `clip_metadata.yaml` records `files_planned: 3`.
 
 The order is the recorder's own where it stated one:
 
@@ -83,8 +94,8 @@ a directory copied mid-recording is the usual offender.
 
 Not every `.mcap` carries a summary worth planning a window from. `clipper clip`
 decides that from the footer and the summary alone, names the fault, exits 1,
-and writes nothing at all — no output directory, no staged file. Over a
-bag directory the message names the split that failed, not the directory.
+and writes nothing at all — not even the output directory. Over a bag directory
+the message names the split that failed, not the directory.
 
 | The message says | The recording is |
 |---|---|
@@ -118,38 +129,78 @@ field the last refusal above reads, and a repaired recording has it non-zero.
 ## When a clip is already there
 
 A finished recording and a trigger describe one window and one copy of its bytes,
-so running the same cut twice would write the clip that is already in
-`--out-dir`. The second run names that clip, exits 1, and writes nothing —
-no clip, no suffixed sibling, nothing left in the staging directory:
+so a window whose clip directory is already in `--out-dir` has already been cut.
+The run says so and moves on:
 
 ```console
 $ clipper clip ./record/rosbag2_0.mcap --out-dir ./clipped \
     --trigger-time 1738000000000000000 --preroll 5000000000 --postroll 5000000000
-Error: ./clipped/1738000000000000000_clip.mcap already exists: this window has been
-cut into this output directory before, and cutting it again writes a second copy of
-the same clip rather than new data. Move or delete it, or cut into a different
-output directory, to cut this window again
+WARN  clip::segment > clip ./clipped/1738000000000000000_5761-7fa4-ab83-75dc is
+already there; skipping this window. A clip is written once: an id that is taken means
+this window has been cut, or a cut of it died leaving the directory behind. Remove it
+to cut the window again
+$ echo $?
+0
 ```
 
-The check is one read of the output directory, made before the window is planned,
-so a window that would have been written as several segments (`_00`, `_01`, …) is
-refused whole rather than half-written. It asks whether the clip's own name **or any
-`_NN` segment beside it** is taken, because how many segments a window becomes is
-settled only while it is being cut — so a clip already there under either shape
-refuses the run. There is no flag to override it: to cut the window again, move
-or delete the clip, or point `--out-dir` somewhere else.
+The clip on disk is not touched — not a byte of it, and not its
+`clip_metadata.yaml`. The check is the directory's own existence, tested before
+the window is planned, so a skipped window reads nothing and copies nothing.
 
-This is where `clipper clip` and `clipper tail` differ on purpose. On the vehicle
-a clip name that is already taken means a *second* trigger asked for the same
-instant and name, and that clip is data no re-run can produce again, so the
-recorder publishes it beside the first as `<name>_1.mcap`. A cut from a finished
-recording is replayable, so the same name means the same bytes, and a second file
-would be a duplicate.
+**That is what makes a re-run a resume.** A run over a recording with many
+embedded triggers that was interrupted half way is finished by running it again:
+the clips already there are skipped, the rest are cut, and the run exits 0. A run
+that finds every clip already there exits 0 having written nothing, so a pipeline
+that re-runs one for safety pays nothing and breaks nothing. Two `clipper clip`
+jobs pointed at one output directory are harmless to each other for the same
+reason — whichever creates a clip's directory first cuts it, and the other skips
+it.
+
+**A directory left by a cut that died is skipped too**, and deliberately. Such a
+directory has no `clip_metadata.yaml` — it is incomplete, and no consumer reads
+it as a clip — but clipper does not repair or overwrite it, because it is the
+only evidence that something went wrong. To cut that window again, remove the
+directory.
+
+## When a window fails
+
+A run cuts its windows in order and stops at the first one that fails, with exit
+1. Three things are true of what it leaves behind:
+
+- **The clips published before it stay.** A clip is complete the moment its
+  `clip_metadata.yaml` is there, and nothing later in the run can unmake one.
+- **The window that failed leaves nothing.** Its directory goes with the error,
+  so a directory without a `clip_metadata.yaml` in `--out-dir` is the residue of
+  a process that *died* and never the leavings of a cut that merely erred. Where
+  even the removal fails, the message names the directory to remove by hand.
+- **The windows after it are not attempted.** A window fails because of the disk
+  or the input, and both outlive the window that met them, so carrying on would
+  raise one fault once per remaining trigger and bury the first report under the
+  rest.
+
+Fix the cause and run it again: the clips already there are skipped, so the
+re-run pays only for the windows that are still missing.
+
+A run that got through every window it had closes with the count it did them in,
+which is also how a re-run reports that it found everything already cut:
+
+```console
+$ clipper clip ./record --out-dir ./clipped --trigger-source mcap
+...
+INFO  clipper > 0 clip(s) cut, 7 skipped as already there in ./clipped
+$ echo $?
+0
+```
+
+The statuses a run ends with are [clipper's own](operating.md): **0** for a run
+that cut every window it had, skips included; **1** for a window that failed or a
+recording [refused](#when-a-recording-is-refused); **2** for a command line or a
+configuration file clipper cannot use; and **101** for a clipper bug.
 
 Nothing machine-readable is printed. The result is the output directory's
-contents when the process exits, each clip carrying its own manifest, and the
-exit status is the verdict. No ROS is involved, so the ROS-free build cuts these
-clips as well as the device build does.
+contents when the process exits, each clip a directory carrying its own
+`clip_metadata.yaml`, and the exit status is the verdict. No ROS is involved, so
+the ROS-free build cuts these clips as well as the device build does.
 
 ## Where a `clip` run's triggers come from: `param` and `mcap`
 
@@ -176,14 +227,15 @@ reads out of the recording it is still following, with the same decoder: `json`
 decodes in every build, `cdr` needs the `ros` cargo feature. That is what one key
 across both subcommands buys — the trigger stream that cut clips on the vehicle
 cuts the same clips from the bag afterwards. A trigger this run cannot use — an
-undecodable payload, or a name that cannot be embedded in a clip pathname — costs
-that trigger its clip and no more; the run logs it and cuts the rest.
+undecodable payload, or a name past the 128-byte bound — costs that trigger its
+clip and no more; the run logs it and cuts the rest.
 
 Both ways of stating the trigger wrongly are refused while the command line is
 being read, with the flag at fault named and nothing written: `param` without one
 of the three flags it needs, and `mcap` alongside any `--trigger-*` flag. A
 recording holding no trigger at all, read under `mcap`, cuts nothing and says so
-— a normal, zero-status run that leaves the output directory untouched.
+— a normal, zero-status run, after which `--out-dir` is there and empty like any
+other run's.
 
 **`ros` is not offered here.** It is a live subscription on a ROS node, and a
 recording nobody is writing has no live topic to carry a trigger and nothing

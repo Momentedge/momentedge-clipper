@@ -29,7 +29,7 @@ overload. For the flags behind any of it, see
 - **Retention is the recorder's job.** The continuous recording grows until you
   stop or split it; clipper never prunes the file it is tailing. See
   [`examples/split-bags`](../examples/split-bags/README.md) for bounding the
-  recording, and prune `./clipped` on your own schedule.
+  recording; the output side is [`--out-dir`'s](#what---out-dir-holds).
 - **Concurrency cap.** Up to 16 triggers are handled at once; a trigger arriving
   while all 16 slots are busy is rejected with a logged error and produces no
   clip and no `Recorded` announcement. Automation waiting on the announcement
@@ -43,6 +43,86 @@ overload. For the flags behind any of it, see
   Damage *ahead* of the scan is the other case, and there clipper exits 1 for
   the supervisor rather than limping on.
 
+## What `--out-dir` holds
+
+A run's whole result is this directory, and its contents are one rule: **every
+entry in it is a clip directory, and a clip directory is complete when it holds
+`clip_metadata.yaml`.** The fields of that document, and the id the directory is
+named by, are [What a clip carries](clip-manifest.md).
+
+```
+/data/clipped/
+  1726300000000000000_fc43-6475-ade8-4730/    a complete clip
+    1726300000000000000_fc43-6475-ade8-4730_0.mcap
+    clip_metadata.yaml
+  1726300180000000000_08b1-9d2a-44ff-c017/    incomplete: a cut running, or residue
+    1726300180000000000_08b1-9d2a-44ff-c017_0.mcap
+```
+
+- **Point a sync tool at it with no exclude list.** clipper writes nothing into
+  the root but clip directories — no staging area, no lock, no sidecar — so
+  rsync, syncthing or an upload agent needs no rule about what to ignore.
+- **Filter on the metadata file, never on an MCAP file appearing.** It is
+  written after every `<id>_N.mcap` beside it is durable, and the directories
+  are fsynced after it, so a clip that answers the rule survives power loss and
+  is whole. A directory without it is a cut in progress or crash residue, and
+  the two look alike from outside.
+- **clipper creates the directory and never clears it.** `clipper tail` creates
+  `--out-dir` with parents at startup and refuses to start if it cannot, so a
+  run that cuts nothing still leaves the directory it was pointed at. It is
+  never required to be empty, and foreign files already in it are left exactly
+  as they were found. Pruning old clips is yours to schedule;
+  `--delete-old-files` is about *recordings* and touches nothing here.
+
+### What a crashed cut leaves, and what happens next
+
+A cut that fails for an ordinary reason — a full disk, an IO error — removes its
+own directory before reporting. So a directory with no `clip_metadata.yaml` is
+either a cut still in flight or, once the process is gone, evidence that it
+**died** mid-cut: SIGKILL, an OOM kill, power loss. It is never the leavings of
+a cut that merely erred. (Where even that removal fails, the error names the
+directory to remove by hand.)
+
+That residue stays, and it is meant to:
+
+- **Nothing repairs or overwrites it.** A later trigger resolving to the same id
+  is **skipped** with a warning naming the directory, exactly as it would be for
+  a complete clip — the claim reads the directory's existence and never its
+  contents. The residue is the evidence that something died, and clipper does
+  not destroy evidence to tidy up.
+- **Re-cutting that window means removing the directory first.** Until then the
+  id is taken and every trigger for it is skipped. Everything else keeps
+  working: the recorder goes on cutting every other window, and a restart cuts
+  clips normally.
+- **No consumer mistakes it for a clip.** It has no metadata file, so a pipeline
+  filtering on that file passes it over without knowing anything about crashes.
+
+```
+WARN  clip::segment > clip /data/clipped/1726300180000000000_08b1-9d2a-44ff-c017 is
+already there; skipping this window. A clip is written once: an id that is taken means
+this window has been cut, or a cut of it died leaving the directory behind. Remove it
+to cut the window again
+```
+
+A skipped window publishes no `Recorded`, since nothing was recorded — the
+warning is its whole trace. Automation watching the announcement should read a
+skip the way it reads any missing clip.
+
+### Two processes on one output directory
+
+They cannot corrupt each other's clips, and that is a property of the design
+rather than a feature to rely on. A clip's directory is claimed with a single
+`mkdir`, which the kernel makes atomic: whichever process creates it cuts the
+clip, and the other is told the id is taken and skips the window. There is no
+lock file, no staging area either can wipe, and no startup step that clears
+anything.
+
+What that buys is that a scheduling accident — two `clipper clip` jobs over one
+recording, or a supervisor briefly running two recorders — loses no clip and
+damages none. What it does not buy is a supported deployment: nothing
+coordinates the two beyond that claim, so they duplicate every scan and every
+window plan, and their logs interleave. Run one process per output directory.
+
 ## A recording that stops producing clips
 
 A run of stray bytes across a record's length prefix — a bad block, a filesystem
@@ -52,8 +132,8 @@ out of bytes whose framing disagrees with what it indexed, and says so the first
 time it costs a clip:
 
 ```
-ERROR clipper > recording /data/bags/rec_0.mcap changed under the tail after it was
-indexed: record at extent offset 19773 declares 18446744073709551615 B; extent
+ERROR tail::handler > recording /data/bags/rec_0.mcap changed under the tail after it
+was indexed: record at extent offset 19773 declares 18446744073709551615 B; extent
 framing inconsistent with the tail's scan. Every clip whose window plans the extent
 at 16777216 is refused with it — up to 4 MiB of recording, data written after the
 damage included — for as long as this recording is tailed, and this recorder goes on

@@ -787,9 +787,10 @@ mod tests {
     use anyhow::{Context, Result};
 
     use super::*;
-    use crate::cut;
-    use crate::manifest::{WindowCoverage, read_manifest};
-    use crate::segment::{Publication, cut_window, spawn_stage_workers};
+    use crate::id::ClipId;
+    use crate::layout::read_metadata;
+    use crate::manifest::{CutRequest, WindowCoverage};
+    use crate::segment::{Clip, CutOutcome, StageJob, cut_window, spawn_stage_workers};
     use crate::select::{ChannelSelection, Spec};
     use crate::testing::{index_file, scan_to_end, test_dir, window_request, write_bag_metadata};
     use crate::trigger::now_ns;
@@ -797,6 +798,24 @@ mod tests {
     /// The clip compression the recorder defaults to, so these cuts write the
     /// clips an operator actually gets.
     const TEST_COMPRESSION: Option<mcap::Compression> = Some(mcap::Compression::Zstd);
+
+    /// [`cut_window`] for a test that expects a clip. Every fixture here cuts
+    /// into an output directory of its own, so an id is never taken and a skip
+    /// would mean the test set itself up wrong.
+    fn cut_clip(
+        planner: &dyn WindowPlanner,
+        request: &Arc<CutRequest>,
+        coverage: WindowCoverage,
+        out_dir: &Path,
+        stage_tx: &crossbeam_channel::Sender<StageJob>,
+    ) -> Result<Clip> {
+        match cut_window(planner, request, coverage, out_dir, stage_tx)? {
+            CutOutcome::Cut(clip) => Ok(clip),
+            CutOutcome::Skipped(dir) => {
+                anyhow::bail!("expected a clip, got a skip of {}", dir.display())
+            }
+        }
+    }
 
     /// One message of a fixture recording, distinct from its neighbours in
     /// every field a copied clip is compared on.
@@ -978,24 +997,22 @@ mod tests {
         let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
         let request = Arc::new(window_request(150, 450, TimeSource::Log));
 
-        let from_summary = cut_window(
+        let from_summary = cut_clip(
             &WholeFileIndex::open(&rec)?,
             &request,
             WindowCoverage::Covered,
-            &root.join("summary.mcap"),
-            Publication::Suffix,
+            &root.join("summary"),
             &stage_tx,
         )?;
-        let from_scan = cut_window(
+        let from_scan = cut_clip(
             &scanned(&rec)?,
             &request,
             WindowCoverage::Covered,
-            &root.join("scan.mcap"),
-            Publication::Suffix,
+            &root.join("scan"),
             &stage_tx,
         )?;
 
-        let summary_msgs = read_messages(&from_summary[0].out_path)?;
+        let summary_msgs = read_messages(&from_summary.files[0].out_path)?;
         assert_eq!(
             summary_msgs,
             vec![
@@ -1007,7 +1024,7 @@ mod tests {
         );
         assert_eq!(
             summary_msgs,
-            read_messages(&from_scan[0].out_path)?,
+            read_messages(&from_scan.files[0].out_path)?,
             "a summary-built cut and a scanned one are the same clip"
         );
 
@@ -1069,36 +1086,34 @@ mod tests {
         let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION, selection);
         let request = Arc::new(window_request(0, 1000, TimeSource::Log));
 
-        let from_summary = cut_window(
+        let from_summary = cut_clip(
             &WholeFileIndex::open(&rec)?,
             &request,
             WindowCoverage::Covered,
-            &root.join("summary.mcap"),
-            Publication::Suffix,
+            &root.join("summary"),
             &stage_tx,
         )?;
-        let from_scan = cut_window(
+        let from_scan = cut_clip(
             &scanned(&rec)?,
             &request,
             WindowCoverage::Covered,
-            &root.join("scan.mcap"),
-            Publication::Suffix,
+            &root.join("scan"),
             &stage_tx,
         )?;
 
         assert_eq!(
-            channels(&from_summary[0].out_path)?,
+            channels(&from_summary.files[0].out_path)?,
             vec!["/camera/image_raw"],
             "the configuration's channel set, and only it"
         );
         assert_eq!(
-            channels(&from_summary[0].out_path)?,
-            channels(&from_scan[0].out_path)?,
+            channels(&from_summary.files[0].out_path)?,
+            channels(&from_scan.files[0].out_path)?,
             "a cloud cut and a device cut declare the same channels"
         );
         assert_eq!(
-            read_messages(&from_summary[0].out_path)?,
-            read_messages(&from_scan[0].out_path)?,
+            read_messages(&from_summary.files[0].out_path)?,
+            read_messages(&from_scan.files[0].out_path)?,
             "and hold the same messages"
         );
 
@@ -1225,14 +1240,12 @@ mod tests {
         let gutted = clobber_data_section(&rec, &root.join("gutted.mcap"))?;
 
         let out_dir = root.join("clipped");
-        crate::cut::reset_capturing_dir(&out_dir)?;
         let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
-        let err = cut_window(
+        let err = cut_clip(
             &WholeFileIndex::open(&gutted)?,
             &Arc::new(window_request(0, 1_000, TimeSource::Log)),
             WindowCoverage::Covered,
-            &out_dir.join("clip.mcap"),
-            Publication::Suffix,
+            &out_dir,
             &stage_tx,
         )
         .unwrap_err();
@@ -1241,15 +1254,12 @@ mod tests {
             "the copy's own error reaches the caller: {err:#}"
         );
 
-        let published: Vec<PathBuf> = std::fs::read_dir(&out_dir)?
+        let left: Vec<PathBuf> = std::fs::read_dir(&out_dir)?
             .map(|e| Ok(e?.path()))
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .filter(|p| p.extension().is_some_and(|e| e == "mcap"))
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         assert!(
-            published.is_empty(),
-            "a failed run leaves no clip in the output directory: {published:?}"
+            left.is_empty(),
+            "a failed cut takes its clip directory with it: {left:?}"
         );
 
         std::fs::remove_dir_all(root)?;
@@ -1303,18 +1313,17 @@ mod tests {
 
         let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
         let began = Instant::now();
-        let stats = cut_window(
+        let stats = cut_clip(
             &index,
             &request,
             WindowCoverage::Short,
-            &root.join("clip.mcap"),
-            Publication::Suffix,
+            &root.join("clip"),
             &stage_tx,
         )?;
         let elapsed = began.elapsed();
 
         assert_eq!(
-            stats[0].messages_copied, 2,
+            stats.files[0].messages_copied, 2,
             "both messages are in the window"
         );
         assert!(
@@ -1928,16 +1937,15 @@ mod tests {
         );
 
         let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
-        let stats = cut_window(
+        let stats = cut_clip(
             &index,
             &Arc::new(window_request(4_500, 5_500, TimeSource::Publish)),
             WindowCoverage::Covered,
-            &root.join("clip.mcap"),
-            Publication::Suffix,
+            &root.join("clip"),
             &stage_tx,
         )?;
         assert_eq!(
-            read_messages(&stats[0].out_path)?,
+            read_messages(&stats.files[0].out_path)?,
             vec![("/a".to_string(), 100, 5_000, 0, 64)],
             "only the message published inside the window is copied"
         );
@@ -1978,23 +1986,21 @@ mod tests {
         Ok(dir)
     }
 
-    /// A published clip's manifest.
-    fn manifest_of(clip: &Path) -> Result<BTreeMap<String, String>> {
-        read_manifest(clip)?.context("every published clip carries a manifest")
-    }
-
-    /// The recording a published segment says its bytes came from.
-    fn source_of(clip: &Path) -> Result<PathBuf> {
+    /// The recording a clip's document says its `n`th file came from.
+    fn source_of(clip: &Clip, n: usize) -> Result<PathBuf> {
+        let sources = read_metadata(&clip.dir)?.sources;
+        let entry = sources.get(n).context("the clip holds that file")?;
         Ok(PathBuf::from(
-            manifest_of(clip)?
-                .get("source.path")
-                .context("a segment cut from a recording names it")?,
+            entry
+                .path
+                .clone()
+                .context("a file cut from a recording names it")?,
         ))
     }
 
-    /// The published segments' filenames, in the order they were cut.
-    fn segment_names(segments: &[cut::ClipStats]) -> Vec<String> {
-        segments
+    /// The clip's files, named as they sit in its directory.
+    fn file_names(clip: &Clip) -> Vec<String> {
+        clip.files
             .iter()
             .map(|stats| {
                 stats
@@ -2044,25 +2050,25 @@ mod tests {
 
         let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
         let request = Arc::new(window_request(250, 450, TimeSource::Log));
-        let segments = cut_window(
+        let segments = cut_clip(
             &index,
             &request,
             WindowCoverage::Covered,
-            &root.join("clip.mcap"),
-            Publication::Suffix,
+            &root.join("clip"),
             &stage_tx,
         )?;
 
+        let id = ClipId::of(&request);
         assert_eq!(
-            segment_names(&segments),
-            vec!["clip_00.mcap", "clip_01.mcap"],
-            "one segment per contributing recording, numbered in collection order"
+            file_names(&segments),
+            vec![format!("{id}_0.mcap"), format!("{id}_1.mcap")],
+            "one file per contributing recording, numbered in collection order"
         );
-        assert_eq!(source_of(&segments[0].out_path)?, first);
-        assert_eq!(source_of(&segments[1].out_path)?, second);
+        assert_eq!(source_of(&segments, 0)?, first);
+        assert_eq!(source_of(&segments, 1)?, second);
 
         let mut copied = Vec::new();
-        for stats in &segments {
+        for stats in &segments.files {
             copied.extend(read_messages(&stats.out_path)?);
         }
         assert_eq!(
@@ -2088,18 +2094,17 @@ mod tests {
                 at("/a", 600),
             ],
         )?;
-        let single = cut_window(
+        let single = cut_clip(
             &WholeFileIndex::open(&single_rec)?,
             &request,
             WindowCoverage::Covered,
-            &root.join("unsplit.mcap"),
-            Publication::Suffix,
+            &root.join("unsplit"),
             &stage_tx,
         )?;
-        assert_eq!(single.len(), 1, "one recording, one segment");
+        assert_eq!(single.files.len(), 1, "one recording, one file");
         assert_eq!(
             copied,
-            read_messages(&single[0].out_path)?,
+            read_messages(&single.files[0].out_path)?,
             "the segments concatenated are the clip the unsplit recording cuts"
         );
 
@@ -2145,44 +2150,41 @@ mod tests {
             ..Spec::default()
         })?;
         let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION, selection);
-        let segments = cut_window(
+        let request = Arc::new(window_request(0, 1_000, TimeSource::Log));
+        let segments = cut_clip(
             &WholeFileIndex::open(&bag)?,
-            &Arc::new(window_request(0, 1_000, TimeSource::Log)),
+            &request,
             WindowCoverage::Covered,
-            &root.join("clip.mcap"),
-            Publication::Suffix,
+            &root.join("clip"),
             &stage_tx,
         )?;
 
+        let id = ClipId::of(&request);
         assert_eq!(
-            segment_names(&segments),
-            vec!["clip_00.mcap", "clip_01.mcap"],
-            "two segments out of three recordings, numbered from zero"
+            file_names(&segments),
+            vec![format!("{id}_0.mcap"), format!("{id}_1.mcap")],
+            "two files out of three recordings, numbered from zero"
         );
+        assert_eq!(source_of(&segments, 0)?, first, "_0 is the first recording");
         assert_eq!(
-            source_of(&segments[0].out_path)?,
-            first,
-            "_00 is the first recording"
-        );
-        assert_eq!(
-            source_of(&segments[1].out_path)?,
+            source_of(&segments, 1)?,
             third,
-            "_01 is the third recording, not the second"
+            "_1 is the third recording, not the second"
         );
         assert_eq!(
-            manifest_of(&segments[0].out_path)?["source.files_planned"],
-            "3",
+            read_metadata(&segments.dir)?.window.files_planned,
+            3,
             "the clip still states how many recordings the window was planned over"
         );
         assert_eq!(
-            read_messages(&segments[0].out_path)?,
+            read_messages(&segments.files[0].out_path)?,
             vec![
                 ("/camera/image".to_string(), 100, 100, 1, 40),
                 ("/camera/image".to_string(), 200, 200, 2, 40),
             ],
         );
         assert_eq!(
-            read_messages(&segments[1].out_path)?,
+            read_messages(&segments.files[1].out_path)?,
             vec![
                 ("/camera/image".to_string(), 500, 500, 5, 40),
                 ("/camera/image".to_string(), 600, 600, 6, 40),
@@ -2212,37 +2214,29 @@ mod tests {
         let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
         let request = Arc::new(window_request(0, 1_000, TimeSource::Log));
 
-        let stated = cut_window(
+        let stated = cut_clip(
             &WholeFileIndex::open(&bag)?,
             &request,
             WindowCoverage::Covered,
-            &root.join("stated.mcap"),
-            Publication::Suffix,
+            &root.join("stated"),
             &stage_tx,
         )?;
         assert_eq!(
-            [
-                source_of(&stated[0].out_path)?,
-                source_of(&stated[1].out_path)?
-            ],
+            [source_of(&stated, 0)?, source_of(&stated, 1)?],
             [first.clone(), second.clone()],
             "the order the metadata file states, against the modification times"
         );
 
         std::fs::remove_file(&metadata)?;
-        let by_mtime = cut_window(
+        let by_mtime = cut_clip(
             &WholeFileIndex::open(&bag)?,
             &request,
             WindowCoverage::Covered,
-            &root.join("mtime.mcap"),
-            Publication::Suffix,
+            &root.join("mtime"),
             &stage_tx,
         )?;
         assert_eq!(
-            [
-                source_of(&by_mtime[0].out_path)?,
-                source_of(&by_mtime[1].out_path)?
-            ],
+            [source_of(&by_mtime, 0)?, source_of(&by_mtime, 1)?],
             [second, first],
             "with no metadata file, oldest first — the same two recordings, the \
              other way round"

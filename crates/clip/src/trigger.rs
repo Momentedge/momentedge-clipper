@@ -163,10 +163,19 @@ pub struct TriggerRecord {
     pub publish_time: u64,
 }
 
-/// What the handler emits once a clip is durable: the trigger echo plus the
-/// staged segment paths. The ROS interface turns this into a
-/// `momentedge_msgs/Recorded`; the MCAP interface treats the clip's atomic move
-/// into `out_dir` as the signal and does nothing further.
+/// What the handler emits once a clip is complete: the trigger echo plus the one
+/// path the clip *is*, its directory.
+///
+/// **`filenames` holds exactly one entry**, however many MCAP files the clip
+/// took, so a subscriber opens one handle per clip and never learns the naming
+/// scheme inside it. Which files are in there, and which recording each came
+/// from, is the clip's own document ([`crate::layout::METADATA_FILE`]) to state.
+///
+/// **It is emitted only after that document is durable** ([`Announce`]), so a
+/// `Completion` names a clip that is already complete by the rule a consumer
+/// filters on and already survives power loss. The ROS interface turns it into a
+/// `momentedge_msgs/Recorded`; the MCAP interface has no announcement channel to
+/// turn it into anything.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Completion {
     pub name: String,
@@ -176,12 +185,24 @@ pub struct Completion {
     pub preroll: u64,
 }
 
-/// The output half of the recorder's interface: announce a finished clip. The
-/// ROS interface publishes a `Recorded`; the MCAP interface is a no-op (the
-/// file move is the announcement). `Clone + Send` so each trigger handler
-/// thread carries its own announcer moved in — not `Sync`, since an announcer
-/// is never shared across threads by reference (the r2r `Publisher` behind the
-/// recorder's ROS announcer is `Send` but not `Sync`).
+/// The output half of the recorder's interface: announce a finished clip.
+///
+/// **The caller's obligation is the ordering**: a [`Completion`] is handed over
+/// only once the clip it names is complete on disk — its
+/// [`METADATA_FILE`](crate::layout::METADATA_FILE) written and fsynced — so an
+/// announcement can never reach a subscriber before the clip it points at is
+/// there to open. Nothing here enforces that, because only the cut knows when it
+/// holds; [`crate::segment::cut_window`] returns after the document is durable
+/// and the announcement is what its caller does next.
+///
+/// The ROS interface publishes a `Recorded`. The MCAP interface is a no-op: it
+/// has no announcement channel at all, and the document's own appearance in the
+/// output directory is what a consumer there watches for.
+///
+/// `Clone + Send` so each trigger handler thread carries its own announcer moved
+/// in — not `Sync`, since an announcer is never shared across threads by
+/// reference (the r2r `Publisher` behind the recorder's ROS announcer is `Send`
+/// but not `Sync`).
 pub trait Announce: Clone + Send + 'static {
     fn announce(&self, completion: &Completion);
 }

@@ -25,10 +25,17 @@
 //!   planned as one collection, so a window straddling a rollover is cut into
 //!   one segment per contributing split.
 //! - [`cut`] — the copy: raw message bytes out of the planned extents into a new
-//!   MCAP, finished with a manifest record, a summary and a footer.
-//! - [`manifest`] — what a clip says about itself: the metadata record every cut
-//!   writes, naming the producer, the trigger, the window, the source recording
-//!   and what each channel contributed.
+//!   MCAP, finished with the clip's id record, a summary and a footer.
+//! - [`id`] — what a clip is called: the id [`layout`] names its directory and
+//!   every file in it by, derived from the six fields of the request that asked
+//!   for it, under a canonical encoding that is a published contract.
+//! - [`layout`] — what a clip is on disk: a directory claimed by one atomic
+//!   `mkdir`, one `<id>_N.mcap` per contributing recording, and the metadata
+//!   file whose presence means the clip is complete.
+//! - [`manifest`] — what a clip says about itself: the document written beside
+//!   its files, naming the producer, the trigger, the window, the source
+//!   recordings and what each channel contributed — plus the one `clip.id`
+//!   record each file carries.
 //! - [`trigger`] — the neutral trigger and completion contract every trigger
 //!   source targets.
 //! - [`decode`] — a trigger payload's bytes to a [`trigger::Trigger`], dispatched
@@ -36,10 +43,11 @@
 //! - [`embedded`] — the triggers a finished recording carries on the trigger
 //!   topic, found through the summary's own chunk index so only the chunks
 //!   holding that channel are read.
-//! - [`segment`] — one window to durable clips: plan, stage a segment per source
-//!   recording, drop the empties, publish atomically — under the caller's
-//!   [`segment::Publication`] verdict on a name the output directory already
-//!   holds.
+//! - [`segment`] — one window to a durable clip, and the one entry point that
+//!   decides where a clip goes: claim the directory under the output directory
+//!   the caller gave, plan, copy one file per source recording, drop the
+//!   empties, number what is left, and complete it — or skip the window whose
+//!   id is already taken.
 //! - [`select`] — which of a recording's topics a clip is cut from, the decision
 //!   [`cut`] applies at the two places it can matter: where a channel is
 //!   registered in the output, and where a message is copied.
@@ -58,7 +66,9 @@ pub mod config;
 pub mod cut;
 pub mod decode;
 pub mod embedded;
+pub mod id;
 pub mod index;
+pub mod layout;
 pub mod manifest;
 pub mod segment;
 pub mod select;
@@ -70,11 +80,12 @@ pub mod trigger;
 pub mod whole;
 
 pub use config::Layered;
+pub use id::ClipId;
 pub use index::{
     ChannelDef, Extent, PlanSource, RecordingIndex, ScanDelta, ScanProgress, ScanSeed, SchemaDef,
     Span, Stamps, TimeBounds, WindowPlan, WindowPlanner,
 };
-pub use manifest::{CutRequest, Producer, WindowCoverage};
+pub use manifest::{ClipMetadata, CutRequest, Producer, WindowCoverage};
 pub use select::ChannelSelection;
 pub use trigger::{Announce, Completion, Stamp, Trigger, TriggerRecord};
 pub use whole::{CountDisagreement, IndexRefusal, OpenError, WholeFileIndex};

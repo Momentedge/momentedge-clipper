@@ -36,7 +36,7 @@ use crossbeam_channel::Sender;
 
 use crate::TimeSource;
 use crate::index::{MAGIC, RecordingIndex, ScanProgress, ScanSeed, WindowPlan, op, scan_available};
-use crate::manifest::{CutRequest, Planned, Producer, WindowCoverage};
+use crate::manifest::{CutRequest, Producer};
 use crate::trigger::{Stamp, Trigger, TriggerRecord};
 
 /// The producer a test's clips are stamped with: a mode name no real binary
@@ -69,17 +69,6 @@ pub fn window_request(start_ns: u64, end_ns: u64, source: TimeSource) -> CutRequ
         end_ns,
         source,
     )
-}
-
-/// The [`Planned`] facts of a window one recording covered end to end — what a
-/// test staging a single segment out of a finished fixture recording is looking
-/// at. Tests about the empty and short cases state their own.
-#[must_use]
-pub fn planned_one_file() -> Planned {
-    Planned {
-        files: 1,
-        coverage: WindowCoverage::Covered,
-    }
 }
 
 /// Read a finished clip back as its `(topic, log_time)` pairs. `MessageStream`

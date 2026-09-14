@@ -8,8 +8,8 @@ that keeps ROS out of two of them, and the clock domain every window lives in.
 Each crate's own internals are in its own `CLAUDE.md`:
 
 - [`clip/CLAUDE.md`](clip/CLAUDE.md) — the format layer and the scan that makes
-  a live MCAP readable, the copy, the manifest, segment assembly and
-  publication, the whole-file index and bag directories.
+  a live MCAP readable, the copy, the layout a clip is on disk, the document it
+  carries, segment assembly, the whole-file index and bag directories.
 - [`tail/CLAUDE.md`](tail/CLAUDE.md) — discovery, the recording collection and
   its lifecycle, coverage, the scan-fault budget, the cut-fault tally, retention,
   and the per-trigger flow with the two waits a growing file costs.
@@ -27,8 +27,9 @@ The producer-facing statement of the same design is
 format layer and its recording index (`clip::index`, and `clip::whole` for a
 recording that is already finished), the copy that cuts a window out of one
 (`clip::cut`), the neutral trigger and completion contract (`clip::trigger`,
-`clip::decode`), the segment assembly that turns one window into published clips
-(`clip::segment`), the record each of those clips carries saying what it is
+`clip::decode`), the segment assembly that turns one window into a durable clip
+(`clip::segment`), the id each clip is named by (`clip::id`), the directory a
+clip is on disk (`clip::layout`), the document it carries saying what it is
 (`clip::manifest`), which of the recording's topics a clip is cut from
 (`clip::select`), and the layered configuration file that decides those topics
 and every other setting (`clip::config`).

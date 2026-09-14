@@ -343,9 +343,24 @@ impl Tailer {
 
     /// A tailer whose scan also lifts messages on `trigger_topic` out of the
     /// recording as [`TriggerRecord`]s, sending each on `trigger_tx` — the MCAP
-    /// interface's trigger source. Only recordings indexed live emit triggers
-    /// (no startup back-indexing); a trigger already on disk before clipper
-    /// started never fires.
+    /// interface's trigger source.
+    ///
+    /// **Which already-recorded triggers fire is the startup seed's answer, and
+    /// it is not "none".** [`Self::run`] adopts the newest existing recording
+    /// and indexes it from its first byte with the tap on, so every trigger that
+    /// split already holds is lifted again on each restart. Only the older
+    /// recordings the discovery iterator is seeded past are never indexed, and
+    /// only their triggers never fire.
+    ///
+    /// A re-delivered trigger cuts nothing: it resolves to the same id the run
+    /// that first answered it used, and [`clip::segment::cut_window`] finds that
+    /// id's directory already there and skips the window. The cost is admission
+    /// rather than output — each one holds one of the sixteen handler slots
+    /// until its waits finish and the claim turns it away, so a restart against
+    /// a split holding many triggers can delay a genuine one behind them.
+    /// Whether the tap should skip what the adopted recording already held, or
+    /// the handler should test the claim before its waits, is beads
+    /// `clipper-9oz`.
     pub fn with_trigger_tap(
         trigger_topic: impl Into<String>,
         trigger_tx: Sender<TriggerRecord>,
