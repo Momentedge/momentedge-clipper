@@ -30,9 +30,11 @@ the clip states the same trigger a clip cut from a live topic does; only
 `producer.mode` differs, reading `clip` rather than `tail`.
 
 `--out-dir` is created with parents when missing, never required to be empty, and
-never cleared: the only thing a run ever adds to its root is a clip directory.
+never cleared: the only thing a run ever adds to its root is a clip directory. A
+run clipper accepted creates it whether or not it has a window to put in it, so
+the directory is there afterwards even when the recording carried no trigger.
 
-Five things follow from the input being finished:
+Six things follow from the input being finished:
 
 - **Nothing waits.** No postroll sleep, no wait for coverage. A window reaching
   past the end of the recording is simply short, and the clip's `clip.short`
@@ -52,6 +54,11 @@ Five things follow from the input being finished:
   trigger describe the same window, so a window whose clip directory is already
   in `--out-dir` has already been cut. It is left alone with a warning and the
   run goes on — see [below](#when-a-clip-is-already-there).
+- **A window that fails stops the run**, with exit 1 and the clips published
+  before it left where they are. The recorder cannot stop — it has to be there
+  for the next trigger — but a run over a recording with an end can, and a fault
+  the disk or the input will raise again is worth reporting before it repeats
+  once per remaining trigger — see [below](#when-a-window-fails).
 
 ## A bag directory is one collection
 
@@ -155,6 +162,41 @@ it as a clip — but clipper does not repair or overwrite it, because it is the
 only evidence that something went wrong. To cut that window again, remove the
 directory.
 
+## When a window fails
+
+A run cuts its windows in order and stops at the first one that fails, with exit
+1. Three things are true of what it leaves behind:
+
+- **The clips published before it stay.** A clip is complete the moment its
+  `clip_metadata.yaml` is there, and nothing later in the run can unmake one.
+- **The window that failed leaves nothing.** Its directory goes with the error,
+  so a directory without a `clip_metadata.yaml` in `--out-dir` is the residue of
+  a process that *died* and never the leavings of a cut that merely erred. Where
+  even the removal fails, the message names the directory to remove by hand.
+- **The windows after it are not attempted.** A window fails because of the disk
+  or the input, and both outlive the window that met them, so carrying on would
+  raise one fault once per remaining trigger and bury the first report under the
+  rest.
+
+Fix the cause and run it again: the clips already there are skipped, so the
+re-run pays only for the windows that are still missing.
+
+A run that got through every window it had closes with the count it did them in,
+which is also how a re-run reports that it found everything already cut:
+
+```console
+$ clipper clip ./record --out-dir ./clipped --trigger-source mcap
+...
+INFO  clipper > 0 clip(s) cut, 7 skipped as already there in ./clipped
+$ echo $?
+0
+```
+
+The statuses a run ends with are [clipper's own](operating.md): **0** for a run
+that cut every window it had, skips included; **1** for a window that failed or a
+recording [refused](#when-a-recording-is-refused); **2** for a command line or a
+configuration file clipper cannot use; and **101** for a clipper bug.
+
 Nothing machine-readable is printed. The result is the output directory's
 contents when the process exits, each clip a directory carrying its own
 `clip_metadata.yaml`, and the exit status is the verdict. No ROS is involved, so
@@ -192,7 +234,8 @@ Both ways of stating the trigger wrongly are refused while the command line is
 being read, with the flag at fault named and nothing written: `param` without one
 of the three flags it needs, and `mcap` alongside any `--trigger-*` flag. A
 recording holding no trigger at all, read under `mcap`, cuts nothing and says so
-— a normal, zero-status run that leaves the output directory untouched.
+— a normal, zero-status run, after which `--out-dir` is there and empty like any
+other run's.
 
 **`ros` is not offered here.** It is a live subscription on a ROS node, and a
 recording nobody is writing has no live topic to carry a trigger and nothing

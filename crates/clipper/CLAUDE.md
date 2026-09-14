@@ -103,8 +103,8 @@ payload or a recorded name the message contract refuses (`validate_name`, a
 length bound and nothing else) is logged and skipped, and the run cuts the rest.
 The same name in the operator's own `--trigger-name` is the opposite — a command
 line to fix — and ends the run. A
-run left with nothing to cut writes nothing, not even the output directory, and
-exits zero.
+run left with nothing to cut writes no clip and exits zero; what it leaves is the
+empty output directory every accepted run leaves (below).
 
 **Both ways of stating the trigger wrongly fail while the command line is being
 read** (`ClipConfig::trigger_argument_fault`, raised by `parse_cli` as a
@@ -140,6 +140,26 @@ directory exists has already been cut: `cut_window` skips it with a warning and
 the run goes on to the next window. That is what makes a re-run over the same
 recording into the same output directory a *resume* — an interrupted run is
 finished by running it again — rather than a conflict to clear by hand.
+
+**The windows are cut in order and the run stops at the first one that fails**,
+which is what `?` in `clip_mode`'s loop is. The clips published before it stay,
+the failed window's own directory leaves with the error (`clip::layout`), and the
+windows after it are never planned — a disk or input fault outlives the window
+that met it, so going on would raise it once per remaining trigger. The error
+carries the window that stopped the run and what the run had published by then,
+so the last line of a stopped run is the reason rather than the arithmetic.
+`ClipTally` is that arithmetic: `cut_one` hands its `CutOutcome` back for the two
+to be counted apart, and a run that got through every window closes with one
+`info!` saying how many it cut and how many were already there — the fact a
+per-window warning cannot state, since "every window was already there" is about
+the run.
+
+**`--out-dir` is created once the input and the triggers are accepted**, before
+the window count is consulted, so a run over a recording carrying no trigger
+still leaves the directory it was pointed at — one shape for a caller listing it,
+whatever the recording held. It is created with parents, never cleared, and never
+required to be empty; the refusals above all happen earlier, which is why they
+leave no directory at all.
 
 Nothing machine-readable is printed: the run's result is `out_dir`'s contents
 when the process exits, each clip a directory carrying its own
