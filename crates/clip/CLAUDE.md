@@ -341,8 +341,12 @@ resolve to one id, and two processes writing into one output directory — with 
 lock file, no staging area, no startup wipe and no same-device check. It returns
 a `Claim`, two variants rather than an `Option`, because a caller has to say
 something about each and a taken id must be impossible to mistake for a free one.
-No parents on purpose: the tree above is `prepare_out_dir`'s, and creating it here
-would turn a typo'd `--out-dir` into a silently fresh one.
+No parents on purpose, and the reason is the exclusion rather than the tree:
+`create_dir_all` answers `Ok` for a directory that is already there, so it would
+report a taken id as a won race and the claim would exclude nothing.
+`create_dir` is the one call whose *failure* is the answer. The tree above it is
+`prepare_out_dir`'s, which `cut_window` runs before every claim, so the parent is
+always there by the time the claim runs.
 
 **The metadata file is the completion signal**, and two things make that true:
 how the name appears, and the order of the fsyncs around it.

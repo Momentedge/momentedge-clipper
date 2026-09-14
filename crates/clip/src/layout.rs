@@ -145,9 +145,15 @@ impl ClipDir {
     ///
     /// The atomicity is the whole point: `mkdir` either creates the directory or
     /// fails with `AlreadyExists`, and the kernel picks exactly one winner among
-    /// however many callers race for it. No parents, because the tree above is
-    /// [`prepare_out_dir`]'s and creating it here would turn a typo'd
-    /// `--out-dir` into a silently fresh one.
+    /// however many callers race for it.
+    ///
+    /// **No parents, because the claim has to be exactly one operation.**
+    /// `create_dir_all` answers `Ok` for a directory that is already there, so a
+    /// taken id would look like a won race and the exclusion would be gone;
+    /// `create_dir` is the one call whose *failure* is the answer. The tree above
+    /// it is [`prepare_out_dir`]'s, which
+    /// [`cut_window`](crate::segment::cut_window) runs before every claim, so
+    /// the parent is there by the time this is reached.
     ///
     /// Anything other than `AlreadyExists` is the error it is — a missing output
     /// directory, no permission, a full filesystem — and the cut has not started.

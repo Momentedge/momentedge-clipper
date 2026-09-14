@@ -455,6 +455,14 @@ mod tests {
     }
 
     /// The clip a cut wrote, or a failure naming what it did instead.
+    ///
+    /// `whole`'s tests and `tail::handler`'s each spell this out again rather
+    /// than share it, and that is the cheaper trade. The match is exhaustive
+    /// with no catch-all arm, so a new [`CutOutcome`] variant is a compile error
+    /// at all three sites — the copies cannot drift, which is the only thing
+    /// sharing would buy. Reaching `tail` would cost the opposite: the helper
+    /// would have to be published from `clip::testing` behind `test-support`,
+    /// making a five-line test unwrap part of this crate's API for good.
     fn cut(outcome: CutOutcome) -> Clip {
         match outcome {
             CutOutcome::Cut(clip) => clip,

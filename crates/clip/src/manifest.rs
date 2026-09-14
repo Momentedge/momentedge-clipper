@@ -216,11 +216,14 @@ impl CutRequest {
     }
 }
 
-/// What the cut found around one window, repeated in every segment's manifest.
+/// What the cut found around one window: over how many recordings it was
+/// planned, and whether the recording had reached the window end.
 ///
-/// Both facts are properties of the *window*, not of any one segment: the
-/// segments of a straddling window agree on them and differ only in their own
-/// source file and their own counters.
+/// Both are facts about the *window* rather than about any one of the files it
+/// was cut into, which is why they reach the document's clip-wide groups
+/// ([`WindowMeta::files_planned`] and [`ClipMeta::short`]) and appear in no
+/// [`SourceMeta`] entry — a window straddling a split would otherwise state each
+/// of them once per file, and the copies could disagree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Planned {
     /// How many source recordings the window was planned over. Zero means no
