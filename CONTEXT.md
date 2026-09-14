@@ -51,13 +51,23 @@ possible source of an anchor, not a synonym for it)
 How far before / after the anchor the window reaches.
 
 **Clip**:
-A standalone, complete MCAP file holding every message whose timestamp on the
-active time source falls inside one trigger's window. Split across several
-segments when the window spans a rollover.
+A directory holding every message whose timestamp on the active time source
+falls inside one trigger's window: one standalone MCAP file per contributing
+recording, plus the metadata file that says what they are. The directory is the
+clip — it is what is announced, synced and uploaded — and it is named by the
+clip's id.
+_Avoid_: clip file (a clip is the directory; the MCAP files are its parts)
+
+**Complete**:
+A clip whose metadata file is present. It is written after every MCAP file in
+the directory is durable, so its presence — and nothing else — is what says a
+clip is finished and safe to read or upload. A clip directory without it is
+being written, or is what a cut that died left behind.
+_Avoid_: finished, done, published
 
 **Recorded**:
-The completion announcement for a finished clip: its name, its segment
-filenames, and the window it was cut with.
+The completion announcement for a finished clip: its name, the one directory it
+is, and the window it was cut with.
 _Avoid_: completion event, done message
 
 ### Time

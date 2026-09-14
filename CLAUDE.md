@@ -12,13 +12,13 @@ own their angle, and this file does not repeat them:
   and the layering rule), [`triggers-and-time.md`](docs/triggers-and-time.md)
   (the `Trigger` message, the two interfaces, the clock a window lives on),
   [`clip-command.md`](docs/clip-command.md) (`clipper clip` over a finished
-  recording), [`clip-manifest.md`](docs/clip-manifest.md) (the `momentedge.clip`
+  recording), [`clip-manifest.md`](docs/clip-manifest.md) (the clip directory and
   record), [`operating.md`](docs/operating.md) (shutdown, logs, retention, a
   recording that stops producing clips, overload, tuning). These are for *humans
   looking something up* — the agent view of the same code is the `CLAUDE.md`
   files below.
 - **[ARCHITECTURE.md](ARCHITECTURE.md)** — the technical overview: thread model,
-  tailing, atomic clip publication, recovery, the `ros`/`mcap` seam, deployment.
+  tailing, what a clip is on disk, recovery, the `ros`/`mcap` seam, deployment.
 - **[CONTEXT.md](CONTEXT.md)** — the domain glossary, and the word for each thing
   every other file here uses: recording, producer, extent, coverage; trigger,
   window, anchor; trigger source and interface. Above all it separates the
@@ -29,8 +29,9 @@ own their angle, and this file does not repeat them:
   clock domain every window lives in, and the contract for keeping these files
   true.
 - **[crates/clip/CLAUDE.md](crates/clip/CLAUDE.md)** — the format layer and the
-  scan that makes a live MCAP readable, the copy, the manifest, segment assembly
-  and publication, the whole-file index and bag directories.
+  scan that makes a live MCAP readable, the copy, the layout a clip is on disk,
+  the document it carries, segment assembly, the whole-file index and bag
+  directories.
 - **[crates/tail/CLAUDE.md](crates/tail/CLAUDE.md)** — discovery, the recording
   collection and its lifecycle, coverage, the scan-fault budget, retention, and
   the per-trigger flow with the two waits a growing file costs.
@@ -79,7 +80,7 @@ message's log time). The example [`trigger-pub`](examples/trigger-pub/CLAUDE.md)
 is a periodic `Trigger` publisher that drives it during development. The mode is
 a subcommand: `clipper tail` is that recorder, and `clipper clip` cuts one window
 out of one already-finished recording and exits — same window plan, same copy,
-same manifest, without the two waits a growing file costs. The full
+same clip directory, without the two waits a growing file costs. The full
 design is in [ARCHITECTURE.md](ARCHITECTURE.md) and the per-crate notes indexed
 above.
 
@@ -118,7 +119,7 @@ neither needs a ROS toolchain anywhere. `clip` is what every consumer of a
 recording shares — the MCAP format layer, the recording index (including the
 whole-file one a finished recording's own summary yields, over one file or a bag
 directory's splits read as one time-ordered collection), the cut path, the
-neutral trigger contract, segment publication, and the manifest record every
+neutral trigger contract, the layout a clip is on disk, and the document every
 clip carries saying what it is — so cutting a window out of a recording nobody
 is writing links `clip` alone. `tail` is what a recording with
 no end yet costs on top: discovery, the recording collection and its lifecycle,
@@ -138,7 +139,7 @@ default features on the plain toolchain, so an r2r dependency that escapes a `ro
 feature fails there rather than in a downstream ROS-free build.
 
 ```
-crates/clip/            # ROS-free library: format layer, index, cut, manifest, trigger contract
+crates/clip/            # ROS-free library: format layer, index, cut, layout, manifest, triggers
 crates/tail/            # ROS-free library: following a recording still being written
 crates/clipper/         # the clipper binary (`clipper tail` is the recorder): interfaces, config, supervision
 momentedge_msgs/        # local ROS2 interface package (Trigger, Recorded)
@@ -191,7 +192,7 @@ The docs describe the same system from different angles. **After a change to
 behaviour, build/run steps, dependencies, or layout, update the relevant docs in
 the same change** — do not duplicate; cross-reference:
 
-- User-facing reference — a flag, a TOML key, the trigger contract, the manifest,
+- User-facing reference — a flag, a TOML key, the trigger contract, the clip's document,
   what a deployed recorder does about logs or overload → the matching page under
   **`docs/`**.
 - The pitch, the quickstart and the install path → **README.md**. It is a primer

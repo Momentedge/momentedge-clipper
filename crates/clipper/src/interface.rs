@@ -183,9 +183,9 @@ impl Interface for McapInterface {
     }
 }
 
-/// The MCAP completion sink: a no-op. The clip's atomic move into `out_dir`
-/// (`clip::publish_clip`) is the announcement; the handler's per-clip `info!`
-/// lines are the log.
+/// The MCAP completion sink: a no-op. The clip's `clip_metadata.yaml` appearing
+/// in its directory under `out_dir` (`clip::layout`) is the announcement; the
+/// handler's per-clip `info!` lines are the log.
 #[derive(Clone)]
 pub(crate) struct NullAnnouncer;
 

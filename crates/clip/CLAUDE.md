@@ -2,10 +2,10 @@
 
 What every consumer of a recording shares: the MCAP format layer and its
 recording index, the copy that cuts a window out of one, the neutral trigger and
-completion contract, the segment assembly that turns one window into published
-clips, the id each clip is named by, the manifest each of them carries, the
-channel selection that says which topics it holds, and the layered configuration
-file behind both.
+completion contract, the segment assembly that turns one window into a durable
+clip, the id each clip is named by, the on-disk layout a clip is, the document
+each clip carries, the channel selection that says which topics it holds, and the
+layered configuration file behind both.
 
 **No ROS anywhere by default**, and no async runtime. Cutting a window out of a
 recording nobody is writing links this crate alone — no successor to find, no
@@ -190,7 +190,7 @@ unit tests use).
 same step that registers the channel. That placement is the whole design: a topic
 `clip::select::ChannelSelection` refuses is never registered, so the clip carries
 no `Channel` record for it, no `Schema` record that only it referenced, no
-message (a copy needs a registration), and no `channel.<id>.*` manifest keys (the
+message (a copy needs a registration), and no per-channel tally (the
 tally is filled by the step that writes a message through). `Route` keeps the two
 ways out apart: `Excluded` is this clip's scope and costs nothing, `Unregistered`
 is a recording that declares no channel for an ID and is counted with the rest of
@@ -206,38 +206,26 @@ topic is kept unless `exclude_trigger_topic` drops it. The keys and their
 `ros2 bag record` counterparts are in the
 [Configuration](../../docs/configuration.md#which-topics-a-clip-contains).
 
-**Two-staged atomic publication.** The cut is two separate calls so the output
-directory only ever holds finished clips, and so a window that straddled a
-rollover can settle its segments' names once their count is known. `stage_clip`
-assembles the clip in a `.capturing` subdirectory of `out_dir`,
-`Writer::finish()`es it, and `sync_all`s the file; `publish_clip` then moves it
-into `out_dir` under the desired name. A staging worker runs only the first
-call, `cut_window` the second. (`extract_clip` composes both in one, for the
-clip-assembly tests.) The capturing area is a *subdirectory* of the output directory
-rather than a sibling so the two always share a filesystem — the move is a true
-atomic link, never a cross-device copy. The move is `hard_link` + unlink of the
-staged path, not `rename`: a duplicate trigger (same stamp and name) must not
-clobber the earlier clip, and `rename` replaces an existing destination
-silently, whereas `hard_link` is equally atomic but fails with `AlreadyExists`,
-which the `_<n>`-suffix retry (`with_suffix_retry`, cap 1000) resolves against
-the *desired* final name. The link is the commit point: once it succeeds the
-output directory holds a complete clip (the staged file was already fsynced), so
-the staged name is unlinked and `out_dir` itself is fsynced to make the new
-directory entry crash-durable. A `StagedClip` is `#[must_use]` and its `Drop`
-unlinks an unpublished staged file, so an early return or panic between the
-stages — or a failed publish — strands nothing in `.capturing` and never
-reaches `out_dir`. The capturing-dir name may carry its own `_<n>` suffix to
-avoid colliding with a concurrent stage, independent of the final name a
-duplicate trigger resolves to at publish — and whether the final name is allowed
-to take a suffix at all is [the cut's own
-answer](#segment-assembly-and-publication-clipsegment) to the subcommand that
-asked, the recorder's `Suffix` against `clipper clip`'s `Refuse`. The one leftover `Drop` cannot
-reclaim is a crash *between* the publish link and the staged-file unlink, which
-strands a stale link in `.capturing` (harmless — only `out_dir` is observed);
-`clip::cut::reset_capturing_dir`, called once from `main` at startup, deletes
-and recreates `.capturing` (and ensures `out_dir` exists) so that clutter never
-outlives a single run. Failing that reset is fatal: a recorder that cannot prepare its
-output directory must not start.
+**The copy writes one file and names nothing.** `stage_clip` creates a file with
+`create_new` inside the clip directory its caller has already claimed,
+`copy_window`s into it, `Writer::finish()`es it and `sync_all`s it, and hands
+back a `StagedClip` — a complete MCAP under a `.part` staging name. It cannot
+name the file it wrote, because a file's number is its position among the
+recordings that *contributed*, and the empty ones are dropped only once every
+copy has run. `cut_window` renames each survivor into place afterwards
+([segment assembly](#segment-assembly-and-the-clip-directory-clipsegment)).
+`create_new` rather than a collision retry is the point: the directory was
+claimed by one atomic `mkdir` and nothing else may write into it, so a taken name
+is a bug rather than a race, and failing loudly beats two writers interleaving
+bytes into one file.
+
+**There is no cleanup on a `StagedClip`.** A file staged into a clip directory
+that is never completed dies with that directory: [a cut that fails removes the
+whole thing](#what-a-clip-is-on-disk-cliplayout), which is the one rule that also
+covers a partially written clip, a panicking copy and a crash. The only local
+tidying the copy does is removing its own half-written file when `copy_window`
+fails, so that a `StagedClip` that exists always names a complete MCAP and
+`is_empty()` can be read off it.
 
 Extraction degrades over localized damage and aborts on anything else.
 Skipped records and dropped chunks are counted in `ClipStats`
@@ -245,9 +233,9 @@ Skipped records and dropped chunks are counted in `ClipStats`
 trigger handler, so a degraded clip is announced but never silent. What stays
 fatal — the recording truncated under the plan, extent framing that no longer
 matches the tail's scan (the bytes changed since the scan, so there is no
-boundary to resync at), and output IO errors — confines its cleanup to the
-capturing directory, so the output directory never holds a footer-less file
-that could be mistaken for a clip. A *deleted* recording is not an error — the
+boundary to resync at), and output IO errors — takes the whole clip directory
+with it, so the output directory never holds a footer-less file that could be
+mistaken for a clip. A *deleted* recording is not an error — the
 plan's `Arc<File>` keeps the inode readable, so extractions in flight across a
 recorder restart still complete.
 
@@ -285,9 +273,9 @@ into clips as-is — only a CDR decode downstream would notice.
 resolved anchor followed by the first 8 bytes of SHA-256 over a canonical
 encoding of the six fields a request *is* — the anchor, `name`, `description`,
 `preroll`, `postroll`, and the time source — rendered as four lower-case hex
-groups of four. `segment::base_name` appends `.mcap` to it and
-`manifest`'s `clip.id` states it, both from that one function, so the filename
-and the record cannot disagree.
+groups of four. `layout::ClipDir` names the clip's directory and every file in
+it from that id, and `manifest`'s `clip.id` states it, all from that one
+function, so the paths, the document and the record cannot disagree.
 
 **The encoding is a published contract**, stated with a worked vector in
 [What a clip carries](../../docs/clip-manifest.md#the-clip-id) and pinned by
@@ -303,155 +291,217 @@ distinct triggers can encode alike however their text is split.
 `/`, `..`, a leading dot, unicode or nothing at all is hashed like any other, so
 there is no sanitizer and nothing for the recorder's admission gate to refuse on
 those grounds; what is left of `validate_name` is the recorder's own length bound
-on a free-text message field. The cost is that a clip's name no longer says what
-it is about, which is what `clip.id` and `trigger.name` in the manifest are for —
-and why the e2e suite finds a clip by reading manifests rather than by matching a
-filename.
+on a free-text message field. The cost is that a clip's name says nothing about
+what it is about, which is what `clip.id` and `trigger.name` in the document are
+for — and why the e2e suite finds a clip by reading documents rather than by
+matching a path.
 
-## Every clip carries its manifest (`clip::manifest`)
+## What a clip is on disk (`clip::layout`)
+
+A clip is a **directory** named by its [id](#a-clip-is-named-by-its-id-clipid),
+holding one `<id>_N.mcap` per contributing source recording and the
+`clip_metadata.yaml` that says it is complete. The shape a consumer sees is in
+[What a clip carries](../../docs/clip-manifest.md); this section is the three
+filesystem operations it is built from, and why each is one operation rather than
+a protocol.
+
+**The directory is the claim.** `ClipDir::claim` is one `mkdir` with no parents,
+which the kernel makes atomic: exactly one caller creates a given path and every
+other sees `AlreadyExists`. That single fact answers a repeated trigger, a
+recorder restart meeting its own earlier clips, two concurrent windows that
+resolve to one id, and two processes writing into one output directory — with no
+lock file, no staging area, no startup wipe and no same-device check. It returns
+a `Claim`, two variants rather than an `Option`, because a caller has to say
+something about each and a taken id must be impossible to mistake for a free one.
+No parents on purpose: the tree above is `prepare_out_dir`'s, and creating it here
+would turn a typo'd `--out-dir` into a silently fresh one.
+
+**The metadata file is the completion signal**, and the write order is what makes
+that true. Every MCAP file was fsynced by its own copy, so `ClipDir::complete`
+writes and fsyncs the document, then fsyncs the clip directory (making every name
+in it durable), then fsyncs the output directory (making the clip directory's own
+entry durable). A crash can therefore lose a clip but can never leave one that
+carries the document and is missing a file the document names. The last fsync is
+what lets the recorder announce a clip as on disk: `Recorded` goes out after
+`cut_window` returns, and by then the clip survives power loss.
+
+**A failed cut takes its directory with it.** `ClipDir::discard` consumes the
+claim, removes the tree and hands back the error that got there — and a removal
+that itself fails is folded in as context naming the directory, because that
+directory is the one thing an operator has to act on (every later window with
+that id is skipped until it is gone). Being *consumed* is what makes this
+unforgettable rather than a rule: the claim is either `complete`d or `discard`ed,
+and `cut_window`'s match over the two is where both arms are visible at once.
+
+**What a crash leaves is deliberate.** A directory with no `clip_metadata.yaml`
+is crash residue by construction, since every ordinary failure removes its own.
+Consumers treat it as incomplete, and a later trigger with that id *skips* it
+rather than repairing or overwriting it — the residue is the evidence that
+something died, and clipper does not destroy evidence to tidy up.
+
+**`.part` is the one name a consumer never sees.** A file's number is its
+position after the empty files are dropped, which is known only once every copy
+has run, so each copy writes under a name derived from its plan's position
+(`ClipDir::staging`) and is renamed into place by `ClipDir::place`. Both names
+live in this module so the two spaces cannot collide, and the window in which a
+`.part` exists is a window in which the directory has no document and is therefore
+incomplete anyway.
+
+## Every clip carries its document (`clip::manifest`)
 
 A clip leaves the output directory and is read somewhere with neither the
-recorder's logs nor the recording beside it, so it states what it is: one
-`mcap::records::Metadata` record under the vendor-namespaced name
-`momentedge.clip`, flat dotted keys and string values. The key groups and what a
-consumer does with them are in the
-[What a clip carries](../../docs/clip-manifest.md); this section is where they come
-from. The name is namespaced because a recording `ros2 bag record` wrote carries
-its *own* metadata record under the bare name `rosbag2` — a manifest under that
-name would be found by whichever record a tool read first.
+recorder's logs nor the recording beside it, so it states what it is. Two
+artefacts do that, and the split between them is the design:
 
-`clip.id` is the one key that is *derived* rather than carried: it is
+- **One `ClipMetadata` per clip**, serialized to `clip_metadata.yaml` by
+  `serde_norway` — the workspace's existing YAML crate, whose only other use is
+  *reading* rosbag2's own `metadata.yaml` in `clip::bag`. It is a typed struct
+  with nested groups (`clip`, `producer`, `trigger`, `window`, `sources`) rather
+  than a hand-built map, so the document and the type cannot drift, and it derives
+  `Deserialize` as well so `layout::read_metadata` reads one back for a consumer
+  and for every test that asserts on a clip.
+- **One key inside every MCAP file** (`manifest::id_record`): an
+  `mcap::records::Metadata` record under the vendor-namespaced name
+  `momentedge.clip` carrying `clip.id` and nothing else. The name is namespaced
+  because a recording `ros2 bag record` wrote carries its *own* metadata record
+  under the bare name `rosbag2`, and a record under that name would be found by
+  whichever a tool read first.
+
+**Why the file carries one key and not the account.** A clip's facts are stated
+once, where one copy cannot disagree with another after a partial rewrite; what a
+*file* has to answer on its own is only "which clip is this?", so that one carried
+away from its directory can still be grouped. Everything else — who cut it, what
+asked for the window, which recordings it came from — is in the document beside
+it.
+
+**`clip.id` is derived, never carried:** it is
 [`ClipId::of`](#a-clip-is-named-by-its-id-clipid) over the same `CutRequest` the
-`trigger.*` and `window.*` keys are written from, and over the same request
-`segment` names the file from. One computation over one value is what makes the
-key and the filename unable to drift.
+`trigger` and `window` groups are written from, and over the same request
+`layout` names the directory and its files from. One computation over one value.
 
 **Written between the last message and `finish`.** `copy_window` walks the
-extents, then calls `ClipWriter::write_manifest`, then `Writer::finish()`. That
+extents, then calls `ClipWriter::write_id_record`, then `Writer::finish()`. That
 position is what earns the two properties a reader depends on: the mcap writer
 appends a `MetadataIndex` to the summary and increments the statistics'
 `metadata_count`, both of which are written by `finish`, so a reader finds the
 record by name through the index rather than by walking the file (`mcap get
 metadata --name momentedge.clip`, and `mcap info` reports `metadata: 1`).
-Writing it earlier would mean guessing counters the copy has not finished
-producing.
 
-**Two halves meet at the writer.** The copy knows what it read and wrote; it
-does not know who asked or what the planner offered. So:
+**Two halves meet at `ClipMetadata::of`**, which is pure. The copy knows what it
+read and wrote; it does not know who asked or what the planner offered. So:
 
 - `clip::manifest::CutRequest` is the caller's half — the `Producer` (the binary
   and the subcommand: `clipper` / `tail`, from `Mode::producer()` in `main.rs`),
   the neutral `Trigger`, the resolved anchor, and the time source. It **derives**
   `start_ns`/`end_ns` from the anchor and the trigger's rolls and exposes them
-  read-only, so the window the manifest states, the window the planner selects
+  read-only, so the window the document states, the window the planner selects
   extents for, and the window each message's membership is tested against are
   one value that cannot drift. `tail::handler::handle_trigger` builds one per
-  trigger, in an `Arc` shared by that window's segments.
-- `clip::manifest::Planned` is the window-level pair every segment repeats:
-  `files`, the number of source recordings `cut_window` was given plans for, and
-  `coverage`, a `WindowCoverage` the *caller* supplies — `Short` when the
-  coverage wait timed out. Both ride in the `StageJob` alongside the request.
-- The copy's own half is per segment: `PlanSource::path` (which split this
-  segment came from), the extents and bytes read, the messages copied, and the
-  per-channel tallies.
+  trigger, in an `Arc` shared by that window's files.
+- `clip::manifest::Planned` is the window-level pair: `files`, the number of
+  source recordings `cut_window` was given plans for, and `coverage`, a
+  `WindowCoverage` the *caller* supplies — `Short` when the coverage wait timed
+  out. `cut_window` holds it; it no longer rides in a `StageJob`, because the
+  copy has nothing to write it into.
+- The copy's own half is one `cut::ClipStats` per file: `PlanSource::path`
+  (which recording this file came from), the extents and bytes read, the messages
+  copied, and the per-channel tallies. Those become one `sources` entry each.
 
 **Per-channel accounting sits on the write.** `ClipWriter::count` is called
-immediately after `write_to_known_channel` and does both the whole-clip counters
-and the `BTreeMap<u16, ChannelTally>` the manifest's `channel.<id>.*` keys come
-from, keyed by the **output** channel id so a reader can join the keys to the
-clip's own `Channel` records. One call site is the point: everything that
-decides which messages are copied — the window test and the channel selection
-beside it — sits in front of that one call, so nothing can leave the accounting
-behind, and a channel nothing was copied from simply never gets an entry, so it
-has no keys rather than a row of zeroes.
+immediately after `write_to_known_channel` and does both the whole-file counters
+and the `BTreeMap<u16, ChannelTally>` that becomes that file's `channels` map,
+keyed by the **output** channel id so a reader can join it to the clip's own
+`Channel` records — *of that file*, since each MCAP numbers its channels from
+scratch, which is why the tallies are per `sources` entry and not clip-wide. One
+call site is the point: everything that decides which messages are copied — the
+window test and the channel selection beside it — sits in front of that one call,
+so nothing can leave the accounting behind, and a channel nothing was copied from
+simply never gets an entry, so it has no keys rather than a row of zeroes.
 
-**An empty clip says which kind of empty it is.** `source.files_planned`,
+**An empty clip says which kind of empty it is.** `window.files_planned`,
 `clip.messages` and `clip.short` are what separate "nothing covered the window"
 from "the window fell in a gap between splits" from "no message matched" —
 three outcomes whose clips are otherwise byte-identical, and the reason
 `WindowCoverage` is plumbed from the wait rather than logged and dropped. The
-table is in the README; `segment::tests::an_empty_clip_says_which_kind_of_empty_it_is`
-builds all three for real and asserts they differ.
+table is in [What a clip carries](../../docs/clip-manifest.md#an-empty-clip-still-explains-itself);
+`segment::tests::an_empty_clip_says_which_kind_of_empty_it_is` builds all three
+for real and asserts they differ.
 
-`clip::manifest::read_manifest` is the other half of the contract: it reads the
-record back through the summary's metadata index — a bounded seek and one
-record, never a walk — and is what the tests assert through.
+Two readers close the contract. `layout::read_metadata` parses a clip
+directory's document and is what most tests assert through — and what a consumer
+filters on, since an error from it *is* "not a complete clip".
+`manifest::read_manifest` reads a file's own record back through the summary's
+metadata index — a bounded seek and one record, never a walk — and returns the
+whole map rather than just the id, so a reader can tell "clipper wrote this and
+said nothing else" from a record under the same name written by something else.
 
-## Segment assembly and publication (`clip::segment`)
+## Segment assembly and the clip directory (`clip::segment`)
 
-`cut_window` is the whole of what turns one window into published clips, and it
-is the same code whichever index found the window: it takes a `&dyn
-WindowPlanner`, names the clip under the output directory it was given, asks the
-planner for the window's plans, stages one clip per plan through the worker pool,
-drops the empty ones, numbers what is left, and publishes each atomically. Its
+`cut_window` is the whole of what turns one window into a durable clip, and it is
+the same code whichever index found the window: it takes a `&dyn WindowPlanner`,
+claims the clip's directory under the output directory it was given, asks the
+planner for the window's plans, copies one file per plan through the worker pool,
+drops the empty ones, numbers what is left, and writes the document last. Its
 caller is either a [trigger handler](../tail/CLAUDE.md#per-trigger-flow) over a
 growing recording or `clipper clip` over a finished one; `cut_window` cannot tell
-them apart except through the one value they do state — which subcommand they
-are.
+them apart and no longer needs to.
 
-**It is the one entry point that decides where a clip goes**, and that is the
-whole reason a caller hands it an `out_dir` rather than a path. Two things follow
-from it, both of which used to be a binary's to get right and are now impossible
-to get differently right in two places:
+**It is the one entry point that decides where a clip goes**, which is why a
+caller hands it an `out_dir` rather than a path. Everything under that directory
+— the name, the file numbering, the document — is
+[`clip::layout`](#what-a-clip-is-on-disk-cliplayout)'s, so neither binary formats
+a clip path and the layout moves in one edit.
 
-- **The name is `segment::base_name`'s**, one private function over the
-  `CutRequest`: the window's [id](#a-clip-is-named-by-its-id-clipid) and the mcap
-  extension. Neither binary formats a clip path, so the scheme moves in one edit.
-- **What a taken name costs is read off the caller's `clip::config::Mode`**
-  (`segment::publication`, an exhaustive match, so a subcommand added to that
-  enum is a compile error until it says what a collision means to it). The
-  recorder says `Mode::Tail` and gets `Publication::Suffix`; `clipper clip` says
-  `Mode::Clip` and gets `Publication::Refuse`. `Publication` itself is private:
-  the policy is nobody's to pass in, and the two halves of it cannot drift.
+**Three outcomes, and the type says which.** `cut_window` returns
+`anyhow::Result<CutOutcome>`, and `CutOutcome` is `Cut(Clip)` or
+`Skipped(PathBuf)`: a clip was written, the id was already taken, or the cut
+failed. A skip is neither of the other two — nothing was written and nothing went
+wrong — and making it a variant rather than an empty `Clip` is what stops a
+caller announcing a clip it did not cut. `Clip` carries the `dir` (what a
+completion names and a consumer syncs) and one `cut::ClipStats` per file (what a
+caller logs).
 
-`Mode` is `clip::config`'s because [the configuration
-file](#the-configuration-file-clipconfig) needs the same two subcommands named
-before argv is parsed; the cut reads it for the one question above and nothing
-else.
+**The skip's warning is the cut's, not the caller's**, so both subcommands say
+the same thing about a taken id and neither can forget to. The claim runs before
+`plan_window`, so a skipped window plans nothing, copies nothing and costs a busy
+device nothing; `segment::tests` hands the second cut an `Unplannable` planner
+that panics if it is asked, which is how that ordering is pinned.
+
+**A cut that fails after the claim removes its directory**, and the two ways out
+of a claim — `complete` or `discard` — are the two arms of one match in
+`cut_window`. `fill` is the separate function everything between them lives in,
+so it may `?` anywhere without leaving a rule to remember at each site.
 
 **Staging worker pool.** `clip::segment::spawn_stage_workers` starts
 `extract_parallelism` threads (at least one) sharing one unbounded FIFO channel,
 started once in `main` and handed to every handler. `cut_window` enqueues one
 `StageJob` per `WindowPlan` — the plan snapshot, the `CutRequest` the window was
-cut from, the `Planned` facts of that window, the base output path, and a
-bounded(1) reply channel — and blocks
-on each reply. The worker dequeues FIFO, runs `clip::cut::stage_clip` into
-`.capturing/`, and replies a `StagedClip`. `cut_window` — not the worker —
-publishes the staged segments once the window's segment count is known, so
-naming (`_00`/`_01`) and atomic publication happen together.
-`std::panic::catch_unwind` isolates a panicking stage per job; the
-pool thread survives and continues processing. With the default
-`extract_parallelism = 1` bulk copies serialize in submission order; postroll
-and coverage waiting are always concurrent.
+cut from, the path inside the claimed directory to write at, and a bounded(1)
+reply channel — and blocks on each reply. The worker dequeues FIFO, runs
+`clip::cut::stage_clip`, and replies a `StagedClip`. `cut_window` — not the
+worker — names the finished files once the clip's file count is known.
+`std::panic::catch_unwind` isolates a panicking copy per job; the pool thread
+survives and continues processing. With the default `extract_parallelism = 1`
+bulk copies serialize in submission order; postroll and coverage waiting are
+always concurrent.
 
 **What the pool captures and what the job carries** is the one distinction worth
 holding onto. The compression codec and the `ChannelSelection` are captured for
 the pool's lifetime: both are properties of the output, process-global, and no
-window may disagree with either. The
-`time_source` rides in each job, because it is a property of the *window* — the
-same value has to choose the extents the planner returns *and* the stamp each
-message's membership is tested on. A pool-level `time_source` would let those two
-be answered from different clocks, and the result is not an error but a clip
-silently holding the wrong messages;
-`cut_window_selects_extents_and_messages_on_the_time_source` drives one
-recording through both domains and pins them together.
+window may disagree with either. The `time_source` rides in each job, because it
+is a property of the *window* — the same value has to choose the extents the
+planner returns *and* the stamp each message's membership is tested on. A
+pool-level `time_source` would let those two be answered from different clocks,
+and the result is not an error but a clip silently holding the wrong messages;
+`cut_window_selects_extents_and_messages_on_the_time_source` drives one recording
+through both domains and pins them together.
 
-**A clip already in `out_dir` is the other refusal** (`clip::segment::ClipExists`).
-The two arms of `Publication` are the same collision answered for different
-inputs: a live trigger colliding with an earlier clip's
-name is a *second* trigger whose data no re-run can produce again, while a cut
-from a finished recording is replayable, so the same name means the same bytes
-and a second file is a duplicate. `cut_window` applies the policy as its first
-step — before `plan_window`, before a `StageJob` is queued — so a refused window
-publishes nothing, stages nothing, and is refused whole even where only one of
-its segments' names is taken. What it checks is the base name **or any
-`<stem>_<digits><ext>` beside it** (`existing_clip`), the one shape both a
-segment name and a suffix-retry sibling take, because a window's segment count is
-settled only once staging has run; the resulting over-refusal — a stray
-`<stem>_00.mcap` blocks a single-segment window — is the cheap direction of that
-trade. The lowest-sorting collision is the one named, so the message is the same
-on every run. There is no override flag: an operator removes the clip or names
-another `--out-dir`.
+**Numbering is settled at close and is internal to the write.** Empty files are
+dropped when the window produced real data elsewhere, and one is kept when they
+are all empty, so `<id>_N.mcap` counts the files that *contributed*, not the
+source recordings that were planned. `window.files_planned` in the document is
+what states the latter, which is how a consumer tells "three splits, one of them
+silent" from "two splits".
 
 ## Cutting from a finished recording (`clip::whole`, `clip::bag`, `clip::embedded`)
 
@@ -468,8 +518,9 @@ the directory a recording run left behind, and `bag::open`
 answers which recordings that is and in what order — the one decision, made in
 one place, that `whole.rs` and `embedded_triggers` both read. The recorder's
 `metadata.yaml` states it where the recorder wrote one: its ordered
-`relative_file_paths` is authoritative, since the order is a clip's *segment*
-order and getting it wrong reorders a clip rather than merely renaming it.
+`relative_file_paths` is authoritative, since the order is the order a clip's
+files are numbered in, and getting it wrong reorders a clip rather than merely
+renaming it.
 Without that file the order is modification time, oldest first — and its absence
 is itself the signal, the file being written at shutdown: a directory without it
 was copied off a device while the recording was still growing. What the file
@@ -484,11 +535,11 @@ own**, so a directory holding one that does not is refused naming *that
 recording* — the file an operator repairs or removes — and the last split of a
 directory copied mid-recording is the usual offender. And the collection is one
 `WindowPlanner`: `plan_window` returns one plan per contributing split, in
-recording order, so `cut_window` publishes one `_NN` segment each. The number is
-the position **after** the segments that copied nothing are dropped, not the
-split's place in the directory — a window over three splits whose middle
-recording contributes nothing yields `_00` and `_01`, where `_01` holds the third
-recording's data.
+recording order, so the clip holds one `<id>_N.mcap` each. The number is the
+position **after** the files that copied nothing are dropped, not the split's
+place in the directory — a window over three splits whose middle recording
+contributes nothing yields `_0` and `_1`, where `_1` holds the third recording's
+data, and the document's `window.files_planned` is `3`.
 
 **The index is the summary** (`clip::whole::WholeFileIndex`), per recording. A finalised MCAP
 already carries a chunk index per chunk (byte range plus the `log_time` span
@@ -536,10 +587,10 @@ indexes, because a chunked recording holding no message emits no chunk either, s
 testing the chunk indexes first would call every empty recording unchunked. Each
 variant's `Display` names the recording, the fault and the same three commands —
 `mcap recover`, `mcap compress`, `mcap list chunks` (whose `message index length`
-column is what `Unindexed` reads). `clipper clip` opens the index *before*
-`reset_capturing_dir`, so a refusal creates neither `out_dir` nor the staging
-directory inside it, and the input is opened read-only and left byte for byte and
-mtime for mtime as it was found. clipper runs no repair; `mcap` does.
+column is what `Unindexed` reads). `clipper clip` opens the index *before* it
+prepares the output directory, so a refusal does not even create `out_dir`, and
+the input is opened read-only and left byte for byte and mtime for mtime as it
+was found. clipper runs no repair; `mcap` does.
 
 `OpenError`'s other three arms are not refusals: `Unreadable` (the file could not
 be opened, stat'd, seeked or read), `Unparsable` (a footer that is not a footer

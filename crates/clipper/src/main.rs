@@ -1466,9 +1466,8 @@ impl Verdict {
 /// `_exit(2)` ends it there instead: no handler, no destructor, and the status
 /// is exactly the one asked for, so a supervisor can tell "clipper decided to
 /// stop" from "clipper was killed". Nothing is lost by skipping that teardown —
-/// a run's result is the contents of `out_dir`, every clip published by an
-/// atomic rename long before, and the startup capturing-dir reset reclaims
-/// anything a killed handler staged.
+/// a run's result is the contents of `out_dir`, and every complete clip in it
+/// was made durable, metadata file and all, before it was announced.
 fn end_process(status: i32) -> ! {
     // The one buffer worth saving: stdout is line-buffered, so a final write
     // without a newline would otherwise go down with the process.
@@ -1510,9 +1509,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 ///
 /// Returning hands that verdict to [`main`], which ends the process on it
 /// ([`end_process`]) and with it the remaining threads: the immortal tail and
-/// interface loops, parked handlers, and any in-flight extraction. That is safe
-/// for clips by construction — the capturing-dir reset at startup reclaims any
-/// stranded staged file, and `out_dir` only ever holds complete clips.
+/// interface loops, parked handlers, and any in-flight extraction. What a killed
+/// handler leaves behind is a clip directory with no `clip_metadata.yaml` in it,
+/// which is by definition incomplete: a consumer skips it, and a later trigger
+/// with that id skips it too rather than overwriting the evidence.
 fn tail_mode(
     cfg: Config,
     producer: Producer,
@@ -1520,12 +1520,12 @@ fn tail_mode(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let cfg = Arc::new(cfg);
 
-    // Start each run with a clean capturing dir: a crash mid-publish can strand
-    // a stale staged file there, and clearing it at startup bounds that clutter
-    // to a single run. This also creates out_dir, so the first clip can be
-    // published without further setup. Fatal if it fails — a recorder that
-    // cannot prepare its output directory must not start.
-    clip::cut::reset_capturing_dir(&cfg.out_dir)?;
+    // Create the output directory, with parents, so a run that never cuts a clip
+    // still leaves the directory it was pointed at. Nothing in it is cleared or
+    // required to be empty: a clip claims its own subdirectory and the root is
+    // otherwise left exactly as it was found. Fatal if it fails — a recorder
+    // that cannot prepare its output directory must not start.
+    clip::layout::prepare_out_dir(&cfg.out_dir)?;
 
     // One staging worker per allowed concurrent clip copy; see
     // Config::extract_parallelism. The clip compression codec and the topic
@@ -1699,9 +1699,9 @@ fn with_usable_names(
 ///
 /// **The input is one recording or a bag directory of them.** A directory is
 /// read as one time-ordered collection ([`clip::bag`]), so a window straddling
-/// a split is cut into one segment per contributing recording — the same
-/// `<anchor>_<name>_NN.mcap` set the device writes when a window straddles a
-/// rollover — and a segment number is the position after the recordings that
+/// a split is cut into one file per contributing recording inside the clip's own
+/// directory — the same shape the device writes when a window straddles a
+/// rollover — and a file's number is the position after the recordings that
 /// contributed nothing are dropped, not the split's place in the directory.
 ///
 /// **How many clips a run writes is the trigger source's answer**
@@ -1719,25 +1719,22 @@ fn with_usable_names(
 /// **A recording it cannot index is refused by name**, from that same footer
 /// and summary, before anything is created: [`clip::whole::IndexRefusal`] is
 /// the taxonomy, the message names the fault and the `mcap` command that
-/// repairs it, and the run exits non-zero having written nothing — not the
-/// output directory, not the staging directory inside it. Every split of a bag
-/// directory faces that contract on its own, so a directory is refused naming
-/// the one recording in it that failed. clipper runs no repair itself;
-/// recovering and re-indexing a recording are the operator's.
+/// repairs it, and the run exits non-zero having written nothing — not even the
+/// output directory. Every split of a bag directory faces that contract on its
+/// own, so a directory is refused naming the one recording in it that failed.
+/// clipper runs no repair itself; recovering and re-indexing a recording are the
+/// operator's.
 ///
-/// **A clip that is already there is refused too**, which is what
-/// [`clip::segment::cut_window`] makes of a taken name under
-/// [`config::Mode::Clip`]. A finished recording and a trigger
-/// describe one window and one copy of its bytes, so a re-run over both writes
-/// the clip that is already in the output directory: the run names it, exits
-/// non-zero, and stages nothing, rather than publishing a second copy beside it
-/// the way the recorder does for a second live trigger. There is no flag to
-/// override it — an operator who wants the clip again removes it or names
-/// another `--out-dir`.
+/// **A clip that is already there is skipped**, which is what
+/// [`clip::segment::cut_window`] makes of a claimed directory. A finished
+/// recording and a trigger describe one window and one copy of its bytes, so a
+/// window whose clip is on disk has already been cut: the run warns, leaves it
+/// alone and goes on to the next window. That is what makes a re-run over the
+/// same recording into the same directory a resume rather than a conflict.
 ///
 /// Nothing is printed for a caller to parse. The result is the output
-/// directory's contents when the process exits, each clip carrying its own
-/// manifest; the exit status is the verdict.
+/// directory's contents when the process exits, each clip a directory carrying
+/// its own `clip_metadata.yaml`; the exit status is the verdict.
 #[expect(
     clippy::needless_pass_by_value,
     reason = "the mode owns the config clap parsed for it; `main` hands it over and \
@@ -1772,10 +1769,10 @@ fn clip_mode(
         return Ok(());
     }
 
-    // Start from a clean capturing dir, which also creates out_dir: a clip is
-    // assembled there and hard-linked into place, so the output directory only
-    // ever holds complete clips.
-    clip::cut::reset_capturing_dir(&cfg.out_dir)?;
+    // Create the output directory, with parents. Nothing in it is cleared and it
+    // is never required to be empty: each window claims its own subdirectory
+    // under it, and the root gains clip directories and nothing else.
+    clip::layout::prepare_out_dir(&cfg.out_dir)?;
 
     // One copy at a time: the windows are cut in trigger order, and the pool is
     // sized to the work in front of it. It exists at all because staging is the
@@ -1796,12 +1793,12 @@ fn clip_mode(
     Ok(())
 }
 
-/// Cut one window out of the indexed recording and log what each published
-/// segment holds.
+/// Cut one window out of the indexed recording and log what each file of the
+/// clip holds — or skip the window whose clip is already on disk.
 ///
-/// A window that straddles a split in a bag directory publishes one segment per
-/// contributing recording, so the reporting loop runs over however many
-/// `cut_window` returned rather than over one clip.
+/// A window that straddles a split in a bag directory writes one file per
+/// contributing recording, so the reporting loop runs over however many files
+/// the clip took rather than over one.
 fn cut_one(
     index: &clip::whole::WholeFileIndex,
     cfg: &ClipConfig,
@@ -1841,19 +1838,14 @@ fn cut_one(
         request.end_ns(),
     );
 
-    let segments = segment::cut_window(
-        index,
-        &request,
-        coverage,
-        &cfg.out_dir,
-        // Cutting from a recording with an end is what this subcommand is, so
-        // the cut is told that and nothing more: what a clip already in the
-        // output directory costs a replayable input is `clip`'s to decide.
-        config::Mode::Clip,
-        stage_tx,
-    )?;
-
-    clip::cut::report_clips(&segments);
+    // A window whose clip is already there is skipped, not failed: the cut has
+    // already warned, naming the directory, and the run goes on to the next
+    // window. That is what makes a re-run a resume.
+    if let segment::CutOutcome::Cut(clip) =
+        segment::cut_window(index, &request, coverage, &cfg.out_dir, stage_tx)?
+    {
+        clip::cut::report_clips(&clip.files);
+    }
     Ok(())
 }
 
@@ -2292,32 +2284,49 @@ mod tests {
         .to_string()
     }
 
-    /// Every clip under `out_dir`, grouped by the name of the trigger that asked
-    /// for it and sorted within each group.
+    /// One complete clip on disk, as a test reads it back: the directory it is,
+    /// and the document it carries.
+    struct Clipped {
+        dir: PathBuf,
+        metadata: clip::ClipMetadata,
+    }
+
+    impl Clipped {
+        /// The clip's MCAP files, in the order its document names them.
+        fn files(&self) -> Vec<PathBuf> {
+            self.metadata
+                .sources
+                .iter()
+                .map(|source| self.dir.join(&source.file))
+                .collect()
+        }
+
+        /// The clip's first (often only) file.
+        fn file(&self) -> PathBuf {
+            self.files()
+                .into_iter()
+                .next()
+                .expect("a clip holds a file")
+        }
+    }
+
+    /// Every complete clip under `out_dir`, by the name of the trigger that
+    /// asked for it.
     ///
-    /// A clip is named by its id, so which trigger a clip answers is something
-    /// the clip *states* rather than something a filename spells: a test looking
-    /// for "the clip of the `brake` trigger" reads the manifests, exactly as a
-    /// consumer would.
+    /// A clip is a directory named by its id, so which trigger a clip answers is
+    /// something the clip *states* rather than something a path spells: a test
+    /// looking for "the clip of the `brake` trigger" reads the documents,
+    /// exactly as a consumer would — and filters on their presence, exactly as
+    /// an upload pipeline would.
     fn clips_by_trigger(
         out_dir: &Path,
-    ) -> anyhow::Result<std::collections::BTreeMap<String, Vec<PathBuf>>> {
-        let mut clips: std::collections::BTreeMap<String, Vec<PathBuf>> =
-            std::collections::BTreeMap::new();
+    ) -> anyhow::Result<std::collections::BTreeMap<String, Clipped>> {
+        let mut clips = std::collections::BTreeMap::new();
         for entry in std::fs::read_dir(out_dir)? {
-            let path = entry?.path();
-            if path.extension().is_none_or(|ext| ext != "mcap") {
-                continue;
-            }
-            let manifest =
-                clip::manifest::read_manifest(&path)?.context("every clip carries a manifest")?;
-            clips
-                .entry(manifest["trigger.name"].clone())
-                .or_default()
-                .push(path);
-        }
-        for paths in clips.values_mut() {
-            paths.sort();
+            let dir = entry?.path();
+            let metadata = clip::layout::read_metadata(&dir)
+                .with_context(|| format!("{} is a complete clip", dir.display()))?;
+            clips.insert(metadata.trigger.name.clone(), Clipped { dir, metadata });
         }
         Ok(clips)
     }
@@ -2798,45 +2807,44 @@ mod tests {
         };
         clip_mode(cfg, producer, clip::ChannelSelection::default())?;
 
-        let clip_path = out_dir.join(format!(
-            "{}.mcap",
-            clip_id(3_000, "brake", "hard brake", 1_500, 500)
-        ));
+        let id = clip_id(3_000, "brake", "hard brake", 1_500, 500);
+        let clip_dir = out_dir.join(&id);
         assert_eq!(
-            clip::testing::read_clip(&clip_path)?,
+            std::fs::read_dir(&out_dir)?.count(),
+            1,
+            "the output directory gains one clip directory and nothing else"
+        );
+        assert_eq!(
+            clip::testing::read_clip(&clip_dir.join(format!("{id}_0.mcap")))?,
             vec![("/t".to_string(), 2_000), ("/t".to_string(), 3_000)],
             "the window [1500, 3500] holds exactly these two messages"
         );
 
-        let m = clip::manifest::read_manifest(&clip_path)?.expect("every clip carries a manifest");
-        assert_eq!(m["producer.name"], "clipper");
+        let m = clip::layout::read_metadata(&clip_dir)?;
+        assert_eq!(m.producer.name, "clipper");
         assert_eq!(
-            m["producer.mode"], "clip",
+            m.producer.mode, "clip",
             "a clip cut here is told from a recorder's without opening the recording"
         );
+        assert_eq!(m.clip.id, id, "the clip states the id it is written under");
+        assert_eq!(m.trigger.name, "brake");
+        assert_eq!(m.trigger.description, "hard brake");
+        assert_eq!(m.trigger.anchor_ns, 3_000);
+        assert_eq!(m.trigger.preroll_ns, 1_500);
+        assert_eq!(m.trigger.postroll_ns, 500);
+        assert_eq!(m.window.time_source, "log");
+        assert_eq!(m.window.start_ns, 1_500);
+        assert_eq!(m.window.end_ns, 3_500);
+        assert_eq!(m.window.files_planned, 1);
         assert_eq!(
-            m["clip.id"],
-            clip_path
-                .file_stem()
-                .expect("the clip has a name")
-                .to_string_lossy(),
-            "the clip states the id it is written under"
+            m.sources
+                .iter()
+                .map(|s| (s.file.clone(), s.path.clone()))
+                .collect::<Vec<_>>(),
+            vec![(format!("{id}_0.mcap"), Some(rec.display().to_string()))],
         );
-        assert_eq!(m["trigger.name"], "brake");
-        assert_eq!(m["trigger.description"], "hard brake");
-        assert_eq!(m["trigger.anchor_ns"], "3000");
-        assert_eq!(m["trigger.preroll_ns"], "1500");
-        assert_eq!(m["trigger.postroll_ns"], "500");
-        assert_eq!(m["window.time_source"], "log");
-        assert_eq!(m["window.start_ns"], "1500");
-        assert_eq!(m["window.end_ns"], "3500");
-        assert_eq!(m["source.path"], rec.display().to_string());
-        assert_eq!(m["source.files_planned"], "1");
-        assert_eq!(m["clip.messages"], "2");
-        assert_eq!(
-            m["clip.short"], "false",
-            "the recording runs past the window end"
-        );
+        assert_eq!(m.clip.messages, 2);
+        assert!(!m.clip.short, "the recording runs past the window end");
 
         std::fs::remove_dir_all(root)?;
         Ok(())
@@ -2870,11 +2878,10 @@ mod tests {
         )?;
         let elapsed = began.elapsed();
 
-        let clip_path = &clips_by_trigger(&out_dir)?["late"][0];
-        let m = clip::manifest::read_manifest(clip_path)?.expect("every clip carries a manifest");
-        assert_eq!(m["clip.messages"], "2");
-        assert_eq!(
-            m["clip.short"], "true",
+        let m = &clips_by_trigger(&out_dir)?["late"].metadata;
+        assert_eq!(m.clip.messages, 2);
+        assert!(
+            m.clip.short,
             "the recording stops well inside the window, and the clip says so"
         );
         assert!(
@@ -2943,16 +2950,15 @@ mod tests {
         )?;
 
         let clips = clips_by_trigger(&out_dir)?;
+        let escaped = &clips["../../escape"];
         assert_eq!(
-            clips["../../escape"],
-            vec![out_dir.join(format!(
-                "{}.mcap",
-                clip_id(1_000, "../../escape", "", 500, 500)
-            ))],
-            "the clip is named by its id, and the name only reaches the manifest"
+            escaped.dir,
+            out_dir.join(clip_id(1_000, "../../escape", "", 500, 500)),
+            "the clip is one ordinary directory under the output directory, named \
+             by its id — the trigger's name only reaches the document"
         );
         assert_eq!(
-            clip_data(&clips["../../escape"][0])?,
+            clip_data(&escaped.file())?,
             vec![1_000],
             "and it is an ordinary clip of the window that was asked for"
         );
@@ -3113,36 +3119,38 @@ mod tests {
         )?;
 
         let id = clip_id(3_000, "brake", "", 1_500, 500);
-        let segments = clips_by_trigger(&out_dir)?;
+        let clips = clips_by_trigger(&out_dir)?;
+        let clip = &clips["brake"];
+        assert_eq!(clip.dir, out_dir.join(&id), "one clip, one directory");
         assert_eq!(
-            segments["brake"]
+            clip.metadata
+                .sources
                 .iter()
-                .map(|p| p.file_name().unwrap_or_default().to_string_lossy())
+                .map(|s| s.file.clone())
                 .collect::<Vec<_>>(),
-            vec![format!("{id}_00.mcap"), format!("{id}_01.mcap")],
-            "one segment per contributing recording, numbered in collection order"
+            vec![format!("{id}_0.mcap"), format!("{id}_1.mcap")],
+            "one file per contributing recording, numbered in collection order"
         );
 
-        // The window [1500, 3500] straddles the split; the segments together
-        // are the two messages inside it, in recording order.
-        let segments = &segments["brake"];
-        assert_eq!(clip_data(&segments[0])?, vec![2_000]);
-        assert_eq!(clip_data(&segments[1])?, vec![3_000]);
+        // The window [1500, 3500] straddles the split; the files together are
+        // the two messages inside it, in recording order.
+        let files = clip.files();
+        assert_eq!(clip_data(&files[0])?, vec![2_000]);
+        assert_eq!(clip_data(&files[1])?, vec![3_000]);
 
-        let manifest = |path: &Path| -> anyhow::Result<_> {
-            clip::manifest::read_manifest(path)?.context("every clip carries a manifest")
-        };
         assert_eq!(
-            manifest(&segments[0])?["source.path"],
-            first.display().to_string()
+            clip.metadata
+                .sources
+                .iter()
+                .map(|s| s.path.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                Some(first.display().to_string()),
+                Some(second.display().to_string())
+            ],
         );
         assert_eq!(
-            manifest(&segments[1])?["source.path"],
-            second.display().to_string()
-        );
-        assert_eq!(
-            manifest(&segments[0])?["source.files_planned"],
-            "2",
+            clip.metadata.window.files_planned, 2,
             "the clip states how many recordings of the collection the window crossed"
         );
 
@@ -3203,17 +3211,16 @@ mod tests {
     }
 
     /// Cutting the same window out of the same recording twice writes the clip
-    /// once: the second run names the clip that is already there, exits
-    /// non-zero, and leaves the output directory exactly as the first left it.
+    /// once: the second run finds the clip already there, skips it with a
+    /// warning, and exits zero having changed nothing.
     ///
-    /// This is what separates a cut from a finished recording from the
-    /// recorder's cut on a vehicle. There a colliding name is a *second*
-    /// trigger, whose clip is data no re-run can produce again, so it is
-    /// published beside the first. Here both runs describe one window over one
-    /// finished file and copy the same bytes, so a second file would be a
-    /// duplicate — and there is no flag that turns the refusal off.
+    /// This is what makes a re-run a **resume**. A finished recording and a
+    /// trigger describe one window over one set of bytes, so a window whose clip
+    /// is on disk has already been cut; an interrupted run is finished by
+    /// running it again, and a pipeline that re-runs one for safety pays nothing
+    /// and breaks nothing.
     #[test]
-    fn clip_mode_refuses_a_re_run_rather_than_duplicating() -> anyhow::Result<()> {
+    fn clip_mode_skips_a_re_run_rather_than_duplicating() -> anyhow::Result<()> {
         let root = clip::testing::test_dir("clip-rerun")?;
         let rec = root.join("rec.mcap");
         clip::testing::write_recording(&rec, true, &[("/t", 1_000), ("/t", 2_000)])?;
@@ -3233,61 +3240,92 @@ mod tests {
         };
 
         cut_it()?;
-        let clip_path = out_dir.join(format!(
-            "{}.mcap",
-            clip_id(1_500, "brake", "", 1_000, 1_000)
-        ));
+        let id = clip_id(1_500, "brake", "", 1_000, 1_000);
+        let clip_dir = out_dir.join(&id);
+        let clip_file = clip_dir.join(format!("{id}_0.mcap"));
         assert_eq!(
-            clip::testing::read_clip(&clip_path)?,
+            clip::testing::read_clip(&clip_file)?,
             vec![("/t".to_string(), 1_000), ("/t".to_string(), 2_000)],
             "the first run writes the clip"
         );
+        let before = std::fs::read(&clip_file)?;
 
-        let err = cut_it().unwrap_err();
-        let text = format!("{err:#}");
-        assert!(
-            text.contains(&clip_path.display().to_string()),
-            "the refusal names the clip that is already there: {text}"
-        );
-        assert!(
-            err.downcast_ref::<clip::segment::ClipExists>().is_some(),
-            "the refusal keeps its type all the way out: {text}"
-        );
+        cut_it().expect("a re-run over an already-cut window is a normal, zero run");
 
-        // Nothing else reached the output directory: no second copy under a
-        // suffixed name, and nothing stranded in the staging area.
-        let mut published: Vec<String> = std::fs::read_dir(&out_dir)?
+        let published: Vec<String> = std::fs::read_dir(&out_dir)?
             .map(|e| Ok::<_, anyhow::Error>(e?.file_name().to_string_lossy().into_owned()))
             .collect::<anyhow::Result<Vec<_>>>()?;
-        published.sort();
         assert_eq!(
             published,
-            vec![
-                ".capturing".to_string(),
-                clip_path
-                    .file_name()
-                    .expect("the clip has a name")
-                    .to_string_lossy()
-                    .into_owned()
-            ],
-            "the refused run publishes nothing, least of all a suffixed sibling"
+            vec![id],
+            "the re-run adds nothing to the output directory"
         );
         assert_eq!(
-            std::fs::read_dir(out_dir.join(".capturing"))?.count(),
-            0,
-            "the refusal happens before staging, so the staging area stays empty"
+            std::fs::read(&clip_file)?,
+            before,
+            "and changes no byte of the clip that was there"
         );
 
-        // What the operator actually sees: `main` boxes the error and returns
-        // it, and the runtime renders that box's `Debug` before exiting
-        // non-zero. A refusal that does not name the clip on the way out is one
-        // nobody can act on.
-        let boxed: Box<dyn std::error::Error> = err.into();
-        let printed = format!("{boxed:?}");
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// What a run may do to `--out-dir`, and what it may never do.
+    ///
+    /// The output directory is somewhere an operator points a sync tool, so the
+    /// contract is narrow: it is created with parents when missing, it is never
+    /// cleared or required to be empty, and the only thing a run ever adds to
+    /// its root is a clip directory. Nothing else — no staging area, no lock, no
+    /// sidecar — so there is no exclude list to keep in step with clipper.
+    #[test]
+    fn a_run_creates_its_out_dir_with_parents_and_adds_only_clip_directories() -> anyhow::Result<()>
+    {
+        let root = clip::testing::test_dir("clip-outdir")?;
+        let rec = root.join("rec.mcap");
+        clip::testing::write_recording(&rec, true, &[("/t", 1_000), ("/t", 2_000)])?;
+        // Two levels the run has to create, under a directory that already has
+        // something of someone else's in it.
+        let out_dir = root.join("uploads").join("clips");
+        std::fs::create_dir_all(root.join("uploads"))?;
+        let foreign = root.join("uploads").join("README");
+        std::fs::write(&foreign, b"not clipper's")?;
+
+        clip_mode(
+            ClipConfig {
+                trigger_time: Some(1_500),
+                preroll: Some(1_000),
+                postroll: Some(1_000),
+                trigger_name: Some("brake".to_string()),
+                ..param_clip_cfg(&rec, &out_dir)
+            },
+            CLIP_PRODUCER,
+            clip::ChannelSelection::default(),
+        )?;
+
         assert!(
-            printed.contains(&clip_path.display().to_string()),
-            "the refusal survives the boxing `main` does: {printed}"
+            out_dir.is_dir(),
+            "the output directory is created with parents"
         );
+        assert_eq!(
+            std::fs::read(&foreign)?,
+            b"not clipper's",
+            "a file that was already there is left exactly as it was"
+        );
+
+        let entries: Vec<String> = std::fs::read_dir(&out_dir)?
+            .map(|e| Ok::<_, anyhow::Error>(e?.file_name().to_string_lossy().into_owned()))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        assert_eq!(
+            entries,
+            vec![clip_id(1_500, "brake", "", 1_000, 1_000)],
+            "the root of the output directory holds clip directories and nothing else"
+        );
+        for entry in std::fs::read_dir(&out_dir)? {
+            assert!(
+                entry?.path().is_dir(),
+                "every entry in the output directory is a clip directory"
+            );
+        }
 
         std::fs::remove_dir_all(root)?;
         Ok(())
@@ -3698,41 +3736,30 @@ mod tests {
         let clips = clips_by_trigger(&out_dir)?;
         assert_eq!(clips.keys().collect::<Vec<_>>(), vec!["first", "second"]);
         assert_eq!(
-            [&clips["first"][0], &clips["second"][0]].map(|p| p
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned()),
+            [&clips["first"], &clips["second"]].map(|c| c.metadata.clip.id.clone()),
             [
-                format!(
-                    "{}.mcap",
-                    clip_id(2_500, "first", "first happened", 1_000, 500)
-                ),
-                format!(
-                    "{}.mcap",
-                    clip_id(4_200, "second", "second happened", 300, 1_000)
-                ),
+                clip_id(2_500, "first", "first happened", 1_000, 500),
+                clip_id(4_200, "second", "second happened", 300, 1_000),
             ]
         );
 
         // Each window is its own trigger's, both bounds inclusive:
         // [2500-1000, 2500+500] and [4200-300, 4200+1000].
-        assert_eq!(clip_data(&clips["first"][0])?, vec![2_000, 3_000]);
-        assert_eq!(clip_data(&clips["second"][0])?, vec![4_000, 5_000]);
+        assert_eq!(clip_data(&clips["first"].file())?, vec![2_000, 3_000]);
+        assert_eq!(clip_data(&clips["second"].file())?, vec![4_000, 5_000]);
 
-        let first = clip::manifest::read_manifest(&clips["first"][0])?
-            .expect("every clip carries a manifest");
-        assert_eq!(first["trigger.name"], "first");
-        assert_eq!(first["trigger.description"], "first happened");
+        let first = &clips["first"].metadata;
+        assert_eq!(first.trigger.name, "first");
+        assert_eq!(first.trigger.description, "first happened");
         assert_eq!(
-            first["trigger.anchor_ns"], "2500",
+            first.trigger.anchor_ns, 2_500,
             "the window anchors on the recorded trigger message's own log time"
         );
-        assert_eq!(first["trigger.preroll_ns"], "1000");
-        assert_eq!(first["trigger.postroll_ns"], "500");
-        assert_eq!(first["window.start_ns"], "1500");
-        assert_eq!(first["window.end_ns"], "3000");
-        assert_eq!(first["producer.mode"], "clip");
+        assert_eq!(first.trigger.preroll_ns, 1_000);
+        assert_eq!(first.trigger.postroll_ns, 500);
+        assert_eq!(first.window.start_ns, 1_500);
+        assert_eq!(first.window.end_ns, 3_000);
+        assert_eq!(first.producer.mode, "clip");
 
         std::fs::remove_dir_all(root)?;
         Ok(())
@@ -3788,8 +3815,8 @@ mod tests {
         );
         // Each window sits inside the recording its trigger was written to, so
         // each clip is one segment and holds that recording's messages.
-        assert_eq!(clip_data(&clips["first"][0])?, vec![2_000]);
-        assert_eq!(clip_data(&clips["second"][0])?, vec![6_000]);
+        assert_eq!(clip_data(&clips["first"].file())?, vec![2_000]);
+        assert_eq!(clip_data(&clips["second"].file())?, vec![6_000]);
 
         std::fs::remove_dir_all(root)?;
         Ok(())
@@ -3839,21 +3866,17 @@ mod tests {
             clip::ChannelSelection::default(),
         )?;
 
-        let clip_name = format!(
-            "{}.mcap",
-            clip_id(3_000, "brake", "brake happened", 1_500, 500)
-        );
-        let recorded_manifest = clip::manifest::read_manifest(&from_recording.join(&clip_name))?
-            .expect("every clip carries a manifest");
-        let flagged_manifest = clip::manifest::read_manifest(&from_flags.join(&clip_name))?
-            .expect("every clip carries a manifest");
+        let id = clip_id(3_000, "brake", "brake happened", 1_500, 500);
+        let recorded = clip::layout::read_metadata(&from_recording.join(&id))?;
+        let flagged = clip::layout::read_metadata(&from_flags.join(&id))?;
         assert_eq!(
-            recorded_manifest, flagged_manifest,
+            recorded, flagged,
             "the same trigger states the same clip, whichever source stated it"
         );
+        let file = format!("{id}_0.mcap");
         assert_eq!(
-            clip_data(&from_recording.join(&clip_name))?,
-            clip_data(&from_flags.join(&clip_name))?,
+            clip_data(&from_recording.join(&id).join(&file))?,
+            clip_data(&from_flags.join(&id).join(&file))?,
         );
 
         std::fs::remove_dir_all(root)?;
@@ -3925,7 +3948,7 @@ mod tests {
             clip::ChannelSelection::default(),
         )?;
         assert_eq!(
-            clip_data(&clips_by_trigger(&out_dir)?["window"][0])?,
+            clip_data(&clips_by_trigger(&out_dir)?["window"].file())?,
             vec![1_000, 2_000],
             "a param run reads the chunks its window needs and no others"
         );
@@ -5580,21 +5603,17 @@ mod tests {
             selection,
         )?;
 
-        let clip_path = &clips_by_trigger(&out_dir)?["sel"][0];
+        let clip = clips_by_trigger(&out_dir)?["sel"].file();
         assert_eq!(
-            clip::testing::read_clip(clip_path)?,
+            clip::testing::read_clip(&clip)?,
             vec![("/imu/data".to_string(), 1_000)],
             "only the selected topic is cut"
         );
-        let manifest =
-            clip::manifest::read_manifest(clip_path)?.expect("every clip carries a manifest");
+        let sources = clips_by_trigger(&out_dir)?["sel"].metadata.sources.clone();
         assert_eq!(
-            manifest
-                .keys()
-                .filter(|k| k.starts_with("channel."))
-                .count(),
-            3,
-            "the excluded topic has no per-channel manifest keys: {manifest:?}"
+            sources[0].channels.len(),
+            1,
+            "the excluded topic is tallied in no channel: {sources:?}"
         );
 
         std::fs::remove_dir_all(root)?;

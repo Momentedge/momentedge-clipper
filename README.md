@@ -36,9 +36,10 @@ through the file on disk.
 - **ROS is optional.** It is a cargo feature. The default build links no ROS at
   all, reads its triggers out of the recording, and cuts identical clips — on
   the vehicle, in a container, or in the cloud.
-- **Every clip says what it is.** A manifest record inside each file names the
-  trigger, the window, the source bytes and the per-channel counts — so a clip
-  that came back empty can still tell you why.
+- **Every clip says what it is.** Each clip is a directory whose
+  `clip_metadata.yaml` names the trigger, the window, the source bytes and the
+  per-channel counts — so a clip that came back empty can still tell you why, and
+  an upload pipeline knows a clip is finished the moment that file appears.
 
 ## How it works
 
@@ -53,9 +54,11 @@ clipper is a standalone application that sits beside a continuous
         ▼                                              │
      clipper ◀──────────────── tails (keeps the file open) ──────────┘
         │
-        ├── copies [anchor − preroll, anchor + postroll] ──▶ ./clipped/<anchor_ns>_<hash>.mcap
+        ├── copies [anchor − preroll, anchor + postroll] ──▶ ./clipped/<anchor_ns>_<hash>/
+        │                                                       <id>_0.mcap …
+        │                                                       clip_metadata.yaml
         │
-        └── announces ──▶ /events/momentedge/recorded   (momentedge_msgs/Recorded, lists every file written)
+        └── announces ──▶ /events/momentedge/recorded   (momentedge_msgs/Recorded, naming the directory)
 ```
 
 1. **Tail.** clipper keeps the growing MCAP file open and incrementally scans
@@ -63,8 +66,9 @@ clipper is a standalone application that sits beside a continuous
    cut the moment its data is physically on disk.
 2. **Listen.** It waits for a `momentedge_msgs/Trigger` carrying a name and a
    pre/post window.
-3. **Copy.** It copies every message inside the window into a standalone clip,
-   then announces the result on `/events/momentedge/recorded`.
+3. **Copy.** It copies every message inside the window into a clip directory,
+   writes the metadata file that marks it complete, then announces the result on
+   `/events/momentedge/recorded`.
 
 Because the recording is already on disk, the preroll — the data from *before*
 the trigger — is there to copy.
@@ -86,27 +90,33 @@ ros2 topic pub --once /events/momentedge/trigger momentedge_msgs/msg/Trigger \
   "{name: clip1, trigger_time: {sec: 0, nanosec: 0}, preroll: 5000000000, postroll: 5000000000}"
 ```
 
-A standalone MCAP lands in `./clipped`, named by its **clip id** — the window's
+A clip directory lands in `./clipped`, named by its **clip id** — the window's
 anchor and a digest of the trigger that asked for it, so two detectors firing on
-one instant never collide and no trigger text reaches a path. It can tell you
-what it is:
+one instant never collide and no trigger text reaches a path. It holds one MCAP
+file per source recording the window crossed, and the metadata file that says it
+is complete and what it is:
 
 ```console
-$ mcap get metadata --name momentedge.clip ./clipped/1738000000000000000_35a7-60a7-01fc-8561.mcap
-{
-  "trigger.name":     "clip1",
-  "trigger.anchor_ns": "1738000000000000000",
-  "window.start_ns":  "1737999995000000000",
-  "window.end_ns":    "1738000005000000000",
-  "clip.id":          "1738000000000000000_35a7-60a7-01fc-8561",
-  "clip.messages":    "4211",
-  "clip.short":       "false",
-  ...
-}
+$ ls ./clipped/1738000000000000000_35a7-60a7-01fc-8561/
+1738000000000000000_35a7-60a7-01fc-8561_0.mcap  clip_metadata.yaml
+
+$ head -12 ./clipped/1738000000000000000_35a7-60a7-01fc-8561/clip_metadata.yaml
+version: '1'
+clip:
+  id: 1738000000000000000_35a7-60a7-01fc-8561
+  messages: 4211
+  short: false
+producer:
+  name: clipper
+  mode: tail
+trigger:
+  name: clip1
+  description: ''
+  anchor_ns: 1738000000000000000
 ```
 
-Or open it in Foxglove, replay it with `ros2 bag play`, inspect it with
-`ros2 bag info` — it is an ordinary MCAP file.
+Each `.mcap` in it is an ordinary, standalone MCAP: open it in Foxglove, replay
+it with `ros2 bag play`, inspect it with `ros2 bag info`.
 
 `trigger_time: 0` means "anchor on the instant clipper receives this" — the
 default. To anchor on an instant of your own choosing instead, see
@@ -193,7 +203,7 @@ clipper is one binary and the mode is a subcommand:
 | Mode | What it does |
 |---|---|
 | **`clipper tail`** | the recorder — follow a recording still being written and cut a clip per trigger, until shutdown |
-| **`clipper clip`** | cut windows out of one *finished* recording and exit — same window plan, same copy, same manifest, without the waits a growing file costs |
+| **`clipper clip`** | cut windows out of one *finished* recording and exit — same window plan, same copy, same clip directory, without the waits a growing file costs |
 
 `clipper clip` is how a bag pulled off a vehicle becomes clips afterwards, on a
 workstation or in the cloud, with no ROS installed anywhere:
@@ -229,9 +239,9 @@ clipper clip ./record --out-dir ./clipped --trigger-source mcap
 | [Configuration](docs/configuration.md) | every flag, environment variable and TOML key, and which layer wins |
 | [Triggers and time](docs/triggers-and-time.md) | the `Trigger` message, the two places a trigger comes from, and which clock a window lives on |
 | [`clipper clip`](docs/clip-command.md) | cutting from a finished recording: bag directories, refusals, re-runs |
-| [What a clip carries](docs/clip-manifest.md) | the `momentedge.clip` manifest inside every clip, and how a clip's id is derived |
+| [What a clip carries](docs/clip-manifest.md) | the clip directory, its `clip_metadata.yaml`, and how a clip's id is derived |
 | [Operating clipper](docs/operating.md) | shutdown, logs, retention, a recording that stops producing clips, overload, and tuning under load |
-| [ARCHITECTURE.md](ARCHITECTURE.md) | how it works inside: threads, tailing, atomic publication, recovery |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | how it works inside: threads, tailing, what a clip is on disk, recovery |
 | [`examples/`](examples/README.md) | setup guides — continuous recording, split bags, `ros2 launch`, and ROS-free MCAP writers |
 
 Building clipper into something of your own: [`crates/clip`](crates/clip) is the

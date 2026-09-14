@@ -172,16 +172,25 @@ The handler's first act is to fold those into one `clip::manifest::CutRequest`
 — the producer, the trigger, the anchor and the time source, with the window
 bounds derived from them — which is then the only window value the flow below
 carries. Everything that names the window afterwards, from the `info!` line to
-each segment's manifest to the membership test on every copied message, reads
-that one request.
+the clip's document to the membership test on every copied message, reads that
+one request.
 
 **The flow crosses the crate seam at the waits.** `tail::handler::record_clip`
 is steps 1–2 and nothing else: they are the only part that needs a file still
-being written, and they are why `tail` exists at all. Steps 3–5 are
+being written, and they are why `tail` exists at all. Steps 3–6 are
 `clip::segment::cut_window` — the same code a consumer cutting from a finished
-recording runs, which waits for nothing. Step 6 is back in
+recording runs, which waits for nothing. Step 7 is back in
 `tail::handler::handle_trigger`, because announcing a clip belongs with the
 trigger it answers and not with the cut.
+
+**A window whose clip is already there is skipped**, and the handler is where
+that stops short of an announcement. `cut_window` returns a
+`clip::segment::CutOutcome`, and `handle_trigger` matches it: a `Cut` is
+reported and announced, a `Skipped` returns having done nothing at all. Nothing
+was recorded, so there is nothing to announce, and the warning `cut_window`
+already logged — naming the directory — is the skip's whole trace. Two triggers
+for one window on a vehicle, and a recorder restart meeting its own earlier
+clips, both land here.
 
 Admission is bounded by
 [the binary's gate](../clipper/CLAUDE.md#the-anchor-seam-and-the-admission-gate): at most
@@ -205,45 +214,43 @@ ignored: no handler runs, no clip is extracted, and no completion is announced.
    recorder's flush latency: near zero for the fastwrite profile, roughly one
    chunk fill (chunk size / aggregate data rate) for chunked profiles. The
    wait's outcome is not only a log line: it travels into the cut as a
-   `clip::manifest::WindowCoverage`, which is what every segment's manifest
-   reports under `clip.short`.
-3. **Multi-file snapshot** (`cut_window`). Call `planner.plan_window(start_ns,
+   `clip::manifest::WindowCoverage`, which is what the clip's document reports
+   as `clip.short`.
+3. **Claim** (`cut_window`, its first act — before the plan, so a skipped window
+   costs nothing). One atomic `mkdir` of `<out_dir>/<id>` decides whether this
+   window writes at all. **Neither the name nor the claim is this crate's**:
+   `record_clip` hands `cut_window` the output *directory* and nothing else, and
+   [`clip` decides the whole layout](../clip/CLAUDE.md#what-a-clip-is-on-disk-cliplayout).
+4. **Multi-file snapshot** (`cut_window`). Call `planner.plan_window(start_ns,
    end_ns, time_source)` once — `tail::Tailer` is the planner here — producing a
    `Vec<WindowPlan>`: one plan per recording whose extents overlap the window on
    the active time source, oldest first. Each plan carries its own `Arc<File>`
    clone, so a retention prune or rollover after this snapshot cannot pull the
    bytes out.
-4. **Stage** (`cut_window`) via the staging worker pool (`extract_parallelism`
+5. **Copy** (`cut_window`) via the staging worker pool (`extract_parallelism`
    `stage-N` threads, default 1): one `StageJob` per plan is enqueued on the
    shared FIFO channel and `cut_window` blocks on each reply. A worker runs
-   `clip::cut::stage_clip` into `.capturing/` and replies a `StagedClip`. Each
-   job carries the `CutRequest` and the window's `Planned` facts (how many
-   recordings were planned over, and the coverage verdict), which is how the
-   trigger reaches the writer that stamps the segment's manifest. When no
-   recording covers the window, one empty plan is staged so every trigger
-   produces a valid (possibly empty) clip — and its manifest says which kind of
+   `clip::cut::stage_clip` into the claimed directory and replies a
+   `StagedClip`. Each job carries the `CutRequest`, which is how the trigger
+   reaches the writer that stamps each file with the clip's id. When no
+   recording covers the window, one empty plan is copied so every trigger
+   produces a valid (possibly empty) clip — and the document says which kind of
    empty it is.
-5. **Publish** (`cut_window`). Empty segments are dropped when the window
+6. **Name and complete** (`cut_window`). Empty files are dropped when the window
    produced real data elsewhere (one is kept if all are empty). The count
-   determines naming, which is why the workers stage but never publish: a
-   single segment keeps the bare `<id>.mcap`; multiple segments get
-   `<id>_00.mcap`, `<id>_01.mcap`, … Each is atomically published into
-   `out_dir` via `hard_link` + unlink. **The name itself is not this crate's**:
-   `record_clip` hands `cut_window` the output *directory* and
-   `clip::config::Mode::Tail` — which subcommand is cutting, and nothing more —
-   and [`clip` decides both the name and what a taken one
-   costs](../clip/CLAUDE.md#segment-assembly-and-publication-clipsegment). For
-   the tail that is a `_1` sibling: a name an earlier clip already holds means a
-   *second* trigger asked for it, so its clip lands beside the first rather than
-   being dropped.
-6. **Announce** (`handle_trigger`) a single `Completion` (the trigger echo plus
-   all segment paths) through the active interface's announcer — only after
-   every segment is in `out_dir` and fsynced, so every announced path is already
-   crash-durable. The
-   `ros` interface turns the `Completion` into one `momentedge_msgs/Recorded`
-   published on `/events/momentedge/recorded`; the `mcap` interface's announcer
-   is a no-op — the segments' atomic move into `out_dir` (step 5) is the only
-   completion signal, with the per-clip `info!` lines as the log.
+   determines the numbering, which is why the workers copy but never name:
+   what is left becomes `<id>_0.mcap`, `<id>_1.mcap`, … Then
+   `clip_metadata.yaml` is written and the directories fsynced, which is what
+   makes the clip complete.
+7. **Announce** (`handle_trigger`) a single `Completion` through the active
+   interface's announcer, with **one entry in `filenames`: the clip's
+   directory**. A subscriber therefore opens one handle per clip whatever the
+   window straddled. It goes out only after the metadata file is durable, so an
+   announced clip is already crash-durable and already complete by the rule a
+   consumer filters on. The `ros` interface turns the `Completion` into one
+   `momentedge_msgs/Recorded` published on `/events/momentedge/recorded`; the
+   `mcap` interface's announcer is a no-op — the metadata file's appearance is
+   the only completion signal, with the per-clip `info!` lines as the log.
 
 ## Retention
 

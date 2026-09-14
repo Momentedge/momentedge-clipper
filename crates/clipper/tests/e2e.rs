@@ -56,15 +56,15 @@ const FATAL_EXIT_CODE: i32 = 1;
 /// The status an orderly stop ends with — SIGINT and SIGTERM alike.
 const CLEAN_EXIT_CODE: i32 = 0;
 
-/// Read every announced segment and concatenate their `(topic, log_time)` pairs
-/// in announcement order — the window's full content across a multi-file cut. A
-/// window straddling a rollover is published as one segment per source file, so
-/// the recovered window is the union of the segments.
+/// Read every announced clip and concatenate its `(topic, log_time)` pairs —
+/// the window's full content. A `Recorded` names one directory per clip, and a
+/// clip holds one file per source recording it was cut from, so the recovered
+/// window is the union of them all.
 fn read_all(recorded: &Recorded) -> Vec<(String, u64)> {
     recorded
         .filenames
         .iter()
-        .flat_map(|f| read_clip(Path::new(f)))
+        .flat_map(|f| read_clip_dir(Path::new(f)))
         .collect()
 }
 
@@ -135,7 +135,7 @@ fn trigger_produces_clip_and_announcement(
         .to_string_lossy();
     assert!(
         is_clip_name(&name, anchor),
-        "announced filename must be <out_dir>/<anchor_ns>_<hash>.mcap, got {name}"
+        "the announced clip must be <out_dir>/<anchor_ns>_<hash>, got {name}"
     );
     assert!(
         !name.contains("e2e-clip"),
@@ -145,7 +145,7 @@ fn trigger_produces_clip_and_announcement(
     // Final-path visibility: the announced file already exists, is a
     // complete MCAP (read_clip parses through the footer), holds only
     // in-window messages, and includes the source topic.
-    let msgs = read_clip(Path::new(recorded.only()));
+    let msgs = read_clip_dir(Path::new(recorded.only()));
     assert!(!msgs.is_empty(), "the clip must hold the recorded window");
     let (ws, we) = announced_window(&recorded, preroll, postroll);
     assert_clip_within_window(&msgs, ws, we);
@@ -156,8 +156,8 @@ fn trigger_produces_clip_and_announcement(
             .map(|(t, _)| t)
             .collect::<std::collections::HashSet<_>>(),
     );
-    assert_clip_manifest(Path::new(recorded.only()), preroll, postroll);
-    env.assert_capturing_drained();
+    assert_clip_metadata(Path::new(recorded.only()), preroll, postroll);
+    env.assert_out_dir_holds_only_clips();
     assert!(extractor.is_running(), "the extractor must outlive the cut");
 }
 
@@ -196,7 +196,7 @@ fn trigger_produces_clip_ros_publish_anchors_on_trigger_time() {
         anchor,
         "the clip name must carry the requested trigger_time as its anchor"
     );
-    let msgs = read_clip(Path::new(recorded.only()));
+    let msgs = read_clip_dir(Path::new(recorded.only()));
     assert!(
         !msgs.is_empty(),
         "the past-anchored window must hold recorded data"
@@ -209,7 +209,7 @@ fn trigger_produces_clip_ros_publish_anchors_on_trigger_time() {
         msgs.iter().any(|(topic, _)| topic == SRC_TOPIC),
         "the source topic must be in the clip"
     );
-    env.assert_capturing_drained();
+    env.assert_out_dir_holds_only_clips();
     assert!(extractor.is_running(), "the extractor must outlive the cut");
 }
 
@@ -250,7 +250,7 @@ fn mcap_interface_reads_trigger_from_the_recording() {
 
     // The clip is a complete MCAP, holds only in-window data, and includes the
     // source topic — clipper cut the exact window the in-bag trigger asked for.
-    let msgs = read_clip(&clip);
+    let msgs = read_clip_dir(&clip);
     assert!(!msgs.is_empty(), "the clip must hold the recorded window");
     assert_clip_within_window(&msgs, anchor - preroll, anchor + postroll);
     assert!(
@@ -259,8 +259,8 @@ fn mcap_interface_reads_trigger_from_the_recording() {
     );
     // The manifest is written by the shared cut, so the ROS-free interface's
     // clips carry the same record the ros interface's do.
-    assert_clip_manifest(&clip, preroll, postroll);
-    env.assert_capturing_drained();
+    assert_clip_metadata(&clip, preroll, postroll);
+    env.assert_out_dir_holds_only_clips();
     assert!(
         extractor.is_running(),
         "the ROS-free extractor must outlive the cut"
@@ -311,14 +311,14 @@ fn mcap_interface_reads_a_chunk_interior_trigger() {
     let clip = env.wait_for_clip_named("mcap-chunk", Duration::from_secs(60));
     let anchor = anchor_from_clip(&clip);
 
-    let msgs = read_clip(&clip);
+    let msgs = read_clip_dir(&clip);
     assert!(!msgs.is_empty(), "the clip must hold the recorded window");
     assert_clip_within_window(&msgs, anchor - preroll, anchor + postroll);
     assert!(
         msgs.iter().any(|(topic, _)| topic == SRC_TOPIC),
         "the source topic must be in the clip"
     );
-    env.assert_capturing_drained();
+    env.assert_out_dir_holds_only_clips();
     assert!(
         extractor.is_running(),
         "the ROS-free extractor must outlive the cut"
@@ -377,7 +377,7 @@ fn time_source_selects_the_window_clock_domain(
     std::fs::rename(&staged, &recording).expect("publishing the synthetic recording");
 
     let clip = env.wait_for_clip_named("ts", Duration::from_secs(60));
-    let mut got: Vec<u64> = read_clip(&clip)
+    let mut got: Vec<u64> = read_clip_dir(&clip)
         .into_iter()
         .filter(|(topic, _)| topic == SRC_TOPIC)
         .map(|(_, log_time)| log_time)
@@ -543,7 +543,7 @@ fn copper_sink_recording_produces_clip() {
 
     // read_clip requires a complete summary/footer/magic, so it is also the MCAP
     // completeness check on the cut clip.
-    let msgs = read_clip(&clip);
+    let msgs = read_clip_dir(&clip);
     assert!(!msgs.is_empty(), "the clip must hold the recorded window");
     assert_clip_within_window(&msgs, anchor - preroll, anchor + postroll);
     assert!(
@@ -578,7 +578,7 @@ fn recorder_restart_recovers_and_keeps_extracting() {
     let mut listener1 = env.start_recorded_listener("first");
     env.fire_trigger("restart-1", 2 * SEC, 2 * SEC);
     let r1 = wait_for_recorded(&mut listener1, Duration::from_secs(60));
-    assert!(!read_clip(Path::new(r1.only())).is_empty());
+    assert!(!read_clip_dir(Path::new(r1.only())).is_empty());
 
     // Restart: clean stop, relaunch; the script wipes record/ and starts a
     // fresh bag, which the tail must notice as a replacement.
@@ -594,12 +594,12 @@ fn recorder_restart_recovers_and_keeps_extracting() {
     env.fire_trigger("restart-2", 2 * SEC, 2 * SEC);
     let r2 = wait_for_recorded(&mut listener2, Duration::from_secs(60));
     assert_eq!(r2.name, "restart-2");
-    let msgs = read_clip(Path::new(r2.only()));
+    let msgs = read_clip_dir(Path::new(r2.only()));
     assert!(!msgs.is_empty(), "the post-restart clip must hold data");
     let (ws, we) = announced_window(&r2, 2 * SEC, 2 * SEC);
     assert_clip_within_window(&msgs, ws, we);
     assert!(msgs.iter().any(|(topic, _)| topic == SRC_TOPIC));
-    env.assert_capturing_drained();
+    env.assert_out_dir_holds_only_clips();
     assert!(extractor.is_running());
 }
 
@@ -700,7 +700,7 @@ fn recorder_restart_inside_the_window_recovers_across_the_boundary(#[case] delet
         msgs.iter().any(|(_, log_time)| *log_time >= restart_ns),
         "the replacement recording's post-restart data must be in the clip"
     );
-    env.assert_capturing_drained();
+    env.assert_out_dir_holds_only_clips();
     assert!(
         extractor.is_running(),
         "the extractor must survive a restart inside an open window"
@@ -738,7 +738,7 @@ fn recorder_killed_mid_trigger_still_announces_via_grace_cut() {
         extractor.log_text().contains("still uncovered after"),
         "the cut must have come from the grace timeout"
     );
-    let msgs = read_clip(Path::new(r.only()));
+    let msgs = read_clip_dir(Path::new(r.only()));
     assert!(
         !msgs.is_empty(),
         "data recorded before the kill lies in the window"
@@ -819,7 +819,7 @@ fn recording_deleted_without_restart_grace_cuts_the_old_data(
     );
     let (ws, we) = announced_window(&r, preroll, postroll);
     assert_clip_within_window(&msgs, ws, we);
-    env.assert_capturing_drained();
+    env.assert_out_dir_holds_only_clips();
     assert!(
         extractor.is_running(),
         "a deleted recording must not take the extractor down"
@@ -889,7 +889,7 @@ fn restart_after_the_window_ended_recovers_the_closing_recording() {
     );
     let (ws, we) = announced_window(&r, preroll, postroll);
     assert_clip_within_window(&msgs, ws, we);
-    env.assert_capturing_drained();
+    env.assert_out_dir_holds_only_clips();
     assert!(
         extractor.is_running(),
         "the extractor must survive a restart after the window ended"
@@ -928,30 +928,27 @@ fn window_straddling_an_in_run_split_recovers_both_sides() {
          got {:?}",
         recorded.filenames,
     );
-    // Every segment is published under the `<id>_NN.mcap` naming — one id for
-    // the window, one number per source file — and is a complete, in-window
-    // MCAP.
-    let id = Path::new(&recorded.filenames[0])
-        .file_stem()
-        .expect("segment has a file name")
+    // One clip whatever the window straddled: the announcement names the
+    // directory, and the two source recordings are two `<id>_N.mcap` files
+    // inside it, each a complete, in-window MCAP.
+    let clip = Path::new(recorded.only());
+    let id = clip
+        .file_name()
+        .expect("the clip has a name")
         .to_string_lossy()
         .into_owned();
-    let (id, _) = id.rsplit_once('_').expect("a segment name ends in _NN");
-    let anchor = anchor_from_clip(Path::new(&recorded.filenames[0]));
+    let anchor = anchor_from_clip(clip);
     assert!(
-        is_clip_name(&format!("{id}.mcap"), anchor),
-        "the segments share one clip id: {id}"
+        is_clip_name(&id, anchor),
+        "the clip is named by its id: {id}"
     );
-    for (n, f) in recorded.filenames.iter().enumerate() {
-        let name = Path::new(f)
-            .file_name()
-            .expect("segment has a file name")
-            .to_string_lossy()
-            .into_owned();
+    let files = clip_files(clip);
+    assert_eq!(files.len(), 2, "one file per source recording: {files:?}");
+    for (n, file) in files.iter().enumerate() {
         assert_eq!(
-            name,
-            format!("{id}_{n:02}.mcap"),
-            "segment {name} must carry the <id>_NN naming"
+            file.file_name().unwrap_or_default().to_string_lossy(),
+            format!("{id}_{n}.mcap"),
+            "every file of a clip is <id>_N.mcap, numbered from 0"
         );
     }
     let msgs = read_all(&recorded);
@@ -981,7 +978,7 @@ fn window_straddling_an_in_run_split_recovers_both_sides() {
         "recovered segments must not overlap — a duplicated source stamp means \
          a recording was indexed more than once"
     );
-    env.assert_capturing_drained();
+    env.assert_out_dir_holds_only_clips();
     assert!(extractor.is_running(), "the extractor must outlive the cut");
 }
 
@@ -1031,7 +1028,7 @@ fn quiet_topics_grace_timeout_cut() {
         "the cut must have come from the grace timeout"
     );
     let (ws, we) = announced_window(&r, preroll, postroll);
-    let msgs = read_clip(Path::new(r.only()));
+    let msgs = read_clip_dir(Path::new(r.only()));
     assert_clip_within_window(&msgs, ws, we);
 
     // What a grace cut owes its window is every message the recording holds
@@ -1059,7 +1056,7 @@ fn quiet_topics_grace_timeout_cut() {
         "the grace cut must carry every recorded message inside the window"
     );
 
-    env.assert_capturing_drained();
+    env.assert_out_dir_holds_only_clips();
     assert!(extractor.is_running());
 }
 
@@ -1120,7 +1117,7 @@ fn window_past_the_last_recorded_message_cuts_an_empty_clip() {
     let r = wait_for_recorded(&mut listener, Duration::from_secs(60));
     let clip = Path::new(r.only());
     let (ws, we) = announced_window(&r, preroll, postroll);
-    let msgs = read_clip(clip);
+    let msgs = read_clip_dir(clip);
     assert!(
         msgs.is_empty(),
         "the window lies past every recorded message, so the clip holds none: {msgs:?}"
@@ -1142,17 +1139,15 @@ fn window_past_the_last_recorded_message_cuts_an_empty_clip() {
 
     // Which kind of empty. `files_planned = 0` says no recording held a byte of
     // the window; `short = true` says the coverage it waited for never arrived.
-    assert_clip_manifest(clip, preroll, postroll);
-    let manifest = clip::manifest::read_manifest(clip)
-        .expect("reading the clip manifest")
-        .expect("the clip carries a manifest");
-    assert_eq!(manifest["clip.messages"], "0");
+    assert_clip_metadata(clip, preroll, postroll);
+    let metadata = clip::layout::read_metadata(clip).expect("reading the clip's document");
+    assert_eq!(metadata.clip.messages, 0);
     assert_eq!(
-        manifest["source.files_planned"], "0",
+        metadata.window.files_planned, 0,
         "no recording overlapped the window"
     );
-    assert_eq!(
-        manifest["clip.short"], "true",
+    assert!(
+        metadata.clip.short,
         "the recording never covered the window end"
     );
 
@@ -1166,13 +1161,13 @@ fn window_past_the_last_recorded_message_cuts_an_empty_clip() {
     assert!(
         log.contains(&format!(
             "clip {} written: 0 msgs from 0 extents",
-            clip.display()
+            clip_files(clip)[0].display()
         )),
         "the extractor must log this clip as copied from no extent; \
          a coverage shortfall would name one"
     );
 
-    env.assert_capturing_drained();
+    env.assert_out_dir_holds_only_clips();
     assert!(extractor.is_running());
 }
 
@@ -1257,7 +1252,7 @@ fn corrupt_tail_payload_damage_live() {
     let clip = Path::new(recorded.only());
     // `read_clip` insists on a complete summary/footer/magic, so this is also
     // the proof that the announced file is a whole MCAP, damage and all.
-    let msgs = read_clip(clip);
+    let msgs = read_clip_dir(clip);
     assert!(
         !msgs.is_empty(),
         "a window over the recording must produce a full clip"
@@ -1265,14 +1260,16 @@ fn corrupt_tail_payload_damage_live() {
     let (ws, we) = announced_window(&recorded, 60 * SEC, SEC);
     assert_clip_within_window(&msgs, ws, we);
     assert!(
-        clip_holds_payload(clip, &damage),
+        clip_files(clip)
+            .iter()
+            .any(|file| clip_holds_payload(file, &damage)),
         "the damaged record is copied through, not skipped"
     );
     assert!(
         extractor.is_running(),
         "payload damage must not take the extractor down"
     );
-    env.assert_capturing_drained();
+    env.assert_out_dir_holds_only_clips();
 }
 
 /// Corrupt tail, live: a run of bytes overwritten across a record's framing
@@ -1327,7 +1324,7 @@ fn corrupt_tail_framing_damage_live() {
     // ahead of that one in the file is behind the scan as well.
     env.fire_trigger("probe", 60 * SEC, SEC);
     let probe = env.wait_for_clip_named("probe", Duration::from_secs(60));
-    let indexed_through = read_clip(&probe)
+    let indexed_through = read_clip_dir(&probe)
         .iter()
         .map(|(_, log_time)| *log_time)
         .max()
@@ -1378,7 +1375,7 @@ fn corrupt_tail_framing_damage_live() {
         ],
         "a refused cut publishes nothing"
     );
-    env.assert_capturing_drained();
+    env.assert_out_dir_holds_only_clips();
 
     // A second window over the same extent: the cost is a number that climbs,
     // and the full announcement is not repeated. One line per trigger is what

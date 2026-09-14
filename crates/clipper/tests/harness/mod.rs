@@ -703,45 +703,39 @@ impl TestEnv {
         }
     }
 
-    /// Every clip published into `out_dir`, by name. The staging directory is
-    /// not one of them, so a test that counts what a run produced counts
-    /// finished clips alone.
+    /// Every clip in `out_dir`, by directory name. A clip is a directory named
+    /// by its id, so this is what a run produced.
     pub(crate) fn published_clips(&self) -> Vec<String> {
         let Ok(entries) = std::fs::read_dir(self.out_dir()) else {
             return Vec::new();
         };
         let mut names: Vec<String> = entries
             .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|x| x == "mcap"))
-            .map(|p| {
-                p.file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned()
-            })
+            .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
         names.sort();
         names
     }
 
-    /// `out_dir/.capturing` must exist (the extractor ran) and hold nothing
-    /// (no finished clip ever lingers there).
-    pub(crate) fn assert_capturing_drained(&self) {
-        let capturing = self.out_dir().join(".capturing");
-        assert!(
-            capturing.is_dir(),
-            "the extractor creates {}",
-            capturing.display()
-        );
-        let leftover: Vec<_> = std::fs::read_dir(&capturing)
-            .expect("reading .capturing")
+    /// The root of `out_dir` holds clip directories and nothing else.
+    ///
+    /// This is the contract an operator points a sync tool at: no staging area,
+    /// no lock file, no sidecar, so there is no exclude list to keep in step
+    /// with clipper. Completeness is not asserted here — a run killed mid-cut
+    /// leaves a directory with no metadata file in it, which is exactly how a
+    /// consumer tells crash residue from a clip.
+    pub(crate) fn assert_out_dir_holds_only_clips(&self) {
+        let out_dir = self.out_dir();
+        let stray: Vec<_> = std::fs::read_dir(&out_dir)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", out_dir.display()))
             .flatten()
             .map(|e| e.path())
+            .filter(|p| !p.is_dir())
             .collect();
         assert!(
-            leftover.is_empty(),
-            ".capturing must hold no finished clip, found: {leftover:?}"
+            stray.is_empty(),
+            "{} must hold clip directories and nothing else, found: {stray:?}",
+            out_dir.display()
         );
     }
 
@@ -802,27 +796,23 @@ impl TestEnv {
         assert!(status.success(), "trigger publish {name} failed: {status}");
     }
 
-    /// Poll `out_dir` for a finished clip whose trigger was named `name`,
-    /// returning its path.
+    /// Poll `out_dir` for a complete clip whose trigger was named `name`,
+    /// returning its directory.
     ///
-    /// A clip is named `<anchor_ns>_<hash>.mcap` — an id derived from the whole
-    /// trigger, carrying none of its text — so which trigger a clip answers is
-    /// something the clip states and not something its path spells. The
-    /// manifest's `trigger.name` is where it states it, which is also how a real
-    /// consumer would find the clip of one event.
+    /// A clip is a directory named `<anchor_ns>_<hash>` — an id derived from the
+    /// whole trigger, carrying none of its text — so which trigger a clip
+    /// answers is something the clip states and not something its path spells.
+    /// `clip_metadata.yaml` is where it states it, and its presence is also what
+    /// makes the clip complete, so this waits for exactly what a real consumer
+    /// would wait for.
     pub(crate) fn wait_for_clip_named(&self, name: &str, timeout: Duration) -> PathBuf {
         let deadline = Instant::now() + timeout;
         loop {
             if let Ok(entries) = std::fs::read_dir(self.out_dir()) {
                 for entry in entries.flatten() {
                     let path = entry.path();
-                    if path.extension().is_none_or(|ext| ext != "mcap") {
-                        continue;
-                    }
-                    let names_it = clip::manifest::read_manifest(&path)
-                        .ok()
-                        .flatten()
-                        .is_some_and(|m| m.get("trigger.name").is_some_and(|n| n == name));
+                    let names_it =
+                        clip::layout::read_metadata(&path).is_ok_and(|m| m.trigger.name == name);
                     if names_it {
                         return path;
                     }
@@ -837,18 +827,15 @@ impl TestEnv {
     }
 }
 
-/// Whether `name` is the file name of a clip anchored at `anchor`: that clip's
-/// id — the anchor, an underscore, and the digest's sixteen lower-case hex
-/// characters in four groups of four — plus the mcap extension.
+/// Whether `name` is the directory name of a clip anchored at `anchor`: that
+/// clip's id — the anchor, an underscore, and the digest's sixteen lower-case
+/// hex characters in four groups of four.
 ///
 /// The shape is what the tests assert, never the digest: the id's own contract
 /// is pinned by `clip::id`'s published vector, and an e2e run's anchor is
 /// clipper's own clock, so its hash is not a value a test can know in advance.
 pub(crate) fn is_clip_name(name: &str, anchor: u64) -> bool {
-    let Some(hash) = name
-        .strip_prefix(&format!("{anchor}_"))
-        .and_then(|rest| rest.strip_suffix(".mcap"))
-    else {
+    let Some(hash) = name.strip_prefix(&format!("{anchor}_")) else {
         return false;
     };
     let groups: Vec<&str> = hash.split('-').collect();
@@ -861,8 +848,8 @@ pub(crate) fn is_clip_name(name: &str, anchor: u64) -> bool {
         })
 }
 
-/// The anchor nanoseconds a clip file name opens with: a clip is named by its
-/// id, `<anchor_ns>_<hash>.mcap`, and the anchor leads it. The window a clip was
+/// The anchor nanoseconds a clip directory's name opens with: a clip is named by
+/// its id, `<anchor_ns>_<hash>`, and the anchor leads it. The window a clip was
 /// cut with is `[anchor - preroll, anchor + postroll]`, so a test that located
 /// the clip recovers the anchor from its name to assert its window.
 pub(crate) fn anchor_from_clip(path: &Path) -> u64 {
@@ -873,8 +860,8 @@ pub(crate) fn anchor_from_clip(path: &Path) -> u64 {
         .unwrap_or_else(|| panic!("clip name has no leading anchor: {}", path.display()))
 }
 
-/// The inclusive `[start, end]` window a cut announced, read back from its first
-/// segment's `<anchor_ns>_<hash>.mcap` name. Under `--trigger-source ros --time-source
+/// The inclusive `[start, end]` window a cut announced, read back from the
+/// `<anchor_ns>_<hash>` name of the clip directory it named. Under `--trigger-source ros --time-source
 /// log` the anchor is clipper's own subscription instant — not the test's
 /// pre-publish `now()`, which the `ros2 topic pub` startup precedes by around a
 /// second — so window assertions recover the anchor from the announced clip
@@ -1212,6 +1199,24 @@ pub(crate) fn read_clip(path: &Path) -> Vec<(String, u64)> {
 /// The cut copies message bytes through without decoding them, so a run of
 /// bytes overwritten in the recording reappears here verbatim — which is how a
 /// test proves a damaged record was copied rather than skipped.
+/// The MCAP files of a complete clip directory, in the order its document names
+/// them — which is also their `_0`, `_1`, … order.
+pub(crate) fn clip_files(dir: &Path) -> Vec<PathBuf> {
+    clip::layout::read_metadata(dir)
+        .unwrap_or_else(|e| panic!("reading the document of {}: {e}", dir.display()))
+        .sources
+        .iter()
+        .map(|source| dir.join(&source.file))
+        .collect()
+}
+
+/// A whole clip read back as its `(topic, log_time)` pairs: every file of the
+/// directory, concatenated in file order. A window straddling a rollover is one
+/// clip in several files, so what it holds is their union.
+pub(crate) fn read_clip_dir(dir: &Path) -> Vec<(String, u64)> {
+    clip_files(dir).iter().flat_map(|f| read_clip(f)).collect()
+}
+
 pub(crate) fn clip_holds_payload(path: &Path, needle: &[u8]) -> bool {
     let buf = std::fs::read(path)
         .unwrap_or_else(|e| panic!("reading announced clip {}: {e}", path.display()));
@@ -1277,52 +1282,54 @@ pub(crate) fn clip_trigger_window(path: &Path) -> Option<(u64, u64)> {
 }
 
 /// Every message in the clip lies inside the inclusive trigger window.
-/// Assert the announced clip carries its manifest and that the manifest agrees
+/// Assert the announced clip carries its document, and that the document agrees
 /// with the clip's own name and contents.
 ///
-/// The unit tests pin the record's keys; what only a live run can show is that
-/// the deployed binary stamps clips with the subcommand it was actually invoked
-/// as, and that the window the record states is the window the announced
-/// filename's anchor implies. Both interfaces go through the same cut, so
-/// calling this from a `ros` test and an `mcap` test covers every clip the
-/// recorder writes.
-pub(crate) fn assert_clip_manifest(path: &Path, preroll_ns: u64, postroll_ns: u64) {
-    let manifest = clip::manifest::read_manifest(path)
-        .unwrap_or_else(|e| panic!("reading the manifest of {}: {e}", path.display()))
-        .unwrap_or_else(|| panic!("clip {} carries no manifest", path.display()));
+/// The unit tests pin the document's fields; what only a live run can show is
+/// that the deployed binary stamps clips with the subcommand it was actually
+/// invoked as, and that the window the document states is the window the
+/// announced directory's anchor implies. Both interfaces go through the same
+/// cut, so calling this from a `ros` test and an `mcap` test covers every clip
+/// the recorder writes.
+pub(crate) fn assert_clip_metadata(dir: &Path, preroll_ns: u64, postroll_ns: u64) {
+    let metadata = clip::layout::read_metadata(dir)
+        .unwrap_or_else(|e| panic!("reading the document of {}: {e}", dir.display()));
+    assert_eq!(metadata.version, clip::manifest::METADATA_VERSION);
+    assert_eq!(metadata.producer.name, "clipper");
     assert_eq!(
-        manifest["manifest.version"],
-        clip::manifest::MANIFEST_VERSION
+        metadata.producer.mode, "tail",
+        "the document names the subcommand the binary ran"
     );
-    assert_eq!(manifest["producer.name"], "clipper");
+    let anchor = anchor_from_clip(dir);
+    assert_eq!(metadata.trigger.anchor_ns, anchor);
     assert_eq!(
-        manifest["producer.mode"], "tail",
-        "the record names the subcommand the binary ran"
-    );
-    let anchor = anchor_from_clip(path);
-    assert_eq!(manifest["trigger.anchor_ns"], anchor.to_string());
-    assert_eq!(
-        manifest["clip.id"],
-        path.file_stem()
-            .expect("a published clip has a name")
+        metadata.clip.id,
+        dir.file_name()
+            .expect("a clip directory has a name")
             .to_string_lossy(),
-        "the clip is named by the id its record states"
+        "the clip's directory is named by the id its document states"
     );
-    assert_eq!(manifest["trigger.preroll_ns"], preroll_ns.to_string());
-    assert_eq!(manifest["trigger.postroll_ns"], postroll_ns.to_string());
+    assert_eq!(metadata.trigger.preroll_ns, preroll_ns);
+    assert_eq!(metadata.trigger.postroll_ns, postroll_ns);
+    assert_eq!(metadata.window.start_ns, anchor.saturating_sub(preroll_ns));
+    assert_eq!(metadata.window.end_ns, anchor.saturating_add(postroll_ns));
     assert_eq!(
-        manifest["window.start_ns"],
-        anchor.saturating_sub(preroll_ns).to_string()
+        metadata.clip.messages as usize,
+        read_clip_dir(dir).len(),
+        "the document counts the messages the clip actually holds"
     );
-    assert_eq!(
-        manifest["window.end_ns"],
-        anchor.saturating_add(postroll_ns).to_string()
-    );
-    assert_eq!(
-        manifest["clip.messages"],
-        read_clip(path).len().to_string(),
-        "the record counts the messages the clip actually holds"
-    );
+    for (n, source) in metadata.sources.iter().enumerate() {
+        assert_eq!(
+            source.file,
+            format!("{}_{n}.mcap", metadata.clip.id),
+            "every file of a clip is <id>_N.mcap, numbered from 0"
+        );
+        assert!(
+            dir.join(&source.file).is_file(),
+            "the document names a file that is there: {}",
+            source.file
+        );
+    }
 }
 
 pub(crate) fn assert_clip_within_window(msgs: &[(String, u64)], start_ns: u64, end_ns: u64) {

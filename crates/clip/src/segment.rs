@@ -1,66 +1,58 @@
-//! One window over a planned recording becomes durable clips: decide where the
-//! clip goes, plan the window, stage one segment per source file through a
-//! worker pool, drop the empties, and publish each atomically.
+//! One window over a planned recording becomes a durable clip: claim the
+//! directory the clip is, plan the window, copy one file per source recording
+//! through a worker pool, drop the empties, number what is left, and write the
+//! document that says the clip is complete.
 //!
 //! [`cut_window`] is the whole of it, over any [`WindowPlanner`], and it is the
-//! **one entry point that decides a clip's location**: a caller hands it the
-//! window and the output directory, never a path, so the name every clip in
-//! every output directory carries is computed in one place
-//! (`base_name`). It then snapshots the plans once, hands each to the FIFO
-//! staging pool ([`spawn_stage_workers`]) that runs the bulk copies off the
-//! caller's thread, and names the results only when the segment count is known —
-//! a bare `<id>.mcap` for a window inside one recording, one `<id>_NN.mcap` per
-//! source file for one that straddled a rollover — where the id is the
-//! [`ClipId`] of the window that asked for it.
+//! **one entry point that decides where a clip goes**: a caller hands it the
+//! window and the output directory, never a path, so every clip in every output
+//! directory is laid out by one rule ([`crate::layout`]).
 //!
-//! **What a name the output directory already holds costs follows from the
-//! caller's [`Mode`]**, decided here rather than by each binary, and it is the
-//! one thing settled before anything is staged: `clipper tail` follows a live
-//! recording and publishes beside the earlier clip, while `clipper clip` cuts
-//! from a finished one — which would copy the same bytes into the same name a
-//! second time — and refuses the whole window instead.
+//! **Three outcomes, and the type says which.** A window is cut, or it is
+//! skipped because its id is already taken, or it fails — and a caller cannot
+//! confuse the first two, because [`CutOutcome`] makes them different values
+//! rather than an empty result. A skip is the answer to a repeated trigger, to a
+//! restart meeting its own earlier clips, and to two processes racing for one
+//! id; it is not an error and it announces nothing.
 //!
 //! The module is deliberately free of any notion of where the window came from
 //! or who is told about it. Nothing here decides a window's bounds, waits for
-//! anything before cutting, or announces the clips it produced — a caller
+//! anything before cutting, or announces the clip it produced — a caller
 //! resolves the bounds, does whatever waiting its own clock and coverage
-//! demand, and reports the returned [`cut::ClipStats`] however it likes.
+//! demand, and reports the returned [`Clip`] however it likes.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
 
-use anyhow::Context as _;
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
+use log::warn;
 
-use crate::config::Mode;
 use crate::id::ClipId;
 use crate::index::{WindowPlan, WindowPlanner};
-use crate::manifest::{CutRequest, Planned, WindowCoverage};
+use crate::layout::{Claim, ClipDir};
+use crate::manifest::{ClipMetadata, CutRequest, Planned, WindowCoverage};
 use crate::select::ChannelSelection;
-use crate::{cut, panic_text};
+use crate::{cut, layout, panic_text};
 
-/// One queued clip-segment staging: the window-plan snapshot [`cut_window`] took
-/// for one source recording, the request that window came from, what the planner
-/// found for it, the base output path, and the reply channel. Queued by
+/// One queued copy: the window-plan snapshot [`cut_window`] took for one source
+/// recording, the request that window came from, the path inside the claimed
+/// clip directory to write it at, and the reply channel. Queued by
 /// [`cut_window`]; dequeued FIFO by the staging workers, which run the bulk copy
-/// into the capturing dir and reply a [`cut::StagedClip`]. Publication is not
-/// theirs — [`cut_window`] publishes the staged segments itself, once the
-/// window's segment count is known and the names are settled.
+/// and reply a `cut::StagedClip`. Naming is not theirs — [`cut_window`] names
+/// the finished files itself, once the clip's file count is known.
 ///
 /// The [`CutRequest`] rides in the job rather than in the pool because it is a
 /// property of the *window*, not of the workers. Its clock domain has to choose
 /// both the extents the planner returned and the stamp each message's membership
 /// is tested on, and a job that carried only the bounds would let those two be
 /// answered from different clocks — a clip silently holding the wrong messages
-/// rather than an error. It is also what the segment's manifest is written from,
-/// which is why the trigger travels this far down: a clip states what asked for
-/// it, and the only way to state it truthfully is to carry it to the writer.
+/// rather than an error. It is also what the file's id record is written from,
+/// which is why the trigger travels this far down.
 #[derive(Debug)]
 pub struct StageJob {
     plan: WindowPlan,
     request: Arc<CutRequest>,
-    planned: Planned,
     out_path: PathBuf,
     reply: Sender<anyhow::Result<cut::StagedClip>>,
 }
@@ -71,8 +63,8 @@ pub struct StageJob {
 /// is what you want whenever the staging reads compete for disk bandwidth with
 /// whatever is still writing the recording. Widening the pool trades that back.
 ///
-/// Each worker runs only [`cut::stage_clip`] — the bulk copy into the capturing
-/// dir — and replies the [`cut::StagedClip`]. The window plan rides in the job,
+/// Each worker runs only `cut::stage_clip` — the bulk copy into the clip
+/// directory the caller claimed — and replies the `cut::StagedClip`. The window plan rides in the job,
 /// snapshotted once per source recording with that file's `Arc<File>` pinned
 /// inside it, so a worker holds everything it needs and never reaches back into
 /// whoever planned the window; a retention prune or a rollover between queueing
@@ -133,7 +125,6 @@ fn stage_jobs(
                 &job.plan,
                 &job.out_path,
                 &job.request,
-                job.planned,
                 compression,
                 selection,
             )
@@ -148,192 +139,158 @@ fn stage_jobs(
     }
 }
 
-/// What a cut does about a clip the output directory already holds under a name
-/// this window could publish under.
+/// What one window's cut did.
 ///
-/// The two subcommands want opposite things from the same collision, because
-/// their inputs differ. On a vehicle a taken name means a *second* trigger asked
-/// for the same window, and dropping its clip loses data that will never come
-/// back — so the recorder publishes beside the earlier clip. A cut from a
-/// finished recording is replayable: the same recording and the same trigger
-/// describe the same window and copy the same bytes, so a taken name means this
-/// cut has already been made, and a second file would be a duplicate rather than
-/// data. It refuses instead.
-///
-/// It is private because it is nobody's to choose: a caller says which
-/// subcommand it is ([`Mode`]) and [`publication`] answers what a collision
-/// costs, so the two halves of the policy cannot drift apart in two binaries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Publication {
-    /// Publish beside the existing clip, under the `_<n>`-suffixed sibling
-    /// [`cut::publish_clip`] resolves the collision to.
-    Suffix,
-    /// Refuse the whole window before anything is staged, naming the clip that
-    /// is already there ([`ClipExists`]).
-    Refuse,
+/// Three things can happen to a window and a caller has to handle each
+/// differently, so the type says which: a clip was written, the id was already
+/// taken, or the cut failed (the `Err` of the [`anyhow::Result`] this rides in).
+/// A skip is neither of the other two — nothing was written, and nothing went
+/// wrong — and making it a variant rather than an empty [`Clip`] is what stops a
+/// caller announcing a clip it did not cut.
+#[derive(Debug)]
+#[must_use = "a window was cut or skipped, and the two are announced differently"]
+pub enum CutOutcome {
+    /// The window claimed its directory, filled it and completed it.
+    Cut(Clip),
+    /// `<out_dir>/<id>` was already there — a complete clip, or residue from a
+    /// cut that died — so this window wrote nothing and changed nothing.
+    /// Carries that directory, already named in a warning by the cut.
+    Skipped(PathBuf),
 }
 
-/// What a clip already in the output directory costs the subcommand that is
-/// cutting: the live recorder's second trigger is data, and a re-run over a
-/// finished recording is a duplicate ([`Publication`]).
+/// One complete clip on disk: the directory, and what each file in it holds.
 ///
-/// An exhaustive match with no catch-all, so a subcommand added to [`Mode`] is a
-/// compile error here until it says what a taken name means to it.
-fn publication(mode: Mode) -> Publication {
-    match mode {
-        Mode::Tail => Publication::Suffix,
-        Mode::Clip => Publication::Refuse,
-    }
+/// The directory is the clip — it is what a completion announcement names and
+/// what a consumer syncs — and the per-file counters are what a caller logs.
+#[derive(Debug)]
+pub struct Clip {
+    /// `<out_dir>/<id>`, holding every file of this clip and the document that
+    /// says it is complete.
+    pub dir: PathBuf,
+    /// One entry per MCAP file written, in file-number order from `_0`.
+    pub files: Vec<cut::ClipStats>,
 }
 
-/// The file name every clip of one window is published under, before a segment
-/// number is appended to it: the window's [`ClipId`] and the MCAP extension.
-///
-/// **The one place a clip's name is computed.** Both subcommands hand
-/// [`cut_window`] an output directory, so neither formats a path of its own and
-/// a rename is one edit rather than two that can disagree.
-pub(crate) fn base_name(request: &CutRequest) -> String {
-    format!("{}.mcap", ClipId::of(request))
-}
-
-/// A clip this window would have written is already in the output directory,
-/// under the refusal policy `clipper clip` cuts with.
-///
-/// The window it names is refused whole: the check runs before the plan is
-/// taken, so no segment of it is staged, published, or left half-written, and a
-/// multi-segment window whose remaining names are free is refused along with the
-/// one that is not.
-#[derive(Debug, thiserror::Error)]
-#[error(
-    "{} already exists: this window has been cut into this output directory \
-     before, and cutting it again writes a second copy of the same clip rather \
-     than new data. Move or delete it, or cut into a different output \
-     directory, to cut this window again",
-    existing.display()
-)]
-pub struct ClipExists {
-    /// The clip already on disk: the window's own base name, or a segment or
-    /// suffixed sibling beside it.
-    pub existing: PathBuf,
-}
-
-/// Cut one window out of the recordings a [`WindowPlanner`] serves into
-/// `out_dir`: name the clip, take one multi-file snapshot, stage one segment per
-/// source recording, and publish each of them.
+/// Cut one window out of the recordings a [`WindowPlanner`] serves into a clip
+/// directory under `out_dir`, or skip it because that directory is already
+/// there.
 ///
 /// **This is where a clip's location is decided.** A caller supplies the output
-/// directory and the window; the name under it is `base_name`'s, so no caller
-/// formats a clip path and the naming scheme lives in one place.
+/// directory and the window; everything under it — the directory named by the
+/// window's [`ClipId`], one `<id>_N.mcap` per contributing source recording, and
+/// the `clip_metadata.yaml` that completes it — is [`crate::layout`]'s, so no
+/// caller formats a clip path and the layout moves in one edit.
 ///
-/// A window inside one recording yields a single segment; one straddling a
-/// rollover (a bag split or a restart the planner indexed while running) yields
-/// one segment per source file, recovered from the planner's retained
-/// collection. Empty segments are dropped when the window produced real data
-/// elsewhere, but one segment is always kept so an all-empty window (a rollover
-/// gap, all relevant files pruned, or nothing recorded yet) still yields a valid
-/// clip. Segments are named only once the count is known: a single segment keeps
-/// the bare `<id>.mcap`, several get one `<id>_NN.mcap` per file. Every
-/// returned [`cut::ClipStats`] names a durable file, so the caller may announce
-/// them all.
+/// **The claim is the first thing that happens.** One atomic `mkdir` either
+/// gives this window the directory or tells it the id is taken, which is the
+/// whole answer to a repeated trigger, to a restart meeting its own earlier
+/// clips, and to two windows or two processes racing for one id. A taken id is
+/// warned about here — so both subcommands say the same thing — and returned as
+/// [`CutOutcome::Skipped`].
+///
+/// A window inside one recording yields a single file, `<id>_0.mcap`; one
+/// straddling a rollover (a bag split or a restart the planner indexed while
+/// running) yields one file per source recording, recovered from the planner's
+/// retained collection. Empty files are dropped when the window produced real
+/// data elsewhere, but one is always kept so an all-empty window (a rollover
+/// gap, all relevant recordings pruned, or nothing recorded yet) still yields a
+/// valid clip; the numbering is the position among what is left.
+///
+/// **A cut that fails after the claim takes its directory with it**, so a
+/// directory without `clip_metadata.yaml` is crash residue and nothing else.
 ///
 /// The window lives entirely in the request's time source: it picks the extents
 /// the planner returns and the stamp each message's membership is tested on.
 /// Whatever has to happen before the cut — a postroll wall floor, a wait for the
 /// recording to cover the window end — is the caller's, and so is telling anyone
-/// about the clips this returns. `coverage` is that caller's verdict on the wait
-/// it did: every segment's manifest repeats it, so a clip that ends early says
-/// whether the recording had got there yet.
-///
-/// `mode` is the subcommand that is cutting, and the only thing it decides here
-/// is what a clip the output directory already holds costs (`publication`) — a
-/// `_<n>` sibling beside the earlier clip for `clipper tail`, a refusal of the
-/// whole window before anything is staged for `clipper clip`.
-#[expect(
-    clippy::similar_names,
-    reason = "`plans` and `planned` are the domain's own two words: the per-file \
-              window plans, and the window-level facts every segment's manifest \
-              repeats. Renaming either would cost more than the similarity does"
-)]
-#[expect(
-    clippy::too_many_arguments,
-    reason = "six inputs from six owners: the planner, the window, the caller's \
-              coverage verdict, the output directory, the subcommand cutting, \
-              and the pool handle. No two of them are chosen together, so a \
-              parameter struct would be a tuple with a name on it"
-)]
+/// about the clip this returns. `coverage` is that caller's verdict on the wait
+/// it did: the clip's document repeats it, so a clip that ends early says whether
+/// the recording had got there yet.
 pub fn cut_window(
     planner: &dyn WindowPlanner,
     request: &Arc<CutRequest>,
     coverage: WindowCoverage,
     out_dir: &Path,
-    mode: Mode,
+    stage_tx: &Sender<StageJob>,
+) -> anyhow::Result<CutOutcome> {
+    layout::prepare_out_dir(out_dir)?;
+    let dir = match ClipDir::claim(out_dir, ClipId::of(request))? {
+        Claim::Ours(dir) => dir,
+        Claim::Taken(path) => {
+            warn!(
+                "clip {} is already there; skipping this window. A clip is written \
+                 once: an id that is taken means this window has been cut, or a cut \
+                 of it died leaving the directory behind. Remove it to cut the \
+                 window again",
+                path.display()
+            );
+            return Ok(CutOutcome::Skipped(path));
+        }
+    };
+
+    // From here the directory is this cut's, and the only two ways out are a
+    // complete clip and a removed directory.
+    match fill(&dir, planner, request, coverage, stage_tx) {
+        Ok(files) => Ok(CutOutcome::Cut(Clip {
+            dir: dir.path().to_path_buf(),
+            files,
+        })),
+        Err(e) => Err(dir.discard(e)),
+    }
+}
+
+/// Fill a claimed clip directory and complete it: plan the window, copy one file
+/// per source recording, drop the empties, name what is left, and write the
+/// document last.
+///
+/// Every failure is the caller's to answer by removing the directory, which is
+/// why this is a separate function: it may return early anywhere without
+/// leaving a rule to remember at each `?`.
+#[expect(
+    clippy::similar_names,
+    reason = "`planner`, `plans` and `planned` are the domain's own three words: \
+              what serves a window's plans, the per-file plans it served, and the \
+              window-level facts the clip's document states. Renaming any of them \
+              would cost more than the similarity does"
+)]
+fn fill(
+    dir: &ClipDir,
+    planner: &dyn WindowPlanner,
+    request: &Arc<CutRequest>,
+    coverage: WindowCoverage,
     stage_tx: &Sender<StageJob>,
 ) -> anyhow::Result<Vec<cut::ClipStats>> {
-    let base_out_path = out_dir.join(base_name(request));
-
-    // 0. The publication policy, applied before anything else happens: under
-    //    `Refuse` a clip already published under any name this window could take
-    //    ends the cut here — before a plan is taken, before a byte is staged —
-    //    so the refusal creates nothing in the output directory or its capturing
-    //    area, and a window whose other segment names are still free is refused
-    //    whole rather than half-written.
-    match publication(mode) {
-        Publication::Refuse => {
-            if let Some(existing) = existing_clip(&base_out_path).with_context(|| {
-                format!(
-                    "reading the output directory for {}",
-                    base_out_path.display()
-                )
-            })? {
-                return Err(ClipExists { existing }.into());
-            }
-        }
-        // A taken name is a second trigger, resolved at publish by a `_<n>`
-        // sibling; nothing to decide here.
-        Publication::Suffix => {}
-    }
-
     // 1. One multi-file snapshot on the window's time source — each plan pins its
     //    own recording's Arc<File>, so a retention prune or rollover after this
     //    cannot pull the bytes out.
     let plans = planner.plan_window(request.start_ns(), request.end_ns(), request.time_source());
 
-    // 2. The window-level facts every segment's manifest repeats. `files` is
-    //    counted here, before the plans are consumed: it is what separates a
-    //    clip empty because no recording held any byte of the window from one
-    //    empty because the bytes held no message inside it.
+    // 2. The window-level facts the clip's document states. `files` is counted
+    //    here, before the plans are consumed: it is what separates a clip empty
+    //    because no recording held any byte of the window from one empty because
+    //    the bytes held no message inside it.
     let planned = Planned {
         files: plans.len(),
         coverage,
     };
 
-    // 3. Stage one segment per plan (FIFO worker pool), or one empty segment
-    //    when no recording covers the window — the empty path needs no source
-    //    file (a channelless MCAP is just magic + manifest + summary + footer).
+    // 3. Copy one file per plan (FIFO worker pool), or one empty file when no
+    //    recording covers the window — the empty path needs no source recording
+    //    (a channelless MCAP is just magic + record + summary + footer). Each is
+    //    written under a staging name derived from its plan's position, since
+    //    the number it will be named by is not known yet.
     let mut staged: Vec<cut::StagedClip> = if plans.is_empty() {
-        vec![stage_segment(
-            stage_tx,
-            WindowPlan::empty(),
-            request,
-            planned,
-            &base_out_path,
-        )?]
+        vec![stage_file(stage_tx, WindowPlan::empty(), request, dir, 0)?]
     } else {
         let mut v = Vec::with_capacity(plans.len());
-        for plan in plans {
-            v.push(stage_segment(
-                stage_tx,
-                plan,
-                request,
-                planned,
-                &base_out_path,
-            )?);
+        for (i, plan) in plans.into_iter().enumerate() {
+            v.push(stage_file(stage_tx, plan, request, dir, i)?);
         }
         v
     };
 
-    // 4. Drop empty segments when the window produced real data elsewhere, but
-    //    keep one so an all-empty window still announces a valid clip.
+    // 4. Drop empty files when the window produced real data elsewhere, but keep
+    //    one so an all-empty window still yields a valid clip.
     if staged.len() > 1 {
         if staged.iter().any(|c| !c.is_empty()) {
             staged.retain(|c| !c.is_empty());
@@ -342,114 +299,42 @@ pub fn cut_window(
         }
     }
 
-    // 5. Publish the staged segments, naming them only now the count is known:
-    //    one segment keeps the bare name, several get one `_NN` per source file.
-    let n = staged.len();
-    let mut stats = Vec::with_capacity(n);
-    for (i, mut clip) in staged.into_iter().enumerate() {
-        if n > 1 {
-            clip.set_final_name(segment_name(&base_out_path, i));
-        }
-        stats.push(cut::publish_clip(clip)?);
+    // 5. Name what is left `<id>_0.mcap`, `<id>_1.mcap`, … — the position among
+    //    the files that contributed, not the source recording's place in the
+    //    collection.
+    let mut files = Vec::with_capacity(staged.len());
+    for (n, clip) in staged.into_iter().enumerate() {
+        files.push(clip.place(dir, n)?);
     }
-    Ok(stats)
+
+    // 6. The document, written once every file above is durable and named: its
+    //    presence is what makes the clip complete.
+    dir.complete(&ClipMetadata::of(request, planned, &files))?;
+    Ok(files)
 }
 
-/// Queue one segment's copy on the staging workers and block on the reply. The
+/// Queue one file's copy on the staging workers and block on the reply. The
 /// plan is [`cut_window`]'s snapshot of one source recording, so a job that
 /// waits in the FIFO queue still copies the recording it was taken from.
-fn stage_segment(
+fn stage_file(
     stage_tx: &Sender<StageJob>,
     plan: WindowPlan,
     request: &Arc<CutRequest>,
-    planned: Planned,
-    out_path: &Path,
+    dir: &ClipDir,
+    plan_idx: usize,
 ) -> anyhow::Result<cut::StagedClip> {
     let (reply_tx, reply_rx) = bounded(1);
     stage_tx
         .send(StageJob {
             plan,
             request: request.clone(),
-            planned,
-            out_path: out_path.to_path_buf(),
+            out_path: dir.staging(plan_idx),
             reply: reply_tx,
         })
         .map_err(|_| anyhow::anyhow!("the staging workers are gone"))?;
     reply_rx
         .recv()
         .map_err(|_| anyhow::anyhow!("the staging worker dropped the job"))?
-}
-
-/// `<base>` with a zero-padded `_NN` segment index inserted before the
-/// extension (`clip.mcap` → `clip_00.mcap`), for a window that spanned a
-/// rollover and writes one segment per source file.
-fn segment_name(base: &Path, idx: usize) -> std::ffi::OsString {
-    let stem = base.file_stem().unwrap_or_default().to_string_lossy();
-    let ext = base
-        .extension()
-        .map(|e| format!(".{}", e.to_string_lossy()))
-        .unwrap_or_default();
-    std::ffi::OsString::from(format!("{stem}_{idx:02}{ext}"))
-}
-
-/// The clip already beside `base_out_path` that a window published under that
-/// base would collide with: the base name itself, or any `<stem>_<digits><ext>`
-/// next to it — the one shape both a segment name (`_00`, `_01`, …) and a
-/// suffixed sibling (`_1`, `_2`, …) take.
-///
-/// A window's segment count is settled only once staging has run, so a check
-/// that must run *before* anything is staged cannot ask about the names this
-/// particular window will use. It asks about every name a window under this base
-/// could take, which refuses slightly more than strictly necessary: a
-/// single-segment window is refused by a stray `<stem>_00.mcap` it would never
-/// have written. That is the trade the right way round — a false refusal costs a
-/// rename and a re-run, while a duplicate nobody refused is two files claiming
-/// to be the same clip.
-///
-/// The lowest-sorting collision is the one returned, so a refusal reads the same
-/// on every run. An output directory that does not exist yet holds nothing and
-/// collides with nothing.
-fn existing_clip(base_out_path: &Path) -> std::io::Result<Option<PathBuf>> {
-    let dir = match base_out_path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p,
-        _ => Path::new("."),
-    };
-    let base = base_out_path.file_name().unwrap_or_default();
-    let stem = base_out_path
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy();
-    let ext = base_out_path
-        .extension()
-        .map(|e| format!(".{}", e.to_string_lossy()))
-        .unwrap_or_default();
-    let prefix = format!("{stem}_");
-
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e),
-    };
-    let mut collision: Option<std::ffi::OsString> = None;
-    for entry in entries {
-        let name = entry?.file_name();
-        if name != base && !is_numbered_sibling(&name.to_string_lossy(), &prefix, &ext) {
-            continue;
-        }
-        if collision.as_ref().is_none_or(|lowest| name < *lowest) {
-            collision = Some(name);
-        }
-    }
-    Ok(collision.map(|name| dir.join(name)))
-}
-
-/// Whether `name` is `<prefix><digits><ext>` — a segment or suffixed sibling of
-/// the base name `prefix` and `ext` were taken from. The digits are not parsed:
-/// what matters is the shape a published clip's name has, not the number in it.
-fn is_numbered_sibling(name: &str, prefix: &str, ext: &str) -> bool {
-    name.strip_prefix(prefix)
-        .and_then(|rest| rest.strip_suffix(ext))
-        .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
 }
 
 #[cfg(test)]
@@ -459,13 +344,15 @@ mod tests {
         clippy::expect_used,
         clippy::indexing_slicing,
         clippy::assert_is_empty,
+        clippy::items_after_statements,
         clippy::too_many_lines,
         reason = "a failed unwrap or a panicking index is a failing test, and \
                   `assert!(x.is_empty())` names the claim better than the \
                   empty-array `assert_eq!` the lint asks for, \
                   and a test that builds a fixture, drives it and asserts on the \
                   whole result is long, nested and argument-heavy by \
-                  construction — splitting one would scatter the case it states"
+                  construction — splitting one would scatter the case it states, \
+                  as would hoisting a one-test planner out of the test that needs it"
     )]
 
     use std::collections::HashMap;
@@ -475,14 +362,15 @@ mod tests {
     use super::*;
     use crate::TimeSource;
     use crate::index::{Extent, PlanSource, RecordingIndex, Span, Stamps, op};
-    use crate::manifest::read_manifest;
+    use crate::layout::{METADATA_FILE, read_metadata};
+    use crate::manifest::{CLIP_ID_KEY, read_manifest};
     use crate::testing::{
-        channel_body, index_file, message_body_pub, planned_one_file, raw_record, read_clip,
-        scan_to_end, test_dir, window_request, write_raw, write_recording,
+        channel_body, index_file, message_body_pub, raw_record, read_clip, scan_to_end, test_dir,
+        window_request, write_raw, write_recording,
     };
 
     /// The window `[start_ns, end_ns]` on `source`, in the `Arc` the cut path
-    /// shares between one window's segments.
+    /// shares between one window's files.
     fn log_request(start_ns: u64, end_ns: u64, source: TimeSource) -> Arc<CutRequest> {
         Arc::new(window_request(start_ns, end_ns, source))
     }
@@ -507,8 +395,8 @@ mod tests {
         }
     }
 
-    /// A planner that must never be asked for a window: a refused cut returns
-    /// before it plans one, so reaching this is the refusal happening too late.
+    /// A planner that must never be asked for a window: a skipped window returns
+    /// before it plans one, so reaching this is the claim happening too late.
     struct Unplannable;
 
     impl WindowPlanner for Unplannable {
@@ -518,7 +406,7 @@ mod tests {
             _end_ns: u64,
             _source: TimeSource,
         ) -> Vec<WindowPlan> {
-            panic!("a refused window is never planned")
+            panic!("a skipped window is never planned")
         }
     }
 
@@ -534,59 +422,63 @@ mod tests {
         Ok(Indexes(indexes))
     }
 
-    /// The clip filenames an output directory holds, sorted — the capturing
-    /// subdirectory itself excluded, since it is not published output.
-    fn published(out_dir: &Path) -> anyhow::Result<Vec<String>> {
-        let mut names = Vec::new();
-        for entry in std::fs::read_dir(out_dir)? {
-            let name = entry?.file_name().to_string_lossy().into_owned();
-            if name != ".capturing" {
-                names.push(name);
-            }
-        }
+    /// The names a directory holds, sorted. An output directory holds clip
+    /// directories and nothing else; a clip directory holds its files and its
+    /// metadata document.
+    fn entries(dir: &Path) -> anyhow::Result<Vec<String>> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)?
+            .map(|e| Ok(e?.file_name().to_string_lossy().into_owned()))
+            .collect::<anyhow::Result<_>>()?;
         names.sort();
         Ok(names)
     }
 
-    /// How many files are sitting in an output directory's capturing area.
-    fn staged(out_dir: &Path) -> anyhow::Result<usize> {
-        Ok(std::fs::read_dir(out_dir.join(".capturing"))?.count())
+    /// Where `request`'s clip goes under `out_dir`: the directory named by its
+    /// id. The scheme is the cut's, so a test states the shape it is about and
+    /// reads the name back from the code that decides it.
+    fn clip_dir(out_dir: &Path, request: &CutRequest) -> PathBuf {
+        out_dir.join(ClipId::of(request).to_string())
     }
 
-    /// A published clip's file name, for comparing against [`published`].
-    fn file_name(clip: &Path) -> String {
-        clip.file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned()
+    /// The `n`th file of `request`'s clip: `<id>/<id>_N.mcap`.
+    fn clip_file(out_dir: &Path, request: &CutRequest, n: usize) -> PathBuf {
+        clip_dir(out_dir, request).join(format!("{}_{n}.mcap", ClipId::of(request)))
     }
 
-    /// The path [`cut_window`] publishes `request`'s clip at under `out_dir`,
-    /// with `suffix` between the name and the extension: `""` for a window
-    /// inside one recording, `"_00"` for the first segment of a straddling one,
-    /// `"_1"` for the sibling a second cut of the same window takes.
-    ///
-    /// The scheme is the cut's, so a test asserting a published path states the
-    /// suffix it is about and reads the rest back from the code that decides it.
-    fn clip_at(out_dir: &Path, request: &CutRequest, suffix: &str) -> PathBuf {
-        let base = base_name(request);
-        let stem = base
-            .strip_suffix(".mcap")
-            .expect("a clip is named with the mcap extension");
-        out_dir.join(format!("{stem}{suffix}.mcap"))
+    /// The clip a cut wrote, or a failure naming what it did instead.
+    fn cut(outcome: CutOutcome) -> Clip {
+        match outcome {
+            CutOutcome::Cut(clip) => clip,
+            CutOutcome::Skipped(dir) => panic!("expected a clip, got a skip of {}", dir.display()),
+        }
     }
 
-    /// A clip is named by its id, and that computation lives here rather than in
-    /// either binary.
+    /// The directory a cut skipped, or a failure naming what it did instead.
+    fn skipped(outcome: CutOutcome) -> PathBuf {
+        match outcome {
+            CutOutcome::Skipped(dir) => dir,
+            CutOutcome::Cut(clip) => {
+                panic!("expected a skip, got the clip {}", clip.dir.display())
+            }
+        }
+    }
+
+    /// A clip is a directory named by its id, and that computation lives here
+    /// rather than in either binary.
     ///
     /// The second name is the property the id buys: a trigger whose text would
     /// be hostile in a path produces the same shape of name as any other,
     /// because none of that text reaches it. [`crate::id`] is where the id's own
     /// contract is pinned.
     #[test]
-    fn a_clip_is_named_by_its_id() {
+    fn a_clip_is_a_directory_named_by_its_id() -> anyhow::Result<()> {
+        let root = test_dir("named")?;
+        let rec = root.join("rec.mcap");
+        write_recording(&rec, false, &[("/t", 100), ("/t", 200)])?;
+        let out_dir = root.join("clipped");
+
         let named = |name: &str| {
-            base_name(&CutRequest::new(
+            Arc::new(CutRequest::new(
                 crate::testing::TEST_PRODUCER,
                 crate::Trigger {
                     name: name.to_string(),
@@ -600,28 +492,103 @@ mod tests {
             ))
         };
         assert_eq!(
-            named("brake-event"),
-            "1726300000000000000_fc43-6475-ade8-4730.mcap"
+            ClipId::of(&named("brake-event")).to_string(),
+            "1726300000000000000_fc43-6475-ade8-4730"
         );
+
+        // A name that would escape the output directory is one plain directory
+        // under it, holding one plainly named file.
+        let planner = indexed(&[&rec])?;
+        let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
+        let hostile = named("../escape");
+        let clip = cut(cut_window(
+            &planner,
+            &hostile,
+            WindowCoverage::Covered,
+            &out_dir,
+            &stage_tx,
+        )?);
+
+        assert_eq!(clip.dir, clip_dir(&out_dir, &hostile));
+        assert_eq!(clip.dir.parent(), Some(out_dir.as_path()));
         assert_eq!(
-            named("../escape").matches('_').count(),
-            1,
-            "a name that would escape the output directory shapes no part of              the clip's own: {}",
-            named("../escape")
+            entries(&out_dir)?,
+            vec![ClipId::of(&hostile).to_string()],
+            "the output directory gains one clip directory and nothing else"
         );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
     }
 
-    /// Two concurrent cuts of one window, on a single staging worker: the copies
-    /// serialize FIFO, the second writer lands on a `_1` sibling at publish, and
-    /// both clips come out complete.
+    /// A window inside one recording: one directory, one numbered file in it,
+    /// the document beside it, and nothing else anywhere.
     ///
-    /// One window is what makes this the race worth pinning: [`cut_window`]
-    /// derives the clip's name from the window, so two windows that agree on it
-    /// are exactly the pair that aim at one file, and two writers must never
-    /// share one. Neither window straddles a rollover, so each is a single
-    /// segment.
+    /// The file is `_0` even though it is the only one — always numbered, so a
+    /// consumer reads one rule rather than two. The file's own metadata record
+    /// carries the clip's id and nothing more: everything else a clip says is in
+    /// the document, stated once.
     #[test]
-    fn concurrent_cuts_of_one_window_serialize_and_take_distinct_paths() -> anyhow::Result<()> {
+    fn a_window_inside_one_recording_is_a_directory_of_one_numbered_file() -> anyhow::Result<()> {
+        let root = test_dir("one-file")?;
+        let rec = root.join("rec.mcap");
+        write_recording(&rec, false, &[("/t", 100), ("/t", 200)])?;
+        let out_dir = root.join("clipped");
+
+        let planner = indexed(&[&rec])?;
+        let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
+        let request = log_request(0, 300, TimeSource::Log);
+        let clip = cut(cut_window(
+            &planner,
+            &request,
+            WindowCoverage::Covered,
+            &out_dir,
+            &stage_tx,
+        )?);
+
+        let id = ClipId::of(&request).to_string();
+        assert_eq!(clip.dir, out_dir.join(&id));
+        assert_eq!(
+            entries(&clip.dir)?,
+            vec![format!("{id}_0.mcap"), METADATA_FILE.to_string()],
+            "one numbered file and the document that completes the clip"
+        );
+        assert_eq!(clip.files.len(), 1);
+        assert_eq!(clip.files[0].out_path, clip_file(&out_dir, &request, 0));
+        assert_eq!(
+            read_clip(&clip.files[0].out_path)?,
+            vec![("/t".to_string(), 100), ("/t".to_string(), 200)]
+        );
+
+        assert_eq!(
+            read_manifest(&clip.files[0].out_path)?,
+            Some(std::collections::BTreeMap::from([(
+                CLIP_ID_KEY.to_string(),
+                id.clone()
+            )])),
+            "a clip's file carries its id and nothing else"
+        );
+        let metadata = read_metadata(&clip.dir)?;
+        assert_eq!(metadata.clip.id, id);
+        assert_eq!(metadata.clip.messages, 2);
+        assert_eq!(metadata.sources.len(), 1);
+        assert_eq!(metadata.sources[0].file, format!("{id}_0.mcap"));
+        assert_eq!(metadata.sources[0].path, Some(rec.display().to_string()));
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// Two concurrent cuts of one window: exactly one directory, complete, and
+    /// the other window is skipped.
+    ///
+    /// One window is what makes this the race worth pinning: the clip's
+    /// directory is named from the window, so two windows that agree on it are
+    /// exactly the pair that aim at one directory. The `mkdir` decides it — one
+    /// caller creates it, the other is told it exists — so the loser never
+    /// writes a byte, and no lock or retry is involved.
+    #[test]
+    fn two_concurrent_cuts_of_one_window_yield_one_clip() -> anyhow::Result<()> {
         let root = test_dir("overlap")?;
         let rec = root.join("rec.mcap");
         write_recording(
@@ -629,146 +596,104 @@ mod tests {
             false,
             &[("/t", 100), ("/t", 200), ("/t", 300), ("/t", 400)],
         )?;
+        let out_dir = root.join("clipped");
 
         let planner = Arc::new(indexed(&[&rec])?);
-
         let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
         let request = log_request(100, 300, TimeSource::Log);
-        let cut = || {
+        let start = || {
             let planner = planner.clone();
             let stage_tx = stage_tx.clone();
             let request = request.clone();
-            let root = root.clone();
+            let out_dir = out_dir.clone();
             std::thread::spawn(move || {
                 cut_window(
                     planner.as_ref(),
                     &request,
                     WindowCoverage::Covered,
-                    &root,
-                    Mode::Tail,
+                    &out_dir,
                     &stage_tx,
                 )
             })
         };
-        let (ha, hb) = (cut(), cut());
-        let a = ha.join().unwrap()?;
-        let b = hb.join().unwrap()?;
-        assert_eq!((a.len(), b.len()), (1, 1), "each window is one segment");
-        let (a, b) = (&a[0], &b[0]);
+        let (ha, hb) = (start(), start());
+        let outcomes = [ha.join().unwrap()?, hb.join().unwrap()?];
 
-        assert_ne!(
-            a.out_path, b.out_path,
-            "two writers must never share a file"
-        );
-        let base = root.join(base_name(&request));
-        let sibling = base.with_file_name(format!(
-            "{}_1.mcap",
-            base.file_stem().unwrap_or_default().to_string_lossy()
-        ));
-        let mut paths = vec![a.out_path.clone(), b.out_path.clone()];
-        paths.sort();
-        assert_eq!(paths, vec![base, sibling]);
-        let window = vec![
-            ("/t".to_string(), 100),
-            ("/t".to_string(), 200),
-            ("/t".to_string(), 300),
-        ];
-        assert_eq!(read_clip(&a.out_path)?, window);
+        let dir = clip_dir(&out_dir, &request);
+        let cuts: Vec<&Clip> = outcomes
+            .iter()
+            .filter_map(|o| match o {
+                CutOutcome::Cut(clip) => Some(clip),
+                CutOutcome::Skipped(_) => None,
+            })
+            .collect();
+        assert_eq!(cuts.len(), 1, "exactly one of the two windows wrote a clip");
+        assert_eq!(cuts[0].dir, dir);
         assert_eq!(
-            read_clip(&b.out_path)?,
-            window,
-            "one window, so the two clips hold the same messages in two files"
+            entries(&out_dir)?,
+            vec![ClipId::of(&request).to_string()],
+            "and the output directory holds that one clip"
+        );
+        assert_eq!(read_metadata(&dir)?.clip.messages, 3, "it is complete");
+        assert_eq!(
+            read_clip(&clip_file(&out_dir, &request, 0))?,
+            vec![
+                ("/t".to_string(), 100),
+                ("/t".to_string(), 200),
+                ("/t".to_string(), 300)
+            ]
         );
 
         std::fs::remove_dir_all(root)?;
         Ok(())
     }
 
-    /// Two segments staged through the worker pool for the same base name
-    /// publish to distinct files: the first claims the bare name, the second
-    /// resolves to the `_1` sibling. The staging copies run FIFO on the worker
-    /// channel; the name collision is settled at publish, on the calling thread.
+    /// A window straddling a rollover: one file per source recording, numbered
+    /// `_0` and `_1` in source order, inside one directory.
     #[test]
-    fn staged_segments_publish_to_distinct_paths() -> anyhow::Result<()> {
-        let root = test_dir("fifo")?;
-        let rec = root.join("rec.mcap");
-        write_recording(&rec, false, &[("/t", 100), ("/t", 200)])?;
-
-        let planner = indexed(&[&rec])?;
-
-        let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
-        let out = root.join("clip.mcap");
-        let plan = || {
-            planner
-                .plan_window(0, 300, TimeSource::Log)
-                .into_iter()
-                .next()
-                .expect("the recording covers the window")
-        };
-        let first = stage_segment(
-            &stage_tx,
-            plan(),
-            &log_request(0, 300, TimeSource::Log),
-            planned_one_file(),
-            &out,
-        )?;
-        let second = stage_segment(
-            &stage_tx,
-            plan(),
-            &log_request(0, 300, TimeSource::Log),
-            planned_one_file(),
-            &out,
-        )?;
-
-        let a = cut::publish_clip(first)?;
-        let b = cut::publish_clip(second)?;
-        assert_eq!(a.out_path, out, "the first published claims the name");
-        assert_eq!(
-            b.out_path,
-            root.join("clip_1.mcap"),
-            "the second resolves against the taken name"
-        );
-        assert_eq!(a.messages_copied, 2);
-        assert_eq!(b.messages_copied, 2);
-
-        std::fs::remove_dir_all(root)?;
-        Ok(())
-    }
-
-    #[test]
-    fn cut_window_recovers_across_a_rollover_into_two_segments() -> anyhow::Result<()> {
-        // Two finished recordings clipper indexed while running (a split): one
-        // `cut_window` over a window straddling the boundary stages one segment
-        // per source file, published as `<base>_00.mcap` and `<base>_01.mcap`,
-        // each a complete clip.
+    fn cut_window_recovers_across_a_rollover_into_two_files() -> anyhow::Result<()> {
         let root = test_dir("two-seg")?;
         let split0 = root.join("rec_0.mcap");
         let split1 = root.join("rec_1.mcap");
         write_recording(&split0, false, &[("/t", 1_000), ("/t", 2_000)])?;
         write_recording(&split1, false, &[("/t", 5_000), ("/t", 6_000)])?;
+        let out_dir = root.join("clipped");
 
         let planner = indexed(&[&split0, &split1])?;
-
         let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
         let request = log_request(1_500, 5_500, TimeSource::Log);
-        let stats = cut_window(
+        let clip = cut(cut_window(
             &planner,
             &request,
             WindowCoverage::Covered,
-            &root,
-            Mode::Tail,
+            &out_dir,
             &stage_tx,
-        )?;
+        )?);
 
-        assert_eq!(stats.len(), 2, "a straddling window yields two segments");
+        assert_eq!(clip.files.len(), 2, "a straddling window yields two files");
         let (first, second) = (
-            clip_at(&root, &request, "_00"),
-            clip_at(&root, &request, "_01"),
+            clip_file(&out_dir, &request, 0),
+            clip_file(&out_dir, &request, 1),
         );
-        let mut paths: Vec<_> = stats.iter().map(|s| s.out_path.clone()).collect();
-        paths.sort();
-        assert_eq!(paths, vec![first.clone(), second.clone()]);
-        // The segments tile the window: split0's tail, then split1's head.
+        assert_eq!(
+            clip.files
+                .iter()
+                .map(|f| f.out_path.clone())
+                .collect::<Vec<_>>(),
+            vec![first.clone(), second.clone()],
+            "numbered in source order"
+        );
+        let id = ClipId::of(&request).to_string();
+        assert_eq!(
+            entries(&clip.dir)?,
+            vec![
+                format!("{id}_0.mcap"),
+                format!("{id}_1.mcap"),
+                METADATA_FILE.to_string()
+            ],
+            "the two files and the document, and nothing left staging"
+        );
+        // The files tile the window: split0's tail, then split1's head.
         assert_eq!(read_clip(&first)?, vec![("/t".to_string(), 2_000)]);
         assert_eq!(read_clip(&second)?, vec![("/t".to_string(), 5_000)]);
 
@@ -776,305 +701,193 @@ mod tests {
         Ok(())
     }
 
-    /// The names in an output directory that make a window under `base` a
-    /// duplicate, and the ones that only look like they do.
+    /// The id is claimed by the directory's existence, whatever the directory
+    /// holds — so a complete clip and a half-written one are both skipped, and
+    /// neither is touched.
     ///
-    /// Both published shapes count — the `_NN` a multi-segment window writes and
-    /// the `_<n>` a suffixing publish resolves a collision to — because a window
-    /// whose segment count is not yet known could take either. A name that
-    /// merely shares the stem does not: refusing on `clip_x.mcap` would make an
-    /// unrelated file in the output directory able to block a cut forever.
+    /// The second cut is handed a planner that panics if it is asked for a
+    /// window: the skip is reached before the window is planned, so nothing
+    /// downstream of it — the plan, the copy, the naming — runs at all. That is
+    /// also why a skip costs nothing on a device already busy cutting.
     #[test]
-    fn existing_clip_matches_the_base_and_every_numbered_sibling() -> anyhow::Result<()> {
-        let root = test_dir("existing")?;
-        let base = root.join("clip.mcap");
-
-        assert_eq!(
-            existing_clip(&root.join("absent").join("clip.mcap"))?,
-            None,
-            "an output directory that does not exist yet collides with nothing"
-        );
-        assert_eq!(
-            existing_clip(&base)?,
-            None,
-            "an empty directory collides with nothing"
-        );
-
-        for name in [
-            "clip_x.mcap",
-            "clip_.mcap",
-            "clipper.mcap",
-            "clip_00.mcap.bak",
-            "other_00.mcap",
-        ] {
-            std::fs::write(root.join(name), b"x")?;
-            assert_eq!(
-                existing_clip(&base)?,
-                None,
-                "{name} is not a clip this window could have written"
-            );
-            std::fs::remove_file(root.join(name))?;
-        }
-
-        for name in ["clip.mcap", "clip_00.mcap", "clip_1.mcap", "clip_123.mcap"] {
-            std::fs::write(root.join(name), b"x")?;
-            assert_eq!(
-                existing_clip(&base)?,
-                Some(root.join(name)),
-                "{name} is a clip a window under this base publishes as"
-            );
-            std::fs::remove_file(root.join(name))?;
-        }
-
-        // Several collisions at once: the refusal names the same one on every
-        // run rather than whichever the directory happened to yield first.
-        for name in ["clip_07.mcap", "clip_02.mcap", "clip.mcap"] {
-            std::fs::write(root.join(name), b"x")?;
-        }
-        assert_eq!(existing_clip(&base)?, Some(root.join("clip.mcap")));
-
-        std::fs::remove_dir_all(root)?;
-        Ok(())
-    }
-
-    /// The cloud policy: a second cut of a window already in the output
-    /// directory refuses instead of publishing a second copy of it.
-    ///
-    /// The first cut writes its clip; the second names that clip, fails, and
-    /// leaves the directory exactly as the first left it — no `_1` sibling, and
-    /// nothing stranded in the capturing area, because the refusal happens
-    /// before a plan is taken or a byte is staged.
-    #[test]
-    fn cut_window_refuses_a_window_already_in_the_output_directory() -> anyhow::Result<()> {
-        let root = test_dir("refuse-rerun")?;
+    fn a_window_whose_id_is_taken_is_skipped_whatever_the_directory_holds() -> anyhow::Result<()> {
+        let root = test_dir("skip-taken")?;
         let rec = root.join("rec.mcap");
         write_recording(&rec, false, &[("/t", 100), ("/t", 200)])?;
         let out_dir = root.join("clipped");
-        cut::reset_capturing_dir(&out_dir)?;
 
         let planner = indexed(&[&rec])?;
         let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
         let request = log_request(0, 300, TimeSource::Log);
-        let base = clip_at(&out_dir, &request, "");
 
-        let first = cut_window(
+        let clip = cut(cut_window(
             &planner,
             &request,
             WindowCoverage::Covered,
             &out_dir,
-            Mode::Clip,
             &stage_tx,
-        )?;
-        assert_eq!(first.len(), 1);
-        assert_eq!(first[0].out_path, base);
+        )?);
+        let dir = clip.dir.clone();
+        let before = std::fs::read(&clip.files[0].out_path)?;
 
-        // The second cut is handed a planner that panics if it is asked for a
-        // window: the refusal is reached before the window is planned, so
-        // nothing downstream of it — the plan, the staging copy, the publish —
-        // runs at all.
-        let err = cut_window(
+        // A complete clip: skipped, and not a byte of it changes.
+        let again = skipped(cut_window(
             &Unplannable,
             &request,
             WindowCoverage::Covered,
             &out_dir,
-            Mode::Clip,
             &stage_tx,
-        )
-        .unwrap_err();
-        assert_eq!(
-            err.downcast_ref::<ClipExists>().map(|e| e.existing.clone()),
-            Some(base.clone()),
-            "the refusal names the clip that is already there: {err:#}"
-        );
-        assert_eq!(
-            published(&out_dir)?,
-            vec![file_name(&base)],
-            "the refused run publishes nothing, least of all a suffixed sibling"
-        );
-        assert_eq!(
-            staged(&out_dir)?,
-            0,
-            "the refusal happens before staging, so the capturing area stays empty"
-        );
+        )?);
+        assert_eq!(again, dir, "the skip names the directory that is there");
+        assert_eq!(std::fs::read(&clip.files[0].out_path)?, before);
+        assert_eq!(entries(&out_dir)?, vec![ClipId::of(&request).to_string()]);
 
-        std::fs::remove_dir_all(root)?;
-        Ok(())
-    }
-
-    /// The device policy over the same collision, which the cloud one must not
-    /// have changed: a second cut of the same window publishes beside the first.
-    ///
-    /// The two runs are the same call but for the [`Mode`] the caller names, so
-    /// this is the rival the refusal has to be told apart from.
-    #[test]
-    fn cut_window_publishes_beside_a_window_already_there_when_suffixing() -> anyhow::Result<()> {
-        let root = test_dir("suffix-rerun")?;
-        let rec = root.join("rec.mcap");
-        write_recording(&rec, false, &[("/t", 100), ("/t", 200)])?;
-        let out_dir = root.join("clipped");
-        cut::reset_capturing_dir(&out_dir)?;
-
-        let planner = indexed(&[&rec])?;
-        let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
-        let request = log_request(0, 300, TimeSource::Log);
-        let (base, sibling) = (
-            clip_at(&out_dir, &request, ""),
-            clip_at(&out_dir, &request, "_1"),
-        );
-        let cut_it = || {
-            cut_window(
-                &planner,
+        // Crash residue — a directory with no document in it — is claimed just
+        // as hard, and nothing about it is repaired.
+        std::fs::remove_file(dir.join(METADATA_FILE))?;
+        let residue = entries(&dir)?;
+        assert_eq!(
+            skipped(cut_window(
+                &Unplannable,
                 &request,
                 WindowCoverage::Covered,
                 &out_dir,
-                Mode::Tail,
                 &stage_tx,
-            )
-        };
-
-        assert_eq!(cut_it()?[0].out_path, base);
-        assert_eq!(cut_it()?[0].out_path, sibling);
+            )?),
+            dir,
+            "an incomplete directory is a taken id too"
+        );
         assert_eq!(
-            published(&out_dir)?,
-            vec![file_name(&base), file_name(&sibling)],
-            "a second live trigger's clip is data, and lands beside the first"
+            entries(&dir)?,
+            residue,
+            "residue is left exactly as it was found: a skip repairs nothing"
         );
 
         std::fs::remove_dir_all(root)?;
         Ok(())
     }
 
-    /// A window that would straddle a rollover is refused whole when only one
-    /// of the segments it would write is already there.
-    ///
-    /// The window's `_00` segment exists and its `_01` does not, so a check made
-    /// per segment as each is published would write the second half of a clip
-    /// whose first half it refused. The check runs once, before staging, and
-    /// neither segment is written.
+    /// `cut_window` with two source recordings where BOTH files are empty keeps
+    /// exactly one of them: the drop step truncates to 1 rather than dropping
+    /// all, so an all-empty window still yields a valid clip.
     #[test]
-    fn cut_window_refuses_a_multi_segment_window_whole() -> anyhow::Result<()> {
-        let root = test_dir("refuse-segment")?;
+    fn cut_window_all_empty_multi_file_keeps_one() -> anyhow::Result<()> {
+        let root = test_dir("all-empty")?;
         let split0 = root.join("rec_0.mcap");
         let split1 = root.join("rec_1.mcap");
+        // Two recordings the window [1_700, 1_900] falls inside the span of —
+        // so both are planned and read — and that neither holds a message in:
+        // both copies come out empty (messages_copied == 0).
         write_recording(&split0, false, &[("/t", 1_000), ("/t", 2_000)])?;
-        write_recording(&split1, false, &[("/t", 5_000), ("/t", 6_000)])?;
+        write_recording(&split1, false, &[("/t", 1_500), ("/t", 2_500)])?;
         let out_dir = root.join("clipped");
-        cut::reset_capturing_dir(&out_dir)?;
-        let request = log_request(1_500, 5_500, TimeSource::Log);
-        // The window's first segment, left behind by an earlier run; its second
-        // segment's name is free.
-        let earlier = clip_at(&out_dir, &request, "_00");
-        std::fs::write(&earlier, b"an earlier segment")?;
 
         let planner = indexed(&[&split0, &split1])?;
         let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
-        let err = cut_window(
+        let request = log_request(1_700, 1_900, TimeSource::Log);
+        let clip = cut(cut_window(
             &planner,
             &request,
             WindowCoverage::Covered,
             &out_dir,
-            Mode::Clip,
             &stage_tx,
-        )
-        .unwrap_err();
+        )?);
 
         assert_eq!(
-            err.downcast_ref::<ClipExists>().map(|e| e.existing.clone()),
-            Some(earlier.clone()),
-            "the refusal names the segment that is already there: {err:#}"
-        );
-        assert_eq!(
-            published(&out_dir)?,
-            vec![file_name(&earlier)],
-            "the free segment name stays free: the window is refused whole"
-        );
-        assert_eq!(staged(&out_dir)?, 0, "nothing was staged either");
-
-        std::fs::remove_dir_all(root)?;
-        Ok(())
-    }
-
-    /// `cut_window` with two source recordings where BOTH segments are empty
-    /// keeps exactly one of them: the drop step truncates to 1 rather than
-    /// dropping all, so an all-empty window still yields a valid clip.
-    #[test]
-    fn cut_window_all_empty_multi_segment_keeps_one() -> anyhow::Result<()> {
-        let root = test_dir("all-empty")?;
-        let split0 = root.join("rec_0.mcap");
-        let split1 = root.join("rec_1.mcap");
-        // Two recordings whose messages all fall far outside the narrow window
-        // [500, 600]: both staged segments will be empty (messages_copied == 0).
-        write_recording(&split0, false, &[("/t", 1_000), ("/t", 2_000)])?;
-        write_recording(&split1, false, &[("/t", 5_000), ("/t", 6_000)])?;
-
-        let planner = indexed(&[&split0, &split1])?;
-
-        let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
-        let stats = cut_window(
-            &planner,
-            &log_request(500, 600, TimeSource::Log),
-            WindowCoverage::Covered,
-            &root,
-            Mode::Tail,
-            &stage_tx,
-        )?;
-
-        // Both segments are empty, so truncate(1) keeps exactly one.
-        assert_eq!(
-            stats.len(),
+            clip.files.len(),
             1,
-            "an all-empty multi-segment window keeps exactly one segment"
+            "an all-empty multi-file window keeps exactly one file"
         );
-        assert_eq!(stats[0].messages_copied, 0, "the kept segment is empty");
-        assert!(read_clip(&stats[0].out_path)?.is_empty());
+        assert_eq!(clip.files[0].messages_copied, 0, "the kept file is empty");
+        assert_eq!(clip.files[0].out_path, clip_file(&out_dir, &request, 0));
+        assert!(read_clip(&clip.files[0].out_path)?.is_empty());
+        let metadata = read_metadata(&clip.dir)?;
+        assert_eq!(metadata.window.files_planned, 2, "both were planned");
+        assert_eq!(metadata.sources.len(), 1, "one file came out of them");
 
         std::fs::remove_dir_all(root)?;
         Ok(())
     }
 
-    /// `cut_window` with two source recordings where only one segment carries
-    /// data drops the empty segment: the `retain(!is_empty)` branch fires, so
-    /// the returned clip list contains only the non-empty one.
+    /// A window over three recordings whose middle one holds none of its
+    /// messages: two files, renumbered `_0` and `_1` by the position they end up
+    /// at, and a document that says three were planned.
+    ///
+    /// The numbering is the position **after** the empty files are dropped, not
+    /// the source recording's place in the collection, which is why `_1` here
+    /// holds the third recording's data.
     #[test]
-    fn cut_window_drops_empty_segment_when_other_has_data() -> anyhow::Result<()> {
+    fn cut_window_drops_an_empty_file_and_renumbers_what_is_left() -> anyhow::Result<()> {
         let root = test_dir("drop-empty")?;
         let split0 = root.join("rec_0.mcap");
         let split1 = root.join("rec_1.mcap");
-        // split0 has messages inside the window [1_500, 5_500]; split1 does not.
-        write_recording(&split0, false, &[("/t", 1_000), ("/t", 2_000)])?;
-        write_recording(&split1, false, &[("/t", 8_000), ("/t", 9_000)])?;
+        let split2 = root.join("rec_2.mcap");
+        // The window [4_000, 8_500] takes one message from split0 and one from
+        // split2; split1's extent spans the window — so it is planned and read
+        // — but neither of its messages falls inside it.
+        write_recording(&split0, false, &[("/t", 1_000), ("/t", 5_000)])?;
+        write_recording(&split1, false, &[("/t", 3_000), ("/t", 9_000)])?;
+        write_recording(&split2, false, &[("/t", 8_000), ("/t", 9_500)])?;
+        let out_dir = root.join("clipped");
 
-        let planner = indexed(&[&split0, &split1])?;
-
+        let planner = indexed(&[&split0, &split1, &split2])?;
         let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
-        let stats = cut_window(
+        let request = log_request(4_000, 8_500, TimeSource::Log);
+        let clip = cut(cut_window(
             &planner,
-            &log_request(1_500, 5_500, TimeSource::Log),
+            &request,
             WindowCoverage::Covered,
-            &root,
-            Mode::Tail,
+            &out_dir,
             &stage_tx,
-        )?;
+        )?);
 
-        // split0 contributes message at 2_000; split1's messages are outside.
-        // The empty split1 segment is dropped; only the data-carrying segment remains.
+        assert_eq!(clip.files.len(), 2, "the empty middle file is dropped");
         assert_eq!(
-            stats.len(),
-            1,
-            "the empty trailing segment is dropped when another carries data"
+            clip.files
+                .iter()
+                .map(|f| f.out_path.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                clip_file(&out_dir, &request, 0),
+                clip_file(&out_dir, &request, 1),
+            ],
+            "what is left is renumbered from 0 by position"
         );
-        assert_eq!(stats[0].messages_copied, 1);
         assert_eq!(
-            read_clip(&stats[0].out_path)?,
-            vec![("/t".to_string(), 2_000)]
+            read_clip(&clip.files[1].out_path)?,
+            vec![("/t".to_string(), 8_000)]
+        );
+
+        let metadata = read_metadata(&clip.dir)?;
+        assert_eq!(
+            metadata.window.files_planned, 3,
+            "three recordings were planned over"
+        );
+        assert_eq!(
+            metadata
+                .sources
+                .iter()
+                .map(|s| (s.file.clone(), s.path.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    format!("{}_0.mcap", metadata.clip.id),
+                    Some(split0.display().to_string())
+                ),
+                (
+                    format!("{}_1.mcap", metadata.clip.id),
+                    Some(split2.display().to_string())
+                ),
+            ],
+            "and two contributed, each entry naming the recording behind its file"
         );
 
         std::fs::remove_dir_all(root)?;
         Ok(())
     }
 
-    /// A plan pointing at bytes that are not record-framed, so the stage that
-    /// copies it always fails. Its `time` span covers everything, so any window
+    /// A plan pointing at bytes that are not record-framed, so the copy that
+    /// reads it always fails. Its `time` span covers everything, so any window
     /// selects it.
     struct Unreadable(PlanSource);
 
@@ -1106,23 +919,25 @@ mod tests {
         }
     }
 
-    /// A stage that fails is reported to the caller that queued it, and the pool
-    /// survives to serve the next job.
+    /// A copy that fails is reported to the caller that queued it, the clip's
+    /// directory is removed, and the pool survives to serve the next job.
     ///
-    /// This is the property that lets one bad window stay one bad window: the
-    /// workers are a long-lived fixed pool shared by every concurrent cut, so a
-    /// job that dies taking the pool with it would silently stall every clip
-    /// after it — with no error anywhere, because the callers would simply block
-    /// on replies that never come. Both halves are asserted here: the failing
-    /// cut returns an `Err` rather than hanging, and a good cut queued on the
-    /// *same* channel afterwards still completes.
+    /// The removal is what keeps "a directory without the document is crash
+    /// residue" true: an ordinary failure must not leave one behind, or an
+    /// operator finding one learns nothing from it. The pool half is the
+    /// property that lets one bad window stay one bad window: the workers are a
+    /// long-lived fixed pool shared by every concurrent cut, so a job that died
+    /// taking the pool with it would silently stall every clip after it, with no
+    /// error anywhere, because the callers would simply block on replies that
+    /// never come.
     #[test]
-    fn a_failing_stage_is_reported_and_the_pool_serves_the_next_job() -> anyhow::Result<()> {
+    fn a_failing_copy_removes_the_clip_and_the_pool_serves_the_next_job() -> anyhow::Result<()> {
         let root = test_dir("stage-fails")?;
         let junk = root.join("junk.bin");
         std::fs::write(&junk, [0xFFu8; 64])?;
         let rec = root.join("rec.mcap");
         write_recording(&rec, false, &[("/t", 100), ("/t", 200)])?;
+        let out_dir = root.join("clipped");
 
         let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
 
@@ -1130,37 +945,158 @@ mod tests {
             path: junk.clone(),
             file: Arc::new(File::open(&junk)?),
         });
-        let bad = root.join("bad");
-        let err = cut_window(
-            &doomed,
-            &log_request(0, u64::MAX, TimeSource::Log),
-            WindowCoverage::Covered,
-            &bad,
-            Mode::Tail,
-            &stage_tx,
-        )
-        .unwrap_err();
+        let bad = log_request(0, u64::MAX, TimeSource::Log);
+        let err =
+            cut_window(&doomed, &bad, WindowCoverage::Covered, &out_dir, &stage_tx).unwrap_err();
         assert!(
             format!("{err:#}").contains("framing inconsistent"),
-            "the stage's own error reaches the caller: {err:#}"
+            "the copy's own error reaches the caller: {err:#}"
         );
-        assert!(published(&bad)?.is_empty(), "no clip is published");
+        assert!(
+            !clip_dir(&out_dir, &bad).exists(),
+            "the failed cut took its directory with it"
+        );
+        assert!(
+            entries(&out_dir)?.is_empty(),
+            "and left nothing else in the output directory"
+        );
 
         // The same pool, immediately afterwards: a well-formed window still cuts.
         let planner = indexed(&[&rec])?;
-        let stats = cut_window(
+        let good = log_request(0, 1_000, TimeSource::Log);
+        let clip = cut(cut_window(
             &planner,
-            &log_request(0, 1_000, TimeSource::Log),
+            &good,
             WindowCoverage::Covered,
-            &root.join("good"),
-            Mode::Tail,
+            &out_dir,
             &stage_tx,
-        )?;
-        assert_eq!(stats.len(), 1);
+        )?);
         assert_eq!(
-            read_clip(&stats[0].out_path)?,
+            read_clip(&clip.files[0].out_path)?,
             vec![("/t".to_string(), 100), ("/t".to_string(), 200)],
             "the worker that replied an error is still serving jobs"
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// A window whose second file cannot be copied leaves no completed clip, and
+    /// in particular no metadata document.
+    ///
+    /// The document is written after every file is durable, so there is no
+    /// instant at which an incomplete clip carries one — which is exactly what
+    /// an upload pipeline filters on. The first recording here copies fine; the
+    /// second is junk, so the failure lands between the two.
+    #[test]
+    fn a_failure_before_the_last_file_leaves_no_metadata() -> anyhow::Result<()> {
+        let root = test_dir("partial")?;
+        let rec = root.join("rec.mcap");
+        write_recording(&rec, false, &[("/t", 100), ("/t", 200)])?;
+        let junk = root.join("junk.bin");
+        std::fs::write(&junk, [0xFFu8; 64])?;
+        let out_dir = root.join("clipped");
+
+        /// One good plan followed by one whose bytes are not record-framed.
+        struct GoodThenBad(Indexes, PlanSource);
+        impl WindowPlanner for GoodThenBad {
+            fn plan_window(
+                &self,
+                start_ns: u64,
+                end_ns: u64,
+                source: TimeSource,
+            ) -> Vec<WindowPlan> {
+                let mut plans = self.0.plan_window(start_ns, end_ns, source);
+                plans.extend(Unreadable(self.1.clone()).plan_window(start_ns, end_ns, source));
+                plans
+            }
+        }
+
+        let planner = GoodThenBad(
+            indexed(&[&rec])?,
+            PlanSource {
+                path: junk.clone(),
+                file: Arc::new(File::open(&junk)?),
+            },
+        );
+
+        let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
+        let request = log_request(0, 300, TimeSource::Log);
+        let err = cut_window(
+            &planner,
+            &request,
+            WindowCoverage::Covered,
+            &out_dir,
+            &stage_tx,
+        )
+        .unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("framing inconsistent"),
+            "{err:#}"
+        );
+        assert!(
+            !clip_dir(&out_dir, &request).join(METADATA_FILE).exists(),
+            "a clip whose files are not all there never carries the document"
+        );
+        assert!(
+            entries(&out_dir)?.is_empty(),
+            "and the whole directory went with the failure"
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// When the failed clip's own directory cannot be removed, the error names
+    /// it — the one thing an operator has to act on, since every later window
+    /// with that id is skipped until the directory is gone.
+    ///
+    /// The planner here yanks the claimed directory out from under the cut and
+    /// leaves a plain file in its place, so both the copy and the removal fail:
+    /// a hostile filesystem, simulated deterministically rather than by
+    /// permissions, which say nothing to a test running as root.
+    #[test]
+    fn a_removal_that_fails_names_the_directory_it_left_behind() -> anyhow::Result<()> {
+        let root = test_dir("undeletable")?;
+        let out_dir = root.join("clipped");
+        let request = log_request(0, 300, TimeSource::Log);
+        let dir = clip_dir(&out_dir, &request);
+
+        /// Replaces the claimed clip directory with a regular file before
+        /// answering, so writing into it and removing it both fail.
+        struct Vandal(PathBuf);
+        impl WindowPlanner for Vandal {
+            fn plan_window(
+                &self,
+                _start_ns: u64,
+                _end_ns: u64,
+                _source: TimeSource,
+            ) -> Vec<WindowPlan> {
+                std::fs::remove_dir(&self.0).expect("the cut claimed the directory");
+                std::fs::write(&self.0, b"not a directory").expect("standing in its way");
+                vec![WindowPlan::empty()]
+            }
+        }
+
+        let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
+        let err = cut_window(
+            &Vandal(dir.clone()),
+            &request,
+            WindowCoverage::Covered,
+            &out_dir,
+            &stage_tx,
+        )
+        .unwrap_err();
+
+        let text = format!("{err:#}");
+        assert!(
+            text.contains(&dir.display().to_string()),
+            "the error names the directory an operator has to remove: {text}"
+        );
+        assert!(
+            text.contains("could not be removed"),
+            "and says that is what it is: {text}"
         );
 
         std::fs::remove_dir_all(root)?;
@@ -1203,8 +1139,8 @@ mod tests {
         }
     }
 
-    /// A stage that **panics** is caught, reported to the caller as an error,
-    /// and leaves the pool serving.
+    /// A copy that **panics** is caught, reported to the caller as an error, and
+    /// leaves the pool serving.
     ///
     /// This is the arm [`spawn_stage_workers`]' `catch_unwind` exists for. A
     /// worker that unwinds out of its receive loop is gone for good: it drops
@@ -1216,12 +1152,13 @@ mod tests {
     /// the ordinary `Err` return; this one kills the worker mid-copy and asserts
     /// the same two properties survive it.
     #[test]
-    fn a_panicking_stage_is_reported_and_the_pool_serves_the_next_job() -> anyhow::Result<()> {
+    fn a_panicking_copy_is_reported_and_the_pool_serves_the_next_job() -> anyhow::Result<()> {
         let root = test_dir("stage-panics")?;
         let src = root.join("src.mcap");
         write_recording(&src, false, &[("/t", 100)])?;
         let rec = root.join("rec.mcap");
         write_recording(&rec, false, &[("/t", 100), ("/t", 200)])?;
+        let out_dir = root.join("clipped");
 
         let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
 
@@ -1229,36 +1166,31 @@ mod tests {
             path: src.clone(),
             file: Arc::new(File::open(&src)?),
         });
-        let boom = root.join("boom");
-        let err = cut_window(
-            &doomed,
-            &log_request(0, u64::MAX, TimeSource::Log),
-            WindowCoverage::Covered,
-            &boom,
-            Mode::Tail,
-            &stage_tx,
-        )
-        .unwrap_err();
+        let boom = log_request(0, u64::MAX, TimeSource::Log);
+        let err =
+            cut_window(&doomed, &boom, WindowCoverage::Covered, &out_dir, &stage_tx).unwrap_err();
         let text = format!("{err:#}");
         assert!(
             text.contains("staging panicked"),
             "the panic is reported as an error, not lost with the thread: {text}"
         );
-        assert!(published(&boom)?.is_empty(), "no clip is published");
+        assert!(
+            entries(&out_dir)?.is_empty(),
+            "and the clip it was writing is gone"
+        );
 
         // The same pool, after a worker caught a panic: a well-formed window
         // still cuts. Without the catch this call never returns.
         let planner = indexed(&[&rec])?;
-        let stats = cut_window(
+        let clip = cut(cut_window(
             &planner,
             &log_request(0, 1_000, TimeSource::Log),
             WindowCoverage::Covered,
-            &root.join("good"),
-            Mode::Tail,
+            &out_dir,
             &stage_tx,
-        )?;
+        )?);
         assert_eq!(
-            read_clip(&stats[0].out_path)?,
+            read_clip(&clip.files[0].out_path)?,
             vec![("/t".to_string(), 100), ("/t".to_string(), 200)],
             "the worker that caught a panic is still serving jobs"
         );
@@ -1314,16 +1246,15 @@ mod tests {
         )?;
         let apart_planner = indexed(&[&apart])?;
 
-        let on_publish_apart = cut_window(
+        let on_publish_apart = cut(cut_window(
             &apart_planner,
             &log_request(900, 1_500, TimeSource::Publish),
             WindowCoverage::Covered,
             &root.join("apart-publish"),
-            Mode::Tail,
             &stage_tx,
-        )?;
+        )?);
         assert_eq!(
-            read_clip(&on_publish_apart[0].out_path)?
+            read_clip(&on_publish_apart.files[0].out_path)?
                 .into_iter()
                 .map(|(_, t)| t)
                 .collect::<Vec<u64>>(),
@@ -1335,55 +1266,52 @@ mod tests {
         // The same window on `log`: the extent's log span [100, 200] is nowhere
         // near it, so the planner returns nothing and the cut is a valid empty
         // clip. This is the assertion a planner hard-wired to one domain fails.
-        let on_log_apart = cut_window(
+        let on_log_apart = cut(cut_window(
             &apart_planner,
             &log_request(900, 1_500, TimeSource::Log),
             WindowCoverage::Covered,
             &root.join("apart-log"),
-            Mode::Tail,
             &stage_tx,
-        )?;
+        )?);
         assert_eq!(
-            on_log_apart.len(),
+            on_log_apart.files.len(),
             1,
-            "an uncovered window still yields one segment"
+            "an uncovered window still yields one file"
         );
         assert_eq!(
-            on_log_apart[0].extents_read, 0,
+            on_log_apart.files[0].extents_read, 0,
             "the planner selects extents on the window's own domain, so a log \
              window past the log span reads none"
         );
-        assert!(read_clip(&on_log_apart[0].out_path)?.is_empty());
+        assert!(read_clip(&on_log_apart.files[0].out_path)?.is_empty());
 
         // The window [180, 320] holds log_times 200 and 300 on `log`; on
         // `publish` only the message published at 250 is inside, and its
         // log_time — what a reader of the clip sees — is 100. Both domains plan
         // the same extent here, so this pins the copy's membership test alone.
-        let on_log = cut_window(
+        let on_log = cut(cut_window(
             &planner,
             &log_request(180, 320, TimeSource::Log),
             WindowCoverage::Covered,
             &root.join("log"),
-            Mode::Tail,
             &stage_tx,
-        )?;
-        let mut log_times: Vec<u64> = read_clip(&on_log[0].out_path)?
+        )?);
+        let mut log_times: Vec<u64> = read_clip(&on_log.files[0].out_path)?
             .into_iter()
             .map(|(_, t)| t)
             .collect();
         log_times.sort_unstable();
         assert_eq!(log_times, vec![200, 300], "log windows on log_time");
 
-        let on_publish = cut_window(
+        let on_publish = cut(cut_window(
             &planner,
             &log_request(180, 320, TimeSource::Publish),
             WindowCoverage::Covered,
             &root.join("publish"),
-            Mode::Tail,
             &stage_tx,
-        )?;
+        )?);
         assert_eq!(
-            read_clip(&on_publish[0].out_path)?
+            read_clip(&on_publish.files[0].out_path)?
                 .into_iter()
                 .map(|(_, t)| t)
                 .collect::<Vec<u64>>(),
@@ -1395,14 +1323,14 @@ mod tests {
         Ok(())
     }
 
-    /// The three ways a clip comes out empty are told apart from their manifests
+    /// The three ways a clip comes out empty are told apart from their documents
     /// alone.
     ///
-    /// This is what the output-directory contract needs and the file itself
+    /// This is what the output-directory contract needs and the files themselves
     /// cannot express: all three clips hold zero messages and their message
-    /// sections are byte-identical, so without the record a consumer cannot tell
-    /// a correct empty clip from a broken recorder. Each case is built for real
-    /// here rather than asserted on hand-made keys.
+    /// sections are byte-identical, so without the document a consumer cannot
+    /// tell a correct empty clip from a broken recorder. Each case is built for
+    /// real here rather than asserted on hand-made fields.
     #[test]
     fn an_empty_clip_says_which_kind_of_empty_it_is() -> anyhow::Result<()> {
         let root = test_dir("empty-kinds")?;
@@ -1410,176 +1338,138 @@ mod tests {
 
         // 1. Nothing covered the window: no recording exists, and the wait for
         //    coverage timed out — the recorder never got there.
-        let nothing = cut_window(
+        let nothing = cut(cut_window(
             &Indexes(Vec::new()),
             &log_request(500, 600, TimeSource::Log),
             WindowCoverage::Short,
             &root.join("nothing"),
-            Mode::Tail,
             &stage_tx,
-        )?;
+        )?);
 
         // 2. The window fell in a gap between splits: split0 ends at 2_000 and
-        //    split1 starts at 5_000, so no file holds a byte of [2_500, 4_500] —
-        //    but the recording ran well past the window, so the coverage wait
-        //    was satisfied.
+        //    split1 starts at 5_000, so no recording holds a byte of
+        //    [2_500, 4_500] — but the recording ran well past the window, so the
+        //    coverage wait was satisfied.
         let split0 = root.join("rec_0.mcap");
         let split1 = root.join("rec_1.mcap");
         write_recording(&split0, false, &[("/t", 1_000), ("/t", 2_000)])?;
         write_recording(&split1, false, &[("/t", 5_000), ("/t", 6_000)])?;
-        let gap = cut_window(
+        let gap = cut(cut_window(
             &indexed(&[&split0, &split1])?,
             &log_request(2_500, 4_500, TimeSource::Log),
             WindowCoverage::Covered,
             &root.join("gap"),
-            Mode::Tail,
             &stage_tx,
-        )?;
+        )?);
 
         // 3. No message matched: one recording whose extent brackets the window
         //    — so it is planned and read — but whose messages all fall outside
         //    it.
         let quiet = root.join("quiet.mcap");
         write_recording(&quiet, false, &[("/t", 100), ("/t", 900)])?;
-        let unmatched = cut_window(
+        let unmatched = cut(cut_window(
             &indexed(&[&quiet])?,
             &log_request(400, 500, TimeSource::Log),
             WindowCoverage::Covered,
             &root.join("unmatched"),
-            Mode::Tail,
             &stage_tx,
-        )?;
+        )?);
 
-        // All three are valid, empty, and — without the manifest —
-        // indistinguishable.
-        for stats in [&nothing[0], &gap[0], &unmatched[0]] {
-            assert_eq!(stats.messages_copied, 0);
-            assert!(read_clip(&stats.out_path)?.is_empty());
+        // All three are valid, empty, one-file clips and — without the document
+        // — indistinguishable.
+        for clip in [&nothing, &gap, &unmatched] {
+            assert_eq!(clip.files.len(), 1);
+            assert_eq!(clip.files[0].messages_copied, 0);
+            assert!(read_clip(&clip.files[0].out_path)?.is_empty());
         }
 
-        let kind = |stats: &cut::ClipStats| -> anyhow::Result<(String, String)> {
-            let m = read_manifest(&stats.out_path)?.expect("every clip carries a manifest");
-            assert_eq!(m["clip.messages"], "0");
-            Ok((m["source.files_planned"].clone(), m["clip.short"].clone()))
+        let kind = |clip: &Clip| -> anyhow::Result<(usize, bool)> {
+            let m = read_metadata(&clip.dir)?;
+            assert_eq!(m.clip.messages, 0);
+            Ok((m.window.files_planned, m.clip.short))
         };
         assert_eq!(
-            kind(&nothing[0])?,
-            ("0".to_string(), "true".to_string()),
-            "nothing covered the window: no file planned, and the cut ran short"
+            kind(&nothing)?,
+            (0, true),
+            "nothing covered the window: no recording planned, and the cut ran short"
         );
         assert_eq!(
-            kind(&gap[0])?,
-            ("0".to_string(), "false".to_string()),
-            "a gap between splits: no file planned, but the recording had passed \
-             the window end"
+            kind(&gap)?,
+            (0, false),
+            "a gap between splits: no recording planned, but the recording had \
+             passed the window end"
         );
         assert_eq!(
-            kind(&unmatched[0])?,
-            ("1".to_string(), "false".to_string()),
-            "no message matched: a file was planned and read, and the recording \
-             covered the window"
+            kind(&unmatched)?,
+            (1, false),
+            "no message matched: a recording was planned and read, and it covered \
+             the window"
         );
 
         std::fs::remove_dir_all(root)?;
         Ok(())
     }
 
-    /// A window straddling a split writes one manifest per segment, each naming
-    /// its own source file, and both agreeing on the window-level facts.
+    /// A window straddling a split states one `sources` entry per file, each
+    /// naming the recording behind it, under one set of window-level facts.
     ///
-    /// A single record for the whole window would have to name one of the two
-    /// files and be wrong about the other; the per-segment record is what lets a
-    /// consumer trace each half of a straddling clip back to the recording it
-    /// came from.
+    /// A document that named one of the two recordings would be wrong about the
+    /// other; the per-file list is what lets a consumer trace each half of a
+    /// straddling clip back to where it came from. Every file of the clip is
+    /// stamped with the same id, so one carried away from the directory can
+    /// still be grouped.
     #[test]
-    fn each_segment_of_a_straddling_window_names_its_own_source() -> anyhow::Result<()> {
+    fn each_file_of_a_straddling_window_names_its_own_source() -> anyhow::Result<()> {
         let root = test_dir("two-seg-manifest")?;
         let split0 = root.join("rec_0.mcap");
         let split1 = root.join("rec_1.mcap");
         write_recording(&split0, false, &[("/t", 1_000), ("/t", 2_000)])?;
         write_recording(&split1, false, &[("/t", 5_000), ("/t", 6_000)])?;
+        let out_dir = root.join("clipped");
 
         let planner = indexed(&[&split0, &split1])?;
         let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
         let request = log_request(1_500, 5_500, TimeSource::Log);
-        let stats = cut_window(
+        let clip = cut(cut_window(
             &planner,
             &request,
             WindowCoverage::Covered,
-            &root,
-            Mode::Tail,
+            &out_dir,
             &stage_tx,
-        )?;
-        assert_eq!(stats.len(), 2, "a straddling window yields two segments");
+        )?);
+        assert_eq!(clip.files.len(), 2, "a straddling window yields two files");
 
         let id = ClipId::of(&request).to_string();
-        let mut sources = Vec::new();
-        for seg in &stats {
-            let m = read_manifest(&seg.out_path)?.expect("every segment carries a manifest");
-            assert_eq!(
-                m["source.files_planned"], "2",
-                "both segments report the window's own file count"
-            );
-            assert_eq!(m["window.start_ns"], "1500");
-            assert_eq!(m["window.end_ns"], "5500");
-            assert_eq!(m["clip.messages"], "1");
-            assert_eq!(
-                m["clip.id"], id,
-                "both segments are the same clip and say so"
-            );
-            assert!(
-                file_name(&seg.out_path).starts_with(&id),
-                "a segment's file name opens with the id its record states"
-            );
-            sources.push(m["source.path"].clone());
+        let metadata = read_metadata(&clip.dir)?;
+        assert_eq!(metadata.clip.id, id);
+        assert_eq!(metadata.clip.messages, 2, "one message from each recording");
+        assert_eq!(metadata.window.files_planned, 2);
+        assert_eq!(metadata.window.start_ns, 1_500);
+        assert_eq!(metadata.window.end_ns, 5_500);
+        assert_eq!(
+            metadata
+                .sources
+                .iter()
+                .map(|s| (s.file.clone(), s.path.clone(), s.messages))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    format!("{id}_0.mcap"),
+                    Some(split0.display().to_string()),
+                    1
+                ),
+                (
+                    format!("{id}_1.mcap"),
+                    Some(split1.display().to_string()),
+                    1
+                ),
+            ],
+        );
+
+        for file in &clip.files {
+            let record = read_manifest(&file.out_path)?.expect("every file carries its id");
+            assert_eq!(record[CLIP_ID_KEY], id, "both files are the same clip");
         }
-        sources.sort();
-        assert_eq!(
-            sources,
-            vec![split0.display().to_string(), split1.display().to_string()],
-            "each segment names the split it was cut from"
-        );
-
-        std::fs::remove_dir_all(root)?;
-        Ok(())
-    }
-
-    /// A clip states the id it is named by, so a file carried away from the
-    /// directory it was published into still says which clip it is.
-    ///
-    /// A window inside one recording is where the two are the same string: the
-    /// manifest's `clip.id` is the file's stem. (A straddling window's segments
-    /// each add their own `_NN`, which the test above pins.)
-    #[test]
-    fn a_clip_is_named_by_the_id_its_manifest_states() -> anyhow::Result<()> {
-        let root = test_dir("clip-id")?;
-        let rec = root.join("rec.mcap");
-        write_recording(&rec, false, &[("/t", 100), ("/t", 200)])?;
-
-        let planner = indexed(&[&rec])?;
-        let stage_tx = spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
-        let request = log_request(0, 300, TimeSource::Log);
-        let stats = cut_window(
-            &planner,
-            &request,
-            WindowCoverage::Covered,
-            &root,
-            Mode::Tail,
-            &stage_tx,
-        )?;
-
-        let clip = &stats[0].out_path;
-        let m = read_manifest(clip)?.expect("every clip carries a manifest");
-        assert_eq!(
-            m["clip.id"],
-            ClipId::of(&request).to_string(),
-            "the record states the window's id"
-        );
-        assert_eq!(
-            clip.file_stem().unwrap_or_default().to_string_lossy(),
-            m["clip.id"],
-            "and the clip is written under it"
-        );
 
         std::fs::remove_dir_all(root)?;
         Ok(())
