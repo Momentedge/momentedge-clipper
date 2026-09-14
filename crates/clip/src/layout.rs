@@ -466,6 +466,17 @@ mod tests {
         Ok(names)
     }
 
+    /// The completion signal spelled out, once, as the contract publishes it.
+    ///
+    /// Every other assertion in the workspace reaches this file through
+    /// [`METADATA_FILE`], so renaming the constant would leave all of them green
+    /// while breaking the one name every upload pipeline filters on. The literal
+    /// is what cannot move with it.
+    #[test]
+    fn the_completion_signal_is_the_name_the_contract_publishes() {
+        assert_eq!(METADATA_FILE, "clip_metadata.yaml");
+    }
+
     /// Reading a directory that is not a complete clip is an ordinary error
     /// naming the file that is missing, which is how a consumer tells crash
     /// residue from a clip.

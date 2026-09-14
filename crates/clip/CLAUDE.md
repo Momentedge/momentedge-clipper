@@ -473,6 +473,17 @@ metadata index — a bounded seek and one record, never a walk — and returns t
 whole map rather than just the id, so a reader can tell "clipper wrote this and
 said nothing else" from a record under the same name written by something else.
 
+**Three literal names are the contract, and each is pinned by a literal.**
+`clip_metadata.yaml` (`METADATA_FILE`), `momentedge.clip` (`MANIFEST_NAME`) and
+`clip.id` (`CLIP_ID_KEY`) are what an upload pipeline filters on and what
+`mcap get metadata --name` is invoked with. Every other assertion in the
+workspace reaches them through the constants, so renaming a constant's *value*
+would leave the whole suite green while breaking every consumer — which is why
+`the_completion_signal_is_the_name_the_contract_publishes` and
+`a_files_record_is_named_and_keyed_as_the_contract_publishes` spell the strings
+out. Same reasoning as `cut`'s `ROSBAG2_METADATA_NAME`: a test that compares a
+constant to itself asserts nothing.
+
 ## Segment assembly and the clip directory (`clip::segment`)
 
 `cut_window` is the whole of what turns one window into a durable clip, and it is

@@ -598,6 +598,20 @@ mod tests {
         );
     }
 
+    /// The record's name and its one key, spelled out as the contract publishes
+    /// them.
+    ///
+    /// Every other assertion in the workspace reaches them through
+    /// [`MANIFEST_NAME`] and [`CLIP_ID_KEY`], so renaming either constant would
+    /// leave all of them green while breaking what a reader looks the record up
+    /// by (`mcap get metadata --name momentedge.clip`) and the key it reads out
+    /// of it. The literals are what cannot move with the constants.
+    #[test]
+    fn a_files_record_is_named_and_keyed_as_the_contract_publishes() {
+        assert_eq!(MANIFEST_NAME, "momentedge.clip");
+        assert_eq!(CLIP_ID_KEY, "clip.id");
+    }
+
     /// One written file, as the copy reports it.
     fn file(name: &str, source: Option<&str>, messages: u64) -> ClipStats {
         ClipStats {
