@@ -348,7 +348,7 @@ report a taken id as a won race and the claim would exclude nothing.
 `prepare_out_dir`'s, which `cut_window` runs before every claim, so the parent is
 always there by the time the claim runs.
 
-**The metadata file is the completion signal**, and two things make that true:
+**The document is the completion signal**, and two things make that true:
 how the name appears, and the order of the fsyncs around it.
 
 The document is written and fsynced under a `.part` staging name and then

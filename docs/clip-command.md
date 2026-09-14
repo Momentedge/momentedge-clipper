@@ -24,7 +24,7 @@ clipper clip ./record --out-dir ./clipped --trigger-source mcap
 
 Each clip lands at `<out-dir>/<clip-id>/` and is the same clip the recorder would
 have written from the same recording and window — the window plan, the byte copy,
-the [layout and its metadata file](clip-manifest.md) are all the shared path. The
+the [layout and its document](clip-manifest.md) are all the shared path. The
 five `--trigger-*` arguments are the fields of a `momentedge_msgs/Trigger`, so
 the clip states the same trigger a clip cut from a live topic does; only
 `producer.mode` differs, reading `clip` rather than `tail`.
