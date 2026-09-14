@@ -344,18 +344,20 @@ Where triggers come from and completions go: `ros` or `mcap`.
 
 `ros` (the default) subscribes to the trigger topic on a ROS node and publishes \
 `Recorded` on completion. `mcap` takes the triggers the recording itself carries \
-(decoding each by its `message_encoding`) and signals completion by moving the \
-clip into `out_dir` — it runs ROS-free, with no node, subscription, or publish. \
-The source is also the completion half: exactly one of the two is active per \
-run, and there is no third combination to select.";
+(decoding each by its `message_encoding`) and signals completion on disk alone, \
+by the clip_metadata.yaml a finished clip directory under `out_dir` carries — it \
+runs ROS-free, with no node, subscription, or publish. The source is also the \
+completion half: exactly one of the two is active per run, and there is no third \
+combination to select.";
 #[cfg(not(feature = "ros"))]
 const TAIL_TRIGGER_SOURCE_LONG_HELP: &str = "\
 Where triggers come from and completions go: `mcap`.
 
 `mcap` takes the triggers the recording itself carries (decoding each by its \
-`message_encoding`) and signals completion by moving the clip into `out_dir` — \
-it runs ROS-free, with no node, subscription, or publish. It is the only source \
-this binary has: `ros`, which subscribes to the trigger topic on a ROS node and \
+`message_encoding`) and signals completion on disk alone, by the \
+clip_metadata.yaml a finished clip directory under `out_dir` carries — it runs \
+ROS-free, with no node, subscription, or publish. It is the only source this \
+binary has: `ros`, which subscribes to the trigger topic on a ROS node and \
 publishes `Recorded`, is compiled in by the `ros` cargo feature, and this build \
 was made without it.";
 
@@ -606,8 +608,8 @@ struct Config {
     ///
     /// The source is the completion half too: `ros` drives the live
     /// subscription and the `Recorded` publish that answers it, `mcap` the
-    /// in-recording triggers and the clip's move into `out_dir`
-    /// ([`crate::interface`]).
+    /// in-recording triggers and the clip's `clip_metadata.yaml` appearing in
+    /// `out_dir` ([`crate::interface`]).
     #[arg(
         long,
         value_parser = trigger_source_parser(config::Mode::Tail),
@@ -1555,7 +1557,7 @@ fn tail_mode(
     // then drive the recorder with them. This match is the pairing: the source
     // names both halves of the seam, so `ros` takes the live subscription and
     // the `Recorded` publish that answers it, and `mcap` takes the in-recording
-    // triggers and the clip's move into `out_dir` as its only completion signal
+    // triggers and the clip's document appearing in `out_dir` as its only signal
     // (`Interface::SOURCE` on each is the same fact, stated on the type).
     // Exactly one is active; `drive` is generic over it (static dispatch, no
     // `Box<dyn>`).
@@ -3879,8 +3881,9 @@ mod tests {
     /// The completion half follows from the trigger source: each interface the
     /// recorder can drive names the source that selects it, and carries the
     /// announcer that pairing implies. `ros` answers each clip with a `Recorded`
-    /// publish; `mcap` has the clip's move into `out_dir` as its only signal, so
-    /// its announcer is the no-op one. There is no separate announcer setting —
+    /// publish; `mcap` has the clip's `clip_metadata.yaml` appearing in `out_dir`
+    /// as its only signal, so its announcer is the no-op one. There is no
+    /// separate announcer setting —
     /// these two cells are the whole matrix.
     #[test]
     fn each_tail_trigger_source_carries_the_announcer_its_interface_implies() {
