@@ -335,14 +335,28 @@ something about each and a taken id must be impossible to mistake for a free one
 No parents on purpose: the tree above is `prepare_out_dir`'s, and creating it here
 would turn a typo'd `--out-dir` into a silently fresh one.
 
-**The metadata file is the completion signal**, and the write order is what makes
-that true. Every MCAP file was fsynced by its own copy, so `ClipDir::complete`
-writes and fsyncs the document, then fsyncs the clip directory (making every name
-in it durable), then fsyncs the output directory (making the clip directory's own
+**The metadata file is the completion signal**, and two things make that true:
+how the name appears, and the order of the fsyncs around it.
+
+The document is written and fsynced under a `.part` staging name and then
+*renamed* onto `clip_metadata.yaml`, so a rename is the only operation that ever
+touches that name. A `File::create` on the final name would publish it holding
+zero bytes and fill it afterwards — and on ext4 with delayed allocation, a
+create-then-write with no rename is the textbook zero-length-file-after-crash
+case, which under a presence rule is a clip that reads as complete and is empty.
+The rename closes that window: the name is absent or it holds the whole
+document.
+
+Every MCAP file was fsynced by its own copy, so `ClipDir::complete` fsyncs the
+staged document, renames it, then fsyncs the clip directory (making every name in
+it durable), then fsyncs the output directory (making the clip directory's own
 entry durable). A crash can therefore lose a clip but can never leave one that
 carries the document and is missing a file the document names. The last fsync is
 what lets the recorder announce a clip as on disk: `Recorded` goes out after
 `cut_window` returns, and by then the clip survives power loss.
+`layout::tests::the_completion_signal_is_never_seen_half_written` pins the
+mechanism — it obstructs the staging name and shows the final name untouched —
+and says in its own doc what that does and does not prove.
 
 **A failed cut takes its directory with it.** `ClipDir::discard` consumes the
 claim, removes the tree and hands back the error that got there — and a removal
@@ -358,13 +372,18 @@ Consumers treat it as incomplete, and a later trigger with that id *skips* it
 rather than repairing or overwriting it — the residue is the evidence that
 something died, and clipper does not destroy evidence to tidy up.
 
-**`.part` is the one name a consumer never sees.** A file's number is its
-position after the empty files are dropped, which is known only once every copy
-has run, so each copy writes under a name derived from its plan's position
-(`ClipDir::staging`) and is renamed into place by `ClipDir::place`. Both names
-live in this module so the two spaces cannot collide, and the window in which a
-`.part` exists is a window in which the directory has no document and is therefore
-incomplete anyway.
+**`.part` is the one name a consumer never sees**, and two things are staged
+under it for the same reason: neither may be seen under its final name before it
+is whole. An MCAP file's number is its position after the empty files are
+dropped, which is known only once every copy has run, so each copy writes under a
+name derived from its plan's position (`ClipDir::staging`) and is renamed into
+place by `ClipDir::place`. The document goes through `metadata_staging` because
+its name *is* the completion signal. The two staging spaces cannot collide: an
+MCAP file's is `<id>_<n>` and an id is digits, hex and `-`, so it carries no `.`
+before the extension, while the document's is `clip_metadata.yaml` and does —
+and every one of these names is spelled in this module, beside the name it
+becomes. The window in which a `.part` exists is a window in which the directory
+has no document and is therefore incomplete anyway.
 
 ## Every clip carries its document (`clip::manifest`)
 

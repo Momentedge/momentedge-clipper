@@ -23,7 +23,8 @@ clipped/
   `ros2 bag record -o <id>` would have written, so `ros2 bag reindex <id> mcap`
   produces a rosbag2 `metadata.yaml` for the directory on demand.
 - **`clip_metadata.yaml` is written last**, after every MCAP file in the
-  directory is durable. **Its presence is what "complete" means:** a directory
+  directory is durable, and it arrives at that name by a rename, so it is there
+  whole or not at all. **Its presence is what "complete" means:** a directory
   without it is a clip still being written or the residue of one that died, and
   is never a clip to upload.
 
