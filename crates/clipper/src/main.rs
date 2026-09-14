@@ -4806,8 +4806,10 @@ mod tests {
     }
 
     /// A trigger `name` is accepted plain and exactly at [`MAX_TRIGGER_NAME_LEN`],
-    /// and rejected when over-length, empty, or carrying a filename hazard (a
-    /// path separator, NUL, leading dot, or embedded `..`).
+    /// and rejected one byte over it. That bound is the whole rule: a clip is
+    /// named by its id, so a path separator, a NUL, a leading dot, an embedded
+    /// `..`, unicode and the empty string are all ordinary names here, and the
+    /// loop below is what says so.
     #[test]
     fn validate_bounds_the_name_and_asks_nothing_else_of_it() {
         let with_name = |name: &str| {
