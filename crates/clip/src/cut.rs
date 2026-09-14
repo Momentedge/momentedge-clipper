@@ -173,10 +173,18 @@ pub struct ClipStats {
 /// settled where the copy is. [`stage_clip`] produces one of these and
 /// [`crate::segment::cut_window`] renames it into place.
 ///
-/// There is no cleanup on it. A file staged into a clip directory that is never
-/// completed dies with that directory: a cut that fails removes the whole thing
-/// ([`crate::layout::ClipDir::discard`]), which is the one rule that also covers
-/// a partially written clip, a panicking copy and a crash.
+/// **It is either placed or discarded, never merely forgotten.**
+/// [`place`](Self::place) renames a file that contributed;
+/// [`discard`](Self::discard) removes one that copied nothing in a window that
+/// produced data elsewhere. Both consume the value, so the pair is exhaustive —
+/// and a dropped file has to be *removed*, because it is already on disk under
+/// its staging name and the directory this cut is about to complete must hold
+/// the files its document names, its document, and nothing else.
+///
+/// A clip directory that is never completed needs no cleanup at all, which is
+/// why `discard` is best effort: a cut that fails removes the whole thing
+/// ([`crate::layout::ClipDir::discard`]), the one rule that also covers a
+/// partially written clip, a panicking copy and a crash.
 #[must_use = "a staged file must be named into its clip or the clip is incomplete"]
 #[derive(Debug)]
 pub(crate) struct StagedClip {
@@ -202,6 +210,25 @@ impl StagedClip {
     pub(crate) fn place(mut self, dir: &crate::layout::ClipDir, n: usize) -> Result<ClipStats> {
         self.stats.out_path = dir.place(&self.path, n)?;
         Ok(self.stats)
+    }
+
+    /// Remove this file instead of placing it — the window produced data in
+    /// other files, so this empty one is not a file of the clip.
+    ///
+    /// The other half of [`place`](Self::place), and the reason a dropped file
+    /// is dropped rather than merely forgotten: it is already on disk under its
+    /// staging name, and a complete clip directory holds its `<id>_N.mcap` files
+    /// and its document and nothing else. Best effort and no `Result`, because
+    /// the clip is correct either way — a leftover staging file is noise in a
+    /// directory an operator syncs, not a broken clip, and failing the cut over
+    /// it would destroy a good clip to tidy one name.
+    pub(crate) fn discard(self) {
+        if let Err(e) = std::fs::remove_file(&self.path) {
+            warn!(
+                "removing the dropped clip file {}: {e}",
+                self.path.display()
+            );
+        }
     }
 }
 

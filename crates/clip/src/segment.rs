@@ -290,13 +290,22 @@ fn fill(
     };
 
     // 4. Drop empty files when the window produced real data elsewhere, but keep
-    //    one so an all-empty window still yields a valid clip.
+    //    one so an all-empty window still yields a valid clip. A dropped file is
+    //    removed rather than forgotten: it is already on disk under its staging
+    //    name, and the directory this cut is about to complete must hold its
+    //    `<id>_N.mcap` files and its document and nothing else.
+    let mut dropped = Vec::new();
     if staged.len() > 1 {
         if staged.iter().any(|c| !c.is_empty()) {
-            staged.retain(|c| !c.is_empty());
+            let (kept, empty) = staged.into_iter().partition::<Vec<_>, _>(|c| !c.is_empty());
+            staged = kept;
+            dropped = empty;
         } else {
-            staged.truncate(1);
+            dropped = staged.split_off(1);
         }
+    }
+    for clip in dropped {
+        clip.discard();
     }
 
     // 5. Name what is left `<id>_0.mcap`, `<id>_1.mcap`, … — the position among
@@ -804,6 +813,16 @@ mod tests {
         let metadata = read_metadata(&clip.dir)?;
         assert_eq!(metadata.window.files_planned, 2, "both were planned");
         assert_eq!(metadata.sources.len(), 1, "one file came out of them");
+        assert_eq!(
+            entries(&clip.dir)?,
+            vec![
+                format!("{}_0.mcap", metadata.clip.id),
+                METADATA_FILE.to_string()
+            ],
+            "the dropped file leaves nothing behind: a complete clip directory \
+             holds the files its document names and the document, and no staging \
+             name"
+        );
 
         std::fs::remove_dir_all(root)?;
         Ok(())
@@ -880,6 +899,16 @@ mod tests {
                 ),
             ],
             "and two contributed, each entry naming the recording behind its file"
+        );
+        assert_eq!(
+            entries(&clip.dir)?,
+            vec![
+                format!("{}_0.mcap", metadata.clip.id),
+                format!("{}_1.mcap", metadata.clip.id),
+                METADATA_FILE.to_string()
+            ],
+            "the dropped middle file leaves nothing behind — not even the \
+             staging name its copy was written under"
         );
 
         std::fs::remove_dir_all(root)?;
