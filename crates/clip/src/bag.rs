@@ -360,6 +360,29 @@ mod tests {
         Ok(())
     }
 
+    /// The sidecar's name, spelled out, because it is **rosbag2's name and not
+    /// clipper's**.
+    ///
+    /// Both halves of the code reach it through [`METADATA_FILE`] — `open`
+    /// looks for it, the fixture writers create it — so the constant is only
+    /// ever compared to itself and its value could move without a test
+    /// noticing. What that would cost is silence rather than a failure:
+    /// [`read_metadata`] answers `None` for a directory carrying no sidecar, so
+    /// a renamed constant refuses no bag. It stops finding the recorder's own
+    /// account of the split order and falls back to modification time — and the
+    /// test below is what that order buys. A clip whose `_0` and `_1` have
+    /// swapped is a wrong clip, not a failed run.
+    ///
+    /// Since the name is not ours to choose, a change to this constant is either
+    /// a rosbag2 change being tracked on purpose or a typo, and this is what
+    /// tells the two apart. [`MCAP_EXT`] needs no such test: the fixtures here
+    /// write literal `bag_0.mcap` files and assert they are listed, so an
+    /// extension that moved would fail them.
+    #[test]
+    fn the_sidecar_carries_the_name_rosbag2_writes() {
+        assert_eq!(METADATA_FILE, "metadata.yaml");
+    }
+
     /// The metadata file states the split order, whatever the modification
     /// times say — the whole reason it is read.
     #[test]

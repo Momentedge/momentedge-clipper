@@ -585,7 +585,20 @@ files are numbered in, and getting it wrong reorders a clip rather than merely
 renaming it.
 Without that file the order is modification time, oldest first — and its absence
 is itself the signal, the file being written at shutdown: a directory without it
-was copied off a device while the recording was still growing. What the file
+was copied off a device while the recording was still growing.
+
+That fallback is why `bag::METADATA_FILE` is pinned by a literal
+(`the_sidecar_carries_the_name_rosbag2_writes`) even though the name is
+rosbag2's rather than clipper's — a different argument from the three names
+[the clip contract publishes](#every-clip-carries-its-document-clipmanifest).
+`open` and the fixture writers both reach the name through the constant, so a
+changed value refuses nothing: `read_metadata` answers `None` for a directory
+with no sidecar, the order silently becomes modification time, and a straddling
+clip's `_0` and `_1` swap. The whole suite stays green for a wrong clip. Since
+the name is not ours to choose, a change to it is either a rosbag2 change being
+tracked on purpose or a typo, and the literal is what tells the two apart.
+`MCAP_EXT` needs no such test — `bag`'s fixtures write literal `bag_0.mcap`
+files and assert they are listed. What the file
 states is checked rather than trusted: a recording it names that is missing and
 one present it never named are both logged, neither is fatal, and the
 collection-wide `topics_with_message_count` is cross-checked against what the
