@@ -13,8 +13,9 @@
 //! therefore indistinguishable from a crash-truncated one, which MCAP readers
 //! are built to tolerate. (Both properties are a producer requirement in
 //! disguise — append complete records, never seek back to rewrite one; the full
-//! treatment, including the seek-back writer that violates it, is in
-//! `crates/clipper/CLAUDE.md`.)
+//! treatment, including the seek-back writer that violates it and the three
+//! example producers that satisfy it, is in `ARCHITECTURE.md` under "Tailing a
+//! live MCAP".)
 //!
 //! Two artefacts come out of a pass ([`scan_available`]), folded into a
 //! [`RecordingIndex`] by the caller ([`RecordingIndex::apply_delta`]) and served
