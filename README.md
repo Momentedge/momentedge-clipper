@@ -20,6 +20,17 @@ on each trigger cuts a standalone clip covering a window around the event.
 Recording stays rosbag2's job; clipping is clipper's. The two never talk except
 through the file on disk.
 
+**clipper clips; it does not ship.** It is a clip engine and nothing else: it
+turns "this moment mattered" into a standalone clip on disk, and stops. What
+counts as a moment is your robots, your models, your thresholds — clipper takes
+a trigger on a topic and asks nothing about where it came from. Getting clips
+off the vehicle is your sync tool, your pipeline, your cloud; what clipper hands
+it is an output directory holding nothing but finished clips, each complete the
+moment one file appears in it. So clipper drops into the stack you already run
+instead of replacing part of it — it opens no sensor subscription and holds the
+recording open read-only, so taking it away leaves that recording byte-for-byte
+as it was.
+
 - **Nearly free to leave running.** 0.45 % of one core and 22 MiB on a Jetson
   Orin Nano, no disk reads while tailing, and the recorder it sits beside does
   not notice it is there. [The numbers →](docs/performance.md)
@@ -34,9 +45,8 @@ through the file on disk.
 - **ROS is optional.** It is a cargo feature: the default build links no ROS,
   reads its triggers out of the recording, and cuts identical clips.
 - **Every clip says what it is.** A clip is a directory whose
-  `clip_metadata.yaml` names the trigger, the window and the source bytes — so an
-  empty clip can still say why, and a pipeline knows a clip is finished the
-  moment that file appears.
+  `clip_metadata.yaml` names the trigger, the window and the source bytes, so
+  even an empty clip can say why.
 
 ## How it works
 
@@ -97,8 +107,7 @@ One ordinary, standalone MCAP per source recording the window crossed — open i
 in Foxglove, replay it with `ros2 bag play` — plus the document that says what
 they are. **`clip_metadata.yaml` is written last, and its presence is what
 "complete" means**: a directory without it is a cut still running, or the residue
-of one that was killed. Nothing else is ever written into `./clipped`, so a sync
-tool needs no exclude list. Every field of the document is
+of one that was killed. Every field of the document is
 [What a clip carries](docs/clip-manifest.md).
 
 `trigger_time: 0` anchors the window on the instant clipper receives the trigger;
@@ -118,8 +127,7 @@ source /opt/ros/humble/setup.bash
 /opt/momentedge-clipper/bin/clipper --help
 ```
 
-From source, ROS is a cargo feature picking one of two builds: `cargo build -p
-clipper` links no ROS and reads its triggers out of the recording, while
+From source, ROS is a cargo feature: `cargo build -p clipper` links none, while
 `--features ros` adds the live subscription and the `Recorded` publish and is
 what every `.deb` is built with. CI covers **Humble, Jazzy and Lyrical**; Rolling
 is not supported, because r2r references an rmw QoS variant Rolling has removed.
@@ -130,9 +138,9 @@ already running clipper: [Installing and building](docs/install.md).
 
 clipper is one binary and the mode is a subcommand: **`clipper tail`** is the
 recorder above, and **`clipper clip`** cuts windows out of one *finished*
-recording and exits — same window plan, same copy, same clip directory, without
-the waits a growing file costs. That is how a bag pulled off a vehicle becomes
-clips afterwards, with no ROS installed anywhere:
+recording and exits — same window plan, same copy, same clip directory. That is
+how a bag pulled off a vehicle becomes clips afterwards, with no ROS installed
+anywhere:
 
 ```bash
 clipper clip ./record --out-dir ./clipped --trigger-source mcap
