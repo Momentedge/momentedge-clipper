@@ -289,12 +289,13 @@ only thing it chooses about the writer is the codec
 That size is worth knowing for two reasons, and both are about reading a clip
 rather than cutting one:
 
-- **It is the clip's seek granularity.** A reader that seeks to one message
-  reaches the chunk holding it, not the message, so a seek lands within roughly
-  a chunk of its target.
-- **It bounds the memory one chunk costs.** A compressed chunk is decompressed
-  whole before any message in it can be read, so a reader spends the
-  uncompressed size of a single chunk, not of the clip.
+- **It is the clip's seek granularity.** A clip carries a message index, so a
+  reader seeking to one message finds that message exactly — but the chunk is
+  the unit it has to fetch and decompress to get there. Reading one message out
+  of the middle of a clip costs a chunk, not a message.
+- **It bounds the memory that costs.** A chunk is decompressed whole before any
+  message in it can be read, so a reader spends the uncompressed size of a
+  single chunk, not of the clip, however long the clip is.
 
 Neither is configurable. A clip whose chunking has to be different is a clip to
 rewrite with `mcap compress --chunk-size`, which produces an equivalent file
