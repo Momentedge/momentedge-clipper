@@ -34,3 +34,6 @@ __pycache__/
 # Debian packages assembled by scripts/package-deb.sh
 /dist/
 /.claude/settings.local.json
+
+# Working notes from a past design review: superseded, and not a repository artifact.
+.claude/REVIEW.md
