@@ -143,9 +143,11 @@ clipper clip ./record --out-dir ./clipped --trigger-source mcap
 - **It does not record.** clipper opens no sensor subscription. `ros2 bag record`
   — or any append-only MCAP writer — has to be running beside it, and nothing on
   disk means nothing to cut.
-- **It does not back-index.** It recovers only rollovers it observed during its
-  own run, so a recording already on disk at startup contributes nothing to a
-  later trigger. Cut those with `clipper clip` instead.
+- **It does not back-index a backlog.** At startup clipper adopts the newest
+  recording in `--record-dir` and indexes it whole, so a trigger can still reach
+  into bytes written before clipper started. Every *older* split beside it is
+  skipped and stays skipped — from then on clipper recovers only the rollovers it
+  watches happen. Cut windows over those with `clipper clip` instead.
 - **It does not manage retention.** The recording grows until you stop or split
   it, and clipper prunes neither it nor `--out-dir` — it will unlink *expired,
   already-rolled-over* recordings if you ask (`--delete-old-files`), and nothing

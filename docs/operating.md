@@ -23,9 +23,11 @@ overload. For the flags behind any of it, see
   diagnostics are a separate stream: rcutils writes them to stderr unless
   `RCUTILS_LOGGING_USE_STDOUT=1`. Under systemd both streams land in the
   journal; under `ros2 launch` see [`examples/launch`](../examples/launch/README.md).
-- **No startup back-indexing.** clipper recovers only rollovers it observed
-  during its own run. A recording already on disk before clipper started
-  contributes nothing to a trigger fired afterwards.
+- **The backlog is not indexed.** At startup clipper adopts the newest recording
+  in `--record-dir` and indexes it whole, so a trigger can reach into bytes
+  written before clipper started; every older split present at that moment is
+  skipped and never revisited. From then on it recovers only the rollovers it
+  observes. Windows over the skipped splits are [`clipper clip`](clip-command.md)'s.
 - **Retention is the recorder's job.** The continuous recording grows until you
   stop or split it; clipper never prunes the file it is tailing. See
   [`examples/split-bags`](../examples/split-bags/README.md) for bounding the
