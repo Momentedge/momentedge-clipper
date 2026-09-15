@@ -287,10 +287,14 @@ names a clip.
 
 ## Retention
 
+The two settings this section turns on — `watch_old_files_duration` and
+`delete_old_files` — have their spellings, environment names and defaults in
+[Configuration](../../docs/configuration.md#clipper-tail); do not restate them
+here.
+
 The tail prunes `Ended` recordings every poll (not only at rollover). A
 recording is pruned when its max `log_time` (`bounds.log.max`) is older than
-`now - watch_old_files_duration` (default 600 s, env
-`MOMENTEDGE_WATCH_OLD_FILES_DURATION`). Retention always ages on `log_time`,
+`now - watch_old_files_duration`. Retention always ages on `log_time`,
 whatever the window's [time source](../CLAUDE.md#time-source): a producer must not be able to
 keep a file alive — or force its deletion — through what it writes into
 `publish_time`. Pruning is file-granular — never the `current` recording, never
@@ -306,8 +310,8 @@ high-water is not tied to the retention floor, but the watch only ever raises it
 so a handler waiting on it never sees it regress either.
 
 By default pruning forgets a recording in-memory only; the `.mcap` file remains
-on disk for `ros2 bag record` and other consumers. When `--delete-old-files` is
-set (env `MOMENTEDGE_DELETE_OLD_FILES`, default false), a prune also unlinks the
+on disk for `ros2 bag record` and other consumers. When `delete_old_files` is
+set, a prune also unlinks the
 expired file from disk. An in-flight extraction's own `Arc<File>` clone keeps
 the unlinked inode readable to completion (POSIX unlink-while-open), so deletion
 never breaks a clip already in progress.
@@ -315,6 +319,5 @@ never breaks a clip already in progress.
 **Prune vs in-flight trigger:** `watch_old_files_duration` must be set
 comfortably above the largest preroll any trigger will request. A trigger whose
 preroll reaches past the retention floor may lose its oldest segment — that
-recording was intentionally forgotten. See the [Configuration](../../docs/configuration.md)
-for the flag reference.
+recording was intentionally forgotten.
 

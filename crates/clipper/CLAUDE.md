@@ -54,6 +54,11 @@ triggers back out of it.
 
 ## `clipper clip`: one window, one finished recording
 
+What this mode does for an operator — bag directories, the refusals and their
+repairs, what a re-run over the same output does, where a run's triggers come
+from — is [`clipper clip`](../../docs/clip-command.md), and that page is where
+those facts are stated. This section is the code that produces them.
+
 `clipper clip <recording> --out-dir <dir> --trigger-time <ns> --preroll
 <ns> --postroll <ns>` (plus optional `--trigger-name`/`--trigger-description`)
 is `clip_mode` in `src/main.rs`. It builds the same `CutRequest` a
@@ -235,7 +240,10 @@ in `main.rs`; each value exactly at its bound is accepted:
 The trigger input and the completion output are one unit — an **interface** —
 named by `clipper tail --trigger-source`. They are mutually exclusive; clipper
 drives exactly one per run. No `rosbag2_interfaces` subscription either way —
-coverage always comes from the file itself.
+coverage always comes from the file itself. What each interface offers an
+operator — the topics, the completion signal, what a ROS-free build accepts — is
+[Two ways in](../../docs/triggers-and-time.md#two-ways-in-ros-and-mcap); this
+section is the code behind it.
 
 **There is no separate setting for the completion half.** The two cells here are
 the only pairings there are, so naming the trigger source names both: splitting
@@ -281,16 +289,18 @@ lines are the only completion record. It runs fully ROS-free at runtime: no ROS
 **Which means the observer under `mcap` lives outside clipper**, and that is the
 whole content of `NullAnnouncer` being a no-op: a run on this interface publishes
 nothing and opens no socket, so what watches for finished clips is whatever
-syncs, uploads or indexes `out_dir`. Giving the announcer a body — a channel, a
-callback, a sidecar file — would invent a second completion signal beside the one
-on disk, and two signals can disagree. What clipper owes that observer is an
-ordering rather than a message: a clip directory answers
-`clip::layout::read_document` only once every MCAP file it names is durable, so
-the rule to follow is *the document is present*, never *a file appeared* — a
-directory holding `<id>_0.mcap` and no `clip_metadata.yaml` is a cut still
-running or the residue of one that was killed, and an observer keying on the MCAP
-file takes either for a clip.
-`interface.rs`'s `the_observer_completes_on_the_document_and_never_on_a_files_appearance`
+syncs, uploads or indexes `out_dir`. **Do not give the announcer a body** — a
+channel, a callback, a sidecar file — because it would invent a second completion
+signal beside the one on disk, and two signals can disagree.
+
+What clipper owes that observer is an ordering rather than a message, and the
+ordering is the published contract *the document is present, never a file
+appeared* ([What a clip carries](../../docs/clip-manifest.md), and stated for
+both interfaces in [Two ways
+in](../../docs/triggers-and-time.md#two-ways-in-ros-and-mcap)). The code side of
+it is that a clip directory answers `clip::layout::read_document` only once every
+MCAP file it names is durable. `interface.rs`'s
+`the_observer_completes_on_the_document_and_never_on_a_files_appearance`
 runs both rules over one output directory holding a finished clip and a stripped
 one, and is where that difference is pinned; the e2e suite's
 `harness::TestEnv::wait_for_clip_named` is the same rule against the real stack.

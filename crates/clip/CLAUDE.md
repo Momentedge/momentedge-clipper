@@ -402,6 +402,12 @@ has no document and is therefore incomplete anyway.
 
 ## Every clip carries its document (`clip::manifest`)
 
+Every field of the document and what each says is [What a clip
+carries](../../docs/clip-manifest.md), which is where a consumer reads them; a
+field may be added within the document's `version`, but one that changes meaning
+takes a new `version`. This section is why the record is split the way it is and
+where the code writes it.
+
 A clip leaves the output directory and is read somewhere with neither the
 recorder's logs nor the recording beside it, so it states what it is. Two
 artefacts do that, and the split between them is the design:
