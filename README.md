@@ -79,6 +79,9 @@ clipper is a standalone application that sits beside a continuous
 
 ## Quickstart
 
+**No ROS 2 to hand?** [Cut a clip on your laptop in two
+minutes](docs/try-it.md) — a Rust toolchain, and nothing else.
+
 Three things, each in its own shell sharing one ROS 2 environment
 (`RMW_IMPLEMENTATION` and `ROS_DOMAIN_ID` must match):
 
@@ -175,6 +178,7 @@ clipper clip ./record --out-dir ./clipped --trigger-source mcap
 
 | Page | What it answers |
 |---|---|
+| [Try it without a robot](docs/try-it.md) | cutting a real clip on a laptop: a Rust toolchain, no ROS, two minutes |
 | [Configuration](docs/configuration.md) | every flag, environment variable and TOML key, and which layer wins |
 | [Triggers and time](docs/triggers-and-time.md) | the `Trigger` message, where triggers come from, which clock a window lives on |
 | [`clipper clip`](docs/clip-command.md) | cutting from a finished recording: bag directories, refusals, re-runs |
