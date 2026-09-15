@@ -133,7 +133,7 @@ ros2 bag record ──▶ <record_dir>/<bag>_0.mcap   (one growing file, append-
                          5. drop the empties, name what is left <id>_N.mcap,
                             write clip_metadata.yaml last, fsync
                          6. announce completion (ros: publish Recorded naming the
-                            directory; mcap: the metadata file is the signal)
+                            directory; mcap: the document is the signal)
 ```
 
 ## Thread model
@@ -321,7 +321,7 @@ the active `--time-source`:
    removes the whole directory. See [What a clip is on
    disk](#what-a-clip-is-on-disk).
 7. **Announce** one completion through the active interface, naming the clip's
-   directory — only after the metadata file is durable, so an announced clip is
+   directory — only after the document is durable, so an announced clip is
    complete and crash-durable. A skipped window announces nothing: nothing was
    recorded, and the warning is its whole trace.
 
@@ -565,7 +565,7 @@ around one neutral boundary so the clip-cutting half (`tail::handler` and the
   `serde_json`. Other encodings return an error the interface logs and skips.
 - **`clipper::interface`** holds `trait Interface` (statically dispatched) with
   `McapInterface` (drains the trigger tap, announces via a no-op — the clip's
-  metadata file is the only signal) and, under the crate's `ros` feature,
+  document is the only signal) and, under the crate's `ros` feature,
   `RosInterface` (owns a node and its internal spin thread, announces by
   publishing `Recorded`).
 

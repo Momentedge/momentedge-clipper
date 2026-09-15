@@ -371,7 +371,7 @@ mod tests {
     use super::*;
     use crate::TimeSource;
     use crate::index::{Extent, PlanSource, RecordingIndex, Span, Stamps, op};
-    use crate::layout::{METADATA_FILE, read_metadata};
+    use crate::layout::{DOCUMENT_FILE, read_document};
     use crate::manifest::{CLIP_ID_KEY, read_manifest};
     use crate::testing::{
         channel_body, index_file, message_body_pub, raw_record, read_clip, scan_to_end, test_dir,
@@ -567,7 +567,7 @@ mod tests {
         assert_eq!(clip.dir, out_dir.join(&id));
         assert_eq!(
             entries(&clip.dir)?,
-            vec![format!("{id}_0.mcap"), METADATA_FILE.to_string()],
+            vec![format!("{id}_0.mcap"), DOCUMENT_FILE.to_string()],
             "one numbered file and the document that completes the clip"
         );
         assert_eq!(clip.files.len(), 1);
@@ -585,7 +585,7 @@ mod tests {
             )])),
             "a clip's file carries its id and nothing else"
         );
-        let metadata = read_metadata(&clip.dir)?;
+        let metadata = read_document(&clip.dir)?;
         assert_eq!(metadata.clip.id, id);
         assert_eq!(metadata.clip.messages, 2);
         assert_eq!(metadata.sources.len(), 1);
@@ -651,7 +651,7 @@ mod tests {
             vec![ClipId::of(&request).to_string()],
             "and the output directory holds that one clip"
         );
-        assert_eq!(read_metadata(&dir)?.clip.messages, 3, "it is complete");
+        assert_eq!(read_document(&dir)?.clip.messages, 3, "it is complete");
         assert_eq!(
             read_clip(&clip_file(&out_dir, &request, 0))?,
             vec![
@@ -706,7 +706,7 @@ mod tests {
             vec![
                 format!("{id}_0.mcap"),
                 format!("{id}_1.mcap"),
-                METADATA_FILE.to_string()
+                DOCUMENT_FILE.to_string()
             ],
             "the two files and the document, and nothing left staging"
         );
@@ -761,7 +761,7 @@ mod tests {
 
         // Crash residue — a directory with no document in it — is claimed just
         // as hard, and nothing about it is repaired.
-        std::fs::remove_file(dir.join(METADATA_FILE))?;
+        std::fs::remove_file(dir.join(DOCUMENT_FILE))?;
         let residue = entries(&dir)?;
         assert_eq!(
             skipped(cut_window(
@@ -818,14 +818,14 @@ mod tests {
         assert_eq!(clip.files[0].messages_copied, 0, "the kept file is empty");
         assert_eq!(clip.files[0].out_path, clip_file(&out_dir, &request, 0));
         assert!(read_clip(&clip.files[0].out_path)?.is_empty());
-        let metadata = read_metadata(&clip.dir)?;
+        let metadata = read_document(&clip.dir)?;
         assert_eq!(metadata.window.files_planned, 2, "both were planned");
         assert_eq!(metadata.sources.len(), 1, "one file came out of them");
         assert_eq!(
             entries(&clip.dir)?,
             vec![
                 format!("{}_0.mcap", metadata.clip.id),
-                METADATA_FILE.to_string()
+                DOCUMENT_FILE.to_string()
             ],
             "the dropped file leaves nothing behind: a complete clip directory \
              holds the files its document names and the document, and no staging \
@@ -885,7 +885,7 @@ mod tests {
             vec![("/t".to_string(), 8_000)]
         );
 
-        let metadata = read_metadata(&clip.dir)?;
+        let metadata = read_document(&clip.dir)?;
         assert_eq!(
             metadata.window.files_planned, 3,
             "three recordings were planned over"
@@ -913,7 +913,7 @@ mod tests {
             vec![
                 format!("{}_0.mcap", metadata.clip.id),
                 format!("{}_1.mcap", metadata.clip.id),
-                METADATA_FILE.to_string()
+                DOCUMENT_FILE.to_string()
             ],
             "the dropped middle file leaves nothing behind — not even the \
              staging name its copy was written under"
@@ -1073,7 +1073,7 @@ mod tests {
             "{err:#}"
         );
         assert!(
-            !clip_dir(&out_dir, &request).join(METADATA_FILE).exists(),
+            !clip_dir(&out_dir, &request).join(DOCUMENT_FILE).exists(),
             "a clip whose files are not all there never carries the document"
         );
         assert!(
@@ -1421,7 +1421,7 @@ mod tests {
         }
 
         let kind = |clip: &Clip| -> anyhow::Result<(usize, bool)> {
-            let m = read_metadata(&clip.dir)?;
+            let m = read_document(&clip.dir)?;
             assert_eq!(m.clip.messages, 0);
             Ok((m.window.files_planned, m.clip.short))
         };
@@ -1477,7 +1477,7 @@ mod tests {
         assert_eq!(clip.files.len(), 2, "a straddling window yields two files");
 
         let id = ClipId::of(&request).to_string();
-        let metadata = read_metadata(&clip.dir)?;
+        let metadata = read_document(&clip.dir)?;
         assert_eq!(metadata.clip.id, id);
         assert_eq!(metadata.clip.messages, 2, "one message from each recording");
         assert_eq!(metadata.window.files_planned, 2);

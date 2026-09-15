@@ -195,7 +195,7 @@ impl Interface for McapInterface {
 ///
 /// **What clipper owes that observer is one guarantee, and it is an ordering
 /// rather than a message**: a clip directory answers
-/// [`clip::layout::read_metadata`] only once every MCAP file it names is durable
+/// [`clip::layout::read_document`] only once every MCAP file it names is durable
 /// (`clip::layout::ClipDir::complete` writes the document last and fsyncs it,
 /// the clip directory and the output directory in that order). So the rule an
 /// observer follows is *the document is present*, never *a file appeared*: a
@@ -429,7 +429,7 @@ mod tests {
         );
         let dir = out_dir.join(clip::ClipId::of(&request).to_string());
         assert!(
-            clip::layout::metadata_path(&dir).is_file(),
+            clip::layout::document_path(&dir).is_file(),
             "a completed clip carries its document: {}",
             dir.display()
         );
@@ -450,9 +450,9 @@ mod tests {
     }
 
     /// The observer's rule: the clip's document is there, which is what
-    /// [`clip::layout::read_metadata`] answering at all means.
+    /// [`clip::layout::read_document`] answering at all means.
     fn has_the_document(dir: &Path) -> bool {
-        clip::layout::read_metadata(dir).is_ok()
+        clip::layout::read_document(dir).is_ok()
     }
 
     /// The rule a consumer must *not* follow: an MCAP file has turned up in the
@@ -491,7 +491,7 @@ mod tests {
         // The cut that died: complete, then stripped of the one file that says
         // so. Its `<id>_0.mcap` stays, exactly as an interrupted cut leaves it.
         let residue = cut_through_the_mcap_interface(&out_dir, "killed-mid-cut");
-        std::fs::remove_file(clip::layout::metadata_path(&residue))?;
+        std::fs::remove_file(clip::layout::document_path(&residue))?;
         // The cut that finished.
         let clip = cut_through_the_mcap_interface(&out_dir, "complete");
 

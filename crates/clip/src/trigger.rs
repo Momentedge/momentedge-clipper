@@ -169,7 +169,7 @@ pub struct TriggerRecord {
 /// **`filenames` holds exactly one entry**, however many MCAP files the clip
 /// took, so a subscriber opens one handle per clip and never learns the naming
 /// scheme inside it. Which files are in there, and which recording each came
-/// from, is the clip's own document ([`crate::layout::METADATA_FILE`]) to state.
+/// from, is the clip's own document ([`crate::layout::DOCUMENT_FILE`]) to state.
 ///
 /// **It is emitted only after that document is durable** ([`Announce`]), so a
 /// `Completion` names a clip that is already complete by the rule a consumer
@@ -189,7 +189,7 @@ pub struct Completion {
 ///
 /// **The caller's obligation is the ordering**: a [`Completion`] is handed over
 /// only once the clip it names is complete on disk — its
-/// [`METADATA_FILE`](crate::layout::METADATA_FILE) written and fsynced — so an
+/// [`DOCUMENT_FILE`](crate::layout::DOCUMENT_FILE) written and fsynced — so an
 /// announcement can never reach a subscriber before the clip it points at is
 /// there to open. Nothing here enforces that, because only the cut knows when it
 /// holds; [`crate::segment::cut_window`] returns after the document is durable

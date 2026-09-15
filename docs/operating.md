@@ -62,7 +62,7 @@ named by, are [What a clip carries](clip-manifest.md).
 - **Point a sync tool at it with no exclude list.** clipper writes nothing into
   the root but clip directories — no staging area, no lock, no sidecar — so
   rsync, syncthing or an upload agent needs no rule about what to ignore.
-- **Filter on the metadata file, never on an MCAP file appearing.** It is
+- **Filter on the document, never on an MCAP file appearing.** It is
   written after every `<id>_N.mcap` beside it is durable, and the directories
   are fsynced after it, so a clip that answers the rule survives power loss and
   is whole. A directory without it is a cut in progress or crash residue, and
@@ -94,7 +94,7 @@ That residue stays, and it is meant to:
   id is taken and every trigger for it is skipped. Everything else keeps
   working: the recorder goes on cutting every other window, and a restart cuts
   clips normally.
-- **No consumer mistakes it for a clip.** It has no metadata file, so a pipeline
+- **No consumer mistakes it for a clip.** It has no document, so a pipeline
   filtering on that file passes it over without knowing anything about crashes.
 
 ```

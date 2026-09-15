@@ -788,7 +788,7 @@ mod tests {
 
     use super::*;
     use crate::id::ClipId;
-    use crate::layout::read_metadata;
+    use crate::layout::read_document;
     use crate::manifest::{CutRequest, WindowCoverage};
     use crate::segment::{Clip, CutOutcome, StageJob, cut_window, spawn_stage_workers};
     use crate::select::{ChannelSelection, Spec};
@@ -1988,7 +1988,7 @@ mod tests {
 
     /// The recording a clip's document says its `n`th file came from.
     fn source_of(clip: &Clip, n: usize) -> Result<PathBuf> {
-        let sources = read_metadata(&clip.dir)?.sources;
+        let sources = read_document(&clip.dir)?.sources;
         let entry = sources.get(n).context("the clip holds that file")?;
         Ok(PathBuf::from(
             entry
@@ -2172,7 +2172,7 @@ mod tests {
             "_1 is the third recording, not the second"
         );
         assert_eq!(
-            read_metadata(&segments.dir)?.window.files_planned,
+            read_document(&segments.dir)?.window.files_planned,
             3,
             "the clip still states how many recordings the window was planned over"
         );

@@ -727,7 +727,7 @@ fn recorder_restart_inside_the_window_recovers_across_the_boundary(#[case] delet
             "every file of a clip is <id>_N.mcap, numbered from 0"
         );
     }
-    let metadata = clip::layout::read_metadata(clip).expect("reading the clip's document");
+    let metadata = clip::layout::read_document(clip).expect("reading the clip's document");
     assert_eq!(
         metadata.sources.len(),
         files.len(),
@@ -1023,7 +1023,7 @@ fn window_straddling_an_in_run_split_recovers_both_sides() {
     // The document is the only place the clip says which recordings it came
     // from, and it has to name each — a consumer reading a several-file clip
     // cannot otherwise tell a straddled window from a re-read one.
-    let metadata = clip::layout::read_metadata(clip).expect("reading the clip's document");
+    let metadata = clip::layout::read_document(clip).expect("reading the clip's document");
     let sources: Vec<&String> = metadata
         .sources
         .iter()
@@ -1239,7 +1239,7 @@ fn window_past_the_last_recorded_message_cuts_an_empty_clip() {
     // Which kind of empty. `files_planned = 0` says no recording held a byte of
     // the window; `short = true` says the coverage it waited for never arrived.
     assert_clip_metadata(clip, "tail", preroll, postroll);
-    let metadata = clip::layout::read_metadata(clip).expect("reading the clip's document");
+    let metadata = clip::layout::read_document(clip).expect("reading the clip's document");
     assert_eq!(metadata.clip.messages, 0);
     assert_eq!(
         metadata.window.files_planned, 0,
@@ -1834,7 +1834,7 @@ fn a_window_inside_one_recording_is_one_file_and_a_document() {
         entry_names(&clip_dir),
         vec![
             format!("{id}_0.mcap"),
-            clip::layout::METADATA_FILE.to_string(),
+            clip::layout::DOCUMENT_FILE.to_string(),
         ],
         "a one-file clip is exactly its file and its document"
     );
@@ -1842,7 +1842,7 @@ fn a_window_inside_one_recording_is_one_file_and_a_document() {
     // The document's account of the same clip, and the one metadata record its
     // file is allowed to carry.
     assert_clip_metadata(&clip_dir, "clip", window.preroll_ns, window.postroll_ns);
-    let metadata = clip::layout::read_metadata(&clip_dir).expect("reading the document");
+    let metadata = clip::layout::read_document(&clip_dir).expect("reading the document");
     assert_eq!(metadata.sources.len(), 1);
     assert_eq!(
         metadata.window.files_planned, 1,
@@ -1914,12 +1914,12 @@ fn a_window_straddling_a_split_keeps_one_file_per_source_recording() {
         vec![
             format!("{id}_0.mcap"),
             format!("{id}_1.mcap"),
-            clip::layout::METADATA_FILE.to_string(),
+            clip::layout::DOCUMENT_FILE.to_string(),
         ],
         "one file per contributing recording, numbered from 0, plus the document"
     );
 
-    let metadata = clip::layout::read_metadata(&clip_dir).expect("reading the document");
+    let metadata = clip::layout::read_document(&clip_dir).expect("reading the document");
     assert_eq!(metadata.window.files_planned, 2);
     let sources: Vec<String> = metadata
         .sources
@@ -2009,13 +2009,13 @@ fn a_recording_that_contributes_nothing_is_dropped_and_the_rest_renumbered() {
         vec![
             format!("{id}_0.mcap"),
             format!("{id}_1.mcap"),
-            clip::layout::METADATA_FILE.to_string(),
+            clip::layout::DOCUMENT_FILE.to_string(),
         ],
         "the contributing recordings are numbered 0 and 1, with no hole where \
          the empty one was planned"
     );
 
-    let metadata = clip::layout::read_metadata(&clip_dir).expect("reading the document");
+    let metadata = clip::layout::read_document(&clip_dir).expect("reading the document");
     assert_eq!(
         metadata.window.files_planned, 3,
         "all three recordings overlapped the window and were read"
@@ -2153,7 +2153,7 @@ fn an_empty_window_still_says_which_kind_of_empty_it_is(
         entry_names(&clip_dir),
         vec![
             format!("{id}_0.mcap"),
-            clip::layout::METADATA_FILE.to_string(),
+            clip::layout::DOCUMENT_FILE.to_string(),
         ],
         "an empty window is still one file and a document"
     );
@@ -2162,7 +2162,7 @@ fn an_empty_window_still_says_which_kind_of_empty_it_is(
         "the {which:?} window holds no message"
     );
 
-    let metadata = clip::layout::read_metadata(&clip_dir).expect("reading the document");
+    let metadata = clip::layout::read_document(&clip_dir).expect("reading the document");
     assert_eq!(metadata.clip.messages, 0);
     assert_eq!(
         metadata.window.files_planned, files_planned,
@@ -2295,8 +2295,8 @@ fn a_single_file_and_the_bag_directory_holding_it_cut_the_same_clip() {
         "the two inputs yield the same messages"
     );
     assert_eq!(
-        clip::layout::read_metadata(&by_file.join(&id)).expect("reading the file run's document"),
-        clip::layout::read_metadata(&by_dir.join(&id)).expect("reading the dir run's document"),
+        clip::layout::read_document(&by_file.join(&id)).expect("reading the file run's document"),
+        clip::layout::read_document(&by_dir.join(&id)).expect("reading the dir run's document"),
         "the two inputs yield the same document, source path included — it is \
          the same recording that was read"
     );
@@ -2621,7 +2621,7 @@ fn a_clip_run_killed_partway_is_finished_by_running_it_again() {
     );
     for name in &residue {
         assert!(
-            clip::layout::read_metadata(&out_dir.join(name)).is_err(),
+            clip::layout::read_document(&out_dir.join(name)).is_err(),
             "the residue of the killed cut is not repaired: {name}"
         );
     }
@@ -2887,7 +2887,7 @@ fn an_incomplete_clip_directory_is_skipped_and_never_repaired() {
         "the residue is left exactly as it was found — not repaired, not replaced"
     );
     assert!(
-        clip::layout::read_metadata(&clip_dir).is_err(),
+        clip::layout::read_document(&clip_dir).is_err(),
         "and it is still incomplete, so no consumer reads it as a clip"
     );
     assert!(
@@ -3083,7 +3083,7 @@ fn a_cut_killed_after_its_claim_leaves_a_directory_without_its_document() {
         "the killed cut's directory stays: it is the evidence something died"
     );
     assert!(
-        clip::layout::read_metadata(&clip_dir).is_err(),
+        clip::layout::read_document(&clip_dir).is_err(),
         "a cut killed before it finished has no document — if this fails the \
          kill landed after the copy, and the window needs more bytes to copy"
     );
@@ -3135,7 +3135,7 @@ fn a_recorder_killed_mid_cut_leaves_residue_its_restart_neither_repairs_nor_re_c
         .expect("SIGKILL must end the recorder");
 
     assert!(
-        clip::layout::read_metadata(&clip_dir).is_err(),
+        clip::layout::read_document(&clip_dir).is_err(),
         "the killed cut left a directory with no document — if this fails the \
          kill landed after the copy, and the window needs more bytes to copy"
     );
@@ -3479,7 +3479,7 @@ fn a_tail_restart_re_cuts_nothing_and_leaves_the_clips_it_finds() {
 /// finished clips is whatever syncs the output directory — and what clipper owes
 /// it is an ordering rather than a message. This samples that directory while a
 /// cut runs and catches it in the state the two rules disagree about: the clip's
-/// directory is there and carries MCAP bytes, and `read_metadata` still refuses
+/// directory is there and carries MCAP bytes, and `read_document` still refuses
 /// it. A consumer keying on a file would have uploaded a clip that was still
 /// being written; the one keying on the document waits, and when it stops
 /// waiting every file the document names is a complete MCAP.
@@ -3510,7 +3510,7 @@ fn the_mcap_observer_completes_on_the_document_and_never_on_a_file() {
                     .extension()
                     .is_some_and(|ext| ext == "mcap" || ext == "part")
             });
-            if holds_mcap_bytes && clip::layout::read_metadata(&dir).is_err() {
+            if holds_mcap_bytes && clip::layout::read_document(&dir).is_err() {
                 caught_half_written = true;
             }
         }

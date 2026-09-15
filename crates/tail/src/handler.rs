@@ -275,7 +275,7 @@ mod tests {
 
     use clip::ChannelSelection;
     use clip::index::op;
-    use clip::layout::read_metadata;
+    use clip::layout::read_document;
     use clip::segment::Clip;
     use clip::testing::{
         TEST_PRODUCER, channel_body, desync_record_framing, message_body_pub, raw_record,
@@ -607,7 +607,7 @@ mod tests {
             let complete_on_arrival = completion
                 .filenames
                 .first()
-                .is_some_and(|dir| clip::layout::metadata_path(Path::new(dir)).is_file());
+                .is_some_and(|dir| clip::layout::document_path(Path::new(dir)).is_file());
             self.0.lock().unwrap().push(Announced {
                 completion: completion.clone(),
                 complete_on_arrival,
@@ -724,7 +724,7 @@ mod tests {
         );
         let clip_dir = PathBuf::from(&done[0].completion.filenames[0]);
         assert!(clip_dir.is_dir(), "the announced clip exists on disk");
-        let metadata = read_metadata(&clip_dir)?;
+        let metadata = read_document(&clip_dir)?;
         assert_eq!(
             metadata.sources.len(),
             1,
@@ -807,7 +807,7 @@ mod tests {
             "and it is complete on arrival however many files it took"
         );
         let clip_dir = PathBuf::from(&done[0].completion.filenames[0]);
-        let metadata = read_metadata(&clip_dir)?;
+        let metadata = read_document(&clip_dir)?;
         assert_eq!(
             metadata.sources.len(),
             2,
@@ -961,7 +961,7 @@ mod tests {
         let extract_tx =
             segment::spawn_stage_workers(1, TEST_COMPRESSION, ChannelSelection::default());
         let is_short =
-            |clip: &Clip| -> anyhow::Result<bool> { Ok(read_metadata(&clip.dir)?.clip.short) };
+            |clip: &Clip| -> anyhow::Result<bool> { Ok(read_document(&clip.dir)?.clip.short) };
 
         // The window ends at 200, exactly the recording's high-water: the wait
         // releases and the clip is complete.
@@ -1229,7 +1229,7 @@ mod tests {
 
         let done = announcer.announced();
         let clip_dir = PathBuf::from(&done[0].completion.filenames[0]);
-        let metadata = read_metadata(&clip_dir)?;
+        let metadata = read_document(&clip_dir)?;
         assert_eq!(metadata.producer.name, TEST_PRODUCER.program);
         assert_eq!(metadata.producer.mode, TEST_PRODUCER.mode);
         assert_eq!(metadata.trigger.name, "evt");

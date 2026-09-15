@@ -285,7 +285,7 @@ syncs, uploads or indexes `out_dir`. Giving the announcer a body — a channel, 
 callback, a sidecar file — would invent a second completion signal beside the one
 on disk, and two signals can disagree. What clipper owes that observer is an
 ordering rather than a message: a clip directory answers
-`clip::layout::read_metadata` only once every MCAP file it names is durable, so
+`clip::layout::read_document` only once every MCAP file it names is durable, so
 the rule to follow is *the document is present*, never *a file appeared* — a
 directory holding `<id>_0.mcap` and no `clip_metadata.yaml` is a cut still
 running or the residue of one that was killed, and an observer keying on the MCAP
@@ -668,7 +668,7 @@ this section is the rationale.
   clip, and signals completion by the clip's `clip_metadata.yaml` appearing in
   `out_dir` — there is no `Recorded` topic to echo, so the harness plays the
   observer instead: `wait_for_clip_named` polls the output directory and accepts
-  an entry only once `clip::layout::read_metadata` answers for it, which is the
+  an entry only once `clip::layout::read_document` answers for it, which is the
   same rule a consumer follows and never a file turning up.
 - **Capture-time windowing is proved against a live momentedge writer**
   (`live_writer_capture_time_windowing`, ROS-free at runtime): clipper tails a

@@ -2415,7 +2415,7 @@ mod tests {
         let mut clips = std::collections::BTreeMap::new();
         for entry in std::fs::read_dir(out_dir)? {
             let dir = entry?.path();
-            let metadata = clip::layout::read_metadata(&dir)
+            let metadata = clip::layout::read_document(&dir)
                 .with_context(|| format!("{} is a complete clip", dir.display()))?;
             clips.insert(metadata.trigger.name.clone(), Clipped { dir, metadata });
         }
@@ -2944,7 +2944,7 @@ mod tests {
             "the window [1500, 3500] holds exactly these two messages"
         );
 
-        let m = clip::layout::read_metadata(&clip_dir)?;
+        let m = clip::layout::read_document(&clip_dir)?;
         assert_eq!(m.producer.name, "clipper");
         assert_eq!(
             m.producer.mode, "clip",
@@ -4189,8 +4189,8 @@ mod tests {
         )?;
 
         let id = clip_id(3_000, "brake", "brake happened", 1_500, 500);
-        let recorded = clip::layout::read_metadata(&from_recording.join(&id))?;
-        let flagged = clip::layout::read_metadata(&from_flags.join(&id))?;
+        let recorded = clip::layout::read_document(&from_recording.join(&id))?;
+        let flagged = clip::layout::read_document(&from_flags.join(&id))?;
         assert_eq!(
             recorded, flagged,
             "the same trigger states the same clip, whichever source stated it"

@@ -902,7 +902,7 @@ impl TestEnv {
                 for entry in entries.flatten() {
                     let path = entry.path();
                     let names_it =
-                        clip::layout::read_metadata(&path).is_ok_and(|m| m.trigger.name == name);
+                        clip::layout::read_document(&path).is_ok_and(|m| m.trigger.name == name);
                     if names_it {
                         return path;
                     }
@@ -923,7 +923,7 @@ impl TestEnv {
     /// Every **complete** clip in `out_dir`, by directory name, sorted.
     ///
     /// The completion rule an upload pipeline follows: a directory counts only
-    /// once `clip::layout::read_metadata` answers for it, so a cut still running
+    /// once `clip::layout::read_document` answers for it, so a cut still running
     /// and the residue of one that was killed are both absent from this list
     /// while [`Self::published_clips`] still shows them. The difference between
     /// the two lists is exactly what "incomplete" means on disk.
@@ -1235,7 +1235,7 @@ pub(crate) fn entry_names(dir: &Path) -> Vec<String> {
 pub(crate) fn complete_clips_in(dir: &Path) -> Vec<String> {
     entry_names(dir)
         .into_iter()
-        .filter(|name| clip::layout::read_metadata(&dir.join(name)).is_ok())
+        .filter(|name| clip::layout::read_document(&dir.join(name)).is_ok())
         .collect()
 }
 
@@ -1900,7 +1900,7 @@ pub(crate) fn read_clip(path: &Path) -> Vec<(String, u64)> {
 /// The MCAP files of a complete clip directory, in the order its document names
 /// them — which is also their `_0`, `_1`, … order.
 pub(crate) fn clip_files(dir: &Path) -> Vec<PathBuf> {
-    clip::layout::read_metadata(dir)
+    clip::layout::read_document(dir)
         .unwrap_or_else(|e| panic!("reading the document of {}: {e}", dir.display()))
         .sources
         .iter()
@@ -2010,7 +2010,7 @@ pub(crate) fn clip_trigger_window(dir: &Path) -> Option<(u64, u64)> {
 /// a `ros` test, an `mcap` test and a `clipper clip` test covers every clip
 /// clipper writes.
 pub(crate) fn assert_clip_metadata(dir: &Path, mode: &str, preroll_ns: u64, postroll_ns: u64) {
-    let metadata = clip::layout::read_metadata(dir)
+    let metadata = clip::layout::read_document(dir)
         .unwrap_or_else(|e| panic!("reading the document of {}: {e}", dir.display()));
     assert_eq!(metadata.version, clip::manifest::METADATA_VERSION);
     assert_eq!(metadata.producer.name, "clipper");

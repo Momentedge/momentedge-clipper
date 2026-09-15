@@ -6,7 +6,7 @@
 //! artefacts answer for it, and the split between them is the whole design:
 //!
 //! - **One [`ClipMetadata`] document per clip**, written as
-//!   [`clip_metadata.yaml`](crate::layout::METADATA_FILE) into the clip's own
+//!   [`clip_metadata.yaml`](crate::layout::DOCUMENT_FILE) into the clip's own
 //!   directory once every file in it is durable. It holds the whole account —
 //!   who cut it, what asked for the window, which bytes of which recordings were
 //!   copied, and what came out per channel — stated once for the clip rather
@@ -286,7 +286,7 @@ pub fn id_record(request: &CutRequest) -> mcap::records::Metadata {
 }
 
 /// Everything one clip says about itself: the document written as
-/// [`clip_metadata.yaml`](crate::layout::METADATA_FILE) into the clip's
+/// [`clip_metadata.yaml`](crate::layout::DOCUMENT_FILE) into the clip's
 /// directory, last of all, once every file in it is durable.
 ///
 /// The field groups are the clip's several halves kept apart on purpose — what

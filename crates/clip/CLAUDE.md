@@ -390,7 +390,7 @@ under it for the same reason: neither may be seen under its final name before it
 is whole. An MCAP file's number is its position after the empty files are
 dropped, which is known only once every copy has run, so each copy writes under a
 name derived from its plan's position (`ClipDir::staging`) and is renamed into
-place by `ClipDir::place`. The document goes through `metadata_staging` because
+place by `ClipDir::place`. The document goes through `document_staging` because
 its name *is* the completion signal. The two staging spaces cannot collide: an
 MCAP file's is `<id>_<n>` and an id is digits, hex and `-`, so it carries no `.`
 before the extension, while the document's is `clip_metadata.yaml` and does —
@@ -409,7 +409,7 @@ artefacts do that, and the split between them is the design:
   *reading* rosbag2's own `metadata.yaml` in `clip::bag`. It is a typed struct
   with nested groups (`clip`, `producer`, `trigger`, `window`, `sources`) rather
   than a hand-built map, so the document and the type cannot drift, and it derives
-  `Deserialize` as well so `layout::read_metadata` reads one back for a consumer
+  `Deserialize` as well so `layout::read_document` reads one back for a consumer
   and for every test that asserts on a clip.
 - **One key inside every MCAP file** (`manifest::id_record`): an
   `mcap::records::Metadata` record under the vendor-namespaced name
@@ -478,7 +478,7 @@ table is in [What a clip carries](../../docs/clip-manifest.md#an-empty-clip-stil
 `segment::tests::an_empty_clip_says_which_kind_of_empty_it_is` builds all three
 for real and asserts they differ.
 
-Two readers close the contract. `layout::read_metadata` parses a clip
+Two readers close the contract. `layout::read_document` parses a clip
 directory's document and is what most tests assert through — and what a consumer
 filters on, since an error from it *is* "not a complete clip".
 `manifest::read_manifest` reads a file's own record back through the summary's
@@ -487,7 +487,7 @@ whole map rather than just the id, so a reader can tell "clipper wrote this and
 said nothing else" from a record under the same name written by something else.
 
 **Three literal names are the contract, and each is pinned by a literal.**
-`clip_metadata.yaml` (`METADATA_FILE`), `momentedge.clip` (`MANIFEST_NAME`) and
+`clip_metadata.yaml` (`DOCUMENT_FILE`), `momentedge.clip` (`MANIFEST_NAME`) and
 `clip.id` (`CLIP_ID_KEY`) are what an upload pipeline filters on and what
 `mcap get metadata --name` is invoked with. Every other assertion in the
 workspace reaches them through the constants, so renaming a constant's *value*
@@ -496,6 +496,18 @@ would leave the whole suite green while breaking every consumer — which is why
 `a_files_record_is_named_and_keyed_as_the_contract_publishes` spell the strings
 out. Same reasoning as `cut`'s `ROSBAG2_METADATA_NAME`: a test that compares a
 constant to itself asserts nothing.
+
+**The clip's file is `DOCUMENT_FILE`; the producer's is `bag::METADATA_FILE`.**
+Two different files written by two different writers, on either side of the seam
+this crate is organised around, so they carry different words and the crate's
+readers do too — `layout::document_path`, `layout::document_staging` and
+`layout::read_document` against `bag::read_metadata`. The glossary
+([CONTEXT.md](../../CONTEXT.md)) settles which word names which file: **document**
+is the clip's `clip_metadata.yaml`, and **metadata file** already names the
+`metadata.yaml` a producer writes beside its splits. Naming both `METADATA_FILE`
+is legal — module scoping keeps it compiling — and is exactly the trap: a bare
+`METADATA_FILE` in either module reads right and can be wrong, and the two cannot
+be imported into one file at all.
 
 ## Segment assembly and the clip directory (`clip::segment`)
 
@@ -592,7 +604,7 @@ That fallback is why `bag::METADATA_FILE` is pinned by a literal
 rosbag2's rather than clipper's — a different argument from the three names
 [the clip contract publishes](#every-clip-carries-its-document-clipmanifest).
 `open` and the fixture writers both reach the name through the constant, so a
-changed value refuses nothing: `read_metadata` answers `None` for a directory
+changed value refuses nothing: `bag::read_metadata` answers `None` for a directory
 with no sidecar, the order silently becomes modification time, and a straddling
 clip's `_0` and `_1` swap. The whole suite stays green for a wrong clip. Since
 the name is not ours to choose, a change to it is either a rosbag2 change being

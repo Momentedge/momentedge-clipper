@@ -1,6 +1,6 @@
 //! What a clip is on disk: a **directory** named by the clip's
 //! [id](crate::id), holding one `<id>_N.mcap` per contributing source recording
-//! and the [`METADATA_FILE`] that says it is complete.
+//! and the [`DOCUMENT_FILE`] that says it is complete.
 //!
 //! ```text
 //! <out-dir>/
@@ -19,7 +19,7 @@
 //!   trigger, two concurrent windows with one id, and two processes writing into
 //!   one output directory, with no lock file and no coordination — the loser
 //!   never had the directory and writes nothing.
-//! - **The metadata file is the completion signal.** It is written after every
+//! - **The document is the completion signal.** It is written after every
 //!   MCAP file in the directory is durable, renamed onto its own name so that
 //!   name is never observable holding a partial document, and the directory is
 //!   fsynced after it. So a directory without it is incomplete by definition,
@@ -27,7 +27,7 @@
 //!   filters on that one fact; it never has to know the naming scheme or guess
 //!   at grouping.
 //! - **A failed cut takes its directory with it** (`ClipDir::discard`), so a
-//!   directory without the metadata file is crash residue and nothing else. A
+//!   directory without the document is crash residue and nothing else. A
 //!   crash does leave one, and a later window with that id skips it rather than
 //!   repairing it: the residue is the evidence that something died, and
 //!   overwriting it would destroy the only trace.
@@ -53,9 +53,9 @@ use crate::manifest::ClipMetadata;
 /// file in the directory is durable, and it arrives at this name by a rename, so
 /// the name holds the whole document from the instant it exists. A consumer
 /// syncing or uploading clips filters on this one name and never sees a
-/// half-written clip. The contents are [`ClipMetadata`]; [`read_metadata`] reads
+/// half-written clip. The contents are [`ClipMetadata`]; [`read_document`] reads
 /// one back.
-pub const METADATA_FILE: &str = "clip_metadata.yaml";
+pub const DOCUMENT_FILE: &str = "clip_metadata.yaml";
 
 /// The extension a file of a clip carries while it is still being written.
 ///
@@ -67,33 +67,33 @@ pub const METADATA_FILE: &str = "clip_metadata.yaml";
 ///   run. Each copy writes under a name derived from its plan's position
 ///   ([`ClipDir::staging`]) and is renamed into place at the end.
 /// - **The document**, because its name is the completion signal
-///   ([`METADATA_FILE`]); creating that name and filling it afterwards would
+///   ([`DOCUMENT_FILE`]); creating that name and filling it afterwards would
 ///   publish an empty clip to anyone reading between the two.
 ///
 /// The two staging name spaces cannot collide: an MCAP file's is `<id>_<n>`,
 /// and an [id](crate::id) is decimal digits, hex and `-`, so no MCAP staging
 /// name carries a `.` before this extension, while the document's is
-/// [`METADATA_FILE`] and does. Nothing outside the cut ever sees either — the
-/// directory has no metadata file while a `.part` exists in it, so it is
+/// [`DOCUMENT_FILE`] and does. Nothing outside the cut ever sees either — the
+/// directory has no document while a `.part` exists in it, so it is
 /// incomplete either way.
 const STAGING_EXT: &str = "part";
 
-/// Where a clip's [`METADATA_FILE`] sits inside its directory.
+/// Where a clip's [`DOCUMENT_FILE`] sits inside its directory.
 ///
 /// The one place the file's location is spelled, so a consumer testing a clip
 /// for completeness and the cut that writes it cannot disagree.
 #[must_use]
-pub fn metadata_path(clip_dir: &Path) -> PathBuf {
-    clip_dir.join(METADATA_FILE)
+pub fn document_path(clip_dir: &Path) -> PathBuf {
+    clip_dir.join(DOCUMENT_FILE)
 }
 
-/// Where the document is written before it is renamed onto [`metadata_path`].
+/// Where the document is written before it is renamed onto [`document_path`].
 ///
 /// The one place this name is spelled, beside the name it becomes, so the pair
 /// is read together and the [staging convention](STAGING_EXT)'s two name spaces
 /// can be seen not to overlap.
-fn metadata_staging(clip_dir: &Path) -> PathBuf {
-    clip_dir.join(format!("{METADATA_FILE}.{STAGING_EXT}"))
+fn document_staging(clip_dir: &Path) -> PathBuf {
+    clip_dir.join(format!("{DOCUMENT_FILE}.{STAGING_EXT}"))
 }
 
 /// Make sure the output directory exists, creating it **with parents**.
@@ -195,12 +195,12 @@ impl ClipDir {
         Ok(named)
     }
 
-    /// Write [`METADATA_FILE`] and make the whole clip durable: the clip is
+    /// Write [`DOCUMENT_FILE`] and make the whole clip durable: the clip is
     /// complete when this returns.
     ///
     /// **The completion signal appears whole.** The document is written and
-    /// fsynced under a [staging name](metadata_staging) and then *renamed* onto
-    /// [`METADATA_FILE`], so a rename is the only operation that ever touches
+    /// fsynced under a [staging name](document_staging) and then *renamed* onto
+    /// [`DOCUMENT_FILE`], so a rename is the only operation that ever touches
     /// that name and the kernel makes it indivisible: a reader, a sync tool or a
     /// machine coming back from power loss finds the name absent or finds the
     /// whole document, with nothing in between. Creating the final name and
@@ -214,10 +214,10 @@ impl ClipDir {
     /// directory (which makes every name in it durable), then the output
     /// directory (which makes the clip directory's own entry durable) means a
     /// crash can lose the clip but can never leave a directory that has the
-    /// metadata file and is missing a file it names.
+    /// document and is missing a file it names.
     pub(crate) fn complete(&self, metadata: &ClipMetadata) -> Result<()> {
-        let path = metadata_path(&self.path);
-        let staged = metadata_staging(&self.path);
+        let path = document_path(&self.path);
+        let staged = document_staging(&self.path);
         let document = serde_norway::to_string(metadata)
             .with_context(|| format!("rendering {}", path.display()))?;
 
@@ -230,7 +230,7 @@ impl ClipDir {
         drop(file);
 
         std::fs::rename(&staged, &path)
-            .with_context(|| format!("naming {} as {METADATA_FILE}", staged.display()))?;
+            .with_context(|| format!("naming {} as {DOCUMENT_FILE}", staged.display()))?;
         sync_dir(&self.path)?;
         match self.path.parent() {
             Some(out_dir) => sync_dir(out_dir),
@@ -243,7 +243,7 @@ impl ClipDir {
     ///
     /// **Best effort, and the cause survives either way.** The cut has already
     /// failed; removing the directory is what keeps "a directory without
-    /// [`METADATA_FILE`] is crash residue" true, so that an operator finding one
+    /// [`DOCUMENT_FILE`] is crash residue" true, so that an operator finding one
     /// knows the process died rather than that a cut merely erred. A removal
     /// that itself fails cannot make the cut any more failed, so it is folded
     /// into the returned error as context naming the directory left behind — the
@@ -254,7 +254,7 @@ impl ClipDir {
             Ok(()) => cause,
             Err(e) => cause.context(format!(
                 "the failed clip's directory {} could not be removed ({e}); it holds \
-                 no {METADATA_FILE}, so it is incomplete, and every later window with \
+                 no {DOCUMENT_FILE}, so it is incomplete, and every later window with \
                  this id is skipped until it is removed",
                 self.path.display()
             )),
@@ -276,8 +276,8 @@ fn sync_dir(dir: &Path) -> Result<()> {
 /// An error means the directory is not a complete clip: the file is absent
 /// (the clip is incomplete, or the directory is not a clip at all), unreadable,
 /// or holds something this version does not understand.
-pub fn read_metadata(clip_dir: &Path) -> Result<ClipMetadata> {
-    let path = metadata_path(clip_dir);
+pub fn read_document(clip_dir: &Path) -> Result<ClipMetadata> {
+    let path = document_path(clip_dir);
     let text =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     serde_norway::from_str(&text).with_context(|| format!("parsing {}", path.display()))
@@ -380,12 +380,12 @@ mod tests {
             &[],
         );
         assert!(
-            !metadata_path(dir.path()).exists(),
+            !document_path(dir.path()).exists(),
             "a claimed directory is incomplete until the document is written"
         );
         dir.complete(&metadata)?;
 
-        assert_eq!(read_metadata(dir.path())?, metadata);
+        assert_eq!(read_document(dir.path())?, metadata);
 
         std::fs::remove_dir_all(root)?;
         Ok(())
@@ -395,14 +395,14 @@ mod tests {
     /// complete document.
     ///
     /// The document is written and fsynced under a staging name and then
-    /// *renamed* onto [`METADATA_FILE`], so a rename is the only operation that
+    /// *renamed* onto [`DOCUMENT_FILE`], so a rename is the only operation that
     /// ever touches that name and the kernel makes it indivisible. Every
     /// consumer's "present = complete" rule rests on that and on nothing else: a
     /// directory is uploaded on the strength of the name alone.
     ///
     /// **What this pins is the mechanism, not the crash.** It obstructs the
     /// staging name so the write cannot finish, and shows that what stands at
-    /// [`METADATA_FILE`] is exactly what stood there before — no truncation, no
+    /// [`DOCUMENT_FILE`] is exactly what stood there before — no truncation, no
     /// short document, no file where there was none. A write that opened the
     /// final name directly would have emptied it before it had a single byte to
     /// put there, which is the window a power loss turns into a zero-length clip
@@ -417,7 +417,7 @@ mod tests {
         let Claim::Ours(dir) = ClipDir::claim(&out_dir, ClipId::of(&request))? else {
             panic!("a free id is claimable");
         };
-        let staged = metadata_staging(dir.path());
+        let staged = document_staging(dir.path());
         let document = |files| {
             ClipMetadata::of(
                 &request,
@@ -440,7 +440,7 @@ mod tests {
         dir.complete(&document(1))?;
         assert_eq!(
             names_in(dir.path())?,
-            vec![METADATA_FILE.to_string()],
+            vec![DOCUMENT_FILE.to_string()],
             "a completed clip holds its document and no staging name"
         );
 
@@ -453,7 +453,7 @@ mod tests {
             "the error names the file it could not write: {err:#}"
         );
         assert_eq!(
-            read_metadata(dir.path())?,
+            read_document(dir.path())?,
             document(1),
             "a completion that cannot finish leaves the standing document whole, \
              because it never opened that name at all"
@@ -475,23 +475,23 @@ mod tests {
     /// The completion signal spelled out, once, as the contract publishes it.
     ///
     /// Every other assertion in the workspace reaches this file through
-    /// [`METADATA_FILE`], so renaming the constant would leave all of them green
+    /// [`DOCUMENT_FILE`], so renaming the constant would leave all of them green
     /// while breaking the one name every upload pipeline filters on. The literal
     /// is what cannot move with it.
     #[test]
     fn the_completion_signal_is_the_name_the_contract_publishes() {
-        assert_eq!(METADATA_FILE, "clip_metadata.yaml");
+        assert_eq!(DOCUMENT_FILE, "clip_metadata.yaml");
     }
 
     /// Reading a directory that is not a complete clip is an ordinary error
     /// naming the file that is missing, which is how a consumer tells crash
     /// residue from a clip.
     #[test]
-    fn an_incomplete_directory_has_no_metadata_to_read() -> Result<()> {
+    fn an_incomplete_directory_has_no_document_to_read() -> Result<()> {
         let root = test_dir("incomplete")?;
-        let err = read_metadata(&root).unwrap_err();
+        let err = read_document(&root).unwrap_err();
         assert!(
-            format!("{err:#}").contains(METADATA_FILE),
+            format!("{err:#}").contains(DOCUMENT_FILE),
             "the error names the file that says a clip is complete: {err:#}"
         );
 
