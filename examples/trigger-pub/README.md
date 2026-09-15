@@ -44,4 +44,7 @@ demo launcher (foreground, Ctrl-C to stop; source a ROS2 environment first):
 ./examples/trigger-pub/start_demo_trigger_pub.sh --preroll 2000000000 --postroll 3000000000
 ```
 
-Design rationale and build mechanics are in [CLAUDE.md](CLAUDE.md).
+To write the real trigger source this stands in for, the field-by-field contract
+is [The trigger message](../../docs/triggers-and-time.md#the-trigger-message),
+and which instant a window ends up centred on is [The
+anchor](../../docs/triggers-and-time.md#the-anchor-which-instant-the-window-centres-on).
