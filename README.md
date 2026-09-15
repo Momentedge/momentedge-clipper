@@ -193,9 +193,10 @@ clipper clip ./record --out-dir ./clipped --trigger-source mcap
 ## Support and contributing
 
 Questions, bug reports and feature requests: [open an issue](../../issues).
-Contributions are welcome — [CLAUDE.md](CLAUDE.md) and the per-crate notes under
-[`crates/`](crates/CLAUDE.md) cover the workspace layout, the build, and the
-conventions a change is expected to follow.
+Contributions are welcome — [CONTRIBUTING.md](CONTRIBUTING.md) covers the
+workspace layout, the build, and the conventions a change is expected to follow.
+
+clipper is built by [Momentedge](https://momentedge.xyz/).
 
 ## License
 
