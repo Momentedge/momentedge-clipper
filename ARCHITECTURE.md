@@ -463,9 +463,7 @@ can still be grouped. Written there and not earlier, it lands in the summary's
 metadata index and the statistics' metadata count, so a reader finds it by name
 without walking the file. Everything else a clip says about itself is stated
 once, in the `clip_metadata.yaml` beside its files — see [What a clip
-carries](docs/clip-manifest.md) for the fields and
-[`crates/clip/CLAUDE.md`](crates/clip/CLAUDE.md) for how the two halves reach
-it.
+carries](docs/clip-manifest.md) for the fields.
 
 ### Every clip is named by its id
 
@@ -664,9 +662,8 @@ and dies on the scan-fault budget within seconds, with no successor to adopt
 unless the recording is being split. So the recorder announces the first clip a
 recording's desync costs in full — the recording, the extent, the blast radius,
 and that rolling the recording over is what clears it — and carries a climbing
-tally on every refusal after. The mechanism is the
-[cut-fault tally](crates/tail/CLAUDE.md#the-cut-fault-tally); what an operator
-does about it is [Operating clipper](docs/operating.md).
+tally on every refusal after. What an operator does about it is [Operating
+clipper](docs/operating.md).
 
 **Detection limit:** the leniency only catches damage loud enough to break
 parsing or a CRC. `fastwrite` disables both chunking and CRCs, so a recording
@@ -737,6 +734,7 @@ distro-independent store path carrying the same `clipper` executable, which runs
 on a host with no ROS 2 installation. It needs no Debian package, because the apt
 `Depends` list that earns one is entirely the device build's ROS dependencies.
 
-The dev-shell build (Nix, per-distro), the two nix packages, the CI matrix, and
-the Debian packaging pipeline are documented in the repository's contributor
-skills — see [`CLAUDE.md`](CLAUDE.md).
+Getting a binary — the Debian packages a release attaches, the two cargo builds,
+the nix package, a native build on the target — is [Installing and
+building](docs/install.md). The per-distro Nix dev shell, the quality gate, and
+what CI builds and runs are [CONTRIBUTING.md](CONTRIBUTING.md).
