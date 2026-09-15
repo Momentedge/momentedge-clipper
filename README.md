@@ -39,11 +39,10 @@ as it was.
   them. No vendor format on either side.
 - **Decode-free.** clipper copies message bytes straight through and never
   deserializes a message body, so it is agnostic to your message types.
-- **Triggers are just a topic.** Anything that can publish
+- **Triggers are just a topic, and ROS is optional.** Anything publishing
   `momentedge_msgs/Trigger` — a fault detector, a watchdog, an operator button —
-  can drive it.
-- **ROS is optional.** It is a cargo feature: the default build links no ROS,
-  reads its triggers out of the recording, and cuts identical clips.
+  drives it; the default build links no ROS, reads triggers out of the recording
+  instead, and cuts identical clips.
 - **Every clip says what it is.** A clip is a directory whose
   `clip_metadata.yaml` names the trigger, the window and the source bytes, so
   even an empty clip can say why.
@@ -120,9 +119,9 @@ the bundled [`trigger-pub`](examples/trigger-pub/README.md) instead of step 3.
 
 ## Install
 
-Each [GitHub release](../../releases) attaches two arm64 Debian packages for
-**Humble** (Ubuntu 22.04) and **Jazzy** (Ubuntu 24.04) — the deployment target is
-a Jetson-class board:
+Each [GitHub release](https://github.com/Momentedge/momentedge-clipper/releases)
+attaches two arm64 Debian packages, for **Humble** (Ubuntu 22.04) and **Jazzy**
+(Ubuntu 24.04) — the deployment target is a Jetson-class board:
 
 ```bash
 sudo apt install ./ros-humble-momentedge-msgs_*.deb ./momentedge-clipper_*.deb
@@ -130,12 +129,10 @@ source /opt/ros/humble/setup.bash
 /opt/momentedge-clipper/bin/clipper --help
 ```
 
-From source, ROS is a cargo feature: `cargo build -p clipper` links none, while
-`--features ros` adds the live subscription and the `Recorded` publish and is
-what every `.deb` is built with. CI covers **Humble, Jazzy and Lyrical**; Rolling
-is not supported, because r2r references an rmw QoS variant Rolling has removed.
-Both builds in full, the nix package, a target build, and the note for a device
-already running clipper: [Installing and building](docs/install.md).
+From source, ROS is a cargo feature: `cargo build -p clipper` links none, and
+`--features ros` is what every `.deb` is built with. Both builds in full, the
+supported distros, the nix package, a target build and the upgrade note:
+[Installing and building](docs/install.md).
 
 ## Two modes
 
@@ -155,10 +152,9 @@ clipper clip ./record --out-dir ./clipped --trigger-source mcap
   — or any append-only MCAP writer — has to be running beside it, and nothing on
   disk means nothing to cut.
 - **It does not back-index a backlog.** At startup clipper adopts the newest
-  recording in `--record-dir` and indexes it whole, so a trigger can still reach
-  into bytes written before clipper started. Every *older* split beside it is
-  skipped and stays skipped — from then on clipper recovers only the rollovers it
-  watches happen. Cut windows over those with `clipper clip` instead.
+  recording in `--record-dir` and indexes it whole; every *older* split beside it
+  is skipped and stays skipped. Cut those windows with `clipper clip` instead —
+  [what a running recorder does](docs/operating.md#in-normal-operation).
 - **It does not manage retention.** The recording grows until you stop or split
   it, and clipper prunes neither it nor `--out-dir` — it will unlink *expired,
   already-rolled-over* recordings if you ask (`--delete-old-files`), and nothing
@@ -168,11 +164,11 @@ clipper clip ./record --out-dir ./clipped --trigger-source mcap
   window cannot be re-cut, until you remove it:
   [what `--out-dir` holds](docs/operating.md#what---out-dir-holds).
 - **It handles 16 triggers at once.** A trigger arriving while all 16 slots are
-  busy is rejected with a logged error and produces no clip and no `Recorded` —
-  automation should read a missing announcement as a dropped trigger.
+  busy is rejected with a logged error — no clip, no `Recorded`, so automation
+  should read a missing announcement as a dropped trigger.
 - **`--time-source publish` is a no-op on Humble**, whose `rosbag2_storage_mcap`
-  writes `publish_time = log_time` verbatim. It differs on Jazzy and newer, and
-  for a writer that owns its own capture stamps.
+  writes `publish_time = log_time` verbatim: [which clock a window lives
+  on](docs/triggers-and-time.md#time-source-log-or-publish).
 
 ## Where to go next
 
@@ -192,7 +188,8 @@ clipper clip ./record --out-dir ./clipped --trigger-source mcap
 
 ## Support and contributing
 
-Questions, bug reports and feature requests: [open an issue](../../issues).
+Questions, bug reports and feature requests: [open an
+issue](https://github.com/Momentedge/momentedge-clipper/issues).
 Contributions are welcome — [CONTRIBUTING.md](CONTRIBUTING.md) covers the
 workspace layout, the build, and the conventions a change is expected to follow.
 
