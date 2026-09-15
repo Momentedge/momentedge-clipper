@@ -177,8 +177,11 @@ Everything else is the mcap crate's. Chunking is on and the size a chunk is cut
 at is `WriteOptions`' own default, which is what sets a clip's seek granularity
 and the memory a reader spends decompressing one chunk. This crate holds no
 opinion about that layout: a bump of the `mcap` dependency may move it, and no
-test here objects (beads clipper-bf3). This paragraph is where that fact lives —
-the other documents link here rather than restate it.
+test here objects (beads clipper-bf3). This paragraph is where that fact lives
+for the crates; another `CLAUDE.md` links here rather than restate it. A
+human-facing page must not — what a consumer of a clip needs to know about its
+chunk layout belongs in [What a clip carries](../../docs/clip-manifest.md), and a
+page that could only be completed by linking here is filed wrong.
 
 Output channels are registered from the registry per source channel ID and
 cached; `mcap::Writer` deduplicates schemas/channels by content. The clip ends
