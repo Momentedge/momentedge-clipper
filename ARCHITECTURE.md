@@ -1,12 +1,16 @@
 # Architecture
 
-A technical overview of how Momentedge Clipper is built. For what it does and
-how to run it, start with the [README](README.md). For deep implementation
-rationale and concurrency invariants, see the per-crate notes:
-[`crates/clip`](crates/clip/CLAUDE.md) (the format layer, the cut, the
-manifest), [`crates/tail`](crates/tail/CLAUDE.md) (following a growing
-recording), [`crates/clipper`](crates/clipper/CLAUDE.md) (the binary), and
-[`crates/CLAUDE.md`](crates/CLAUDE.md) for what the three share.
+A technical overview of how Momentedge Clipper is built: the two processes and
+the module map between them, the thread model, how a live MCAP is read at all,
+how a window becomes a clip on disk, what survives a restart, and what happens
+when any of it is damaged. This is the deepest account of the system there is —
+past it is the source, which [CONTRIBUTING.md](CONTRIBUTING.md) is the way into.
+
+For what clipper does and how to run it, start with the [README](README.md).
+For the words this document uses — recording, extent, coverage, anchor, and the
+several distinct instants a message can be said to have happened at — see
+[CONTEXT.md](CONTEXT.md). For flags, keys, message contracts and day-to-day
+operation, the pages under [`docs/`](docs/).
 
 ## System overview
 
