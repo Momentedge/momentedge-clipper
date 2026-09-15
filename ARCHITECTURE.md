@@ -455,8 +455,10 @@ comes from the configuration file's `[topics]` table
 worker pool beside the compression codec, so one configuration cuts the same
 channel set on the device and out of the finished recording afterwards. The clip
 writer is built from `mcap::WriteOptions` carrying one deliberate setting, the
-codec (`--clip-compression`); what it inherits instead is
-[`crates/clip/CLAUDE.md`](crates/clip/CLAUDE.md). It is finished with
+codec (`--clip-compression`); everything else about the output, chunk size
+included, is the `mcap` crate's default and clipper states no opinion about it
+— what that costs a reader is [Chunk
+layout](docs/clip-manifest.md#chunk-layout). It is finished with
 `Writer::finish()` (summary + footer + closing magic), so every clip is a
 complete, standalone MCAP file.
 

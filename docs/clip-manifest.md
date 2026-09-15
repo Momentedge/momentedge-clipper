@@ -277,3 +277,25 @@ so every MCAP tool reads one directly. The `momentedge.clip` record inside it
 survives the MCAP CLI's rewrite commands (`compress`, `decompress`, `sort`,
 `filter`, `recover`). `mcap merge` refuses two files of one clip by default, since
 both carry a record under the same name — pass `--allow-duplicate-metadata`.
+
+### Chunk layout
+
+A clip's messages are written in **chunks**, and the size a chunk is cut at is
+the `mcap` crate writer's own default — 1 MiB of uncompressed records at the
+version clipper builds against. clipper states no chunk size of its own; the
+only thing it chooses about the writer is the codec
+([`--clip-compression`](configuration.md), default `zstd`).
+
+That size is worth knowing for two reasons, and both are about reading a clip
+rather than cutting one:
+
+- **It is the clip's seek granularity.** A reader that seeks to one message
+  reaches the chunk holding it, not the message, so a seek lands within roughly
+  a chunk of its target.
+- **It bounds the memory one chunk costs.** A compressed chunk is decompressed
+  whole before any message in it can be read, so a reader spends the
+  uncompressed size of a single chunk, not of the clip.
+
+Neither is configurable. A clip whose chunking has to be different is a clip to
+rewrite with `mcap compress --chunk-size`, which produces an equivalent file
+under a layout you choose.
