@@ -27,7 +27,7 @@
 //! There is no capture-time machinery here — owning `publish_time` as a
 //! capture stamp is `examples/custom-mcap-writer`'s story. The synthetic
 //! trigger's JSON payload leaves `trigger_time` at `{sec: 0, nanosec: 0}`:
-//! under `--interface mcap` the field is inert — clipper anchors the clip
+//! under `--trigger-source mcap` the field is inert — clipper anchors the clip
 //! window on the trigger *record's own* MCAP stamp (here its `log_time`) —
 //! and a non-zero value in that cell is a mis-anchoring hazard clipper
 //! rejects (see "Why `trigger_time` is zero" in custom-mcap-writer's README).
@@ -103,7 +103,7 @@ const POSE_SCHEMA: &[u8] = br#"{
 }"#;
 
 /// `builtin_interfaces/Time` flattened to its two fields — the JSON shape
-/// `crates/clipper/src/trigger.rs::Stamp` derives `Deserialize` for.
+/// `crates/clip/src/trigger.rs::Stamp` derives `Deserialize` for.
 #[derive(Serialize)]
 struct StampMsg {
     sec: i32,
@@ -111,7 +111,7 @@ struct StampMsg {
 }
 
 /// The JSON payload for `/events/momentedge/trigger` — field-for-field the
-/// shape `crates/clipper/src/trigger.rs::Trigger` decodes. `trigger_time`
+/// shape `crates/clip/src/trigger.rs::Trigger` decodes. `trigger_time`
 /// stays `{sec: 0, nanosec: 0}`: inert under the mcap interface, where the
 /// anchor is the trigger record's own MCAP stamp (see the module docs).
 #[derive(Serialize)]
@@ -144,7 +144,7 @@ fn register<W: Write + Seek>(writer: &mut mcap::Writer<W>) -> Result<(u16, u16)>
     let schema_id = writer.add_schema("Pose", "jsonschema", POSE_SCHEMA)?;
     let pose_id = writer.add_channel(schema_id, "/pose", "json", &BTreeMap::new())?;
     // Schemaless, schema id 0 — clipper's MCAP interface decodes triggers by
-    // `message_encoding` alone, not a schema (see crates/clipper/src/decode.rs).
+    // `message_encoding` alone, not a schema (see crates/clip/src/decode.rs).
     let trigger_id = writer.add_channel(0, TRIGGER_TOPIC, "json", &BTreeMap::new())?;
     Ok((pose_id, trigger_id))
 }
@@ -157,7 +157,12 @@ fn write_pose<W: Write + Seek>(
     seq: u32,
     now_ns: u64,
 ) -> Result<()> {
-    let a = seq as f64 * 0.05;
+    let a = f64::from(seq) * 0.05;
+    #[expect(
+        clippy::expect_used,
+        reason = "a struct of three finite `f64`s and no map keys; `to_vec` has no \
+                  failing path for it"
+    )]
     let payload = serde_json::to_vec(&Pose {
         x: a.cos(),
         y: a.sin(),
@@ -191,6 +196,11 @@ fn write_trigger<W: Write + Seek>(
         preroll: TRIGGER_PREROLL_NS,
         postroll: TRIGGER_POSTROLL_NS,
     };
+    #[expect(
+        clippy::expect_used,
+        reason = "a struct of owned strings and integers; `to_vec` has no failing \
+                  path for it"
+    )]
     let payload = serde_json::to_vec(&trigger).expect("TriggerMsg serializes");
     writer.write_to_known_channel(
         &mcap::records::MessageHeader {
@@ -207,6 +217,10 @@ fn write_trigger<W: Write + Seek>(
     Ok(())
 }
 
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "u64 nanoseconds since the epoch runs to the year 2554"
+)]
 fn now_ns() -> Result<u64> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() as u64)
 }
@@ -266,6 +280,16 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::cast_possible_truncation,
+        reason = "a failed unwrap or a panicking index is a failing test, and a \
+                  catch-all over the foreign `mcap::records::Record` is the only \
+                  arm upstream lets this assertion have"
+    )]
+
     use super::*;
 
     /// Synthetic stamps for the sample recording: an arbitrary absolute base
@@ -307,9 +331,9 @@ mod tests {
         fn seek(&mut self, from: std::io::SeekFrom) -> std::io::Result<u64> {
             use std::io::SeekFrom;
             let new = match from {
-                SeekFrom::Start(p) => p as i128,
-                SeekFrom::End(off) => self.buf.len() as i128 + off as i128,
-                SeekFrom::Current(off) => self.pos as i128 + off as i128,
+                SeekFrom::Start(p) => i128::from(p),
+                SeekFrom::End(off) => self.buf.len() as i128 + i128::from(off),
+                SeekFrom::Current(off) => i128::from(self.pos) + i128::from(off),
             };
             self.pos = u64::try_from(new).expect("seek before start of file");
             Ok(self.pos)
@@ -329,7 +353,13 @@ mod tests {
         let mut writer = chunked_writer(sink).expect("writer");
         let (pose_id, trigger_id) = register(&mut writer).expect("register");
         for seq in 0..n_pose {
-            write_pose(&mut writer, pose_id, seq, BASE_NS + seq as u64 * STEP_NS).expect("pose");
+            write_pose(
+                &mut writer,
+                pose_id,
+                seq,
+                BASE_NS + u64::from(seq) * STEP_NS,
+            )
+            .expect("pose");
         }
         write_trigger(&mut writer, trigger_id, trigger_ns(n_pose)).expect("trigger");
         writer.finish().expect("finish");
@@ -339,7 +369,7 @@ mod tests {
     /// The stamp [`sample_recording`] puts on its trigger: one step past the
     /// last `/pose` message.
     fn trigger_ns(n_pose: u32) -> u64 {
-        BASE_NS + n_pose as u64 * STEP_NS
+        BASE_NS + u64::from(n_pose) * STEP_NS
     }
 
     /// Walk the top-level record framing by hand, exactly the way clipper's
@@ -379,7 +409,7 @@ mod tests {
         (records, pos)
     }
 
-    /// Mirrors `crates/clipper/src/trigger.rs::Stamp`'s `Deserialize` shape —
+    /// Mirrors `crates/clip/src/trigger.rs::Stamp`'s `Deserialize` shape —
     /// a local copy so this crate stays free of any dependency on
     /// `crates/clipper` (which pulls in `r2r`/ROS), while still proving the
     /// JSON this program writes decodes into that exact field shape.
@@ -389,10 +419,10 @@ mod tests {
         nanosec: u32,
     }
 
-    /// Mirrors `crates/clipper/src/trigger.rs::Trigger`'s `Deserialize` shape
+    /// Mirrors `crates/clip/src/trigger.rs::Trigger`'s `Deserialize` shape
     /// (`description` optional, defaulting empty; the rest required; unknown
     /// fields ignored) — see that module's doc comment and
-    /// `crates/clipper/src/decode.rs`'s `json_decodes_the_msg_shape` test.
+    /// `crates/clip/src/decode.rs`'s `json_decodes_the_msg_shape` test.
     #[derive(serde::Deserialize, Debug, PartialEq)]
     struct TestTrigger {
         name: String,
@@ -486,7 +516,7 @@ mod tests {
                 pose_idx += 1;
             }
         }
-        assert_eq!(pose_idx, n as u64, "every /pose message decodes");
+        assert_eq!(pose_idx, u64::from(n), "every /pose message decodes");
         assert!(saw_trigger, "the trigger record must be present");
     }
 

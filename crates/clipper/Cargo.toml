@@ -5,28 +5,56 @@ edition.workspace = true
 license.workspace = true
 description = "Triggered MCAP clip recorder for ROS2"
 
+# One binary, and the mode is a subcommand: `clipper tail` is the device
+# recorder, and a mode that cuts clips from a recording nobody is writing joins
+# it as a sibling subcommand rather than as a second executable.
 [[bin]]
 name = "clipper"
 path = "src/main.rs"
 
+[features]
+default = []
+# The ROS interface: a live `momentedge_msgs/Trigger` subscription on a node and
+# the `Recorded` publish answering it (`--trigger-source ros`), plus everything
+# that exists only to serve it — r2r, the futures its typed subscription stream
+# is drained with, and `clip`'s CDR trigger decoder. This is the device build, and
+# every packaging path asks for it: the nix package, the on-target build behind
+# the .deb, and the per-distro CI matrix.
+#
+# Off by default, so a plain `cargo build -p clipper` links no ROS, needs no ROS
+# installation anywhere, and offers `--trigger-source mcap` alone — the recorder
+# reading its triggers out of the recording it already tails. The ROS-free CI
+# lane holds that down by asserting r2r is absent from the default dependency
+# tree before it builds the crate.
+ros = ["dep:r2r", "dep:futures", "clip/ros"]
+
 [dependencies]
-# r2r: ROS2 client bindings. Typed subscription to the Trigger topic and a typed
-# Recorded publisher. No WriteSplitEvent — coverage comes from tailing the file.
-r2r.workspace = true
+# r2r, `ros` only: ROS2 client bindings. Typed subscription to the Trigger topic
+# and a typed Recorded publisher. No WriteSplitEvent — coverage comes from
+# tailing the file.
+r2r = { workspace = true, optional = true }
 # `futures::StreamExt` + `futures::executor::block_on` drain the typed trigger
 # stream on the consumer thread; r2r's subscriptions are futures-channel-backed
-# and need no async runtime.
-futures.workspace = true
+# and need no async runtime. `ros` only — that subscription is its one user.
+futures = { workspace = true, optional = true }
 # FIFO channel plumbing between the threads: the extraction job queue, each
 # job's reply channel, and the exit channels `supervise` select!s over.
 crossbeam-channel.workspace = true
 # SIGINT/SIGTERM delivered as a message on a channel `supervise` selects on.
 signal-hook.workspace = true
-# MCAP record parsing (`parse_record`, `read::ChunkReader`) for the tail scan
-# and extraction — the scan and the copy own their own opcode + length framing,
-# so the halt-on-first-error `LinearReader` is deliberately unused (see
-# src/clip.rs) — and `Writer` for the clip output (schemas/channels by content,
-# summary + footer on `finish`).
+# The shared library: the MCAP format layer and recording index, the cut path,
+# the neutral trigger contract and segment publication. `clap` makes `TimeSource`
+# a `ValueEnum` for the `--time-source` flag, and every build needs it. Its `ros`
+# feature — the CDR trigger decoder and the two r2r message conversions — comes
+# through this crate's own `ros` feature above, so the default build takes `clip`
+# ROS-free too.
+clip = { path = "../clip", features = ["clap"] }
+# Live tailing over `clip`: recording discovery, the recording collection and its
+# lifecycle, coverage, retention, and the per-trigger waits a cut from a growing
+# file needs before the shared cut path runs.
+tail = { path = "../tail" }
+# MCAP write options for the clip compression flag; the record parsing itself
+# lives in `clip`.
 mcap.workspace = true
 # Error plumbing for the tail and extraction paths.
 anyhow.workspace = true
@@ -37,13 +65,6 @@ clap.workspace = true
 # Logging via the `log` facade; pretty_env_logger is the backend (honours RUST_LOG).
 log.workspace = true
 pretty_env_logger.workspace = true
-# Trigger payload decoders for the MCAP interface (src/decode.rs), dispatched on
-# a channel's message_encoding. Both are already in the dependency closure
-# transitively, so declaring them direct adds no crates to the build: serde +
-# serde_json decode `json` triggers. (`cdr` needs no new dependency — r2r's rmw
-# deserialization.)
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 
 # Dev-dependencies serve the live e2e suite (tests/e2e.rs + tests/harness/);
 # the inline unit tests use only the crate's own dependencies.
@@ -55,7 +76,17 @@ tempfile = "3"
 libc = "0.2"
 # Test structuring: expands the storage-profile matrix into per-case tests
 # that nextest runs as isolated processes.
-rstest = "0.26"
+rstest = "0.27"
+# `Watch`'s test-only setter, which the admission-gate test parks and releases
+# sixteen handlers with. Cargo's v2+ resolver does not enable a dev-dependency's
+# features for a normal build, so a release binary compiles none of it.
+tail = { path = "../tail", features = ["test-support"] }
+# The MCAP fixture writers and clip readers the `clipper clip` tests cut real
+# recordings with — the same ones `clip`'s own tests use, so a fixture cannot
+# drift from what the index and the cut expect. Dev-only, like `tail`'s above.
+clip = { path = "../clip", features = ["clap", "test-support"] }
+# Reading back the JSON trigger payloads the e2e harness writes into a recording.
+serde_json = "1"
 
 # Debian packaging via cargo-deb: `cargo deb -p clipper --no-build --variant <distro>`
 # (scripts/package-clipper-deb.sh). bloom has no cargo build type, so cargo-deb is
@@ -73,16 +104,18 @@ section = "utils"
 priority = "optional"
 # Vendor-namespaced under /opt rather than /usr/bin (the `clipper` binary name is
 # taken by an unrelated Debian package); the deb name and prefix match.
+# One executable, no symlinks: the mode is an argument (`clipper tail`), so the
+# package has a single entry point to install and to name in a unit file.
 assets = [["target/release/clipper", "opt/momentedge-clipper/bin/", "755"]]
 # Per-distro Depends live in the variants below; this base default targets humble.
 depends = "ros-humble-ros-base, ros-humble-rmw-fastrtps-cpp, ros-humble-momentedge-msgs"
 extended-description = """\
-Triggered MCAP clip recorder for ROS2. clipper tails one continuous ros2 bag MCAP \
-recording and cuts clips around momentedge_msgs/Trigger events, announcing each via \
-momentedge_msgs/Recorded. Built natively against the host ROS2 distro for ABI \
+Triggered MCAP clip recorder for ROS2. clipper tail follows one continuous ros2 bag \
+MCAP recording and cuts clips around momentedge_msgs/Trigger events, announcing each \
+via momentedge_msgs/Recorded. Built natively against the host ROS2 distro for ABI \
 compatibility; the momentedge_msgs interface package, ros-base, and rmw_fastrtps_cpp \
 are pulled from apt. Run by sourcing /opt/ros/<distro>/setup.bash, then \
-/opt/momentedge-clipper/bin/clipper."""
+/opt/momentedge-clipper/bin/clipper tail."""
 
 # `--variant <distro>` selects the matching dependency set; `name` is repeated so the
 # package stays `momentedge-clipper` (cargo-deb would otherwise append the variant).
@@ -95,3 +128,7 @@ depends = "ros-humble-ros-base, ros-humble-rmw-fastrtps-cpp, ros-humble-momented
 [package.metadata.deb.variants.jazzy]
 name = "momentedge-clipper"
 depends = "ros-jazzy-ros-base, ros-jazzy-rmw-fastrtps-cpp, ros-jazzy-momentedge-msgs"
+
+# The workspace lint policy (root `Cargo.toml`), inherited whole.
+[lints]
+workspace = true

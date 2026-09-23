@@ -3,24 +3,78 @@
 This is the entry point for contributing to or operating clipper. The other docs
 own their angle, and this file does not repeat them:
 
-- **[README.md](README.md)** — user-facing: what clipper is, how to install, run,
-  configure, and the trigger interface. Start there to *use* clipper.
+- **[README.md](README.md)** — the human primer: what clipper is, why it is
+  worth running, what it costs, how to install it and cut a first clip. It is
+  short on purpose and links onward rather than explaining. Keep it that way.
+- **[docs/](docs/)** — the user-facing reference the README links to, one page
+  per question a user arrives with:
+  [`configuration.md`](docs/configuration.md) (every flag, env var and TOML key,
+  and the layering rule), [`triggers-and-time.md`](docs/triggers-and-time.md)
+  (the `Trigger` message, the two interfaces, the clock a window lives on),
+  [`clip-command.md`](docs/clip-command.md) (`clipper clip` over a finished
+  recording), [`clip-manifest.md`](docs/clip-manifest.md) (the clip directory and
+  record), [`operating.md`](docs/operating.md) (shutdown, logs, retention, a
+  recording that stops producing clips, overload, tuning),
+  [`install.md`](docs/install.md) (the release `.deb`s, the two cargo builds, the
+  nix package, a native build on the target, the distro matrix),
+  [`performance.md`](docs/performance.md) (what leaving clipper running costs on
+  the board it is deployed to, measured). These are for *humans
+  looking something up* — the agent view of the same code is the `CLAUDE.md`
+  files below.
 - **[ARCHITECTURE.md](ARCHITECTURE.md)** — the technical overview: thread model,
-  tailing, atomic clip publication, recovery, the `ros`/`mcap` seam, deployment.
-- **[crates/clipper/CLAUDE.md](crates/clipper/CLAUDE.md)** — the recorder's deep
-  internals and concurrency invariants, for changing the crate.
-- **[examples/trigger-pub/CLAUDE.md](examples/trigger-pub/CLAUDE.md)** and
-  **[sim/CLAUDE.md](sim/CLAUDE.md)** — the example trigger source and sim camera.
+  tailing, what a clip is on disk, recovery, the `ros`/`mcap` seam, deployment.
+- **[CONTEXT.md](CONTEXT.md)** — the domain glossary, and the word for each thing
+  every other file here uses: recording, producer, extent, coverage; trigger,
+  window, anchor; clip, document and complete; trigger source and interface.
+  **Document** is the one to reach for first — a producer writes a recording's
+  own `metadata.yaml`, so "the metadata file" names that and never a clip's
+  `clip_metadata.yaml`. Above all it separates the
+  several distinct instants a message can be said to have happened at, which are
+  easy to conflate and expensive to conflate. Read it before writing about time.
+- **[crates/CLAUDE.md](crates/CLAUDE.md)** — what the three crates share: the
+  seam between them, the cargo-feature matrix that keeps ROS out of two, the
+  clock domain every window lives in, and the contract for keeping these files
+  true.
+- **[crates/clip/CLAUDE.md](crates/clip/CLAUDE.md)** — the format layer and the
+  scan that makes a live MCAP readable, the copy, the layout a clip is on disk,
+  the document it carries, segment assembly, the whole-file index and bag
+  directories.
+- **[crates/tail/CLAUDE.md](crates/tail/CLAUDE.md)** — discovery, the recording
+  collection and its lifecycle, coverage, the scan-fault budget, retention, and
+  the per-trigger flow with the two waits a growing file costs.
+- **[crates/clipper/CLAUDE.md](crates/clipper/CLAUDE.md)** — the binary: the two
+  interfaces, the anchor seam and admission gate, thread supervision, `clipper
+  clip`, configuration, and the live e2e suite.
+- **[examples/CLAUDE.md](examples/CLAUDE.md)** — the examples' shared rules, with
+  a file per example crate ([`trigger-pub`](examples/trigger-pub/CLAUDE.md),
+  [`custom-mcap-writer`](examples/custom-mcap-writer/CLAUDE.md),
+  [`chunked-mcap-writer`](examples/chunked-mcap-writer/CLAUDE.md),
+  [`cu-mcap-record`](examples/cu-mcap-record/CLAUDE.md)).
+- **[sim/CLAUDE.md](sim/CLAUDE.md)** — the sim camera.
+
+**These nested files load lazily.** Claude Code injects the `CLAUDE.md` of every
+directory between this one and a file you *read or edit with the file tools* —
+so opening `crates/clip/src/cut.rs` brings in `crates/CLAUDE.md` and
+`crates/clip/CLAUDE.md`, and nothing from `crates/tail/` or `crates/clipper/`.
+Two things follow. Work done entirely through shell commands (`cat`, `grep`)
+sees none of that layer, so read a file you are about to change with the Read
+tool. And a fact filed under the wrong directory is a fact nobody working there
+is shown — which is why changing a crate's behaviour obliges updating that
+crate's own `CLAUDE.md` in the same change. The rules for doing that well are in
+[crates/CLAUDE.md](crates/CLAUDE.md#keeping-these-files-true).
 
 Build, CI, packaging, and release mechanics live in **skills** (loaded on demand):
 
 - **`build`** ([`.claude/skills/build/SKILL.md`](.claude/skills/build/SKILL.md))
-  — the Nix dev shell, per-distro builds, the r2r/IDL model, tests and coverage,
-  the live e2e suite, the binary cache.
+  — the Nix dev shell, the recorder's two builds and the two nix packages that
+  match them, the r2r/IDL model, the quality gate (`justfile`, `rustfmt.toml`,
+  `clippy.toml` and the `[workspace.lints]` block they tune), tests and
+  coverage, the live e2e suite, the binary cache.
 - **`ci`** ([`.claude/skills/ci/SKILL.md`](.claude/skills/ci/SKILL.md)) — the
   GitHub Actions workflows, skip rules, and local `act` testing.
 - **`packaging`** ([`.claude/skills/packaging/SKILL.md`](.claude/skills/packaging/SKILL.md))
-  — the two-deb (bloom + cargo-deb) release pipeline and its gotchas.
+  — the device build's two-deb (bloom + cargo-deb) release pipeline, the ROS-free
+  build's nix package, and the gotchas of both.
 - **`release`** ([`.claude/skills/release/SKILL.md`](.claude/skills/release/SKILL.md))
   — writing the tag annotation that becomes the release headline and overview.
 
@@ -30,9 +84,12 @@ Build, CI, packaging, and release mechanics live in **skills** (loaded on demand
 message index, and cuts clips out of a continuous on-disk `ros2 bag record` on
 trigger events, copying MCAP messages straight through (decoding only each
 message's log time). The example [`trigger-pub`](examples/trigger-pub/CLAUDE.md)
-is a periodic `Trigger` publisher that drives it during development. The full
-design is in [ARCHITECTURE.md](ARCHITECTURE.md) and
-[crates/clipper/CLAUDE.md](crates/clipper/CLAUDE.md).
+is a periodic `Trigger` publisher that drives it during development. The mode is
+a subcommand: `clipper tail` is that recorder, and `clipper clip` cuts one window
+out of one already-finished recording and exits — same window plan, same copy,
+same clip directory, without the two waits a growing file costs. The full
+design is in [ARCHITECTURE.md](ARCHITECTURE.md) and the per-crate notes indexed
+above.
 
 ## The sim camera (`sim/`)
 
@@ -51,27 +108,57 @@ matrix detail: [`sim/CLAUDE.md`](sim/CLAUDE.md).
 A virtual workspace (no root package), so `resolver = "3"` (the edition-2024
 resolver) is set explicitly — a virtual workspace does not infer the resolver
 from member editions and otherwise falls back to `"1"` with a warning. Members
-are the recorder crate (`crates/clipper`), the example trigger source
-(`examples/trigger-pub`), the two mcap-writer examples
-(`examples/custom-mcap-writer`, `examples/chunked-mcap-writer`), and the copper
-producer example (`examples/cu-mcap-record`) — the examples stay members so they
-inherit `[workspace.package]` and the shared `[workspace.dependencies]`
-versions, rather than for shipping. `examples/cu-mcap-record` keeps its copper
-dependencies (`cu29` and the `cu-bincode` fork) declared in its own `Cargo.toml`
-rather than in `[workspace.dependencies]`, so the heavy cu29 tree stays scoped
-to that one member; it still lives in the shared root lockfile, and a lean
-ROS-free CI job builds and tests it with `-p cu-mcap-record`. `momentedge_msgs/`
-(ROS2 interface package) and `sim/` (the sim camera's launch/config tree) are
-not Cargo members.
+are the two libraries (`crates/clip`, `crates/tail`), the recorder binary
+(`crates/clipper`), the example trigger source (`examples/trigger-pub`), the two
+mcap-writer examples (`examples/custom-mcap-writer`,
+`examples/chunked-mcap-writer`), and the copper producer example
+(`examples/cu-mcap-record`) — the examples stay members so they inherit
+`[workspace.package]` and the shared `[workspace.dependencies]` versions, rather
+than for shipping. `examples/cu-mcap-record` keeps every copper dependency it
+takes declared in its own `Cargo.toml` rather than in
+`[workspace.dependencies]`, so the heavy cu29 tree stays scoped to that one
+member; it still lives in the shared root lockfile, and a lean ROS-free CI job
+builds and tests it with `-p cu-mcap-record`. `momentedge_msgs/` (ROS2 interface
+package) and `sim/` (the sim camera's launch/config tree) are not Cargo members.
+
+`crates/clip` and `crates/tail` are the libraries under the recorder, and
+neither needs a ROS toolchain anywhere. `clip` is what every consumer of a
+recording shares — the MCAP format layer, the recording index (including the
+whole-file one a finished recording's own summary yields, over one file or a bag
+directory's splits read as one time-ordered collection), the cut path, the
+neutral trigger contract, the layout a clip is on disk, and the document every
+clip carries saying what it is — so cutting a window out of a recording nobody
+is writing links `clip` alone. `tail` is what a recording with
+no end yet costs on top: discovery, the recording collection and its lifecycle,
+coverage, retention, the scan-fault budget, and the waits a cut from a growing
+file does before the shared cut path runs. `clip`'s `ros` feature, off by
+default, adds only the CDR trigger decoder and the two r2r message conversions;
+its `clap` feature makes `TimeSource` a `ValueEnum`; its `test-support` feature
+publishes the MCAP fixture writers a consumer's tests build recordings with, and
+`tail`'s publishes the watch setter a waiter test drives.
+
+The recorder carries a `ros` feature of its own, likewise off by default, adding
+the live trigger subscription, the `Recorded` publish, and `clip/ros` underneath.
+So `cargo build -p clipper` links no ROS and its `clipper tail --trigger-source`
+offers `mcap` alone, while `--features ros` is the device build every packaging
+path selects. The `libraries` CI job builds, lints and tests all three crates with
+default features on the plain toolchain, so an r2r dependency that escapes a `ros`
+feature fails there rather than in a downstream ROS-free build.
 
 ```
-crates/clipper/         # triggered clip recorder tailing the continuous mcap
+crates/clip/            # ROS-free library: format layer, index, cut, layout, manifest, triggers
+crates/tail/            # ROS-free library: following a recording still being written
+crates/clipper/         # the clipper binary (`clipper tail` is the recorder): interfaces, config, supervision
 momentedge_msgs/        # local ROS2 interface package (Trigger, Recorded)
 examples/               # setup guides + trigger-pub + mcap-writer examples + cu-mcap-record (copper)
 sim/                    # synthetic gscam camera (sim/cam_sim.sh) — see sim/README.md
-nix/                    # flake package defs: momentedge-msgs, ros-env, binaries
+nix/                    # flake package defs: momentedge-msgs, ros-env, the per-distro
+                        #   ROS binaries, and the ROS-free clipper package
 scripts/                # record.sh, run.sh, build-on-target.sh, packaging scripts
-flake.nix               # per-distro ROS2 dev shells + nix-built binaries
+flake.nix               # per-distro ROS2 dev shells + nix-built binaries + clipper-ros-free
+justfile                # the quality gate: fmt, check, test, cov, e2e (`just --list`)
+rustfmt.toml            # formatting policy (nightly: several keys are unstable)
+clippy.toml             # thresholds for the size and shape lints Cargo.toml enables
 ```
 
 ## Sibling repositories
@@ -112,9 +199,16 @@ The docs describe the same system from different angles. **After a change to
 behaviour, build/run steps, dependencies, or layout, update the relevant docs in
 the same change** — do not duplicate; cross-reference:
 
-- User-facing overview, quickstart, configuration → **README.md**.
-- Technical/system design → **ARCHITECTURE.md** (crate internals →
-  `crates/clipper/CLAUDE.md`).
+- User-facing reference — a flag, a TOML key, the trigger contract, the clip's document,
+  what a deployed recorder does about logs or overload → the matching page under
+  **`docs/`**.
+- The pitch, the quickstart and the install path → **README.md**. It is a primer
+  that has to stay readable in one sitting, so a new fact earns a place there
+  only by changing what clipper *is* or what it costs to run. Everything else
+  goes to `docs/` and is linked from "Where to go next".
+- Technical/system design → **ARCHITECTURE.md** (crate internals → that
+  crate's own `CLAUDE.md` under `crates/`; anything the three share →
+  `crates/CLAUDE.md`).
 - Build / CI / packaging mechanics → the **`build` / `ci` / `packaging`** skills.
 - Contributor orientation and conventions → this **CLAUDE.md**.
 

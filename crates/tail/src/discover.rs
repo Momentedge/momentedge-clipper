@@ -28,6 +28,7 @@ use std::path::{Path, PathBuf};
 /// each inode exactly once.
 ///
 /// See the module docs for the identity/ordering contract.
+#[derive(Debug)]
 pub struct NewFileWatchIterator {
     dir: PathBuf,
     /// `(dev, ino)` of files already yielded (and, for [`Self::seeded`], the
@@ -52,14 +53,16 @@ impl NewFileWatchIterator {
     /// behind it is deliberately not indexed.
     pub fn seeded(dir: impl Into<PathBuf>) -> Self {
         let dir = dir.into();
-        let mut seen = HashSet::new();
-        if let Ok(entries) = std::fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                if let Some(id) = mcap_id(&entry.path()) {
-                    seen.insert(id);
-                }
-            }
-        }
+        let seen = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries
+                .flatten()
+                .filter_map(|entry| mcap_id(&entry.path()))
+                .collect(),
+            // A directory that cannot be read seeds nothing, so everything in it
+            // is new on the first pass — the same outcome as a directory that is
+            // genuinely empty, and the pass itself reports the read error.
+            Err(_) => HashSet::new(),
+        };
         Self { dir, seen }
     }
 }
@@ -117,7 +120,15 @@ impl Iterator for NewFileWatchIterator {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        reason = "a failed unwrap or a panicking index is a failing test"
+    )]
+
     use std::fs::File;
+    use std::io::Write;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use anyhow::Result;
@@ -252,7 +263,6 @@ mod tests {
         // Append to `a`, bumping its mtime well past when it was yielded.
         for _ in 0..3 {
             std::thread::sleep(Duration::from_millis(10));
-            use std::io::Write;
             let mut f = File::options().append(true).open(&a)?;
             f.write_all(b"more bytes")?;
             f.sync_all()?;

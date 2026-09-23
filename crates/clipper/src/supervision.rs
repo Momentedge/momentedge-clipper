@@ -15,10 +15,11 @@
 //! - it **panics**, and the closure unwinds without sending, so the channel
 //!   disconnects instead. [`harvest_panic`] then joins the handle — immediate,
 //!   since the disconnect already proves the thread is dead — and lifts the
-//!   panic payload into the error chain via [`panic_text`].
+//!   panic payload into the error chain via [`clip::panic_text`].
 
 use std::thread::{self, JoinHandle};
 
+use clip::panic_text;
 use crossbeam_channel::{Receiver, bounded};
 
 /// One supervised thread: the channel its closure's return value arrives on,
@@ -37,6 +38,12 @@ pub(crate) fn spawn_supervised<T: Send + 'static>(
     f: impl FnOnce() -> T + Send + 'static,
 ) -> Supervised<T> {
     let (tx, rx) = bounded(1);
+    #[expect(
+        clippy::expect_used,
+        reason = "the supervised threads are spawned once at startup; a recorder \
+                  that cannot start its tail or its interface has nothing to do, so \
+                  failing loudly beats a process that runs and records nothing"
+    )]
     let handle = thread::Builder::new()
         .name(name.to_string())
         .spawn(move || {
@@ -46,17 +53,6 @@ pub(crate) fn spawn_supervised<T: Send + 'static>(
         })
         .expect("spawning thread");
     (rx, handle)
-}
-
-/// Render a panic payload (from [`JoinHandle::join`] or
-/// [`std::panic::catch_unwind`]) as text: panics carry a `&str` or `String`
-/// message in practice; anything else gets a placeholder.
-pub(crate) fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
-    payload
-        .downcast_ref::<&str>()
-        .map(|s| s.to_string())
-        .or_else(|| payload.downcast_ref::<String>().cloned())
-        .unwrap_or_else(|| "non-string panic payload".to_string())
 }
 
 /// The error for a supervised thread whose result channel disconnected without

@@ -1,43 +1,46 @@
 //! The outside-facing interface seam: trigger input and completion output as
-//! one unit, in exactly one of two forms selected by `--interface`.
+//! one unit, in exactly one of two forms. Which one a run drives is
+//! `clipper tail --trigger-source` — the flag names where the triggers come
+//! from, and the completion half follows from it, because these two pairings are
+//! the only ones there are ([`Interface::SOURCE`]).
 //!
 //! An [`Interface`] is the only layer that knows ROS from MCAP or one wire
 //! encoding from another. It produces decoded [`Trigger`]s (calling the driver's
 //! `fire` callback) and owns the completion half through its [`Announce`]r:
 //!
-//! - [`RosInterface`] subscribes to the trigger topic on a ROS node and
-//!   publishes `Recorded` on completion. Its `run` owns the node and spawns its
-//!   own spin thread, so the driver supervises one uniform interface thread in
-//!   either mode.
 //! - [`McapInterface`] drains [`TriggerRecord`]s the tail lifts out of the recorded
 //!   MCAP, decoding each by `message_encoding` ([`decode_trigger`]). It touches
-//!   no ROS node, executor, or subscription — the recorder runs ROS-free in this
-//!   mode. Completion is implicit: the clip's atomic move into `out_dir` is the
-//!   signal, so its [`Announce`]r is a no-op.
+//!   no ROS node, executor, or subscription, and it has no announcement channel
+//!   either: completion is a fact on disk, so its [`Announce`]r is a no-op
+//!   ([`NullAnnouncer`]). Every build offers it.
+//! - `ros::RosInterface` subscribes to the trigger topic on a ROS node and
+//!   publishes `Recorded` on completion. Its `run` owns the node and spawns its
+//!   own spin thread, so the driver supervises one uniform interface thread in
+//!   either mode. The `ros` cargo feature compiles it in; without the feature
+//!   the `ros` module does not exist and the recorder links no ROS at all.
 //!
 //! The trait is generic (not `dyn`), so the driver dispatches statically over
 //! whichever interface is active.
 
-use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
 
-use anyhow::Context;
-use crossbeam_channel::{Receiver, select};
-use futures::executor::block_on;
-use futures::stream::{Stream, StreamExt};
-use log::{error, info, warn};
-use r2r::{Publisher, QosProfile};
+use clip::TimeSource;
+use clip::decode::decode_trigger;
+use clip::trigger::{Announce, Completion, Trigger, TriggerRecord};
+use crossbeam_channel::Receiver;
+use log::{info, warn};
 
-use crate::TimeSource;
-use crate::decode::decode_trigger;
-use crate::supervision::{harvest_panic, spawn_supervised};
-use crate::trigger::{Announce, Completion, Trigger, TriggerRecord, now_ns};
+use crate::TriggerSource;
+
+#[cfg(feature = "ros")]
+pub(crate) mod ros;
 
 /// The window anchor an interface resolved for one trigger, plus whether it came
-/// from the trigger's own `trigger_time` field. Exactly one cell of the
-/// interface × `--time-source` matrix reads `trigger_time` (`ros` + `publish`);
-/// every other cell anchors on a transport stamp and ignores it. The driver uses
+/// from the trigger's own `trigger_time` field. At most one cell of the
+/// trigger-source × `--time-source` matrix reads `trigger_time` — `ros` +
+/// `publish`,
+/// so a build without the `ros` feature has no such cell at all; every other
+/// cell anchors on a transport stamp and ignores it. The driver uses
 /// `from_trigger_time` to reject a trigger that set `trigger_time` in a cell that
 /// ignores it — the field would otherwise be silently dropped and the window
 /// mis-anchored (see [`crate::validate_trigger`]).
@@ -63,36 +66,25 @@ fn resolve_mcap_anchor(record: &TriggerRecord, source: TimeSource) -> Anchor {
     }
 }
 
-/// The window anchor the ROS interface resolves for one trigger. A live ROS
-/// trigger has no MCAP record — no `log_time`, no `publish_time`, and r2r
-/// surfaces no wire timestamp — so the interface anchors on what it has. Under
-/// `--time-source log` that is `now` (the subscription instant), faithful to
-/// MCAP's `log_time` definition; the trigger's own `trigger_time` is ignored, so
-/// the anchor is not `from_trigger_time`. Under `--time-source publish` the
-/// publisher's `trigger_time` *is* the anchor — the one cell that reads it,
-/// standing in for the `publish_time` a publisher cannot set on the wire.
-fn resolve_ros_anchor(trigger: &Trigger, source: TimeSource, now: u64) -> Anchor {
-    match source {
-        TimeSource::Log => Anchor {
-            ns: now,
-            from_trigger_time: false,
-        },
-        TimeSource::Publish => Anchor {
-            ns: trigger.trigger_time.ns(),
-            from_trigger_time: true,
-        },
-    }
-}
-
 /// One active interface to the outside world: a trigger source paired with its
-/// completion sink. Exactly one is active per run (`--interface`). Generic so the
-/// driver dispatches statically — no `Box<dyn>`.
+/// completion sink. Exactly one is active per run, and the one that is active is
+/// the trigger source's: `clipper tail --trigger-source` names where the
+/// triggers come from, and [`SOURCE`](Interface::SOURCE) is each implementation
+/// saying which value names it. There is no separate setting for the completion
+/// half — the two cells here are the only pairings, and splitting them would
+/// offer a third (in-recording triggers answered by a `Recorded` publish) that
+/// no build without the `ros` feature could even provide.
+///
+/// Generic so the driver dispatches statically — no `Box<dyn>`.
 pub(crate) trait Interface: Send + Sized + 'static {
     /// The completion sink, cloned once per trigger handler thread.
     type Announcer: Announce;
 
-    /// A short label for logs (`"ros"` / `"mcap"`).
-    fn name(&self) -> &'static str;
+    /// The `--trigger-source` value that selects this interface. It is also the
+    /// label the recorder logs itself up with, so the word an operator types and
+    /// the word the log prints are one fact rather than two strings to keep in
+    /// step.
+    const SOURCE: TriggerSource;
 
     /// A fresh announcer handle for a trigger handler.
     fn announcer(&self) -> Self::Announcer;
@@ -110,159 +102,6 @@ pub(crate) trait Interface: Send + Sized + 'static {
         F: Fn(Trigger, Anchor) + Send + 'static;
 }
 
-// ── ROS interface ───────────────────────────────────────────────────────────
-
-/// The ROS interface: a typed subscription to the trigger topic feeding the
-/// driver, and a `Recorded` publisher behind [`RosAnnouncer`].
-pub(crate) struct RosInterface {
-    node: r2r::Node,
-    sub: Pin<Box<dyn Stream<Item = r2r::momentedge_msgs::msg::Trigger> + Send>>,
-    announcer: RosAnnouncer,
-    /// The clock domain the anchor is resolved on: `log` anchors on the
-    /// subscription instant, `publish` on the trigger's `trigger_time`.
-    time_source: TimeSource,
-}
-
-impl RosInterface {
-    /// Create the node, the trigger subscription, and the `Recorded` publisher.
-    /// `time_source` selects how each trigger's window anchor is resolved.
-    pub(crate) fn new(
-        trigger_topic: &str,
-        recorded_topic: &str,
-        time_source: TimeSource,
-    ) -> anyhow::Result<Self> {
-        let ctx = r2r::Context::create()?;
-        let mut node = r2r::Node::create(ctx, "clipper", "")?;
-        let sub = node.subscribe::<r2r::momentedge_msgs::msg::Trigger>(
-            trigger_topic,
-            QosProfile::default(),
-        )?;
-        let recorded_pub = node.create_publisher::<r2r::momentedge_msgs::msg::Recorded>(
-            recorded_topic,
-            QosProfile::default(),
-        )?;
-        Ok(RosInterface {
-            node,
-            sub: Box::pin(sub),
-            announcer: RosAnnouncer {
-                recorded_pub,
-                recorded_topic: recorded_topic.into(),
-            },
-            time_source,
-        })
-    }
-}
-
-impl Interface for RosInterface {
-    type Announcer = RosAnnouncer;
-
-    fn name(&self) -> &'static str {
-        "ros"
-    }
-
-    fn announcer(&self) -> RosAnnouncer {
-        self.announcer.clone()
-    }
-
-    /// Own the node spin and the subscription drain as two internal supervised
-    /// threads, returning when either resolves. A live subscription needs the
-    /// node spun, so the two run concurrently; encapsulating both here keeps the
-    /// driver's supervision uniform across interfaces, and a dead spin thread
-    /// (which would otherwise silently stall trigger delivery) still surfaces.
-    fn run<F>(self, fire: F) -> anyhow::Result<()>
-    where
-        F: Fn(Trigger, Anchor) + Send + 'static,
-    {
-        let RosInterface {
-            mut node,
-            mut sub,
-            time_source,
-            ..
-        } = self;
-
-        let spin = spawn_supervised("node-spin", move || {
-            loop {
-                node.spin_once(Duration::from_millis(10));
-            }
-        });
-        let drain = spawn_supervised("trigger-drain", move || -> anyhow::Result<()> {
-            while let Some(t) = block_on(sub.next()) {
-                // `t.into()` is the shared r2r-Trigger -> domain-Trigger conversion
-                // (the `From` impl in `crate::decode`). The anchor is resolved on
-                // the active `--time-source`: `now` at this subscription instant
-                // under `log`, the trigger's `trigger_time` under `publish`.
-                let trigger: Trigger = t.into();
-                let anchor = resolve_ros_anchor(&trigger, time_source, now_ns());
-                fire(trigger, anchor);
-            }
-            anyhow::bail!("the trigger subscription stream ended")
-        });
-
-        let (spin_rx, spin_handle) = spin;
-        let (drain_rx, drain_handle) = drain;
-        select! {
-            recv(spin_rx) -> res => match res {
-                Ok(()) => anyhow::bail!("node spin thread exited unexpectedly"),
-                Err(_) => Err(harvest_panic(spin_handle)
-                    .context("node spin thread exited unexpectedly")),
-            },
-            recv(drain_rx) -> res => match res {
-                Ok(r) => r.context("trigger drain ended"),
-                Err(_) => Err(harvest_panic(drain_handle)
-                    .context("trigger drain thread exited unexpectedly")),
-            },
-        }
-    }
-}
-
-/// A finished clip's [`Completion`] maps field-for-field onto the r2r-generated
-/// `momentedge_msgs/Recorded` the ROS interface publishes (its [`Stamp`] onto
-/// the nested `builtin_interfaces/Time`). By reference — the announcer keeps the
-/// `Completion` to log from after the publish. The orphan rule permits this
-/// foreign-target impl because [`Completion`] is local.
-///
-/// [`Stamp`]: crate::trigger::Stamp
-impl From<&Completion> for r2r::momentedge_msgs::msg::Recorded {
-    fn from(completion: &Completion) -> Self {
-        r2r::momentedge_msgs::msg::Recorded {
-            name: completion.name.clone(),
-            filenames: completion.filenames.clone(),
-            description: completion.description.clone(),
-            trigger_time: r2r::builtin_interfaces::msg::Time {
-                sec: completion.trigger_time.sec,
-                nanosec: completion.trigger_time.nanosec,
-            },
-            preroll: completion.preroll,
-        }
-    }
-}
-
-/// The ROS completion sink: publishes a `momentedge_msgs/Recorded` per finished
-/// clip. `Clone` (the r2r `Publisher` is) so every handler thread holds its own;
-/// the topic it publishes on rides along as an `Arc<str>` so the logs name the
-/// topic this announcer was actually built with.
-#[derive(Clone)]
-pub(crate) struct RosAnnouncer {
-    recorded_pub: Publisher<r2r::momentedge_msgs::msg::Recorded>,
-    recorded_topic: Arc<str>,
-}
-
-impl Announce for RosAnnouncer {
-    fn announce(&self, completion: &Completion) {
-        let recorded = r2r::momentedge_msgs::msg::Recorded::from(completion);
-        match self.recorded_pub.publish(&recorded) {
-            Ok(()) => info!(
-                "emitted {} name={:?} filenames={:?}",
-                self.recorded_topic, completion.name, completion.filenames,
-            ),
-            Err(e) => error!(
-                "publishing {} for name={:?} failed: {e}",
-                self.recorded_topic, completion.name,
-            ),
-        }
-    }
-}
-
 // ── MCAP interface ────────────────────────────────────────────────────────────
 
 /// The MCAP interface: drains [`TriggerRecord`]s the tail lifts out of the
@@ -275,7 +114,7 @@ pub(crate) struct McapInterface {
     trigger_topic: Arc<str>,
     /// The clock domain the anchor is read from: each trigger record's own
     /// `log_time` or `publish_time`.
-    time_source: crate::TimeSource,
+    time_source: TimeSource,
 }
 
 impl McapInterface {
@@ -285,7 +124,7 @@ impl McapInterface {
     pub(crate) fn new(
         trigger_topic: &str,
         triggers: Receiver<TriggerRecord>,
-        time_source: crate::TimeSource,
+        time_source: TimeSource,
     ) -> Self {
         McapInterface {
             triggers,
@@ -298,9 +137,7 @@ impl McapInterface {
 impl Interface for McapInterface {
     type Announcer = NullAnnouncer;
 
-    fn name(&self) -> &'static str {
-        "mcap"
-    }
+    const SOURCE: TriggerSource = TriggerSource::Mcap;
 
     fn announcer(&self) -> NullAnnouncer {
         NullAnnouncer
@@ -309,12 +146,14 @@ impl Interface for McapInterface {
     /// Drain the tap until it closes (the tail thread is gone). Each raw trigger
     /// is decoded by `message_encoding`; an undecodable one (unknown encoding or
     /// malformed body) is logged and skipped, never fatal — one bad trigger must
-    /// not stop the recorder.
+    /// not stop the recorder. A `cdr` payload is undecodable in a build without
+    /// the `ros` feature, which links no CDR typesupport; `json` decodes in every
+    /// build.
     fn run<F>(self, fire: F) -> anyhow::Result<()>
     where
         F: Fn(Trigger, Anchor) + Send + 'static,
     {
-        for raw in self.triggers.iter() {
+        for raw in &self.triggers {
             match decode_trigger(&raw.message_encoding, &raw.body) {
                 Ok(trigger) => {
                     // The window anchors on the trigger record's own stamp — its
@@ -344,9 +183,31 @@ impl Interface for McapInterface {
     }
 }
 
-/// The MCAP completion sink: a no-op. The clip's atomic move into `out_dir`
-/// (`clip::publish_clip`) is the announcement; the handler's per-clip `info!`
-/// lines are the log.
+/// The MCAP completion sink: a no-op, because this interface has no completion
+/// channel to send anything down.
+///
+/// **The observer is the consumer of `out_dir`, and it lives outside clipper.**
+/// A run on this interface publishes nothing and opens no socket, so there is
+/// nothing here for a subscriber to attach to; what watches for finished clips
+/// is whatever syncs, uploads or indexes the output directory. Giving this type
+/// a body — a channel, a callback, a sidecar file — would invent a second
+/// completion signal beside the one on disk, and two signals can disagree.
+///
+/// **What clipper owes that observer is one guarantee, and it is an ordering
+/// rather than a message**: a clip directory answers
+/// [`clip::layout::read_document`] only once every MCAP file it names is durable
+/// (`clip::layout::ClipDir::complete` writes the document last and fsyncs it,
+/// the clip directory and the output directory in that order). So the rule an
+/// observer follows is *the document is present*, never *a file appeared*: a
+/// directory holding `<id>_0.mcap` and no `clip_metadata.yaml` is a cut still
+/// running, or the residue of one that was killed, and an observer keying on the
+/// MCAP file would take either for a clip.
+/// `the_observer_completes_on_the_document_and_never_on_a_files_appearance`
+/// drives both rules over one output directory and is where that difference is
+/// pinned.
+///
+/// The handler's per-clip `info!` lines are the log, and the only trace in the
+/// process itself.
 #[derive(Clone)]
 pub(crate) struct NullAnnouncer;
 
@@ -356,26 +217,30 @@ impl Announce for NullAnnouncer {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        reason = "a failed unwrap or a panicking index is a failing test"
+    )]
+
+    use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use crossbeam_channel::unbounded;
 
     use super::*;
-    use crate::trigger::Stamp;
 
-    /// CDR-serialize a `momentedge_msgs/Trigger` the way rosbag2 writes it, so a
-    /// [`TriggerRecord`] with `message_encoding = "cdr"` decodes back to it.
-    fn cdr_trigger_bytes(name: &str) -> Vec<u8> {
-        use r2r::WrappedTypesupport;
-        r2r::momentedge_msgs::msg::Trigger {
-            name: name.to_string(),
-            description: "e2e".to_string(),
-            trigger_time: r2r::builtin_interfaces::msg::Time { sec: 1, nanosec: 2 },
-            preroll: 10,
-            postroll: 20,
-        }
-        .to_serialized_bytes()
-        .expect("serialize")
+    /// A `json` trigger payload, the encoding every build decodes. Its
+    /// `trigger_time` (7_000_000_250 ns) differs from both record stamps the
+    /// tests below give a record, so a resolved anchor can only have come from
+    /// the record.
+    fn json_trigger_bytes(name: &str) -> Vec<u8> {
+        format!(
+            r#"{{"name":"{name}","trigger_time":{{"sec":7,"nanosec":250}},"preroll":1,"postroll":2}}"#
+        )
+        .into_bytes()
     }
 
     fn raw(encoding: &str, body: Vec<u8>, log_time: u64) -> TriggerRecord {
@@ -396,25 +261,46 @@ mod tests {
         }
     }
 
+    /// Drain `records` through the MCAP interface on `source`, returning the
+    /// `(name, anchor)` pair of every trigger it fired, in order. `run` bails
+    /// when the tap closes — expected, since the buffered records are drained
+    /// first.
+    fn drain(records: Vec<TriggerRecord>, source: TimeSource) -> Vec<(String, Anchor)> {
+        let (tx, rx) = unbounded();
+        for record in records {
+            tx.send(record).expect("the interface holds the receiver");
+        }
+        // Drop the sender so `run` drains the buffered records and returns.
+        drop(tx);
+
+        let fired: Arc<Mutex<Vec<(String, Anchor)>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = fired.clone();
+        let iface = McapInterface::new(crate::TRIGGER_TOPIC, rx, source);
+        let _ = iface.run(move |t, anchor| sink.lock().unwrap().push((t.name, anchor)));
+
+        let fired = fired.lock().unwrap();
+        fired.clone()
+    }
+
+    /// The names the interface fired, dropping the anchors.
+    fn fired_names(records: Vec<TriggerRecord>) -> Vec<String> {
+        drain(records, TimeSource::Log)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect()
+    }
+
     /// The McapInterface decodes each tapped record by its `message_encoding` and
     /// fires the callback once per decoded trigger, in order.
     #[test]
     fn mcap_interface_decodes_and_fires_each_trigger() {
-        let (tx, rx) = unbounded();
-        tx.send(raw("cdr", cdr_trigger_bytes("first"), 100))
-            .unwrap();
-        tx.send(raw("cdr", cdr_trigger_bytes("second"), 200))
-            .unwrap();
-        // Drop the sender so `run` drains the buffered records and returns.
-        drop(tx);
-
-        let fired: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let sink = fired.clone();
-        let iface = McapInterface::new(crate::TRIGGER_TOPIC, rx, TimeSource::Log);
-        // `run` bails when the tap closes — expected, the records are drained first.
-        let _ = iface.run(move |t, _anchor| sink.lock().unwrap().push(t.name));
-
-        assert_eq!(*fired.lock().unwrap(), vec!["first", "second"]);
+        assert_eq!(
+            fired_names(vec![
+                raw("json", json_trigger_bytes("first"), 100),
+                raw("json", json_trigger_bytes("second"), 200),
+            ]),
+            vec!["first", "second"]
+        );
     }
 
     /// The failure path: an undecodable record (unknown encoding or malformed
@@ -422,77 +308,56 @@ mod tests {
     /// still fire.
     #[test]
     fn mcap_interface_skips_undecodable_triggers_and_keeps_going() {
-        let (tx, rx) = unbounded();
-        // Unknown encoding — no decoder.
-        tx.send(raw("ros1", b"whatever".to_vec(), 1)).unwrap();
-        // Known encoding, malformed body — decode fails.
-        tx.send(raw("cdr", b"not-a-valid-cdr-trigger".to_vec(), 2))
-            .unwrap();
-        // Malformed JSON — decode fails.
-        tx.send(raw("json", b"{ this is not json".to_vec(), 3))
-            .unwrap();
-        // One good record survives the bad ones on either side.
-        tx.send(raw("cdr", cdr_trigger_bytes("survivor"), 4))
-            .unwrap();
-        drop(tx);
-
-        let fired: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let sink = fired.clone();
-        let iface = McapInterface::new(crate::TRIGGER_TOPIC, rx, TimeSource::Log);
-        let _ = iface.run(move |t, _anchor| sink.lock().unwrap().push(t.name));
-
         assert_eq!(
-            *fired.lock().unwrap(),
+            fired_names(vec![
+                // Unknown encoding — no decoder.
+                raw("ros1", b"whatever".to_vec(), 1),
+                // Known encoding, malformed body — decode fails. (In a build
+                // without the `ros` feature there is no CDR decoder at all, and
+                // the record is skipped for that reason instead.)
+                raw("cdr", b"not-a-valid-cdr-trigger".to_vec(), 2),
+                // Malformed JSON — decode fails.
+                raw("json", b"{ this is not json".to_vec(), 3),
+                // One good record survives the bad ones on either side.
+                raw("json", json_trigger_bytes("survivor"), 4),
+            ]),
             vec!["survivor"],
             "only the one decodable trigger fires; the three bad ones are skipped"
         );
     }
 
-    /// A `Completion` maps field-for-field onto the r2r `Recorded` the ROS
-    /// interface publishes, its `Stamp` onto the nested `builtin_interfaces/Time`.
+    /// CDR is the encoding rosbag2 writes, so the feature build decodes a real
+    /// serialized `momentedge_msgs/Trigger` off the tap — the same rmw
+    /// typesupport path a recorded ROS trigger takes.
+    #[cfg(feature = "ros")]
     #[test]
-    fn completion_maps_onto_recorded() {
-        let completion = Completion {
-            name: "evt".to_string(),
-            filenames: vec!["/out/a.mcap".to_string(), "/out/b.mcap".to_string()],
-            description: "two segments".to_string(),
-            trigger_time: Stamp {
-                sec: 7,
-                nanosec: 250,
-            },
-            preroll: 1_000,
-        };
-        let recorded = r2r::momentedge_msgs::msg::Recorded::from(&completion);
-        assert_eq!(recorded.name, "evt");
-        assert_eq!(recorded.filenames, completion.filenames);
-        assert_eq!(recorded.description, "two segments");
-        assert_eq!(recorded.trigger_time.sec, 7);
-        assert_eq!(recorded.trigger_time.nanosec, 250);
-        assert_eq!(recorded.preroll, 1_000);
+    fn mcap_interface_decodes_a_cdr_trigger_under_the_ros_feature() {
+        use r2r::WrappedTypesupport;
+
+        let body = r2r::momentedge_msgs::msg::Trigger {
+            name: "recorded".to_string(),
+            description: "e2e".to_string(),
+            trigger_time: r2r::builtin_interfaces::msg::Time { sec: 1, nanosec: 2 },
+            preroll: 10,
+            postroll: 20,
+        }
+        .to_serialized_bytes()
+        .expect("serialize");
+
+        assert_eq!(fired_names(vec![raw("cdr", body, 100)]), vec!["recorded"]);
     }
 
-    /// A `json` trigger whose payload `trigger_time` (7_000_000_250 ns) differs
-    /// from both record stamps, so the resolved anchor can only be coming from
-    /// the record. The MCAP interface anchors on the record's `log_time` under
-    /// `--time-source log` and on its `publish_time` under `publish` — never on
-    /// the decoded `trigger_time`.
-    const JSON_TRIGGER: &[u8] =
-        br#"{"name":"t","trigger_time":{"sec":7,"nanosec":250},"preroll":1,"postroll":2}"#;
-
-    /// Drain one `json` trigger record (log_time 100, publish_time 900) through
-    /// the MCAP interface on `source` and return the anchors it fired. Every MCAP
-    /// anchor is resolved from the record, so none is `from_trigger_time`.
+    /// The anchors one `json` record (log_time 100, publish_time 900) resolves to
+    /// on `source`. Every MCAP anchor is resolved from the record, so none is
+    /// `from_trigger_time`.
     fn anchors_for(source: TimeSource) -> Vec<Anchor> {
-        let (tx, rx) = unbounded();
-        tx.send(raw_stamped("json", JSON_TRIGGER.to_vec(), 100, 900))
-            .unwrap();
-        drop(tx);
-        let anchors: Arc<Mutex<Vec<Anchor>>> = Arc::new(Mutex::new(Vec::new()));
-        let sink = anchors.clone();
-        let iface = McapInterface::new(crate::TRIGGER_TOPIC, rx, source);
-        let _ = iface.run(move |_t, anchor| sink.lock().unwrap().push(anchor));
-        let anchors = anchors.lock().unwrap();
-        anchors.clone()
+        drain(
+            vec![raw_stamped("json", json_trigger_bytes("t"), 100, 900)],
+            source,
+        )
+        .into_iter()
+        .map(|(_, anchor)| anchor)
+        .collect()
     }
 
     #[test]
@@ -519,47 +384,132 @@ mod tests {
         );
     }
 
-    /// A domain [`Trigger`] with a given `trigger_time`, for the ROS anchor
-    /// resolvers (which read the domain trigger, not a raw record).
-    fn ros_trigger(trigger_time_ns: u64) -> Trigger {
-        Trigger {
-            name: "t".to_string(),
+    /// Cut one clip into `out_dir` through the MCAP interface's own announcer,
+    /// for a window `[anchor - 1s, anchor]` that no recording covers, and hand
+    /// back its directory. The window end is in the past, so nothing sleeps out
+    /// a postroll, and the short grace is what the (never-arriving) coverage
+    /// wait burns before the empty clip is written.
+    fn cut_through_the_mcap_interface(out_dir: &Path, name: &str) -> PathBuf {
+        let (_tx, rx) = unbounded();
+        let announcer = McapInterface::new(crate::TRIGGER_TOPIC, rx, TimeSource::Log).announcer();
+        let (tailer, _) = tail::Tailer::new();
+        let stage_tx =
+            clip::segment::spawn_stage_workers(1, None, clip::ChannelSelection::default());
+        let trigger = Trigger {
+            name: name.to_string(),
             description: String::new(),
-            trigger_time: Stamp {
-                sec: (trigger_time_ns / 1_000_000_000) as i32,
-                nanosec: (trigger_time_ns % 1_000_000_000) as u32,
-            },
-            preroll: 1,
-            postroll: 2,
-        }
+            trigger_time: clip::Stamp { sec: 0, nanosec: 0 },
+            preroll: 1_000_000_000,
+            postroll: 0,
+        };
+        let anchor_ns = clip::trigger::now_ns();
+
+        tail::handler::handle_trigger(
+            trigger.clone(),
+            anchor_ns,
+            out_dir,
+            Duration::from_millis(50),
+            tailer,
+            stage_tx,
+            Arc::new(tail::CutFaults::new()),
+            announcer,
+            TimeSource::Log,
+            clip::testing::TEST_PRODUCER,
+        )
+        .expect("the cut writes a valid empty clip once the grace expires");
+
+        // Name the directory the way `clip::layout` does rather than by looking
+        // for it: the observer rules below are what is under test here, so the
+        // fixture must not be found by one of them.
+        let request = clip::CutRequest::new(
+            clip::testing::TEST_PRODUCER,
+            trigger,
+            anchor_ns,
+            TimeSource::Log,
+        );
+        let dir = out_dir.join(clip::ClipId::of(&request).to_string());
+        assert!(
+            clip::layout::document_path(&dir).is_file(),
+            "a completed clip carries its document: {}",
+            dir.display()
+        );
+        dir
     }
 
-    /// ROS + `log`: the anchor is `now` (the subscription instant), and the
-    /// trigger's own `trigger_time` is ignored — the resolved anchor is not
-    /// `from_trigger_time`.
-    #[test]
-    fn ros_anchor_under_log_is_now_and_ignores_trigger_time() {
-        let anchor = resolve_ros_anchor(&ros_trigger(7_000_000_250), TimeSource::Log, 42);
-        assert_eq!(
-            anchor,
-            Anchor {
-                ns: 42,
-                from_trigger_time: false
-            }
-        );
+    /// What an observer of `out_dir` calls a clip, given the `rule` it applies to
+    /// each entry: every entry the rule accepts, in a stable order.
+    fn observed(out_dir: &Path, rule: impl Fn(&Path) -> bool) -> Vec<PathBuf> {
+        let mut found: Vec<PathBuf> = std::fs::read_dir(out_dir)
+            .expect("the output directory")
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| rule(path))
+            .collect();
+        found.sort();
+        found
     }
 
-    /// ROS + `publish`: the anchor is the trigger's own `trigger_time` — the one
-    /// cell that reads it — so the resolved anchor is `from_trigger_time`.
+    /// The observer's rule: the clip's document is there, which is what
+    /// [`clip::layout::read_document`] answering at all means.
+    fn has_the_document(dir: &Path) -> bool {
+        clip::layout::read_document(dir).is_ok()
+    }
+
+    /// The rule a consumer must *not* follow: an MCAP file has turned up in the
+    /// directory. It says a copy finished, never that the clip did.
+    fn holds_an_mcap_file(dir: &Path) -> bool {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        entries
+            .flatten()
+            .any(|file| file.path().extension().is_some_and(|ext| ext == "mcap"))
+    }
+
+    /// **T24, the completion half of the `mcap` interface.** The observer is the
+    /// consumer of `out_dir` — this interface publishes nothing — and what it
+    /// completes on is the clip's document, never an MCAP file turning up.
+    ///
+    /// Both rules run over one output directory holding two entries: a clip this
+    /// cut finished, and the residue of a cut that died between naming its files
+    /// and writing its document — which is what a SIGKILL in that window leaves,
+    /// reproduced here by removing the document from a finished clip. The rules
+    /// disagree, which is the whole point: the document finds the one clip,
+    /// while a file's appearance finds the residue too and would hand a consumer
+    /// a clip that was never completed.
+    ///
+    /// Nothing is asserted about an announcement because there is nothing to
+    /// assert: [`NullAnnouncer::announce`] has no body and this interface has no
+    /// channel to publish on, so "no `Recorded` is published here" is a property
+    /// of the build rather than an observation a test can make.
     #[test]
-    fn ros_anchor_under_publish_reads_trigger_time() {
-        let anchor = resolve_ros_anchor(&ros_trigger(7_000_000_250), TimeSource::Publish, 42);
+    fn the_observer_completes_on_the_document_and_never_on_a_files_appearance() -> anyhow::Result<()>
+    {
+        let root = clip::testing::test_dir("mcap-observer")?;
+        let out_dir = root.join("clipped");
+
+        // The cut that died: complete, then stripped of the one file that says
+        // so. Its `<id>_0.mcap` stays, exactly as an interrupted cut leaves it.
+        let residue = cut_through_the_mcap_interface(&out_dir, "killed-mid-cut");
+        std::fs::remove_file(clip::layout::document_path(&residue))?;
+        // The cut that finished.
+        let clip = cut_through_the_mcap_interface(&out_dir, "complete");
+
         assert_eq!(
-            anchor,
-            Anchor {
-                ns: 7_000_000_250,
-                from_trigger_time: true
-            }
+            observed(&out_dir, has_the_document),
+            vec![clip.clone()],
+            "the document is present for the finished clip alone"
         );
+        let mut both = vec![clip, residue];
+        both.sort();
+        assert_eq!(
+            observed(&out_dir, holds_an_mcap_file),
+            both,
+            "and an observer keying on an MCAP file would have taken the residue \
+             for a clip too — which is why the rule is the document"
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
     }
 }

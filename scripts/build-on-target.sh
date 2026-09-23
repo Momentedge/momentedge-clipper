@@ -16,8 +16,9 @@
 # Produces, under the repo root:
 #   install/                  colcon overlay carrying momentedge_msgs typesupport
 #   target/release/clipper, target/release/trigger-pub
-# trigger-pub is run by examples/trigger-pub/start_demo_trigger_pub.sh; clipper
-# is run with scripts/record.sh per deployment.
+# trigger-pub is run by examples/trigger-pub/start_demo_trigger_pub.sh;
+# `clipper tail` is run by scripts/run.sh, against the recording scripts/record.sh
+# writes.
 #
 # Override the ROS install with ROS_SETUP=/opt/ros/<distro>/setup.bash.
 set -euo pipefail
@@ -35,14 +36,31 @@ cd "$REPO_ROOT"
 # 2. Build the binaries through scripts/ros-cargo.sh, which sources ROS + the
 #    just-built overlay and adds the r2r codegen env (IDL_PACKAGE_FILTER) and any
 #    MOMENTEDGE_RPATH. Both deployables by default; the .deb build sets
-#    BUILD_PACKAGES=clipper, the only binary it packages.
+#    BUILD_PACKAGES=clipper, the only one it packages.
+#
+#    --features clipper/ros is what makes clipper the device build. ROS is a
+#    cargo feature of the recorder and it is off by default, so without this flag
+#    the binary would link no ROS and offer no `--trigger-source ros` — exactly
+#    the wrong artefact for a target set up with an apt ROS2 above. The flag is
+#    added only when clipper is selected: cargo rejects a `<pkg>/<feature>`
+#    naming a package no `-p` picked. trigger-pub has no such feature; it links
+#    r2r unconditionally.
 read -ra _build_pkgs <<< "${BUILD_PACKAGES:-clipper trigger-pub}"
 _pkg_flags=()
-for _p in "${_build_pkgs[@]}"; do _pkg_flags+=(-p "$_p"); done
-"$REPO_ROOT/scripts/ros-cargo.sh" build --release "${_pkg_flags[@]}"
+_feature_flags=()
+for _p in "${_build_pkgs[@]}"; do
+  _pkg_flags+=(-p "$_p")
+  if [[ "$_p" == clipper ]]; then
+    _feature_flags=(--features clipper/ros)
+  fi
+done
+"$REPO_ROOT/scripts/ros-cargo.sh" build --release "${_feature_flags[@]}" "${_pkg_flags[@]}"
 
 echo
 echo "built:"
-for _p in "${_build_pkgs[@]}"; do echo "  $REPO_ROOT/target/release/$_p"; done
-echo "run the recorder: scripts/record.sh + target/release/clipper"
+# Each package here builds one binary of the same name.
+for _p in "${_build_pkgs[@]}"; do
+  echo "  $REPO_ROOT/target/release/$_p"
+done
+echo "run the recorder: scripts/record.sh + target/release/clipper tail"
 echo "run the demo trigger: examples/trigger-pub/start_demo_trigger_pub.sh (needs trigger-pub built)"

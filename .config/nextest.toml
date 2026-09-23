@@ -1,6 +1,6 @@
 # Repo-wide cargo-nextest configuration. The `e2e` profile is the required
 # runner for the live ROS2 suite (crates/clipper/tests/e2e.rs) —
-# see README "Integration tests (live ROS2 e2e)".
+# see the `build` skill, "Live ROS 2 e2e suite".
 
 # One live test at a time: every e2e test drives a real `ros2 bag record`
 # against the disk and a real DDS graph; concurrent suites would compete for
@@ -30,12 +30,6 @@ leak-timeout = "2s"
 [[profile.e2e.overrides]]
 filter = "binary(e2e)"
 test-group = "ros-e2e"
-
-# Live damage injection races the tail's scan by design — the closest test to
-# real corruption, and the one acknowledged flaky case.
-[[profile.e2e.overrides]]
-filter = "test(corrupt_tail_health_live)"
-retries = 2
 
 # The copper live e2e builds its Producer fixture (the cu-mcap-record member)
 # on demand with `-p cu-mcap-record` when no prebuilt binary is present. That

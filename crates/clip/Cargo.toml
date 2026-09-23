@@ -1,0 +1,81 @@
+[package]
+name = "clip"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+# Read at compile time as `producer.url` in every clip's manifest, so the crate
+# that writes the record is the crate that names the project.
+repository.workspace = true
+description = "MCAP recording index, cut path and trigger contract shared by every consumer of a recording"
+
+[features]
+default = []
+# The CDR arm of the trigger decoder, and the `From<r2r …Trigger>` conversion the
+# live ROS interface shares with it. Both need r2r's rmw deserialization (the
+# linked rmw library only — never a node), so they sit behind this feature and a
+# default build pulls no r2r: a ROS-free consumer of a recording never links the
+# ROS toolchain. `json` triggers decode either way.
+ros = ["dep:r2r"]
+# `TimeSource` as a clap `ValueEnum`, for a binary that takes the clock domain on
+# its command line. Off by default so a library consumer never links clap.
+clap = ["dep:clap"]
+# Publishes the MCAP fixture writers in `clip::testing` — the same recordings
+# this crate's own tests are built from — so a downstream crate's tests write
+# their fixtures through them instead of keeping a copy that drifts from what the
+# scan expects. A dev-only opt-in: a consumer enables it under
+# `[dev-dependencies]`, where the v2+ resolver keeps it out of a normal build, so
+# a release binary compiles no fixture code.
+test-support = []
+
+[dependencies]
+# MCAP record parsing (`parse_record`, `read::ChunkReader`) for the incremental
+# scan and the cut — both own their opcode + length framing, so the halt-on-first-
+# error `LinearReader` is deliberately unused — and `Writer` for the clip output.
+mcap.workspace = true
+# Error plumbing for the scan and the cut.
+anyhow.workspace = true
+# The typed error enums this crate hands its callers: `whole::OpenError` and the
+# `whole::IndexRefusal` taxonomy under it, where the caller branches on which
+# fault a recording has rather than on the text of a message.
+thiserror.workspace = true
+# Logging via the `log` facade; the binary picks the backend.
+log.workspace = true
+# The scan's trigger tap and the staging worker pool are both channel-shaped: the
+# tap sends lifted `TriggerRecord`s at the far end, and each stage job carries its
+# own reply channel.
+crossbeam-channel.workspace = true
+# `json` trigger payloads: `Trigger` derives `Deserialize`, `serde_json` parses.
+# The configuration file's own shape derives `Deserialize` through the same
+# `derive` feature.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# The rosbag2 `metadata.yaml` a bag directory carries (`clip::bag`): the split
+# order it states, and the per-topic counts that cross-check the collection.
+serde_norway.workspace = true
+# The configuration file's format (`clip::config`). TOML rather than JSON so an
+# operator's file may carry comments, and rather than YAML so the parser is one
+# a Rust workspace already builds.
+toml = "1"
+# The digest a clip's id is derived from (`clip::id`): SHA-256 over the
+# canonical encoding of the six trigger fields the id is a function of.
+sha2.workspace = true
+# The two regular-expression forms of the topic selection (`clip::select`).
+# Linear-time matching with no backtracking, so a pattern out of a configuration
+# file cannot cost the recorder a topic match it never finishes.
+regex = "1"
+# ROS2 client bindings, `ros` only: the rmw typesupport the `cdr` trigger decoder
+# deserializes through, and the generated `momentedge_msgs/Trigger` the `From`
+# impl maps onto the neutral domain type.
+r2r = { workspace = true, optional = true }
+# CLI value parsing, `clap` only: derives `ValueEnum` for `TimeSource`.
+clap = { workspace = true, optional = true }
+
+# The workspace lint policy (root `Cargo.toml`), inherited whole: cargo cannot
+# override a workspace lint per member, so what this crate keeps against the
+# policy is an `#[expect(lint, reason = "…")]` in the source instead. The two
+# that recur here are `wildcard_enum_match_arm` at each match over
+# `mcap::records::Record` — a foreign `#[non_exhaustive]` enum upstream may add
+# variants to that this crate has no opinion about — and `indexing_slicing`
+# inside the index's own accessors, where indexing is the design.
+[lints]
+workspace = true

@@ -5,7 +5,7 @@
 //! development.
 //!
 //! `trigger_time` is left zero by default. clipper reads `trigger_time` only
-//! under `--interface ros --time-source publish`; every other cell (including the
+//! under `--trigger-source ros --time-source publish`; every other cell (including the
 //! default `--time-source log`) anchors the window on the recorder's own receipt
 //! instant and *rejects* a trigger that sets `trigger_time`, so the default dev
 //! loop must send zero. Pass `--stamp-trigger-time` to stamp it with the current
@@ -29,8 +29,9 @@
 //! recorder sees varied clip lengths during development. Pass either flag to pin
 //! that side to a fixed nanosecond value.
 //!
-//! Logging uses the `log` facade with a pretty_env_logger backend; `RUST_LOG`
-//! controls verbosity (defaults to `info`).
+//! Logging uses the `log` facade with a pretty_env_logger backend and goes to
+//! **stdout**, matching the recorder; `RUST_LOG` controls verbosity (defaults
+//! to `info`).
 
 use std::time::Duration;
 
@@ -48,8 +49,8 @@ struct Args {
     name: String,
     description: String,
     /// Stamp `trigger_time` with RosTime at publish. Off by default: only
-    /// `--interface ros --time-source publish` reads `trigger_time`; the other
-    /// cells reject a non-zero one, so the default sends zero.
+    /// `--trigger-source ros --time-source publish` reads `trigger_time`; the
+    /// other cells reject a non-zero one, so the default sends zero.
     stamp_trigger_time: bool,
 }
 
@@ -66,6 +67,11 @@ impl Default for Args {
     }
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "an example's argv parsing: a bad flag ends the run before anything \
+              is published, which is the whole contract this parser has"
+)]
 fn parse_args() -> Args {
     let mut args = Args::default();
     let mut it = std::env::args().skip(1);
@@ -73,7 +79,7 @@ fn parse_args() -> Args {
         let mut value = || it.next().expect("flag needs a value");
         match flag.as_str() {
             "--period" => {
-                args.period = Duration::from_secs_f64(value().parse().expect("--period: number"))
+                args.period = Duration::from_secs_f64(value().parse().expect("--period: number"));
             }
             "--preroll" => args.preroll = Some(value().parse().expect("--preroll: u64 ns")),
             "--postroll" => args.postroll = Some(value().parse().expect("--postroll: u64 ns")),
@@ -93,7 +99,10 @@ fn resolve_roll(fixed: Option<u64>) -> u64 {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // stdout, like the recorder; `Target` comes through the `env_logger` that
+    // `pretty_env_logger` re-exports.
     pretty_env_logger::formatted_builder()
+        .target(pretty_env_logger::env_logger::fmt::Target::Stdout)
         .filter_level(log::LevelFilter::Info)
         .parse_default_env()
         .init();
@@ -127,9 +136,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut counter: u64 = 0;
     loop {
-        // Zero unless --stamp-trigger-time: clipper reads trigger_time only under
-        // --interface ros --time-source publish and rejects a non-zero one in
-        // every other cell.
+        // Zero unless --stamp-trigger-time: clipper reads trigger_time only
+        // under --trigger-source ros --time-source publish and rejects a
+        // non-zero one in every other cell.
         let trigger_time = if args.stamp_trigger_time {
             r2r::Clock::to_builtin_time(&clock.get_now()?)
         } else {

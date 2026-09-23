@@ -8,7 +8,7 @@ keeps that file open and cuts clips from it on each trigger.
 ros2 bag record --all ──one growing mcap──▶ ./record/<bag>_0.mcap
        ▲ kept open + tailed
 clipper ◀── /events/momentedge/trigger
-       ├──▶ ./clipped/<anchor_ns>_<name>.mcap
+       ├──▶ ./clipped/<anchor_ns>_<hash>/   (the clip: <id>_N.mcap + clip_metadata.yaml)
        └──▶ /events/momentedge/recorded
 ```
 
@@ -33,13 +33,19 @@ ros2 bag record --all \
 ## Run clipper
 
 ```bash
-./scripts/run.sh                    # clipper --record-dir ./record …
+./scripts/run.sh                    # clipper tail --record-dir ./record …
 # or, in the dev shell without an install:
-cargo run -p clipper -- --record-dir ./record --out-dir ./clipped --grace-secs 30
+cargo run -p clipper --features ros -- tail \
+  --record-dir ./record --out-dir ./clipped --grace-secs 30
 ```
 
 Fire test triggers with `cargo run -p trigger-pub` (or publish
 `momentedge_msgs/Trigger` on `/events/momentedge/trigger` yourself).
+
+`--features ros` is what puts the live trigger subscription in the binary: ROS is
+a cargo feature of the recorder and it is off by default, so without it clipper
+runs on `--trigger-source mcap` and reads its triggers out of the recording
+instead of off the topic. See the README's [Install](../../README.md#install).
 
 ## The two latency knobs
 
@@ -94,7 +100,7 @@ ros2 bag record --all \
   --max-cache-size 0 \
   --output ./record
 
-clipper --record-dir ./record --grace-secs 2
+clipper tail --record-dir ./record --grace-secs 2
 ```
 
 ## Retention

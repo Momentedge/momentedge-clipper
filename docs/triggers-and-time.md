@@ -1,0 +1,185 @@
+# Triggers and time
+
+What a trigger is, how it reaches clipper, and which clock the window it asks
+for lives on. For cutting from a recording that is already finished, see
+[`clipper clip`](clip-command.md); for the flags named here, see
+[Configuration](configuration.md). The words this page leans on — anchor, window,
+trigger source, and the several instants a message can be said to have happened
+at — are each defined once in the [glossary](../CONTEXT.md).
+
+## The trigger message
+
+A trigger is a `momentedge_msgs/Trigger` message:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `name` | `string` | trigger identifier; free text, recorded in the clip's [manifest](clip-manifest.md) and echoed in `Recorded` |
+| `description` | `string` | optional free-form context |
+| `trigger_time` | `builtin_interfaces/Time` | publish-domain anchor; read only under `--trigger-source ros --time-source publish` (see [the anchor matrix](#the-anchor-which-instant-the-window-centres-on)), must be `0` in every other cell |
+| `preroll` | `uint64` | nanoseconds before the anchor to keep |
+| `postroll` | `uint64` | nanoseconds after the anchor to keep |
+
+**Validation.** Every field is checked before any work; a trigger failing any
+check is logged at `error!` and ignored — no clip, no `Recorded`. The limits
+(each value exactly at its bound is accepted):
+
+- `preroll` and `postroll` — at most **30 minutes** (`1_800_000_000_000` ns) each.
+- The resolved **anchor** — at most **30 minutes** past the current clock. The
+  anchor drives the window's wait, so a far-future one (a producer clock fault or
+  a hostile record stamp) is refused rather than parking a handler for that long.
+- `name` — at most **128 bytes**. That is the whole of it: the name reaches the
+  clip's `clip_metadata.yaml` and the `Recorded` echo and never a path, so `/`,
+  `..`, a leading dot, unicode and the empty string are all ordinary names.
+- `trigger_time` — `0` except in the one cell that reads it (`--trigger-source
+  ros --time-source publish`); non-zero elsewhere is rejected (see
+  [the anchor matrix](#the-anchor-which-instant-the-window-centres-on)).
+
+For each finished clip, clipper publishes a `momentedge_msgs/Recorded` on
+`/events/momentedge/recorded`, echoing the trigger's `name`, `description`,
+`trigger_time` and `preroll`, and naming the clip in its `string[] filenames`.
+**`filenames` holds exactly one entry — the clip's directory** — however many
+MCAP files the clip took, so a subscriber opens one handle per clip and never
+learns the naming scheme inside it; which files are in there is the clip's own
+[`clip_metadata.yaml`](clip-manifest.md) to say.
+
+The announcement goes out only once that `clip_metadata.yaml` is written and
+fsynced, so a `Recorded` always names a clip that is complete and already
+survives power loss.
+
+**What the trigger decides about the clip's name.** A clip is a directory named
+by its **id**, `<anchor_ns>_<hash>`: the resolved window anchor, then a digest
+over the six fields the request is — the anchor, `name`, `description`,
+`preroll`, `postroll`, and the run's time source.
+
+```
+./clipped/1726300000000000000_fc43-6475-ade8-4730/
+  1726300000000000000_fc43-6475-ade8-4730_0.mcap
+  clip_metadata.yaml
+```
+
+Inside it, one `<id>_N.mcap` per source recording the window crossed — one file
+for a window inside a single recording, one per recording for a window that
+straddles a rollover — and `clip_metadata.yaml` written last. The layout in full
+is [What a clip carries](clip-manifest.md). Three things follow for whoever
+writes the triggers:
+
+- **Two detectors firing on one instant get their own clips**, as long as
+  anything about the two requests differs — a different name, a different
+  description, a different roll. A change to any of the six yields a different
+  id, the description included.
+- **The same request always names the same clip**, on every machine and every
+  clipper version, so a producer can predict a clip's directory before it
+  exists. The encoding is a published contract, with a worked vector, in
+  [What a clip carries](clip-manifest.md#the-clip-id).
+- **A trigger resolving to an id already on disk is skipped** with a warning and
+  announced not at all: a clip is written once. A repeated trigger, and a
+  restarted recorder meeting its own earlier clips, both leave what is there
+  exactly as it is — see
+  [What `--out-dir` holds](operating.md#what---out-dir-holds).
+
+## Two ways in: `ros` and `mcap`
+
+Where `clipper tail`'s triggers come from is one choice, set by
+`--trigger-source`, and exactly one source is active per launch. The **completion
+half follows from it** — there is no second setting for how a finished clip is
+announced:
+
+- **`ros`** (the deployed path, and the default where it exists) subscribes to
+  `/events/momentedge/trigger` and publishes `momentedge_msgs/Recorded` on
+  `/events/momentedge/recorded`.
+- **`mcap`** reads triggers straight out of the recording clipper already tails
+  (run `ros2 bag record --all` so the trigger topic is captured) and runs
+  **ROS-free** — no node, subscription, or publisher. It publishes nothing, so
+  the clip's `clip_metadata.yaml` appearing in `--out-dir` is the only
+  completion signal.
+
+Both cut identical clips; only the trigger and completion edges differ.
+
+**What "finished" means on disk is one rule, and it is the same under either
+source: a clip directory is complete when it holds `clip_metadata.yaml`, and not
+before.** Under `ros` the `Recorded` publish rides on that rule and is simply an
+earlier notice of it; under `mcap` the document's appearance is the only signal
+there is. Either way a consumer watching `--out-dir` keys on the document and
+never on an MCAP file turning up — a directory holding `<id>_0.mcap` and no
+document is a cut still running, or what a cut that was killed left behind, and
+a watcher looking for files would take either for a clip. What else that
+directory can hold is [Operating clipper](operating.md#what---out-dir-holds).
+
+`ros` is the source the `ros` cargo feature adds, so a
+[ROS-free build](../README.md#install) offers `mcap` alone and takes it by default, and
+`clipper tail --help` lists the values the binary in front of you accepts. Asking
+a build for a source it does not carry is a parse error naming the value and
+listing what it does take.
+
+The `mcap` source decodes each trigger by its MCAP `message_encoding`: `json`
+decodes in every build, while `cdr` — what `ros2 bag record` writes — needs the
+rmw typesupport the same feature links, and a ROS-free build skips such a trigger
+with an error naming the feature. So a ROS-free deployment wants a producer that
+writes its triggers as `json` (see
+[`examples/custom-mcap-writer`](../examples/custom-mcap-writer/README.md)).
+
+**`mcap` means the same thing on both sides of the recording's end.**
+`--trigger-source` is one key spanning both subcommands, and its `mcap` value
+names the recorded trigger in either: under `clipper tail` the tailed recording
+that is still growing, under
+[`clipper clip`](clip-command.md#where-a-clip-runs-triggers-come-from-param-and-mcap)
+the finished one. Same topic, same decoder, same anchor rule — so a trigger
+stream that drives the recorder on the vehicle re-cuts the same clips from the
+bag afterwards. The values that do not span both are the ones with nowhere to
+land: `ros` is a live subscription, which a finished recording has none of, and
+`param` names a single trigger on the command line, which a run with no end has
+no use for.
+
+## Time source: `log` or `publish`
+
+`--time-source` picks the clock domain the **whole clip window** lives in — the
+anchor it centres on, which messages fall inside it, which bytes are read, and
+the coverage a cut waits for. Every MCAP message carries two stamps, and clipper
+windows on whichever the flag selects:
+
+- **`log`** (the default) — the message's `log_time`: when the producer received
+  it. One writer stamps every recording in receive order, so log times run
+  (approximately) non-decreasing on disk. Coverage on `log` is a *completeness*
+  proof: once it passes a window end, every in-window message is on disk.
+- **`publish`** — the message's `publish_time`: whatever the producer wrote
+  there. `ros2 bag record` fills it with the DDS source timestamp; a momentedge
+  writer fills it with the capture time (see
+  [`examples/custom-mcap-writer`](../examples/custom-mcap-writer/README.md)). clipper
+  never interprets it — it windows on the raw value.
+
+## The anchor: which instant the window centres on
+
+The window centres on an **anchor** the active trigger source resolves from what
+it has. A live ROS trigger carries no recording stamp, so the `ros` source
+anchors on `now` or the publisher's `trigger_time`; an in-recording trigger
+carries its own stamps, so the `mcap` source anchors on those. The four
+`--trigger-source` × `--time-source` cells resolve it thus:
+
+| | `--time-source log` | `--time-source publish` |
+|---|---|---|
+| **`--trigger-source ros`** | `now` at the subscription instant | the trigger's `trigger_time` |
+| **`--trigger-source mcap`** | the trigger record's `log_time` | the trigger record's `publish_time` |
+
+**`trigger_time` is read in exactly one cell — `ros` + `publish`.** There it is
+the anchor: a publisher declaring its own publish-domain instant, standing in for
+the `publish_time` it cannot set on the wire, so a request like "clip around ten
+minutes ago" lands where it means to. Every other cell anchors on a transport
+stamp and **rejects** a trigger that sets a non-zero `trigger_time` — logging it
+at `error!` and cutting no clip — rather than silently dropping the field and
+mis-anchoring the window. A producer for those cells must send `trigger_time = 0`
+(the [`trigger-pub`](../examples/trigger-pub/README.md) example does by default).
+
+Retention is unaffected by the flag — a recording is always aged out on its
+`log_time`, so a producer cannot drive file deletion through `publish_time`.
+
+**Publish coverage is a liveness signal, not a completeness proof.** Publish
+times carry no ordering guarantee; out-of-order arrival is normal. Under
+`--time-source publish` a message can land on disk *after* a cut with a
+`publish_time` that falls inside the window, and is then missing from that clip.
+`--grace-secs` bounds how long a cut waits, exactly as on `log`.
+
+**On Humble, `--time-source publish` is a no-op.** Humble's
+`rosbag2_storage_mcap` writes `publish_time = log_time` verbatim, so the two
+domains are identical there. It differs on Jazzy and newer (where `publish_time`
+is the DDS source timestamp) and for a momentedge writer (capture time).
+

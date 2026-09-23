@@ -1,15 +1,62 @@
 ---
 name: packaging
 description: >
-  How clipper ships as Debian packages — the bloom (momentedge_msgs) + cargo-deb
-  (clipper) two-deb pipeline, its run model, and the gotchas. Use when editing the
-  packaging scripts, crates/clipper/Cargo.toml [package.metadata.deb], the
+  How clipper ships — the device build's bloom (momentedge_msgs) + cargo-deb
+  (clipper) two-deb pipeline, and the ROS-free build's nix package. Their run
+  models and gotchas. Use when editing the packaging scripts,
+  crates/clipper/Cargo.toml [package.metadata.deb], nix/clipper-ros-free.nix, the
   release.yml deb job, or building/verifying the .debs on the target or under act.
 ---
 
-# Packaging — two debs, two tools
+# Packaging
 
-clipper deploys as **two Debian packages**, each built the way the ROS2 ecosystem
+The recorder's two builds ship as two kinds of artefact, and neither is a
+repackaging of the other:
+
+| Build | Ships as | Produced by | Runs on |
+|---|---|---|---|
+| `--features ros` — the device build | two Debian packages | bloom + cargo-deb, natively on the target | a ROS 2 device, against its own apt ROS 2 |
+| default — ROS-free | one nix package, `clipper-ros-free` | `nix build .#clipper-ros-free` | anywhere; it links no ROS |
+
+Both carry the same single executable, `clipper`, whose modes are subcommands.
+The **`build`** skill owns the cargo feature and the flake's package set; this
+skill owns how each artefact is produced and verified.
+
+## The ROS-free artefact: one nix package, no deb
+
+```bash
+nix build .#clipper-ros-free              # -> ./result/bin/clipper
+nix run .#clipper-ros-free -- tail --help
+```
+
+[`nix/clipper-ros-free.nix`](nix/clipper-ros-free.nix) is a plain
+`rustPlatform.buildRustPackage` of `-p clipper` with no features: no `rosEnv`, no
+`IDL_PACKAGE_FILTER`, no distro. The result's only dynamic dependencies are libc
+and libgcc, so the store path is the whole artefact — `nix copy` it to a host
+with no ROS 2 and it runs. It still needs the r2r vendor hash
+(`cargoOutputHashes` in `flake.nix`), because `Cargo.lock` carries r2r's git
+source whether or not a feature enables it: nix fetches the crate and cargo never
+compiles it.
+
+**It gets no Debian package, deliberately.** A deb earns its keep by letting apt
+resolve the device build's ROS dependencies — `ros-<distro>-ros-base`,
+`rmw-fastrtps-cpp`, `momentedge-msgs`. That entire `Depends` list is precisely
+what the ROS-free binary does not have, and nothing about the way it is deployed
+wants apt. An OCI image built from this package is the natural next artefact, and
+belongs to whatever pipeline runs it.
+
+**What proves it.** The derivation's `installCheckPhase`, in a sandbox that holds
+no ROS 2 of any kind: `clipper --help` and
+`clipper tail --trigger-source mcap --help` running at all prove the binary
+needs none, and `clipper tail --trigger-source ros` must fail with clap's
+`invalid value 'ros'`. Asserting that parse error rather than merely a non-zero
+exit is what makes the check bite — a build that leaked the `ros` feature would
+accept the flag and start a recorder, whose own exit status says nothing about
+which trigger sources the binary offers.
+
+## The device artefact: two debs, two tools
+
+The device build deploys as **two Debian packages**, each built the way the ROS2 ecosystem
 builds its kind. This is the rule, not an accident: **bloom only understands ament
 build types (`ament_cmake`/`ament_python`/`cmake`/`catkin`) — it has no cargo build
 type**, so it cannot build the Rust crate; **cargo-deb is the idiomatic deb tool for
@@ -18,7 +65,7 @@ a Cargo binary**. So:
 | Package | Source | Tool | Script | Installs to |
 |---|---|---|---|---|
 | `ros-<distro>-momentedge-msgs` | `momentedge_msgs/` (ament_cmake) | **bloom** | `scripts/package-msgs-deb.sh` | `/opt/ros/<distro>` |
-| `momentedge-clipper` | `crates/clipper` (Rust/r2r) | **cargo-deb** | `scripts/package-clipper-deb.sh` | `/opt/momentedge-clipper/bin` |
+| `momentedge-clipper` | `crates/clipper` (Rust/r2r) | **cargo-deb** | `scripts/package-clipper-deb.sh` | `/opt/momentedge-clipper/bin` (as `clipper`) |
 
 `momentedge-clipper` declares `Depends: ros-<distro>-momentedge-msgs,
 ros-<distro>-rmw-fastrtps-cpp, ros-<distro>-ros-base`. The msgs package is a
@@ -28,10 +75,10 @@ bundled overlay** — its message typesupport resolves through the distro's own
 
 ## Run model: no baked rpath, source setup.bash
 
-The clipper binary is built **without `MOMENTEDGE_RPATH`** (the optional rpath knob
-in `ros-cargo.sh` stays unset), so it carries **no RUNPATH**. It resolves `rcl`/`rmw`
-and the `momentedge_msgs` typesupport — including the dlopen'd rmw-specific
-`libmomentedge_msgs__rosidl_typesupport_fastrtps_c.so` — through
+The recorder binary, `clipper`, is built **without `MOMENTEDGE_RPATH`** (the
+optional rpath knob in `ros-cargo.sh` stays unset), so it carries **no RUNPATH**.
+It resolves `rcl`/`rmw` and the `momentedge_msgs` typesupport — including the dlopen'd
+rmw-specific `libmomentedge_msgs__rosidl_typesupport_fastrtps_c.so` — through
 `LD_LIBRARY_PATH`/`AMENT_PREFIX_PATH` set by sourcing `/opt/ros/<distro>/setup.bash`.
 The msgs package puts those `.so` files in `/opt/ros/<distro>/lib`, which the distro
 `setup.bash` already covers. Run it:
@@ -42,9 +89,12 @@ source /opt/ros/humble/setup.bash
 /opt/momentedge-clipper/bin/clipper --help
 ```
 
-A systemd unit does the same: source `/opt/ros/<distro>/setup.bash` in `ExecStart`,
-or set the equivalent `Environment=`/`LD_LIBRARY_PATH`. There is **no overlay
-`setup.bash` and no launcher wrapper** in the clipper package — only the binary.
+The mode is a subcommand, so what a unit file's `ExecStart` names is
+`/opt/momentedge-clipper/bin/clipper tail`; the bare binary with recorder flags
+is refused. A systemd unit sources `/opt/ros/<distro>/setup.bash` in `ExecStart`,
+or sets the equivalent `Environment=`/`LD_LIBRARY_PATH`. There is **no overlay
+`setup.bash` and no launcher wrapper** in the clipper package — the one
+executable is all of it.
 
 ## Build both debs
 
@@ -59,8 +109,9 @@ ROS_DISTRO=humble ./scripts/package-clipper-deb.sh     # cargo-deb --no-build ->
 
 Both `.deb` files land in `dist/`. `release.yml`'s `deb` job runs exactly this per
 distro (humble/jazzy) on native arm64 runners, then a smoke-test that installs both
-and runs `clipper`. `cargo install cargo-deb --locked` and `python3-bloom fakeroot
-debhelper dpkg-dev` are the build prerequisites beyond `setup-ros` + `libclang`.
+and runs the recorder under both installed names. `cargo install cargo-deb --locked`
+and `python3-bloom fakeroot debhelper dpkg-dev` are the build prerequisites beyond
+`setup-ros` + `libclang`.
 
 **One naming convention, one version.** Both scripts emit
 `<pkg>_<VERSION>_ubuntu<YY.MM>-<distro>_<arch>.deb` (e.g.
@@ -89,31 +140,46 @@ artifact/release steps are `!env.ACT`-gated, so act never publishes.
 
 ## Verify on the target (authoritative arm64)
 
-The deployment box is the Jetson (`momentedge@momentedge-desktop`, aarch64 Ubuntu
-22.04 / ROS2 Humble). Build there for a real arm64/Humble proof. The strong test is
-to install **both** debs into a clean state and run clipper sourcing **only**
-`/opt/ros/<distro>/setup.bash` (not the build overlay), proving the typesupport
-comes from the installed msgs package:
+The board to build and verify on is **`jetson@jetson.stfl.dev`** — a Jetson
+running aarch64 Ubuntu 24.04 with ROS 2 **jazzy**. Building there is the real
+arm64/jazzy proof; both debs build, install and smoke-test green on it. The
+strong test is to install **both** debs into a clean state and run clipper
+sourcing **only** `/opt/ros/jazzy/setup.bash` (not the build overlay), proving
+the typesupport comes from the installed msgs package:
 
 ```bash
-sudo dpkg --purge momentedge-clipper ros-humble-momentedge-msgs   # clean slate
-sudo apt install ./dist/ros-humble-momentedge-msgs_*.deb ./dist/momentedge-clipper_*.deb
-readelf -d /opt/momentedge-clipper/bin/clipper | grep -i runpath   # expect: none
-source /opt/ros/humble/setup.bash
-ldd /opt/momentedge-clipper/bin/clipper | grep momentedge          # => /opt/ros/humble/lib/...
-RUST_LOG=info MOMENTEDGE_RECORD_DIR=$(mktemp -d) timeout -s INT 6 /opt/momentedge-clipper/bin/clipper
+sudo dpkg --purge momentedge-clipper ros-jazzy-momentedge-msgs    # clean slate
+sudo apt install ./dist/ros-jazzy-momentedge-msgs_*.deb ./dist/momentedge-clipper_*.deb
+bin=/opt/momentedge-clipper/bin
+dpkg -L momentedge-clipper                                  # one executable, no symlink
+readelf -d "$bin/clipper" | grep -i runpath                 # expect: none
+source /opt/ros/jazzy/setup.bash
+ldd "$bin/clipper" | grep momentedge                        # => /opt/ros/jazzy/lib/...
+"$bin/clipper" --help                                       # lists the modes
+"$bin/clipper" tail --help                                  # lists the recorder's flags
+RUST_LOG=info MOMENTEDGE_RECORD_DIR=$(mktemp -d) timeout -s INT 6 "$bin/clipper" tail
 ```
 
+The humble half of the release matrix has no board here; CI's native arm64
+runners are what cover it.
+
 Success: `ldd` resolves the typesupport from `/opt/ros/<distro>/lib` (the apt
-package, not the build overlay or a baked rpath), clipper logs `clipper up: ...`,
-idles, then `SIGINT received; shutting down`.
+package, not the build overlay or a baked rpath), and the recorder logs
+`clipper tail up: ...`, idles, then `SIGINT received; shutting down`.
+`release.yml`'s smoke-test step asserts the same per distro, plus that a bare
+`clipper --record-dir …` is refused (its shape is in the **`ci`** skill) — keep
+the two in step.
 
 ## Gotchas (each cost real time)
 
-- **Jetson `apt-get update` is blocked.** A wrapper refuses it to protect the
-  L4T/BSP on the Seeed carrier (escape: `sudo /usr/bin/apt-get.real` — do **not** use
-  it on the production board). `apt-get install` works from the existing package
-  cache, so install `debhelper dpkg-dev` without an update.
+- **`apt-get update` depends on which Jetson you are on.** On
+  `jetson@jetson.stfl.dev` it works normally — install the build prerequisites
+  the ordinary way. A Jetson on a Seeed carrier is the other case: a wrapper
+  refuses `apt-get update` there to protect the L4T/BSP, and `apt-get install`
+  still works from the existing package cache, so `debhelper dpkg-dev` install
+  without one. The escape (`sudo /usr/bin/apt-get.real`) exists but must not be
+  used on a production board — bypassing the wrapper is what it is there to
+  prevent. Check which board you have before assuming either.
 - **bloom needs rosdep + debhelper + fakeroot.** `sudo rosdep init` (once) +
   `rosdep update` populate the keys bloom resolves from `package.xml`
   (`ament_cmake`, `rosidl_default_generators`, `builtin_interfaces`,
@@ -126,6 +192,26 @@ idles, then `SIGINT received; shutting down`.
   repeats `name = "momentedge-clipper"` so cargo-deb does **not** append `-<distro>`
   to the package name (the distro lives in the `.deb` filename instead, via
   `--output`). Select with `cargo deb --variant <distro>`.
+- **The packaged binary is the `ros` feature build.** ROS is a cargo feature of
+  `clipper`, off by default, so a plain `cargo build -p clipper` produces a
+  binary that links no ROS and offers no `--trigger-source ros` — the wrong
+  artefact for a package whose whole `Depends` list is ROS.
+  `build-on-target.sh` adds `--features clipper/ros` whenever clipper is among
+  its `BUILD_PACKAGES`, and that is the only place the choice is made: cargo-deb
+  runs `--no-build` and packages whatever binary is at `target/release/clipper`.
+  A build that skipped the feature would install and start cleanly and then
+  never see a trigger, so the smoke-test's live run is worth keeping.
+- **One package, one executable.** The cargo package, the `[[bin]]` target and
+  the installed file are all `clipper`; `cargo deb -p clipper` and
+  `BUILD_PACKAGES=clipper` name it, and the artefact both scripts hand each other
+  is `target/release/clipper`, named literally in `assets`:
+
+  ```toml
+  assets = [["target/release/clipper", "opt/momentedge-clipper/bin/", "755"]]
+  ```
+
+  A second mode is a subcommand of that binary, not a second asset — so adding
+  one changes no packaging at all.
 - **cargo-deb summary comes from `[package].description`.** Without it the deb
   Description is `[generated from Rust crate clipper]`; clipper sets `description`
   (and `license`) in its `[package]` so the control file reads properly.

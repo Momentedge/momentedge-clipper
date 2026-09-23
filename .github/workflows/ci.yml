@@ -11,12 +11,15 @@
 # instead of realising it from source. Cargo artifacts are cached per distro
 # via Swatinem/rust-cache, which is orthogonal and remains.
 #
-# Scope: only clipper is built and tested (trigger-pub is not in CI).
+# Scope: the recorder's device build (`--features clipper/ros`) on every distro,
+# plus two lean ROS-free lanes on a plain toolchain — the `clip` and `tail`
+# libraries together with the recorder's own default (ROS-free) build, and the
+# `cu-mcap-record` copper example (trigger-pub is not in CI).
 # Distros: humble, jazzy, lyrical — the three the Rust crates build under
-# (rolling cannot build r2r 0.9.6; see README "Integration tests"). The e2e step
-# below runs the full suite on every leg under the `e2e` nextest profile,
-# skipping only the one inherently flaky live-corruption test (via an env gate);
-# the matrix comment explains why.
+# (rolling cannot build r2r 0.9.6; see the `build` skill, "r2r / IDL build model
+# and distro support"). The e2e step below runs the full suite on every leg under
+# the `e2e` nextest profile — the whole binary, nothing filtered out and nothing
+# skipped from inside a test; the matrix comment says what each distro costs.
 
 name: CI
 
@@ -90,23 +93,31 @@ jobs:
       # otherwise corrupt the restored target/ and break the build after it.
       #
       # cu29-derive's build script copies its trybuild fixtures into
-      # <target>/tests/trybuild, so any target/ that has compiled cu29 carries a
-      # `tests` entry. rust-cache special-cases that entry and recurses into both
-      # <target>/tests/target and <target>/tests/trybuild — but the first call is
-      # not awaited, so when that directory is absent (only trybuild is ever
-      # created) the ENOENT rejection escapes its try/catch as an unhandled
-      # rejection and kills the action mid-clean. The half-cleaned target/ keeps
-      # .fingerprint entries whose build-script binaries were already deleted, and
-      # the next cargo build dies on a build script it thinks is up to date:
-      # "could not execute process .../build-script-build (never executed)".
+      # <target>/tests/trybuild — it climbs four levels out of its own OUT_DIR to
+      # reach the shared workspace target/ — so any target/ that has compiled
+      # cu29 carries a `tests` entry. rust-cache special-cases that entry and
+      # recurses into both <target>/tests/target and <target>/tests/trybuild, and
+      # neither call is awaited, so an absent directory's ENOENT rejection
+      # escapes its try/catch as an unhandled rejection and kills the action
+      # mid-clean. The half-cleaned target/ keeps .fingerprint entries whose
+      # build-script binaries were already deleted, and the next cargo build dies
+      # on a build script it thinks is up to date: "could not execute process
+      # .../build-script-build (never executed)".
       #
-      # Creating the directory makes that recursion open an empty dir and return.
-      # It runs before rust-cache so the guard is in place for the restore-time
-      # clean (which fires on a partial key match), and the directory is then
-      # cached too — so a cache already poisoned with a bare tests/trybuild heals
-      # on its next run rather than needing a cache-key bump.
-      - name: Pre-create target/tests/target for rust-cache
-        run: mkdir -p target/tests/target
+      # Both directories are created, because which one is missing depends on the
+      # job: a lane that compiles cu29 gets tests/trybuild from the build script
+      # and lacks tests/target, while the ROS-free lane compiles no cu29 at all
+      # and lacks tests/trybuild. Creating only one leaves the other to throw —
+      # and creating either is what makes tests/ exist for rust-cache to recurse
+      # into in the first place.
+      #
+      # Creating them makes that recursion open an empty dir and return. It runs
+      # before rust-cache so the guard is in place for the restore-time clean
+      # (which fires on a partial key match), and the directories are then cached
+      # too — so a cache already poisoned with a bare tests/trybuild heals on its
+      # next run rather than needing a cache-key bump.
+      - name: Pre-create target/tests for rust-cache
+        run: mkdir -p target/tests/target target/tests/trybuild
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
@@ -118,6 +129,111 @@ jobs:
 
       - name: Test
         run: cargo test --locked -p cu-mcap-record
+
+  # ROS-free lane for the two library crates. The whole reason the MCAP format
+  # layer, the recording index, the cut path and the tail live outside the
+  # recorder is that a consumer can link them with no ROS installation anywhere —
+  # so something has to hold that property down. The recorder itself is here for
+  # the same reason: ROS is a cargo feature of `clipper`, off by default, so a
+  # default-features recorder links no ROS either and runs its MCAP interface on
+  # a host that has never seen a ROS install.
+  #
+  # This job builds, lints and tests `clip`, `tail` and `clipper` (default
+  # features) on a plain stable toolchain — no nix, no ROS2 closure, nothing on
+  # PATH but cargo — and asserts up front that none of the three default
+  # dependency trees contains r2r. An r2r dependency that escapes `clip`'s or
+  # `clipper`'s `ros` feature then turns this job red in seconds, instead of
+  # surfacing much later as a missing rmw at link time in a build that has no ROS
+  # toolchain at all.
+  #
+  # It is cheap for the same reasons: small crates on a stock toolchain, with
+  # neither a nix realization nor a ROS2 closure to substitute, so it reports long
+  # before the recorder matrix finishes. `--locked` enforces the shared root
+  # lockfile; formatting is covered by the `fmt` job's `cargo fmt --all --check`.
+  # The e2e binary compiles here (it drives the ros2 CLI as a subprocess and links
+  # no ROS itself) but every one of its tests short-circuits on the unset
+  # CLIPPER_E2E gate; the live suite runs in the recorder matrix below.
+  #
+  # There is deliberately no `--features ros` build here: that arm needs the ROS
+  # toolchain this job is defined by not having. The per-distro `recorder` matrix
+  # below covers it — it builds and tests the recorder with the feature on, and
+  # its unit step selects `clip` and `tail` alongside it so the resolver unifies
+  # `ros` and `clap` onto clip's test target and the feature-gated tests run there.
+  libraries:
+    name: clip + tail + clipper (ROS-free)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # stable for the edition-2024 build and test: this lane's whole point is
+      # that the three crates need nothing special, and compiling them on stable
+      # is what proves it.
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # Clippy runs on nightly, because the lint policy is a nightly policy —
+      # the test modules allow `clippy::assert_is_empty`, which stable clippy
+      # does not know and rejects outright as an unknown lint under `-D
+      # warnings`, exactly as stable rustfmt rejects `rustfmt.toml`'s unstable
+      # keys (which is why the `fmt` job installs nightly too). Running the
+      # gate here on the toolchain it is written against is what keeps
+      # `just check` and CI the same gate; when they differed, this job was red
+      # for three days without the dev box being able to reproduce it.
+      #
+      # Each step names its toolchain explicitly, since installing two leaves
+      # the last one default.
+      - name: Install nightly clippy
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: clippy
+
+      # The same rust-cache guard the cu-mcap-record job documents at length
+      # above. This lane compiles no cu29, so nothing here creates the `tests`
+      # entry on its own — but the guard's own directories are saved into this
+      # job's cache and restored with it, so the entry is present from the second
+      # run onwards. Creating both keeps rust-cache's recursion total either way;
+      # creating only one is what made this job annotate an unhandled ENOENT on
+      # the other.
+      - name: Pre-create target/tests for rust-cache
+        run: mkdir -p target/tests/target target/tests/trybuild
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: libraries
+
+      # The property this lane exists for, checked before anything is compiled:
+      # `cargo tree` resolves from the lockfile without building, so a leak fails
+      # here rather than deep in a clippy run. The tree is captured first and
+      # tested afterwards on purpose — piping cargo into grep would let the good
+      # case (grep matches nothing, exits 1) decide the step's status under
+      # pipefail, inverting the check.
+      - name: Assert the default builds pull no r2r
+        run: |
+          set -euo pipefail
+          for crate in clip tail clipper; do
+            tree=$(cargo tree --locked -p "$crate" -e normal --prefix none)
+            echo "$tree"
+            if grep -q '^r2r' <<<"$tree"; then
+              echo "::error::$crate's default dependency tree contains r2r: the crate no longer builds without a ROS installation."
+              echo "Every r2r dependency must sit behind an optional 'ros' feature (clip's, or clipper's, which enables clip's), and both are off by default."
+              exit 1
+            fi
+          done
+
+      - name: Clippy
+        run: cargo +nightly clippy --locked --all-targets -p clip -p tail -p clipper -- -D warnings
+
+      # Building the docs is the only thing that runs rustdoc's lints, and
+      # `RUSTDOCFLAGS` is what promotes the `[workspace.lints.rustdoc]` block to
+      # a gate. It catches what clippy cannot: an intra-doc link that does not
+      # resolves, or one from public documentation into a private item. Same
+      # command as `just check`'s last line.
+      - name: Docs
+        run: RUSTDOCFLAGS="-D warnings" cargo +nightly doc --locked --no-deps -p clip -p tail -p clipper
+
+      - name: Test
+        run: cargo +stable test --locked -p clip -p tail -p clipper
 
   recorder:
     name: ${{ matrix.distro }}
@@ -132,16 +248,13 @@ jobs:
       matrix:
         distro: [humble, jazzy, lyrical]
         include:
-          # Per-distro e2e selection (nextest filterset). corrupt_tail_health_live
-          # — the live-corruption race the project flags as its one inherently
-          # flaky case (README "Integration tests") — is skipped on every leg: the
-          # E2E step sets CLIPPER_E2E_SKIP_FLAKY=1, which its in-test skip_flaky()
-          # gate reads to skip-and-pass. Its mandatory 60 s post-damage
-          # announcement misses under CI-grade timing, and nextest's default
-          # fail-fast then masks the rest of the suite (beads clipper-3q8). The
-          # recovery suite discovers recordings by ctime and asserts on path-free
-          # log needles, so lyrical's timestamped rosbag2 filenames no longer
-          # break it (beads clipper-7ys); every distro runs the full binary.
+          # Per-distro e2e selection (nextest filterset). Every distro runs the
+          # whole e2e binary, nothing filtered out and nothing skipped from
+          # inside a test. The recovery suite discovers recordings by mtime and
+          # asserts on path-free log needles, so lyrical's timestamped rosbag2
+          # filenames do not break it (beads clipper-7ys); the live-corruption
+          # cases place their damage against the recording's own record framing,
+          # so each asks the recorder for one outcome (beads clipper-3q8).
           - distro: humble
             e2e_filter: binary(e2e)
           - distro: jazzy
@@ -203,8 +316,8 @@ jobs:
       # The copper example is a workspace member, so its cu29 tree builds into the
       # same root target/ as everything else — which is also why this leg needs
       # the same rust-cache guard the cu-mcap-record job documents above.
-      - name: Pre-create target/tests/target for rust-cache
-        run: mkdir -p target/tests/target
+      - name: Pre-create target/tests for rust-cache
+        run: mkdir -p target/tests/target target/tests/trybuild
 
       # Caches cargo registry + this distro's target/ (the r2r build links the
       # distro's rcl/rmw, so the key is per distro). The copper example's cu29
@@ -228,22 +341,36 @@ jobs:
       # the cu29 compile out of the test's own timeout — the e2e's on-demand
       # build then finds it up to date. Its cu29 deps are crate-local, so `-p`
       # pulls the cu29 tree only for this one target, not the whole matrix.
+      #
+      # `--features clipper/ros` is what makes this the device build: ROS is a
+      # cargo feature of the recorder, off by default, and this matrix is the
+      # lane that has the ROS toolchain to build it with. The package-qualified
+      # spelling is required because more than one package is selected.
       - name: Build
-        run: nix develop ".#${{ matrix.distro }}" --command cargo build --locked -p clipper -p custom-mcap-writer -p cu-mcap-record
+        run: nix develop ".#${{ matrix.distro }}" --command cargo build --locked --features clipper/ros -p clipper -p custom-mcap-writer -p cu-mcap-record
 
+      # The libraries are selected alongside the recorder so their feature-gated
+      # tests actually run somewhere. `clip`'s `cdr_round_trips_through_r2r` needs
+      # the `ros` feature and `display_matches_the_clap_value_names` needs `clap`;
+      # the ROS-free `libraries` job builds neither feature by design, so this is
+      # the only lane that can. Selecting all three lets the resolver unify the
+      # recorder's `clip` features onto clip's own test target — and
+      # `clipper/ros` is what turns `clip`'s `ros` on in the first place.
       - name: Unit tests
-        run: nix develop ".#${{ matrix.distro }}" --command cargo nextest run --locked -p clipper -E 'not binary(e2e)'
+        run: nix develop ".#${{ matrix.distro }}" --command cargo nextest run --locked --features clipper/ros -p clip -p tail -p clipper -E 'not binary(e2e)'
 
       # Live ROS2 e2e: real `ros2 bag record`, CLI-published triggers, real
       # Recorded announcements. Gated on CLIPPER_E2E; serialized and
       # timeout-bounded by the `e2e` nextest profile (.config/nextest.toml).
-      # CLIPPER_E2E_SKIP_FLAKY=1 makes the in-test skip_flaky() gate skip the
-      # flaky live-corruption race (see the matrix comment above).
+      # CLIPPER_E2E=1 is the whole gate: every test in the binary runs on every
+      # leg. `--features ros` builds the binary under test as the device build —
+      # the suite drives it on `--trigger-source ros`, which only that build
+      # offers.
       - name: E2E tests
         run: |
           nix develop ".#${{ matrix.distro }}" --command \
-            env CLIPPER_E2E=1 CLIPPER_E2E_SKIP_FLAKY=1 cargo nextest run --locked -p clipper \
-            --profile e2e -E '${{ matrix.e2e_filter }}'
+            env CLIPPER_E2E=1 cargo nextest run --locked -p clipper \
+            --features ros --profile e2e -E '${{ matrix.e2e_filter }}'
 
       # Pushes the entire /nix/store to momentedge so the full ROS2 closure lands
       # in the cache even on a complete GitHub-cache restore when nothing is

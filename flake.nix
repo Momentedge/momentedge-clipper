@@ -6,6 +6,10 @@
   inputs = {
     nix-ros-overlay.url = "github:lopsided98/nix-ros-overlay/master";
     nixpkgs.follows = "nix-ros-overlay/nixpkgs";
+    mcap-cli = {
+      url = "https://flakehub.com/f/stfl/mcap-cli/*";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   # Pull prebuilt ROS2 packages from the ROS binary cache instead of compiling.
@@ -25,14 +29,36 @@
   outputs = {
     nixpkgs,
     nix-ros-overlay,
+    mcap-cli,
     ...
   }:
     nix-ros-overlay.inputs.flake-utils.lib.eachDefaultSystem (system: let
       pkgs = import nixpkgs {
         inherit system;
-        overlays = [nix-ros-overlay.overlays.default];
+        overlays = [
+          nix-ros-overlay.overlays.default
+          # nixpkgs binds `mcap-cli` to the Go implementation (0.0.6x). This
+          # overlay rebinds the name to the Rust CLI (0.3.0), so `pkgs.mcap-cli`
+          # in the dev shell below is the Rust one.
+          mcap-cli.overlays.default
+        ];
       };
       lib = pkgs.lib;
+
+      # The workspace version, read from the one place it is set
+      # (`[workspace.package].version` in Cargo.toml), so every nix-built binary
+      # reports what a cargo-built one does instead of a hand-kept copy.
+      version = (lib.importTOML ./Cargo.toml).workspace.package.version;
+
+      # Vendor hashes for the lockfile's git sources, shared by every
+      # rustPlatform build below. r2r is pinned to its 0.9.6 git tag (for
+      # lyrical support — see Cargo.toml) until 0.9.6 reaches crates.io, and a
+      # git source has no registry checksum to vendor against. Nix vendors the
+      # whole lockfile before cargo picks a feature set, so this is needed by the
+      # ROS-free package too, which fetches r2r and never compiles it.
+      cargoOutputHashes = {
+        "r2r-0.9.6" = "sha256-1DQPrRQOYzxTckzyH0p6pnyEy1lOw/OmU0sDAMNzHpg=";
+      };
 
       # The ROS2 distros this repo is built and tested against. nix-ros-overlay
       # packages each one as `pkgs.rosPackages.<distro>`; everything below
@@ -61,7 +87,7 @@
       # a distro left off this list still gets the full recorder/e2e core
       # (nix/ros-env.nix `withSim`). Add a distro here (and a `simOverlays` entry
       # only if its closure needs the pkg-config fix) to put sim in its shell.
-      simDistros = [ "jazzy" "humble" "lyrical" "rolling" ];
+      simDistros = ["jazzy" "humble" "lyrical" "rolling"];
 
       # Distro-specific overlays correcting upstream sim-stack packaging.
       # nix-ros-overlay's gscam and ffmpeg_image_transport omit pkg-config from
@@ -76,11 +102,11 @@
       simOverlays = {
         humble = _final: prev: {
           gscam = prev.gscam.overrideAttrs (old: {
-            nativeBuildInputs = (old.nativeBuildInputs or []) ++ [ pkgs.pkg-config ];
+            nativeBuildInputs = (old.nativeBuildInputs or []) ++ [pkgs.pkg-config];
           });
           ffmpeg-image-transport = prev.ffmpeg-image-transport.overrideAttrs (old: {
-            nativeBuildInputs = (old.nativeBuildInputs or []) ++ [ pkgs.pkg-config ];
-            cmakeFlags = (old.cmakeFlags or []) ++ [ "-DFFMPEG_PKGCONFIG=${pkgs.ffmpeg.dev}/lib/pkgconfig" ];
+            nativeBuildInputs = (old.nativeBuildInputs or []) ++ [pkgs.pkg-config];
+            cmakeFlags = (old.cmakeFlags or []) ++ ["-DFFMPEG_PKGCONFIG=${pkgs.ffmpeg.dev}/lib/pkgconfig"];
           });
         };
       };
@@ -115,10 +141,12 @@
       mkDistro = rosDistro: let
         # Apply the distro's sim packaging fix (if any) so the patched gscam /
         # ffmpeg-image-transport flow through to every consumer of `ros`.
-        ros = let base = pkgs.rosPackages.${rosDistro};
-        in if simOverlays ? ${rosDistro}
-           then base.overrideScope simOverlays.${rosDistro}
-           else base;
+        ros = let
+          base = pkgs.rosPackages.${rosDistro};
+        in
+          if simOverlays ? ${rosDistro}
+          then base.overrideScope simOverlays.${rosDistro}
+          else base;
         withSim = lib.elem rosDistro simDistros;
         momentedge-msgs = import ./nix/momentedge-msgs.nix {
           inherit ros;
@@ -126,7 +154,7 @@
         };
         rosEnv = import ./nix/ros-env.nix {inherit ros momentedge-msgs lib withSim;};
         binaries = import ./nix/binaries.nix {
-          inherit pkgs rosEnv idlPackageFilter rosDistro;
+          inherit pkgs rosEnv idlPackageFilter rosDistro version cargoOutputHashes;
           src = ./.;
           cargoLockFile = ./Cargo.lock;
         };
@@ -141,6 +169,7 @@
               rosEnv
               pkgs.clang # r2r's build script invokes clang/bindgen
               pkgs.pkg-config
+              pkgs.mcap-cli # inspect/convert recorded bags (`mcap info`, `mcap cat`)
             ]
             # the sim camera's GStreamer pipeline (sim/) — only where the sim
             # stack is in the closure (see simDistros).
@@ -175,6 +204,17 @@
       # only humble's devShell, never the others.
       distros = lib.genAttrs rosDistros mkDistro;
 
+      # The ROS-free recorder, built once and for no distro — with the `ros`
+      # cargo feature off there is no ROS closure to build against and so nothing
+      # a distro would select. It sits outside `mkDistro` for that reason, and
+      # unlike everything in it, the result is a shippable artefact: see
+      # nix/clipper-ros-free.nix.
+      clipper-ros-free = import ./nix/clipper-ros-free.nix {
+        inherit pkgs version cargoOutputHashes;
+        src = ./.;
+        cargoLockFile = ./Cargo.lock;
+      };
+
       # Per-distro package outputs: rosEnv-<distro>,
       # clipper-<distro>, trigger-pub-<distro>.
       perDistroPackages =
@@ -196,12 +236,16 @@
           ;
       };
     in {
-      # rosEnv (the dev shell's ROS2 closure) and the nix-built binaries are
-      # exposed mostly as build checks — `nix build .#clipper-rolling`
+      # `clipper-ros-free` is the one shippable package here: the recorder with
+      # its `ros` feature off, which links no ROS and so carries none of the nix
+      # ROS closure into whatever runs it.
+      #
+      # rosEnv (the dev shell's ROS2 closure) and the per-distro binaries are
+      # exposed as build checks instead — `nix build .#clipper-rolling`
       # compiles the deployable under nix, against that distro, without the
-      # system cargo. The target deploys native apt builds, not these (see
+      # system cargo. The device target deploys native apt builds, not those (see
       # README "Deployment").
-      packages = perDistroPackages // defaultPackages;
+      packages = perDistroPackages // defaultPackages // {inherit clipper-ros-free;};
 
       # `nix develop .#<distro>` selects a distro; bare `nix develop` is the
       # default (jazzy). Each shell pins ROS_DISTRO and the matching ROS2 closure.

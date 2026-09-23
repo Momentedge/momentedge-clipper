@@ -1,5 +1,5 @@
 //! A copper (cu29) `CuSinkTask` that appends routed task outputs to an MCAP
-//! Recording `clipper --interface mcap` can tail live — the copper producer
+//! Recording `clipper tail --trigger-source mcap` can follow live — the copper producer
 //! path beside the two plain-`mcap`-crate writer examples
 //! (`examples/custom-mcap-writer`, `examples/chunked-mcap-writer`). No ROS
 //! stack is involved anywhere: the Trigger travels in-band, written into the
@@ -160,7 +160,7 @@ struct MetaEnvelope<'a> {
 }
 
 /// `builtin_interfaces/Time` flattened to its two fields — the shape
-/// `crates/clipper/src/trigger.rs::Stamp` decodes.
+/// `crates/clip/src/trigger.rs::Stamp` decodes.
 #[derive(Serialize)]
 struct TriggerStampWire {
     sec: i32,
@@ -170,7 +170,7 @@ struct TriggerStampWire {
 /// The wire JSON for the trigger channel: the momentedge `Trigger`, written
 /// **unwrapped** (not in the copper envelope) because clipper's decoder reads
 /// these fields at the top level. This is the one channel with no exporter
-/// parity. `trigger_time` is the constant zero: under `--interface mcap`
+/// parity. `trigger_time` is the constant zero: under `--trigger-source mcap`
 /// clipper anchors on the trigger record's own MCAP stamp, and its admission
 /// gate rejects a non-zero payload `trigger_time`.
 #[derive(Serialize)]
@@ -761,18 +761,22 @@ fn main() -> Result<()> {
         .ok_or_else(|| anyhow!("'sink' node vanished from the graph"))?
         .set_param::<String>("out_dir", args.out.clone());
 
-    let mut app = RecorderApp::builder()
+    let app = RecorderApp::builder()
         .with_config(cfg)
         .build()
         .map_err(|e| anyhow!("building copper app: {e}"))?;
 
-    // Ctrl+C flips the flag so the bounded loop stops and reaches stop_all_tasks
-    // (and the sink's finish()) rather than dying mid-write.
+    // Ctrl+C flips the flag so the bounded loop stops and reaches the stop
+    // transition (and the sink's finish()) rather than dying mid-write.
     let stop = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&stop))?;
 
-    app.start_all_tasks()
-        .map_err(|e| anyhow!("starting tasks: {e}"))?;
+    // The application lifecycle is a typestate: `build()` hands back an
+    // `Initialized` handle, `start()` consumes it into a `Running` one, and
+    // `stop()` consumes that into a `Stopped` one. Each transition moves the
+    // handle, so a stale pre-transition one cannot be reused and the loop below
+    // cannot run against an application that has already been stopped.
+    let mut app = app.start().map_err(|e| anyhow!("starting tasks: {e}"))?;
     println!(
         "cu-mcap-record: recording to {}/ — Ctrl+C to stop",
         args.out
@@ -781,20 +785,26 @@ fn main() -> Result<()> {
         app.run_one_iteration()
             .map_err(|e| anyhow!("running iteration: {e}"))?;
         // Pace the loop, then stop after the sleep (before the next iteration)
-        // so Ctrl+C lands between iterations and reaches stop_all_tasks below.
+        // so Ctrl+C lands between iterations and reaches the stop below.
         std::thread::sleep(LOOP_PERIOD);
         if stop.load(Ordering::Relaxed) {
             break;
         }
     }
-    app.stop_all_tasks()
-        .map_err(|e| anyhow!("stopping tasks: {e}"))?;
+    app.stop().map_err(|e| anyhow!("stopping tasks: {e}"))?;
     println!("cu-mcap-record: stopped, Recording finalised");
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        reason = "a failed unwrap or a panicking index is a failing test"
+    )]
+
     use std::io::Cursor;
 
     use serde_json::Value;
@@ -894,7 +904,7 @@ mod tests {
         (records, pos)
     }
 
-    /// Mirrors `crates/clipper/src/trigger.rs::Stamp`'s `Deserialize` shape — a
+    /// Mirrors `crates/clip/src/trigger.rs::Stamp`'s `Deserialize` shape — a
     /// local copy so this crate stays free of any dependency on
     /// `crates/clipper` (which pulls in `r2r`/ROS), while still proving the JSON
     /// this program writes decodes into that exact field shape.
@@ -904,10 +914,10 @@ mod tests {
         nanosec: u32,
     }
 
-    /// Mirrors `crates/clipper/src/trigger.rs::Trigger`'s `Deserialize` shape
+    /// Mirrors `crates/clip/src/trigger.rs::Trigger`'s `Deserialize` shape
     /// (`description` optional, defaulting empty; the rest required; unknown
     /// fields ignored) — see that module's doc comment and
-    /// `crates/clipper/src/decode.rs`'s `json_decodes_the_msg_shape` test.
+    /// `crates/clip/src/decode.rs`'s `json_decodes_the_msg_shape` test.
     #[derive(serde::Deserialize, Debug, PartialEq)]
     struct TestTrigger {
         name: String,

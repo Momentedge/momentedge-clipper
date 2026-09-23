@@ -1,0 +1,30 @@
+# Thresholds for the size and shape lints. Every key tunes a lint the
+# `[workspace.lints]` block in `Cargo.toml` already enables, and every default
+# is loose enough that it never fires on the code these lints exist to catch —
+# so the file is the lint config, not a decoration on it.
+#
+# A hit is a cleanup item, not a failure: fix it, or record it as a bead.
+# `#[expect]` only with a reason a reviewer would accept.
+
+# too_many_lines (pedantic); default 100. Past it, extract by decision — never
+# by line count.
+too-many-lines-threshold = 60
+# too_many_arguments (complexity); default 7. Past it, a parameter struct.
+too-many-arguments-threshold = 5
+# struct_excessive_bools (pedantic); default 3. Two bools on one thing name
+# four states, of which the type permits every one; that is an enum.
+max-struct-bools = 1
+# fn_params_excessive_bools (pedantic); default 3. A bool parameter is a flag
+# argument, unreadable at the call site.
+max-fn-params-bools = 1
+# cognitive_complexity (restriction, enabled in Cargo.toml); default 25.
+cognitive-complexity-threshold = 15
+# excessive_nesting (complexity); default 0, which never fires. Guard clauses,
+# `let ... else`, or a match.
+excessive-nesting-threshold = 4
+# large_enum_variant (perf); the default, stated so it is visible. Box the fat
+# variant and keep the enum.
+enum-variant-size-threshold = 200
+# result_large_err (perf); the default. The error enum sits inside every
+# `Result` this crate returns.
+large-error-threshold = 128

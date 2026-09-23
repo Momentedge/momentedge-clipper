@@ -28,10 +28,10 @@
 //! ## The trigger payload's `trigger_time`
 //!
 //! Which timestamp clipper resolves a clip window's anchor from depends on
-//! its interface and time source. Under `--interface mcap`, on either time
+//! its interface and time source. Under `--trigger-source mcap`, on either time
 //! source, the anchor is the trigger *record's own* MCAP stamp (`log_time` or
 //! `publish_time`) — the JSON payload's `trigger_time` field is read only
-//! under `--interface ros` with the `publish` time source, standing in there
+//! under `--trigger-source ros` with the `publish` time source, standing in there
 //! for the `publish_time` a ROS publisher cannot set on the wire. A non-zero
 //! `trigger_time` in any other cell is a mis-anchoring hazard clipper rejects.
 //! So this program leaves the payload's `trigger_time` at `{sec: 0, nanosec:
@@ -154,7 +154,7 @@ const POSE_SCHEMA: &[u8] = br#"{
 }"#;
 
 /// `builtin_interfaces/Time` flattened to its two fields — the JSON shape
-/// `crates/clipper/src/trigger.rs::Stamp` derives `Deserialize` for.
+/// `crates/clip/src/trigger.rs::Stamp` derives `Deserialize` for.
 #[derive(Serialize)]
 struct StampMsg {
     sec: i32,
@@ -165,6 +165,10 @@ impl StampMsg {
     /// Split an absolute Unix-epoch-nanosecond anchor into `{sec, nanosec}`.
     /// `sec` is `i32` (matching `builtin_interfaces/Time`, so it inherits that
     /// message's year-2038 rollover) — safe for any anchor before then.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the documented year-2038 rollover this message type already has"
+    )]
     fn from_ns(ns: u64) -> Self {
         StampMsg {
             sec: (ns / 1_000_000_000) as i32,
@@ -174,8 +178,8 @@ impl StampMsg {
 }
 
 /// The JSON payload for `/events/momentedge/trigger`. Field-for-field the
-/// shape `crates/clipper/src/trigger.rs::Trigger` derives `Deserialize` for
-/// (verified against its doc comments and `crates/clipper/src/decode.rs`'s
+/// shape `crates/clip/src/trigger.rs::Trigger` derives `Deserialize` for
+/// (verified against its doc comments and `crates/clip/src/decode.rs`'s
 /// `json_decodes_the_msg_shape` test): `description` is optional there but
 /// always emitted here, `trigger_time` mirrors `builtin_interfaces/Time`, and
 /// `preroll`/`postroll` are nanoseconds either side of `trigger_time`.
@@ -213,6 +217,12 @@ fn channels() -> Vec<Channel> {
             schema_name: "Pose",
             schema_encoding: "jsonschema",
             schema: POSE_SCHEMA,
+            #[expect(
+                clippy::cast_precision_loss,
+                clippy::expect_used,
+                reason = "a synthetic angle from a counter no run reaches 2^53 of, \
+                          and a struct of three finite `f64`s `to_vec` cannot fail on"
+            )]
             source: Box::new((0u64..).map(|i| {
                 let a = i as f64 * 0.05;
                 serde_json::to_vec(&Pose {
@@ -229,6 +239,10 @@ fn channels() -> Vec<Channel> {
             schema_name: "",
             schema_encoding: "",
             schema: b"", // schemaless — the most basic payload there is
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "a synthetic angle from a counter no run reaches 2^53 of"
+            )]
             source: Box::new((0u64..).map(|i| {
                 let size = 1.0 + (i as f64 * 0.05).sin().abs();
                 format!("{{\"size\": {size}}}").into_bytes()
@@ -315,6 +329,11 @@ fn write_trigger<W: std::io::Write + std::io::Seek>(
         preroll: TRIGGER_PREROLL_NS,
         postroll: TRIGGER_POSTROLL_NS,
     };
+    #[expect(
+        clippy::expect_used,
+        reason = "a struct of owned strings and integers; `to_vec` has no failing \
+                  path for it"
+    )]
     let payload = serde_json::to_vec(&trigger).expect("TriggerMsg serializes");
     writer.write_to_known_channel(
         &mcap::records::MessageHeader {
@@ -331,6 +350,10 @@ fn write_trigger<W: std::io::Write + std::io::Seek>(
     Ok(())
 }
 
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "u64 nanoseconds since the epoch runs to the year 2554"
+)]
 fn now_ns() -> Result<u64> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() as u64)
 }
@@ -350,7 +373,7 @@ fn main() -> Result<()> {
     let mut channels = channels();
     let ids = register(&mut writer, &channels)?;
     // Schemaless, like `/size` — clipper's MCAP interface decodes triggers by
-    // `message_encoding` alone, not a schema (see crates/clipper/src/decode.rs).
+    // `message_encoding` alone, not a schema (see crates/clip/src/decode.rs).
     let trigger_channel_id = writer.add_channel(0, TRIGGER_TOPIC, "json", &BTreeMap::new())?;
 
     let publish_offset_ns = cfg.publish_offset_ms * 1_000_000;
@@ -387,6 +410,10 @@ fn main() -> Result<()> {
         )?;
         seq += 1;
 
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "u64 milliseconds of uptime runs to half a billion years"
+        )]
         if !trigger_emitted
             && cfg
                 .trigger_after_ms
@@ -417,11 +444,22 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::cast_possible_truncation,
+        clippy::wildcard_enum_match_arm,
+        reason = "a failed unwrap or a panicking index is a failing test, and a \
+                  catch-all over the foreign `mcap::records::Record` is the only \
+                  arm upstream lets this assertion have"
+    )]
+
     use std::io::Cursor;
 
     use super::*;
 
-    /// Mirrors `crates/clipper/src/trigger.rs::Stamp`'s `Deserialize` shape —
+    /// Mirrors `crates/clip/src/trigger.rs::Stamp`'s `Deserialize` shape —
     /// a local copy so this crate stays free of any dependency on
     /// `crates/clipper` (which pulls in `r2r`/ROS), while still proving the
     /// JSON this program writes decodes into that exact field shape.
@@ -431,10 +469,10 @@ mod tests {
         nanosec: u32,
     }
 
-    /// Mirrors `crates/clipper/src/trigger.rs::Trigger`'s `Deserialize` shape
+    /// Mirrors `crates/clip/src/trigger.rs::Trigger`'s `Deserialize` shape
     /// (`description` optional, defaulting empty; the rest required; unknown
     /// fields ignored) — see that module's doc comment and
-    /// `crates/clipper/src/decode.rs`'s `json_decodes_the_msg_shape` test,
+    /// `crates/clip/src/decode.rs`'s `json_decodes_the_msg_shape` test,
     /// which this mirrors field-for-field.
     #[derive(serde::Deserialize, Debug, PartialEq)]
     struct TestTrigger {
@@ -457,7 +495,7 @@ mod tests {
                 &mut chans,
                 &ids,
                 seq,
-                EPOCH_FLOOR_NS + seq as u64 * 20_000_000,
+                EPOCH_FLOOR_NS + u64::from(seq) * 20_000_000,
                 0,
             )?;
         }
@@ -510,7 +548,7 @@ mod tests {
         let trigger_channel_id = writer.add_channel(0, TRIGGER_TOPIC, "json", &BTreeMap::new())?;
 
         for seq in 0..5u32 {
-            let log_time = base + seq as u64 * 20_000_000;
+            let log_time = base + u64::from(seq) * 20_000_000;
             write_tick(&mut writer, &mut chans, &ids, seq, log_time, offset_ns)?;
         }
         let trigger_log_time = base + 2 * 20_000_000;
@@ -587,7 +625,7 @@ mod tests {
                 &mut chans,
                 &ids,
                 seq,
-                EPOCH_FLOOR_NS + seq as u64 * 20_000_000,
+                EPOCH_FLOOR_NS + u64::from(seq) * 20_000_000,
                 0,
             )?;
         }

@@ -9,15 +9,15 @@
 #
 # Splitting bounds each file; disk is bounded only once old splits are pruned,
 # which is a separate job — this script only records. See examples/split-bags
-# for a delete-by-age timer and examples/systemd for the recorder + clipper +
-# pruner as services.
+# for a delete-by-age timer and examples/launch for the recorder and clipper
+# under `ros2 launch`.
 #
 # This is a minimal example invocation, not a deployment entry point. The full
-# setups — low-latency tuning, split bags with retention, and a systemd unit
-# layout — live under examples/:
+# setups — low-latency tuning, split bags with retention, and a supervised
+# launch — live under examples/:
 #   examples/continuous/   one growing file (no splits) + latency trade-offs
 #   examples/split-bags/   --max-bag-size / --max-bag-duration + pruning
-#   examples/systemd/      rosbag + clipper + pruning as services
+#   examples/launch/       rosbag + clipper under `ros2 launch`, with respawn
 #
 # rosbag2 refuses to record into an existing bag directory, so ./record is
 # wiped on start. ./record is gitignored.
@@ -37,13 +37,15 @@ fi
 
 OUT_DIR="${OUT_DIR:-./record}"
 
-# Storage defaults: regular caching and the stock chunked+compressed profile.
-# These are the rosbag2 defaults — a clip's data becomes visible to the tail
-# only once a chunk fills and the cache drains, so clipper's --grace-secs must
-# exceed that flush latency (see examples/continuous for the fastwrite profile,
-# which writes every message straight through for minimal tail latency).
+# Storage: rosbag2's own cache size, and a chunked+compressed profile this
+# script picks. A clip's data becomes visible to the tail only once a chunk
+# fills and the cache drains, so clipper's --grace-secs must exceed that flush
+# latency (see examples/continuous for the fastwrite profile, which turns
+# chunking off and writes every message straight through for minimal tail
+# latency).
 MAX_CACHE_SIZE="${MAX_CACHE_SIZE:-104857600}"     # 100 MiB, rosbag2 default
 STORAGE_PRESET="${STORAGE_PRESET:-zstd_fast}"      # none | fastwrite | zstd_fast | zstd_small
+                                                   # rosbag2's own default is none; zstd_fast is this script's choice
 
 # Split controls — the bag rolls over when either cap is hit; 0 disables that
 # cap. Keep the active split well longer than clipper's pre+post-roll window: a

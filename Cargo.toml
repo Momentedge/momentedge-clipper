@@ -4,6 +4,14 @@
 # resolver "1" and warns.
 resolver = "3"
 members = [
+    # The shared library: the MCAP format layer, the recording index, the cut
+    # path, the neutral trigger contract, and segment publication. ROS-free by
+    # default — the `ros` feature adds only the CDR trigger decoder.
+    "crates/clip",
+    # Live tailing over `clip`: recording discovery, the recording collection and
+    # its lifecycle, coverage, retention, and the waits a cut from a growing file
+    # needs. ROS-free like `clip`.
+    "crates/tail",
     "crates/clipper",
     # Example trigger source — a workspace member so it inherits the shared
     # package metadata and dependency versions below, not a deployable crate.
@@ -17,17 +25,21 @@ members = [
     # `disable_seeking(true)`): the second compliant producer path.
     "examples/chunked-mcap-writer",
     # Copper (cu29) CuSinkTask producer example — appends a tailable MCAP
-    # Recording clipper cuts clips from, ROS-free. Its copper deps (cu29 and the
-    # cu-bincode fork) stay declared in the crate's own Cargo.toml by decision —
-    # do NOT hoist them into [workspace.dependencies]; keeping them crate-local
-    # keeps the cu29 tree scoped to this one member.
+    # Recording clipper cuts clips from, ROS-free. Every copper dependency it
+    # takes stays declared in the crate's own Cargo.toml by decision — do NOT
+    # hoist one into [workspace.dependencies]; keeping them crate-local keeps
+    # the cu29 tree scoped to this one member.
     "examples/cu-mcap-record",
 ]
 
 [workspace.package]
-version = "0.1.3"
+version = "0.2.0"
 edition = "2024"
 license = "Apache-2.0"
+# The project URL a clip's manifest carries under `producer.url`
+# (`clip::manifest`), so a clip read far from here names where it came from.
+# Members inherit it with `repository.workspace = true`.
+repository = "https://github.com/Momentedge/momentedge-clipper"
 
 # Shared dependency versions; members inherit with `<crate>.workspace = true` and
 # keep their own role comment (and any crate-specific features) at the use site.
@@ -41,9 +53,18 @@ license = "Apache-2.0"
 r2r = { git = "https://github.com/sequenceplanner/r2r.git", tag = "0.9.6" }
 futures = "0.3"
 crossbeam-channel = "0.5"
-signal-hook = "0.3"
-mcap = "0.24"
+signal-hook = "0.4"
+# The MCAP format layer: record parsing for the scan and the cut, and the clip
+# writer. One version across the workspace, matching the `mcap` CLI on the dev
+# shell, so a recording and a clip are read and written by the same format code
+# the CLI inspects them with. A clip's chunk layout is this crate's rather than
+# clipper's, so bumping this version may move it (`crates/clip/CLAUDE.md`).
+mcap = "0.25"
 anyhow = "1"
+# Typed error enums for the library crates: a `thiserror` enum is what lets a
+# caller branch on *which* way something failed, where an `anyhow` context chain
+# only lets it print. `clip::whole`'s refusal taxonomy is the first user.
+thiserror = "2"
 # CLI + env parsing: `derive` for the `Config` parser, `env` so each arg falls
 # back to a `MOMENTEDGE_*` environment variable, `string` so the runtime-built
 # env names (one prefix applied to every arg) can be set on the args.
@@ -54,3 +75,69 @@ fastrand = "2"
 # JSON payloads for the mcap-writer examples.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The rosbag2 `metadata.yaml` sidecar a bag directory carries (`clip::bag`).
+# YAML is the recorder's choice, not this workspace's — the file is read, never
+# written — and the split order it states decides which recording each segment
+# of a straddling clip is cut from, so it is deserialized into a typed struct
+# rather than scanned by hand. `serde_norway` is the maintained continuation of
+# the deprecated `serde_yaml`.
+serde_norway = "0.9"
+# SHA-256 behind a clip's id (`clip::id`). The digest is a published contract —
+# an id in a report has to stay valid across versions — so it is a named
+# dependency on the standard implementation rather than a hash of this
+# workspace's own devising, and `DefaultHasher` is unusable for it outright
+# (std makes no stability promise about what it produces).
+sha2 = "0.10"
+
+# One lint policy for every member, inherited with `[lints] workspace = true`.
+# Cargo cannot override a workspace lint per member, so anything a member keeps
+# against the policy is an `#[expect(lint, reason = "…")]` at the narrowest scope
+# in the source — which reports itself the day the lint stops firing.
+[workspace.lints.rust]
+# `deny`, not `forbid`: `forbid` cannot be lifted anywhere in the package, tests
+# included, so the env-var guards the recorder's config tests need and the
+# `kill(2)` the e2e harness signals a process group with would both become
+# impossible.
+unsafe_code = "deny"
+unreachable_pub = "warn"
+# A public type a downstream crate holds in a struct or logs on an error path
+# needs `Debug`, and the omission only shows up in the consumer's build.
+missing_debug_implementations = "warn"
+# Deliberately no `missing_docs`: measured on this workspace, nearly every hit is
+# a struct field on a type whose own docs already say what it carries, so the
+# lint buys restated field names rather than contracts. The discipline is the
+# `//!` module header instead.
+
+[workspace.lints.rustdoc]
+# Rot-detection for the links the docs do carry — these crates cross-reference
+# heavily between `clip`, `tail` and the recorder.
+broken_intra_doc_links = "warn"
+bare_urls = "warn"
+
+[workspace.lints.clippy]
+# `priority = -1` so the single-lint entries below override it.
+pedantic = { level = "warn", priority = -1 }
+missing_errors_doc = "allow"                  # what it forces is usually the variant list
+missing_panics_doc = "allow"                  # public-item-only; misses the panics we have
+doc_markdown = "allow"                        # a hand-maintained proper-noun allowlist
+# Every arm of a match over one of *our* enums is a decision; a catch-all hides
+# the site a new variant has to be handled at. It is blind to matches over a
+# tuple, and cannot be satisfied on a foreign `#[non_exhaustive]` enum
+# (`mcap::records::Record`, `io::ErrorKind`) — those carry an `#[expect]`.
+wildcard_enum_match_arm = "warn"
+unwrap_used = "warn"
+expect_used = "warn"                          # the half that catches an invariant nothing checks
+indexing_slicing = "warn"                     # carved out per accessor in the index/arena code
+string_slice = "warn"                         # `indexing_slicing` does not cover `&s[a..b]` on a str
+allow_attributes_without_reason = "warn"
+undocumented_unsafe_blocks = "warn"           # meaningful because `unsafe_code` is `deny`, not `forbid`
+await_holding_lock = "deny"                   # nothing here is async; the entry is the ratchet
+# A restriction lint, off by default: its threshold in `clippy.toml` is what
+# makes it the second pass's worklist rather than a style opinion.
+cognitive_complexity = "warn"
+
+# Deliberately not enabled, having been measured rather than assumed:
+#   clippy::arithmetic_side_effects — ~50 hits across `clip` and `tail`, all
+#     offset and length arithmetic in the scan and the cut, every one already
+#     bounded by an explicit `MAX_RECORD_LEN` or file-length check before it
+#     runs. Suppressing every site would bury the two that matter.

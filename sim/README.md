@@ -158,7 +158,7 @@ recording the triggered-recording workflow cuts clips from — run `ros2 bag
 record --topics /camera/image_raw /camera/camera_info
 /camera/image_raw/compressed /camera/image_raw/ffmpeg` from the root, or
 `./scripts/record.sh` to capture every live topic. See the root
-[README](../README.md#triggered-recording).
+[README](../README.md#how-it-works).
 
 ## Environment
 

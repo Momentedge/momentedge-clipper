@@ -1,6 +1,22 @@
 # clipper
 
-A *triggered* clip recorder over a **continuous `ros2 bag record`** output. It keeps the growing recording(s) open and **tails them**, so a clip can be cut as soon as the data is physically on disk: clip latency is bounded by the recorder's write-through latency. Built on [r2r](https://github.com/sequenceplanner/r2r) over plain OS threads — there is no async runtime.
+The binary: a *triggered* clip recorder over a **continuous `ros2 bag record`**
+output. It keeps the growing recording(s) open and **tails them**, so a clip can
+be cut as soon as the data is physically on disk — clip latency is bounded by the
+recorder's write-through latency. Plain OS threads throughout; there is no async
+runtime.
+
+Four files are all this crate is: the interface seam and its MCAP implementation
+(`src/interface.rs`), the ROS implementation behind the `ros` feature
+(`src/interface/ros.rs`), and the clap configuration of each mode, the admission
+gate and the thread supervision (`src/main.rs`, `src/supervision.rs`). Telling
+ROS from MCAP, taking configuration, and deciding what to do when a thread dies
+is the whole of what a device recorder adds over the two libraries under it —
+[`clip`](../clip/CLAUDE.md), the format layer and the cut, and
+[`tail`](../tail/CLAUDE.md), what following a growing recording adds. ROS is this
+crate's `ros` cargo feature, off by default; the feature matrix and the seam
+between the three crates are one level up in
+[`crates/CLAUDE.md`](../CLAUDE.md).
 
 ## The pipeline it sits in
 
@@ -11,20 +27,24 @@ ros2 bag record (scripts/record.sh) ──▶ ./record/<bag>_0.mcap   (one growi
 clipper ◀── trigger ── EITHER /events/momentedge/trigger (ros interface)
         │              OR read out of the tailed ./record/*.mcap (mcap interface)
         │ cuts [anchor-preroll, anchor+postroll]  (anchor resolved per cell)
-        │   one recording  → ./clipped/<anchor_ns>_<name>.mcap
-        │   rollover split → ./clipped/<anchor_ns>_<name>_00.mcap + _01.mcap …
-        └──▶ completion: ros → /events/momentedge/recorded (filenames[] lists
-             every segment); mcap → the clip's atomic move into ./clipped is
-             the only signal (no Recorded published)
+        │   → ./clipped/<anchor_ns>_<hash>/          the clip is the directory
+        │       <id>_0.mcap                          one file per source recording
+        │       <id>_1.mcap                          (only when the window straddled a split)
+        │       clip_metadata.yaml                   written last: present = complete
+        └──▶ completion: ros → /events/momentedge/recorded (filenames[] holds the
+             one directory); mcap → the metadata file's appearance is the only
+             signal (no Recorded published)
 ```
 
-The trigger and the completion are paired into one **interface**, selected by
-`--interface {ros|mcap}` (default `ros`); the two interfaces are mutually
-exclusive and clipper drives exactly one per run. The `ros` interface
-subscribes on a ROS node and publishes `Recorded`; the `mcap` interface reads
-triggers out of the recording clipper already tails and runs ROS-free, with the
-clip's move into `out_dir` as the only completion signal. See "The interface
-abstraction" below.
+The trigger and the completion are paired into one **interface**, named by
+`clipper tail --trigger-source`: the key says where the run's triggers come from
+and the completion half follows from it. The interfaces are mutually exclusive and
+clipper drives exactly one per run. The `ros` interface subscribes on a ROS node and publishes
+`Recorded`; the `mcap` interface reads triggers out of the recording clipper
+already tails and runs ROS-free, with the clip's metadata file as the only
+completion signal. Which of them the binary has is the build: `mcap` is in every
+one, `ros` needs the crate's `ros` feature, and the default is `ros` where it
+exists and `mcap` otherwise. See "The interface abstraction" below.
 
 `record.sh` is a standalone `ros2 bag record` — this binary never
 spawns it. The two communicate only through the files. Under the `mcap`
@@ -32,327 +52,142 @@ interface that file path is also the *trigger* path: the continuous recording
 must capture the trigger topic (`ros2 bag record --all`) so clipper can lift the
 triggers back out of it.
 
-## Why tailing a live MCAP is sound (`tail.rs`)
+## `clipper clip`: one window, one finished recording
 
-Two properties carry the whole design:
+What this mode does for an operator — bag directories, the refusals and their
+repairs, what a re-run over the same output does, where a run's triggers come
+from — is [`clipper clip`](../../docs/clip-command.md), and that page is where
+those facts are stated. This section is the code that produces them.
 
-1. **The MCAP writer is append-only while recording.** Bytes below the current
-   end of file never change; the summary/footer is appended only at close. So
-   everything behind the last complete record is immutable.
-2. **Every record is length-prefixed** (1-byte opcode + u64le length). A record
-   whose declared extent runs past the current file length is still being
-   appended — the scan stops there and resumes on a later pass. An in-progress
-   file is indistinguishable from a crash-truncated one, which MCAP readers are
-   designed to tolerate.
+`clipper clip <recording> --out-dir <dir> --trigger-time <ns> --preroll
+<ns> --postroll <ns>` (plus optional `--trigger-name`/`--trigger-description`)
+is `clip_mode` in `src/main.rs`. It builds the same `CutRequest` a
+[trigger handler](../tail/CLAUDE.md#per-trigger-flow) builds — the trigger's five
+values are spelled as flags, and `--trigger-time` is both the `Stamp` the trigger
+carries (`Stamp::from_ns`) and the anchor the window centres on — and hands it to
+the same [`clip::segment::cut_window`](../clip/CLAUDE.md#segment-assembly-and-the-clip-directory-clipsegment),
+along with `--out-dir`: the output *directory*, never a path. The cut itself is
+therefore unchanged, and so are the document, the `<anchor_ns>_<hash>` directory
+`clip` names and the rule that the metadata file is written last.
+`--trigger-name` passes the same `validate_name` gate a name arriving on a topic
+does, so a name accepted by one mode is accepted by the other.
 
-Both properties are a producer requirement in disguise — append complete
-records, never seek back to rewrite one (the producer-facing statement lives in
-[ARCHITECTURE.md](../../ARCHITECTURE.md#tailing-a-live-mcap)). The Rust `mcap`
-crate's chunked writer (`use_chunks(true)`, its default) is exactly the
-violation: it leaves a `Chunk` header's length as the placeholder `u64::MAX`
-until the chunk closes and the true length is back-patched in, so a `len >
-MAX_RECORD_LEN` framing fault (below) is guaranteed the moment the scan meets
-one mid-write. Because `u64::MAX` is a value only a seek-back writer's
-placeholder could ever produce — no valid record reaches it under
-`MAX_RECORD_LEN` — that one length is special-cased to name the cause instead
-of reading as bare corruption: "record at offset {offset} declares u64::MAX
-bytes — an unpatched length from a seek-back (chunked) writer? such a recording
-cannot be tailed until it is finalised". (The compliant chunked configuration —
-buffered chunks via `disable_seeking(true)`, which appends each chunk as one
-complete record — is demonstrated by
-[`examples/chunked-mcap-writer`](../../examples/chunked-mcap-writer/README.md).)
-This is also why the scan never waits
-out an over-`MAX_RECORD_LEN` length instead of faulting on it: `u64::MAX` (or
-anything else past the ceiling) has no path to becoming a valid record, so
-retrying it as though it were a transient stall would only delay the identical
-fault. Treating it as fatal once the retry budget below is exhausted is the
-deliberate choice: the alternative — waiting it out — would silently degrade
-every clip to a grace-timeout cut instead of failing fast.
+**Where the triggers come from is `--trigger-source`** (`TriggerSource`), the
+same key over the same value set the recorder takes, and exactly one source is
+active per run. **Which subcommands take which source is a property of the type**:
+`TriggerSource::modes` is an exhaustive match with no catch-all naming the
+`config::Mode`s that take each variant, and `trigger_source_parser(mode)` derives
+both `--trigger-source` surfaces from that one answer — so adding a variant is a
+compile error until it says who takes it, and a source a subcommand does not take
+never reaches its `--help` and is refused by name while the command line is being
+read. This subcommand's subset is `param` and `mcap`; `ros` is a live subscription
+and a finished recording has no live topic. Neither of the two is behind a cargo
+feature, so the cutter's surface is the same in every build — the `ros` feature
+shows here only in what a *recorded* trigger may be encoded as. The `--help`
+default renders through a `Display` reading the `ValueEnum`'s own possible-value
+name, so the accepted values and the help text cannot drift.
 
-The tail keeps the recording open and never re-reads consumed bytes. Each pass
-yields three artefacts, shared with the per-trigger handlers:
+- **`param`** (the default) cuts the one trigger the flags name.
+  `ClipConfig::param_trigger` is where the flags become that trigger, and it is
+  called twice with the same answer: once by `parse_cli`, where a missing flag
+  ends the process, and once by the cut, which takes the trigger it built.
+- **`mcap`** cuts every trigger the recording itself carries on `TRIGGER_TOPIC`.
+  `clip::embedded::read_triggers` returns them as the same undecoded
+  `TriggerRecord`s the tail's trigger tap emits, `clip::decode::decode_trigger`
+  turns each into a `Trigger`, and the window anchors on the record's own
+  `log_time` — the stamp `resolve_mcap_anchor` picks under `--time-source log`,
+  so a clip cut here and the one the device cut from that trigger centre on the
+  same instant. One run, one clip per trigger, cut in trigger order. Over a bag
+  directory every split is read, in the order the collection is planned in, so a
+  trigger reaches its clip whichever recording of the run was being written when
+  it fired.
 
-- **Extent index** — contiguous byte ranges (closed at 4 MiB) carrying the
-  min/max `log_time` and `publish_time` of the messages they hold. Extraction
-  reads only the extents whose span on the active [time source](#time-source)
-  overlaps its window; the overlap test is exact on both spans (real min/max,
-  not a heuristic), so no in-window message can be missed on either clock
-  domain. Retention ages on the `log` span alone.
-- **Schema/channel registry** — owned copies of every `Schema`/`Channel`
-  record, keyed by channel ID (unique within one continuous file). The MCAP
-  spec puts a Schema before any Channel referencing it, so resolution always
-  succeeds on conformant files; an inverted (invalid) file degrades the
-  channel to schemaless rather than erroring. Chunked recordings carry these
-  records *inside* chunks, so chunks are decompressed during the tail
-  (zstd, lz4 and uncompressed chunks all work — mcap's default features);
-  the default fastwrite profile is unchunked and skips that cost entirely.
-- **Coverage watch** — a `Watch<Coverage>` (`Mutex` + `Condvar`, `src/watch.rs`)
-  holding a collection-wide high-water per source: the highest `log_time`
-  (`high_water_ns`) and the highest `publish_time` (`publish_high_water_ns`). A
-  handler waits on the high-water of its window's [time source](#time-source).
-  The `log` high-water is a completeness proof — messages land in the file in
-  (approximately) non-decreasing `log_time` order (rosbag2's single writer stamps
-  `log_time` at receive) and the tail scans recordings strictly oldest-first, one
-  at a time, so a later recording's coverage cannot advance before an earlier one
-  is complete. The `publish` high-water is a liveness signal only: `publish_time`
-  has no ordering guarantee, so a message can arrive after a cut with an in-window
-  `publish_time` and be missing from that clip. Both rise independently and never
-  regress (the watch only raises each).
+**A trigger nobody can use costs that trigger its clip and no more**, the
+isolation the recorder's interface gives an undecodable trigger: an unreadable
+payload or a recorded name the message contract refuses (`validate_name`, a
+length bound and nothing else) is logged and skipped, and the run cuts the rest.
+The same name in the operator's own `--trigger-name` is the opposite — a command
+line to fix — and ends the run. A
+run left with nothing to cut writes no clip and exits zero; what it leaves is the
+empty output directory every accepted run leaves (below).
 
-Per top-level `Message` record only the 22-byte fixed header is read, in one
-read (channel id, sequence, `log_time`, `publish_time`); bodies are first
-touched at extraction. Both stamps are indexed so a window can live on either
-[time source](#time-source); the gap between the two — recorder queue backlog
-plus producer clock skew — is also observable (logged per scan pass at debug). A
-record too short
-to hold the full 22-byte header is skipped like other localized damage: warned
-and consumed via its intact framing, contributing to neither bounds nor
-coverage. The same "decode only the timestamps" discipline as the rest of the
-workspace, applied to file tailing.
+**Both ways of stating the trigger wrongly fail while the command line is being
+read** (`ClipConfig::trigger_argument_fault`, raised by `parse_cli` as a
+`clap::Error` against the `clip` subcommand): `param` without `--trigger-time`,
+`--preroll` or `--postroll`, and `mcap` alongside any `--trigger-*` flag. The
+check is hand-written because clap's derive cannot state it — `required_if_eq`
+and `conflicts_with` key on an argument being *given*, and an absent
+`--trigger-source` still selects `param`, so a defaulted run would slip past
+both. It is also why the five `--trigger-*` arguments carry no clap default: a
+default is indistinguishable from a value the caller typed, and the conflict
+turns on exactly that distinction (`DEFAULT_TRIGGER_NAME` is applied when the
+trigger is built instead).
 
-The one exception is an **opt-in trigger tap**, enabled only under the `mcap`
-interface (`Tailer::with_trigger_tap`). With the tap on, the scan additionally
-reads the *full body* of every message on the configured trigger topic, lifting
-it as a raw `(message_encoding, body, log_time, publish_time)` quadruple the
-MCAP interface decodes by `message_encoding` — the two record stamps are what
-the mcap interface resolves its anchor from; the tap learns the trigger topic's channel IDs
-from the same registry pass, so a body is read only for a message it has already
-matched to that topic. With the tap disabled — the `ros` interface, the default
-— the scan is byte-for-byte the timestamp-only walk above: no message body is
-ever read.
+**The waits are what is absent, and that is the whole difference.** The handler's
+[first two steps](../tail/CLAUDE.md#per-trigger-flow) — sleeping out the postroll
+and blocking on coverage — exist because a window may reach past the last byte on
+disk. This input has an
+end: nothing sleeps out the postroll, nothing blocks on coverage, and a window
+reaching past the recording's end is simply short. The coverage verdict is still
+a real decision rather than an assumption — `WholeFileIndex::log_end_ns()`
+against `request.end_ns()` — and it travels into the cut as the same
+`WindowCoverage`, so `clip.short` means what it means everywhere else.
 
-**Damage in the recording is survivable up to the point of framing desync.**
-The scan tolerates localized damage the same way extraction does (see "The copy
-is direct (`clip.rs`)"): a chunk that fails to decompress, fails its CRC, or
-carries an unsupported compression algorithm contributes nothing — its interior
-is absorbed into a throwaway sub-delta merged into the live state only once the
-chunk iterates cleanly, so a chunk whose CRC fails mid-iteration leaves no
-registry entry and no time folded into coverage or extent bounds, and coverage
-never claims data the cut would silently drop. An unparseable top-level
-`Schema`/`Channel` record (spec-legal bytes the parser rejects, e.g. an
-invalid-UTF-8 name) is warned and skipped. Both keep the framing intact — the
-length prefix is self-consistent — so the record is consumed and the scan keeps
-indexing the records behind it.
+**What it refuses, it refuses by name.** A recording it cannot index is answered
+before anything is written, naming the file and the repair — the taxonomy is
+[`clip`'s](../clip/CLAUDE.md#cutting-from-a-finished-recording-clipwhole-clipbag-clipembedded).
+`clip_mode` opens the index *before* it prepares the output directory, so a
+refusal does not even create `out_dir`.
 
-A **framing** fault has no resync point and so cannot be skipped: a record whose
-declared length exceeds `MAX_RECORD_LEN`, or an IO error reading a record's
-header or body. The scan stops at the faulted record, having already applied the
-delta it accumulated before it, and reports the fault with that record's offset.
-Everything before the fault therefore stays plannable — clips cut from the
-pre-fault index still extract and announce. The tail then retries from exactly
-that offset, never re-attaching and never rescanning from scratch (the index is
-attached once per recording, so a retry that resumed earlier would re-extend an
-extent the open delta already spans and underflow). Retries are bounded by
-`MAX_SCAN_FAULTS` consecutive faults with backoff escalating from `DISCOVER_POLL`
-toward `SCAN_BACKOFF_CAP`, slept in `DISCOVER_POLL` increments so a recorder
-restart mid-backoff is noticed within one increment and taken as recovery; a
-single fault-free pass resets the count, so transient trouble that clears never
-accumulates. Exhausting the budget is fatal: every retry in a row ended in a
-fault — usually the same stuck byte — so `run()` returns the fault (named with
-the path, offset, and attempt count), `supervise()` carries it out, and the
-process exits non-zero for a supervisor to restart. Limping on would degrade every clip to a
-grace-timeout cut with no other signal, which is exactly what the fail-fast
-budget exists to prevent.
+**What it does not refuse is a clip that is already there.** A finished recording
+and a trigger describe one window over one set of bytes, so a window whose
+directory exists has already been cut: `cut_window` skips it with a warning and
+the run goes on to the next window. That is what makes a re-run over the same
+recording into the same output directory a *resume* — an interrupted run is
+finished by running it again — rather than a conflict to clear by hand.
 
-**Recorder restarts and bag splits:** recordings are discovered by
-`discover::NewFileWatchIterator`, a lazy iterator that yields new `*.mcap` files
-one per `next()`. Each poll drains it; each yielded path is opened and inserted
-as a `New` recording into the collection (`TailState`). Files are tracked by
-`(dev, ino)` **identity**, not a timestamp cursor: a file under tail grows and
-its mtime (and ctime) advances, so a cursor would re-yield it every poll and
-index the same recording as a phantom duplicate. The iterator records the inode
-of every file it yields and never yields it again, forgetting inodes no longer on
-disk (so the set stays bounded and a reused inode yields its new file). mtime
-orders the unseen files oldest-first, so several appearing between polls drain in
-creation order. No file observed during a run is skipped.
+**The windows are cut in order and the run stops at the first one that fails**,
+which is what `?` in `clip_mode`'s loop is. The clips published before it stay,
+the failed window's own directory leaves with the error (`clip::layout`), and the
+windows after it are never planned — a disk or input fault outlives the window
+that met it, so going on would raise it once per remaining trigger. The error
+carries the window that stopped the run and what the run had published by then,
+so the last line of a stopped run is the reason rather than the arithmetic.
+`ClipTally` is that arithmetic: `cut_one` hands its `CutOutcome` back for the two
+to be counted apart, and a run that got through every window closes with one
+`info!` saying how many it cut and how many were already there — the fact a
+per-window warning cannot state, since "every window was already there" is about
+the run.
 
-At startup the newest existing file (by mtime) is adopted directly and the
-iterator seeded past every file present then. Pre-existing bags older than that
-newest file are not indexed: clipper recovers only rollovers it observes during
-its own run, never reconstructing offsets or footers it did not scan
-incrementally. A trigger fired shortly after startup whose preroll reaches into a
-prior split that existed before launch gets no segment from that file.
+**`--out-dir` is created once the input and the triggers are accepted**, before
+the window count is consulted, so a run over a recording carrying no trigger
+still leaves the directory it was pointed at — one shape for a caller listing it,
+whatever the recording held. It is created with parents, never cleared, and never
+required to be empty; the refusals above all happen earlier, which is why they
+leave no directory at all.
 
-A bag split (rosbag2 `--max-bag-size`/`--max-bag-duration`) is detected when a
-footer appears on disk, when a successor is yielded by the iterator while
-`current` is length-stable, or when the tailed inode vanishes or is replaced. In
-each case the recording transitions to `Ended` and the tail advances to the next
-indexed recording — no index reset, no data lost from recordings already in the
-collection. A recorder restart (record script wipes the bag directory) is detected
-via `inode_changed`: the tailed path no longer resolves to the open fd's inode.
-The `Arc<File>` keeps the old inode readable, so the final scan drains every
-complete record before the recording is retired, and in-flight extractions finish
-safely against the deleted inode. A magic mismatch stays fatal — an append-only
-file whose first eight bytes are wrong can never become a valid MCAP. A `NotFound`
-when opening a discovered path (the file vanished between discovery and open) is
-silently skipped; the iterator has already advanced past it.
+Nothing machine-readable is printed: the run's result is `out_dir`'s contents
+when the process exits, each clip a directory carrying its own
+`clip_metadata.yaml`, and the exit status is the verdict. No ROS is involved anywhere on this path, so a default (ROS-free)
+`cargo build -p clipper` cuts these clips.
 
-## Per-trigger flow (`handle_trigger` / `record_clip`)
-
-Each admitted trigger is handled on its own thread, so overlapping windows are
-cut concurrently against the shared tail. The handler (`handler.rs`) is generic
-over the [`Announce`](#the-interface-abstraction) the active interface supplies
-and knows only the neutral `Trigger`/`Completion` contract plus the window's
-`anchor_ns` and [time source](#time-source) — nothing of ROS or any wire
-encoding. The interface resolves the `anchor_ns` (the window centre) and hands it
-in; the handler never derives an anchor itself. Admission is bounded: at most
-`MAX_ACTIVE_TRIGGERS` (16) handlers may be active at once, and a trigger that
-arrives while all of them are is rejected — logged with `error!` and otherwise
-ignored: no handler runs, no clip is extracted, and no completion is announced.
-
-1. **Wait out the postroll.** Sleep until the system clock passes
-   `anchor + postroll`. The wall floor is always the system clock, whatever the
-   time source. `checked_sub` reads the clock once per iteration, so a clock that
-   crosses `end_ns` between the check and the sleep cannot underflow.
-2. **Wait for coverage.** Block on the collection-wide coverage watch until the
-   window's source high-water reaches `end_ns` (`c.for_source(time_source)`). A
-   grace timeout (`grace_secs`, default 30 s) bounds the wait; on timeout the clip
-   is cut from what exists, with a warning. On `log` a window whose end falls
-   inside an already-scanned recording is satisfied as soon as the scan reaches
-   `end_ns` (or at the footer), so only a window whose end is past the last
-   recorded message with no successor waits out the full grace; on `publish` the
-   high-water is a liveness signal, so a later out-of-order message can still be
-   missed. The grace must exceed the recorder's flush latency: near zero for the
-   fastwrite profile, roughly one chunk fill (chunk size / aggregate data rate)
-   for chunked profiles.
-3. **Multi-file snapshot.** Call `tailer.plan_window(start_ns, end_ns,
-   time_source)` once, producing a `Vec<WindowPlan>` — one plan per recording
-   whose extents overlap the window on the active time source, oldest first. Each plan carries its own `Arc<File>` clone, so a
-   retention prune or rollover after this snapshot cannot pull the bytes out.
-4. **Stage** via the staging worker pool (`extract_parallelism` `stage-N`
-   threads, default 1): one `StageJob` per plan is enqueued on the shared FIFO
-   channel and the handler blocks on each reply. A worker runs
-   `clip::stage_clip` into `.capturing/` and replies a `StagedClip`. When no
-   recording covers the window, one empty plan is staged so every trigger
-   produces a valid (possibly empty) clip.
-5. **Publish.** Empty segments are dropped when the window produced real data
-   elsewhere (one is kept if all are empty). The count determines naming: a
-   single segment keeps the bare `<anchor_ns>_<name>.mcap`; multiple segments
-   get `<base>_00.mcap`, `<base>_01.mcap`, … Each is atomically published into
-   `out_dir` via `hard_link` + unlink.
-6. **Announce** a single `Completion` (the trigger echo plus all segment paths)
-   through the active interface's announcer — only after every segment is in
-   `out_dir` and fsynced, so every announced path is already crash-durable. The
-   `ros` interface turns the `Completion` into one `momentedge_msgs/Recorded`
-   published on `/events/momentedge/recorded`; the `mcap` interface's announcer
-   is a no-op — the segments' atomic move into `out_dir` (step 5) is the only
-   completion signal, with the per-clip `info!` lines as the log.
-
-## The copy is direct (`clip.rs`)
-
-Extraction reads each planned extent with `read_at` (no seek state shared with
-the tail) and walks its records with **its own opcode + length framing** — the
-same walk the tail performed to build the extent, so the boundaries are known
-to tile. Owning the framing makes extraction damage-tolerant the way the MCAP
-format is designed to be (length prefixes delimit every record; chunk CRCs
-exist to detect and discard a damaged chunk — the format the official
-`mcap recover` tool salvages by): a record whose body fails to parse, or a
-message on a channel the recording never declared, is skipped with an error
-log; a chunk that fails decompression, CRC, or interior parsing is dropped
-whole — its messages are buffered and written only once the chunk iterates
-cleanly (`mcap::read::ChunkReader` verifies the CRC at the end of iteration),
-since a bad CRC cannot say which of the chunk's bytes are lying. The mcap
-library readers are unsuitable for this walk: they halt at the first error,
-and the `LinearReader::sans_magic` constructor additionally caps every
-record — including chunk-interior records after decompression — at the slice
-length, failing any conformant chunk whose contents out-compress it. Messages whose
-`log_time` falls in the inclusive window are written through with their **raw
-serialized bytes** (`write_to_known_channel`); CDR bodies are never decoded.
-
-The clip writer is built from explicit `mcap::WriteOptions` with `.compression(..)`
-set — the codec is a deliberate choice (`--clip-compression`, default zstd; see
-the [README](../../README.md#configuration)), not inherited from the mcap crate
-default, so a future default change cannot silently alter clip output. `copy_window`
-takes the codec as `Option<mcap::Compression>` (`None` = uncompressed), threaded
-down from `Config` through `extract_clip`/`stage_clip`; chunk size and chunking
-stay at the `WriteOptions` default. Output channels are registered from the
-registry per source channel ID and
-cached; `mcap::Writer` deduplicates schemas/channels by content. The clip ends
-with `Writer::finish()`, which writes the summary section, footer and closing
-magic — every clip is a complete, standalone MCAP file
-(`mcap::MessageStream` over a clip is the validity check the
-unit tests use).
-
-**Two-staged atomic publication.** `extract_clip` composes two stages so the
-output directory only ever holds finished clips. `stage_clip` assembles the
-clip in a `.capturing` subdirectory of `out_dir`, `Writer::finish()`es it, and
-`sync_all`s the file; `publish_clip` then moves it into `out_dir` under the
-desired name. The capturing area is a *subdirectory* of the output directory
-rather than a sibling so the two always share a filesystem — the move is a true
-atomic link, never a cross-device copy. The move is `hard_link` + unlink of the
-staged path, not `rename`: a duplicate trigger (same stamp and name) must not
-clobber the earlier clip, and `rename` replaces an existing destination
-silently, whereas `hard_link` is equally atomic but fails with `AlreadyExists`,
-which the `_<n>`-suffix retry (`with_suffix_retry`, cap 1000) resolves against
-the *desired* final name. The link is the commit point: once it succeeds the
-output directory holds a complete clip (the staged file was already fsynced), so
-the staged name is unlinked and `out_dir` itself is fsynced to make the new
-directory entry crash-durable. A `StagedClip` is `#[must_use]` and its `Drop`
-unlinks an unpublished staged file, so an early return or panic between the
-stages — or a failed publish — strands nothing in `.capturing` and never
-reaches `out_dir`. The capturing-dir name may carry its own `_<n>` suffix to
-avoid colliding with a concurrent stage, independent of the final name a
-duplicate trigger resolves to at publish. The one leftover `Drop` cannot
-reclaim is a crash *between* the publish link and the staged-file unlink, which
-strands a stale link in `.capturing` (harmless — only `out_dir` is observed);
-`reset_capturing_dir`, called once at startup, deletes and recreates
-`.capturing` (and ensures `out_dir` exists) so that clutter never outlives a
-single run. Failing that reset is fatal: a recorder that cannot prepare its
-output directory must not start.
-
-Extraction degrades over localized damage and aborts on anything else.
-Skipped records and dropped chunks are counted in `ClipStats`
-(`records_skipped` / `chunks_dropped`) and surfaced as a warning by the
-trigger handler, so a degraded clip is announced but never silent. What stays
-fatal — the recording truncated under the plan, extent framing that no longer
-matches the tail's scan (the bytes changed since the scan, so there is no
-boundary to resync at), and output IO errors — confines its cleanup to the
-capturing directory, so the output directory never holds a footer-less file
-that could be mistaken for a clip. A *deleted* recording is not an error — the
-plan's `Arc<File>` keeps the inode readable, so extractions in flight across a
-recorder restart still complete.
-
-**Detection limit:** the leniency applies to damage loud enough to break
-parsing or a CRC. The default fastwrite profile is unchunked and carries no
-CRCs, so corruption inside a message *body* that leaves the framing and the
-22-byte message header intact is invisible to every MCAP reader and is copied
-into clips as-is — only a CDR decode downstream would notice.
-
-## Time base
-
-`log_time`, `publish_time`, the trigger stamp, and the wait clock are all
-nanoseconds on the system clock — this assumes the default (no `use_sim_time`).
-The trigger stamp is the neutral `Stamp` (`trigger.rs`), a
-`builtin_interfaces/Time` flattened to its `sec`/`nanosec` fields free of `r2r`;
-`Stamp::ns()` flattens it to that scale (`sec.max(0) * 1e9 + nanosec`, negative
-seconds clamped to 0). The same arithmetic anchors the window identically whether
-the trigger arrived live over ROS or was decoded out of the tailed MCAP.
-
-## Time source
-
-`--time-source` (`log` or `publish`, default `log`; `TimeSource` in `main.rs`,
-threaded through the handler, tail, and clip) picks the clock domain the whole
-window lives in: the anchor, which messages fall inside, which extents are read
-(`Extent::overlaps` / `plan_window` on the source's `Span`), and which coverage
-high-water the wait blocks on (`Coverage::for_source`). It governs nothing else —
-retention ages files on `log_time` (`TimeBounds.log.max`) whatever the window's
-source, and the postroll floor is the wall clock. clipper never interprets
-`publish_time`; it windows on the raw value, so `publish` coverage is a liveness
-signal, not a completeness proof (out-of-order publish times are normal). On ROS 2
-Humble `publish_time = log_time` verbatim, so `publish` is a no-op there.
+## The anchor seam and the admission gate
 
 **The anchor seam.** The interface resolves each trigger's [`Anchor`] (in
 `interface.rs`) — the instant the window centres on, plus whether it came from
 `trigger_time` — and passes it to the driver's `fire` callback, which hands
-`anchor.ns` to `handle_trigger` for both the window bounds and the output name
-`<anchor_ns>_<name>.mcap`. The four interface × `--time-source` cells resolve it:
+`anchor.ns` to `handle_trigger` for both the window bounds and the clip's id,
+which the directory name `<anchor_ns>_<hash>` is the rendering of. The four
+`clipper tail --trigger-source` ×
+`--time-source` cells resolve it:
 
-|                    | `--time-source log`             | `--time-source publish`      |
-| ------------------ | ------------------------------- | ---------------------------- |
-| **`--interface ros`**  | `now_ns()` at the subscription | the trigger's `trigger_time` |
-| **`--interface mcap`** | the record's `log_time`        | the record's `publish_time`  |
+|                             | `--time-source log`            | `--time-source publish`      |
+| --------------------------- | ------------------------------ | ---------------------------- |
+| **`--trigger-source ros`**  | `now_ns()` at the subscription | the trigger's `trigger_time` |
+| **`--trigger-source mcap`** | the record's `log_time`        | the record's `publish_time`  |
 
-`resolve_ros_anchor` and `resolve_mcap_anchor` (in `interface.rs`) do the
+`resolve_ros_anchor` (in `interface/ros.rs`) and `resolve_mcap_anchor` (in
+`interface.rs`) do the
 resolution; a live ROS trigger has no record stamp and r2r surfaces no wire
 timestamp, so ROS anchors on `now` or the publisher's `trigger_time`. The
 `Completion` echoes the trigger's `trigger_time` unchanged.
@@ -379,21 +214,60 @@ in `main.rs`; each value exactly at its bound is accepted:
   hostile record stamp) would wedge a handler. `ros`+`log` resolves the anchor to
   `now` and always passes; the guard bites on a `ros`+`publish` `trigger_time` and
   on a tail record's own stamp.
-- **A `name` that is empty, past `MAX_TRIGGER_NAME_LEN` (128 B), or unsafe in the
-  clip pathname** (`validate_name`: no path separator, NUL, leading dot, or `..`).
-  `handler::sanitize` still maps stray characters to `_` at clip creation; the
-  structural hazards are refused whole here rather than silently rewritten.
+- **A `name` past `MAX_TRIGGER_NAME_LEN` (128 B)** (`validate_name`). That is
+  the whole of the name rule, and the bound is a *message* bound rather than a
+  path one: the name is free text copied into every clip's document and echoed in
+  every `Recorded`, and nothing else. A clip is named by
+  [its id](../clip/CLAUDE.md#a-clip-is-named-by-its-id-clipid), a digest, so `/`,
+  `..`, a leading dot, unicode and the empty string shape no path and there is
+  nothing to refuse them for.
+
+  **An interior NUL is the one byte with a live reason to be refused, and the
+  reason is C strings rather than paths.** A published `Recorded` crosses rmw as
+  a NUL-terminated `rosidl_runtime_c__String`, so a name carrying one would reach
+  a subscriber truncated at it. No path in this crate produces such a name: a
+  `cdr` trigger is deserialized through that same C-string boundary and cannot
+  hold one, and a `json` trigger — whose `serde_json` decode can — is read only
+  by `McapInterface` and by `clip_mode`, neither of which publishes anything
+  (`NullAnnouncer`, and no announcer at all). That is why `validate_name` is a
+  length bound and nothing else, and it is what a publishing path added to either
+  of those two, or a third encoding accepted on the `ros` one, would invalidate.
 
 [`Anchor`]: src/interface.rs
 
 ## The two interfaces
 
 The trigger input and the completion output are one unit — an **interface** —
-chosen by `--interface {ros|mcap}` (default `ros`). The two are mutually
-exclusive; clipper drives exactly one per run. No `rosbag2_interfaces`
-subscription either way — coverage always comes from the file itself.
+named by `clipper tail --trigger-source`. They are mutually exclusive; clipper
+drives exactly one per run. No `rosbag2_interfaces` subscription either way —
+coverage always comes from the file itself. What each interface offers an
+operator — the topics, the completion signal, what a ROS-free build accepts — is
+[Two ways in](../../docs/triggers-and-time.md#two-ways-in-ros-and-mcap); this
+section is the code behind it.
 
-**`ros`** (the default, the deployed path) talks to the ROS graph:
+**There is no separate setting for the completion half.** The two cells here are
+the only pairings there are, so naming the trigger source names both: splitting
+them would offer a third — in-recording triggers answered by a `Recorded` publish
+— that nobody asked for and no build without the `ros` feature could provide.
+`Interface::SOURCE` is each implementation saying which `--trigger-source` value
+names it, and it is also the label the recorder logs itself up with, so the word
+an operator types and the word the log prints are one fact rather than two strings
+to keep in step.
+
+Which interfaces the binary offers is decided at compile time by the `ros`
+feature. `TriggerSource::Ros` is a `#[cfg(feature = "ros")]` variant, so the
+accepted `--trigger-source` values are what the build actually has: a ROS-free
+build refuses `--trigger-source ros` as an unknown *value* at parse time rather
+than failing later on a node it cannot create, and `clipper tail --help` lists
+`mcap` alone (with a `long_help` saying which feature the missing one needs). That
+parse-time refusal is what `nix/clipper-ros-free.nix`'s `installCheckPhase`
+asserts — on the error text, because a build that leaked the feature would accept
+the flag and start a recorder whose own exit status says nothing about which
+sources it offers. `TAIL_DEFAULT_TRIGGER_SOURCE` follows the same `#[cfg]` split,
+so an absent flag means `ros` where it exists and `mcap` where it does not.
+
+**`ros`** (the deployed path, and the default where the feature built it) talks
+to the ROS graph:
 
 | Direction | Topic | Type |
 |---|---|---|
@@ -401,36 +275,65 @@ subscription either way — coverage always comes from the file itself.
 | out | `/events/momentedge/recorded` | `momentedge_msgs/Recorded` |
 
 It subscribes to the trigger topic on a ROS node and publishes one `Recorded`
-per finished clip, with every segment path in `filenames[]`.
+per finished clip, with the clip's directory — one entry — in `filenames[]`.
 
 **`mcap`** has no ROS surface at all. Its trigger *input* is the tailed
 recording itself: the continuous `ros2 bag record` (run `--all`) captures the
 trigger topic, and the tail's opt-in trigger tap lifts each trigger message
 back out by `message_encoding` (see "The interface abstraction"). Its
-completion *output* is the clip's atomic move into `out_dir` — there is no
-`Recorded` topic and nothing is published; the per-clip `info!` log lines are
-the only completion record. It runs fully ROS-free at runtime: no ROS
+completion *output* is the clip's `clip_metadata.yaml` appearing in `out_dir` —
+there is no `Recorded` topic and nothing is published; the per-clip `info!` log
+lines are the only completion record. It runs fully ROS-free at runtime: no ROS
 `Context`/`Node`, no spin thread, no subscription.
+
+**Which means the observer under `mcap` lives outside clipper**, and that is the
+whole content of `NullAnnouncer` being a no-op: a run on this interface publishes
+nothing and opens no socket, so what watches for finished clips is whatever
+syncs, uploads or indexes `out_dir`. **Do not give the announcer a body** — a
+channel, a callback, a sidecar file — because it would invent a second completion
+signal beside the one on disk, and two signals can disagree.
+
+What clipper owes that observer is an ordering rather than a message, and the
+ordering is the published contract *the document is present, never a file
+appeared* ([What a clip carries](../../docs/clip-manifest.md), and stated for
+both interfaces in [Two ways
+in](../../docs/triggers-and-time.md#two-ways-in-ros-and-mcap)). The code side of
+it is that a clip directory answers `clip::layout::read_document` only once every
+MCAP file it names is durable. `interface.rs`'s
+`the_observer_completes_on_the_document_and_never_on_a_files_appearance`
+runs both rules over one output directory holding a finished clip and a stripped
+one, and is where that difference is pinned; the e2e suite's
+`harness::TestEnv::wait_for_clip_named` is the same rule against the real stack.
 
 ## The interface abstraction
 
 The recorder is decoupled into four layers around one neutral boundary, so the
 clip-cutting half never learns of ROS or any wire encoding and the
-outside-facing half is the only place either appears:
+outside-facing half is the only place either appears. The first two layers — the
+contract and the decoder — are `clip`'s, so a trigger source that is neither ROS
+nor this recorder still speaks them; the third is the binary's, because telling
+ROS from MCAP is exactly what a device recorder is for; the fourth is `tail`'s,
+because what a cut has to wait for before it can run is the tail's business and
+no interface's:
 
-- **`trigger.rs`** — the neutral contract: `Trigger`, `Stamp`, `TriggerRecord`
+- **`clip::trigger`** — the neutral contract: `Trigger`, `Stamp`, `TriggerRecord`
   (the MCAP message record carrying an undecoded trigger), `Completion`, and the
-  `Announce` trait. It pulls in neither `r2r` nor `mcap` — only `serde`, so
-  `Trigger`/`Stamp` derive `Deserialize` for the `json` decode shape — so either
-  side can change without dragging the other along.
-- **`decode.rs`** — `decode_trigger`, which decodes one trigger payload
+  `Announce` trait. It pulls in no `mcap` and, in a default build, no `r2r` —
+  only `serde`, so `Trigger`/`Stamp` derive `Deserialize` for the `json` decode
+  shape — so either side can change without dragging the other along. The one
+  ROS-shaped thing here, `Completion` → `momentedge_msgs/Recorded`, is behind
+  the `ros` feature and lives here only because the orphan rule allows it
+  nowhere else.
+- **`clip::decode`** — `decode_trigger`, which decodes one trigger payload
   according to its MCAP channel's `message_encoding`, dispatching over two
   encodings, both decodable with dependencies already in the closure (no new
   ones):
-  - **`cdr`** (the ROS2 default) via `r2r`'s rmw deserialization — the linked
-    rmw library only, never a ROS `Context`/`Node`/executor, so it works in the
-    fully ROS-free MCAP interface. r2r's generated `Trigger` maps onto the
-    domain `Trigger` through a `From` impl shared with the live ROS path.
+  - **`cdr`** (the ROS2 default, behind the `ros` feature) via `r2r`'s rmw
+    deserialization — the linked rmw library only, never a ROS
+    `Context`/`Node`/executor, so it works in the fully ROS-free MCAP
+    interface. r2r's generated `Trigger` maps onto the domain `Trigger` through
+    a `From` impl shared with the live ROS path. Without the feature a `cdr`
+    payload is an error naming the absent feature, never a silent loss.
   - **`json`** via `serde_json` — a first-class peer of `cdr`, so a writer
     interleaving a trigger into the bag is never forced to serialize as CDR;
     the domain `Trigger` derives `Deserialize`, so serde reads straight into it.
@@ -438,15 +341,29 @@ outside-facing half is the only place either appears:
   `cbor`, schema-bound `protobuf`/`flatbuffer`, `ros1`, and any unknown encoding
   return an error the interface logs and skips — one undecodable trigger never
   stops the recorder.
-- **`interface.rs`** — the `trait Interface` (generic, dispatched statically,
-  no `Box<dyn>`), with `RosInterface` (owns the node and its own internal spin
-  thread) and `McapInterface` (drains the tail's trigger tap and decodes each
-  raw trigger), plus the two announcers: `RosAnnouncer` (publishes `Recorded`)
-  and `NullAnnouncer` (no-op). An interface produces decoded `Trigger`s and owns
-  the completion half through its `Announce`r.
-- **`handler.rs`** — `handle_trigger` (generic over `Announce`), `record_clip`,
-  and the staging worker pool: the ROS- and encoding-agnostic clip-cutting half,
-  speaking only the `Trigger`/`Completion` contract.
+- **`clip::embedded`** — `read_triggers`, the trigger list a *finished* recording
+  states about itself, found through the summary's own chunk index so that only
+  the chunks holding the trigger channel are decompressed. It is the trigger tap
+  answered all at once instead of a record at a time, which is what a recording
+  with an end makes possible, and `clipper clip --trigger-source mcap` is its
+  caller.
+- **`src/interface.rs`** — the `trait Interface` (generic, dispatched statically,
+  no `Box<dyn>`) and the `Anchor` it resolves, with `McapInterface` (drains the
+  tail's trigger tap and decodes each raw trigger) and its no-op `NullAnnouncer`.
+  Nothing in this file names ROS. **`src/interface/ros.rs`** is the other
+  implementation — `RosInterface` (owns the node and its own internal spin
+  thread) and `RosAnnouncer` (publishes `Recorded`) — and the whole module is
+  `#[cfg(feature = "ros")]`, which is why the r2r, futures, `Pin` and
+  `spawn_supervised` imports it needs live there and not in the parent. An
+  interface produces decoded `Trigger`s and owns the completion half through its
+  `Announce`r.
+- **`tail::handler`** (`crates/tail/src/handler.rs`) — `handle_trigger`
+  (generic over `Announce`) and `record_clip`: the ROS- and encoding-agnostic
+  half, speaking only the `Trigger`/`Completion` contract. It waits, calls
+  `clip::segment::cut_window`, and announces what comes back — or nothing, when
+  the cut reports the window's clip was already there. The claim, the planning,
+  the copy and the completion below it are `clip`'s and know nothing of triggers
+  at all.
 
 `main.rs` wires it together: it builds the selected interface, and a generic
 `drive<I: Interface>` runs the recorder and supervises the tail, the one
@@ -458,9 +375,10 @@ interface thread, and the signal forwarder.
 run for the process's lifetime, plus one short-lived thread per admitted
 trigger:
 
-- **`tail`** — runs `Tailer::run`; discovers recordings via
+- **`tail`** — runs `tail::Tailer::run`; discovers recordings via
   `NewFileWatchIterator`, performs all blocking file IO for the incremental
-  scan, and prunes the collection every poll. Under the `mcap` interface it
+  scan (`clip::index::scan_available`, called with no lock held), and prunes
+  the collection every poll. Under the `mcap` interface it
   also forwards each tapped trigger to the interface thread (the trigger tap).
 - **`interface`** — runs `iface.run`, the single owner of the active
   interface's trigger source. For the **ROS** interface this thread internally
@@ -472,15 +390,17 @@ trigger:
   interface this thread drains the tail's trigger tap, decoding each raw trigger
   by its `message_encoding`. For each decoded trigger it fires the per-trigger
   callback, which admits and spawns a named `trigger-<ns>` handler thread.
-- **`stage-N`** (N = 0 .. `extract_parallelism − 1`) — the staging worker
-  pool; each worker loops on the shared FIFO `StageJob` channel, runs
-  `clip::stage_clip`, and replies a `StagedClip`. The handler publishes the
-  staged segments itself once the window's segment count is known.
+- **`stage-N`** (N = 0 .. `extract_parallelism − 1`) — the
+  [staging worker pool](../clip/CLAUDE.md#segment-assembly-and-the-clip-directory-clipsegment)
+  (`clip::segment::spawn_stage_workers`); each worker loops on the shared
+  FIFO `StageJob` channel, runs `clip::cut::stage_clip`, and replies a
+  `StagedClip`. Naming is not theirs: `cut_window` renames each finished file
+  into place on the handler's own thread, once the clip's file count is known.
 - **`signals`** — blocks on signal-hook's iterator and forwards the first
   SIGINT or SIGTERM into a channel for `supervise`.
 - **`trigger-<ns>`** (one per admitted trigger) — runs the
-  wait/snapshot/stage/publish/announce flow for one trigger; exits when the
-  clip is published or an error is logged.
+  wait/claim/copy/complete/announce flow for one trigger; exits when the clip is
+  complete, when the window was skipped, or when an error is logged.
 
 The announcer the handler uses is `Clone + Send` and is moved into each handler
 thread (`RosAnnouncer` for the ROS interface, the no-op `NullAnnouncer` for the
@@ -495,27 +415,29 @@ holds an `Arc<Admission>` and decrements the counter on `Drop`, so a panicking
 handler returns its slot through unwinding. The cap is a flood-sanity bound
 rather than a resource necessity: an active handler is a parked thread sleeping
 through its postroll and waiting on the coverage watch — the heavy copy stage
-is already serialized by the staging worker pool. 16 comfortably exceeds
+is already serialized by the
+[staging worker pool](../clip/CLAUDE.md#segment-assembly-and-the-clip-directory-clipsegment).
+16 comfortably exceeds
 any legitimate concurrent trigger burst. Per-trigger failures stay isolated
 inside each handler thread — logged and counted, never propagated to the
 consumer.
 
-**Staging worker pool.** `spawn_stage_workers` starts `extract_parallelism`
-threads (at least one) sharing one unbounded FIFO channel. A handler enqueues
-one `StageJob` per `WindowPlan` (the plan snapshot, window bounds, base output
-path, bounded(1) reply channel) and blocks on each reply. The worker dequeues
-FIFO, runs `clip::stage_clip` into `.capturing/`, and replies a `StagedClip`.
-The handler — not the worker — publishes the staged segments once the window's
-segment count is known, so naming (`_00`/`_01`) and atomic publication happen
-together. `std::panic::catch_unwind` isolates a panicking stage per job; the
-pool thread survives and continues processing. With the default
-`extract_parallelism = 1` bulk copies serialize in submission order; postroll
-and coverage waiting are always concurrent.
+**The other per-run handle every trigger reads is `tail::CutFaults`**, the
+recorder-wide tally of clips refused because a recording's bytes changed under
+the tail. `drive` builds it — it carries no configuration, so unlike `Admission`
+it is born at the wiring rather than passed down from `main` — clones it into the
+per-trigger callback, and hands it to `handler::handle_trigger`, which is the
+only thing that reads it back. Together the two are why a per-trigger failure is
+more than a log line: the admission gate bounds how many handlers exist at once,
+and the tally bounds how often the same damaged recording is announced. What it
+counts, what resets it, and why a repeated refusal is counted rather than made
+fatal are the [cut-fault tally](../tail/CLAUDE.md#the-cut-fault-tally).
 
 **`supervise()`.** Each long-lived companion thread is started with
-`spawn_supervised`: the closure sends its return value over a `bounded(1)`
-channel before returning; a panic unwinds without sending, dropping the sender.
-`supervise` uses `crossbeam_channel::select!` on three arms:
+`spawn_supervised` (`src/supervision.rs`): the closure sends its return value
+over a `bounded(1)` channel before returning; a panic unwinds without sending,
+dropping the sender. `supervise` uses `crossbeam_channel::select!` on three
+arms:
 
 1. **tail channel** — receives `anyhow::Result<()>`. `Ok(())` is an unexpected
    exit (the loop never returns on its own); `Err(e)` wraps the scan-fault root
@@ -537,31 +459,63 @@ channel before returning; a panic unwinds without sending, dropping the sender.
 
 A dead tailer silently degrades every clip to a grace-timeout cut; a dead
 interface thread silently stops delivering and acting on triggers — both must
-run for the process's lifetime, so either ending is non-zero exit for a
-supervisor to restart.
+run for the process's lifetime, so either ending is exit 1 for a supervisor to
+restart.
 
-**Process-exit teardown.** `main` returning ends the process, which kills all
-remaining threads — the immortal tail and interface loops, parked handler
-threads, and any in-flight extraction. That is safe by construction: the capturing-dir reset
-at startup reclaims any stranded staged file, and `out_dir` only ever holds
-complete clips. There is no explicit runtime teardown step.
+**Process-exit teardown.** There is no runtime teardown step: ending the process
+kills all remaining threads — the immortal tail and interface loops, parked
+handler threads, and any in-flight extraction — and that is safe by
+construction: a killed cut leaves a clip directory with no `clip_metadata.yaml`
+in it, which is incomplete by definition, so no consumer reads it as a clip and a
+later trigger with that id skips it rather than overwriting the evidence.
+
+**Which is why `main` does not end the process by returning** — it is `-> ()`,
+and every door out goes through `end_process` (`src/main.rs`, which carries the
+whole argument). The failure signature it exists against: a returning `main`
+ends the process through `exit(3)`, whose static destructors tear the ROS
+middleware down underneath an interface thread still spinning a node inside
+`rcl`, so the recorder prints its fault and *then* dies of **SIGSEGV — status
+139**, with a core dump per fault. `std::process::exit` takes the same path and
+is no fix. A signal death out of a supervised process is worse than a wrong
+number: it is indistinguishable from the supervisor's own kill.
+
+Two things to keep true here. The statuses are clipper's own, so a main-thread
+**panic is caught** (`catch_unwind` in `main`) rather than unwound out of the
+process, since unwinding reaches that same teardown; `Verdict` and `CONFIG_EXIT_CODE`
+are where the four are decided, and [the operating
+guide](../../docs/operating.md) is where they are tabulated for operators. And
+`tests/e2e.rs` asserts exit *codes* — never `!success()`, which a signal death
+satisfies too.
 
 ## Integration tests (`tests/e2e.rs`)
 
-The inline `#[cfg(test)]` suites cover the tail/clip/supervise logic against
-synthetic MCAP files; `tests/e2e.rs` covers the contract against the real
-stack — a live `ros2 bag record` matching the production `scripts/record.sh`
-invocation (the harness builds the command directly), triggers published with
-the ros2 CLI, and
+The inline `#[cfg(test)]` suites span all three crates. `clip`'s cover the
+index, the cut and the segment assembly; `tail`'s cover the discovery iterator,
+the tail loop and its fault budget, the coverage watch and the two waits — both
+against synthetic MCAP files written by `clip::testing`, which `tail` pulls in
+through clip's `test-support` feature as a dev-dependency so no fixture drifts
+from what the scan expects. `clipper`'s are largely pure functions and thread
+choreography — the config parser, the four anchor cells, the admission gate and
+`supervise`'s three arms. What is not is anything that is a fact about `out_dir`
+rather than about a value, since only writing a clip into one can assert it:
+`interface.rs`'s observer test drives a real cut through the `mcap` interface's
+`NullAnnouncer` over an empty window, which costs the staging pool and a temp
+tree but still no recording. `tests/e2e.rs` covers the contract
+against the real stack — a live `ros2 bag record` matching the production
+`scripts/record.sh` invocation (the harness builds the command directly),
+triggers published with the ros2 CLI, and
 `Recorded` asserted via `ros2 topic echo`. How to run it (gating, the
-cargo-nextest prerequisite, the exact command) is in the
-[README](../../README.md#integration-tests-live-ros2-e2e); this section is the
-rationale.
+cargo-nextest prerequisite, the exact command) is in the **`build`** skill
+([`.claude/skills/build/SKILL.md`](../../.claude/skills/build/SKILL.md#live-ros-2-e2e-suite));
+this section is the rationale.
 
 - **Everything is a child process; the test owns no ROS node.** The ros2 CLI
   resolves `momentedge_msgs` types from `AMENT_PREFIX_PATH`, so the test
   binary needs no r2r dependency and carries no process-global DDS state.
-  The binary under test is located via `CARGO_BIN_EXE_clipper`.
+  The binary under test is located via `CARGO_BIN_EXE_clipper`, spawned with
+  `tail` as its one command-line argument (everything else is `MOMENTEDGE_*`
+  env), and every spawn blocks until its `clipper tail up` startup line
+  appears.
 - **nextest is the required runner, not launch_testing**: process-per-test
   isolation, per-test slow-timeouts, leak detection for orphaned children,
   and the `ros-e2e` test group (`.config/nextest.toml`) serializing the suite
@@ -579,13 +533,137 @@ rationale.
   methods rather than fixture-on-fixture injection — rstest resolves a
   fixture fresh at each injection site, so fixtures sharing a `domain`
   dependency would each get a different domain.
+- **The two halves of the suite record under different storage profiles, and
+  have to.** A live scenario records the unchunked `fastwrite` profile, which is
+  what the tail is built to read while it grows. `clipper clip` plans its window
+  out of the *finished* recording's own summary, so it needs the chunked,
+  message-indexed shape and refuses an unchunked recording by name
+  (`clip::whole::IndexRefusal::Unchunked`, *"summary indexes no chunk"*) — a
+  `fastwrite` recording is exactly what the cutter cannot take. So every
+  `clipper clip` fixture records under `CUTTABLE_PRESET`, which is where that
+  value lives and why. Reaching for `fastwrite` in a new `clipper clip` scenario
+  out of habit fails as a refusal rather than as a wrong assertion, which is the
+  suite being right about the contract rather than a fixture being awkward.
+- **A window a test can name is what makes an exact `out_dir` assertion
+  possible.** Under `clipper clip --trigger-source param` and `clipper tail
+  --trigger-source ros --time-source publish` the anchor is a value the *caller*
+  supplies, so `harness::clip_id_of` computes a clip's directory name before the
+  run creates it. That is what lets a scenario say exactly what `out_dir` must
+  hold, plant crash residue under an id a trigger is about to claim, and express
+  "the same trigger again" at all. Under the deployed `ros` + `log` default the
+  anchor is clipper's own subscription instant, so two publishes of one request
+  resolve to two ids and two clips — correct, and the reason every skip and
+  resume scenario lives on the other two paths. A skip scenario written against
+  `ros` + `log` cannot work, and it fails looking like a clipper bug rather than
+  a test one.
+- **Catching a cut in the act takes one of two levers.** For `clipper clip`,
+  volume: `TestEnv::start_bulk_source` publishes about 2 MB/s (`BULK_RATE` 50 Hz
+  × `BULK_PAYLOAD` 40 kB), so a window's copy outlasts the 2 ms poll watching for
+  its directory by orders of magnitude. For a live handler, the postroll: a
+  handler claims its directory when its window *closes*, so a window closing
+  seconds from now puts the claim at an instant the test is already watching for.
+  Both buy a wide margin rather than a race, which is why a kill that lands after
+  the document is written fails saying the cut outran the watcher — a slow
+  machine, not a semantics regression.
+- **`assert_out_dir_holds_only_clips` tests the shape of every entry**, not
+  merely that it is a directory: each must also be *named by a clip id*
+  (`harness::is_clip_id` — the anchor, an underscore, four lower-case hex groups
+  of four). "Is a directory" alone is too weak a test, because a staging area is
+  a directory too and would pass it. Completeness is deliberately not asserted
+  there: a directory with no document is how a consumer tells crash residue from
+  a clip, so the helper has to tolerate one.
+- **Permission injection needs an ordinary user, and says so out loud.**
+  `harness::assert_permissions_bite` probes that an `r-x` directory really
+  refuses a `mkdir` before a scenario leans on it, and **fails** rather than
+  skips when it does not: uid 0 bypasses the mode bits these scenarios inject
+  their fault with, so the `mkdir` succeeds and the fault under test never
+  happens. A run that passes having injected nothing is worse than a red one, and
+  the known way to reach it is `act`, which runs the workflow in a container as
+  root. CI's `recorder` job is a plain GitHub runner, so it holds there.
+- **The `ROS_DOMAIN_ID` band is 1–101, and its width is load-bearing.**
+  `harness::unique_domain` is `1 + (pid + counter) % 101`: nextest gives each
+  test its own process, so the pid separates test processes and the counter
+  separates tests within one. Consecutive test processes get pids a handful
+  apart, so a band narrow enough for that modulus to wrap inside that distance
+  hands the same domain to tests running back to back — and a child outliving its
+  test by a moment then publishes into the next test's graph, which reads as an
+  announcement that test never triggered. A hundred domains puts the wrap far
+  beyond any run's pid spread. 1 keeps clear of the host's domain 0; 101 is the
+  top of the range whose DDS ports fit the default port plan.
+- **What it costs: 46 cases, about nine to ten minutes per distro leg in CI.**
+  The suite is serialized, so that is wall clock rather than load, and a dev box
+  doing anything else takes longer. Most of it is the live scenarios sleeping out
+  real trigger windows; the `clipper clip` cases are the cheap ones (0.3 s to
+  13 s) because they wait for nothing — no postroll, no coverage. Budget a case's
+  runtime before adding one: a live scenario costs whatever window it asks for,
+  and a `clipper clip` scenario over a fixture costs almost nothing.
 - **Determinism over realism, except where realism is the point.** The
   chunked-profile case stops the recorder cleanly so the footer (`ended`)
-  releases the coverage wait instead of racing a chunk flush; the offline
-  corruption test plants a framing fault at a known record boundary of a
-  closed file. Only `corrupt_tail_health_live` races the scan by design (the
-  closest test to real corruption) and is the one case with extra nextest
-  retries.
+  releases the coverage wait instead of racing a chunk flush; every corruption
+  case places its damage against the recording's own record framing
+  (`harness::message_records`) rather than at an arithmetic offset, because
+  *where* a run of bytes lands decides *which* fault it is, and a test that
+  leaves that to chance is asking for a different answer each run.
+- **Damage has two classes and the suite keeps them apart.** A run of bytes
+  inside a message's payload leaves the framing, the channel and both stamps
+  intact: the scan is indifferent to it and the copy carries it into the clip
+  unexamined (`corrupt_tail_payload_damage_live`). A run across a record's
+  framing header is a length no record can have: ahead of the scan it is the
+  fatal [scan fault](../tail/CLAUDE.md#the-scan-fault-budget) the offline case
+  plants in a closed file (`corrupt_tail_fails_fast_offline`); behind the scan
+  the tail never sees it and the *copy* meets it instead, refusing every clip
+  whose plan includes that extent (`corrupt_tail_framing_damage_live`). Extents
+  close at 4 MiB, so that refusal reaches windows over data recorded long after
+  the damage, for as long as the recording lives — the recorder stays up and
+  names the fault per trigger, and no clip is published. Which of the two a
+  framing run causes turns on whether the scan has passed it, so the live case
+  cuts a clip first and damages a record that clip proves was already indexed.
+- **The window's anchor is clipper's clock, not the harness's.** Under the
+  default `ros` interface on `log`, the anchor is the recorder's own
+  subscription instant, and it trails the harness's `ros2 topic pub` by a second
+  or more — a python CLI startup plus DDS discovery, unbounded and growing with
+  machine load. So window assertions read the anchor back out of the announced
+  clip's name (`announced_window`) rather than off a captured `now()`; and a
+  test that needs data *inside* its window keeps the source publishing across
+  the trigger rather than going quiet first and hoping the preroll outruns the
+  CLI. `quiet_topics_grace_timeout_cut` stops its source only once the trigger
+  is in, and `recorder_killed_mid_trigger_still_announces_via_grace_cut` kills
+  the recorder inside the postroll, for exactly that reason: a window anchored
+  past the last recorded message holds nothing, and the recorder's correct,
+  documented empty clip is indistinguishable at the assertion from a lost one.
+  Where the quiet must come first — `recording_deleted_without_restart_grace_cuts_the_old_data`'s
+  pre-trigger case, whose whole point is a trigger arriving against an
+  already-frozen tail — the preroll is sized to span the harness's own latency
+  and says so. The data a preroll must cover is established with
+  `TestEnv::wait_for_recording_span`, which blocks on the recording's own
+  `log_time` extent; a fixed sleep cannot promise it, because the ros2 CLI
+  source starts publishing an unbounded moment after it is spawned.
+  **The asymmetry in that latency is what lets one test wait on purpose.** It
+  only ever pushes the anchor *later*, so it can only take data off the front of
+  a window: a test needing data inside its window cannot absorb it, while a test
+  needing the window *empty* is made more right by it, however long it lasts.
+  `window_past_the_last_recorded_message_cuts_an_empty_clip` is that test, and it
+  waits with `TestEnv::wait_for_recording_quiet` — the mirror of the span wait,
+  blocking until the recording's latest `log_time` is further in the past than
+  the preroll. Both read the recording's own stamps rather than counting wall
+  clock off a CLI: neither the ros2 source's startup nor a dying source's last
+  message is bounded, and the gap that decides either window is between the
+  recorder's clock and the window, not the harness's.
+- **An empty clip that is correct is asserted to be correct.** A window lying
+  entirely past the last recorded message is a documented outcome: no recording
+  overlaps it, the grace expires on coverage that can never arrive, and one empty
+  `<id>_0.mcap` is written, completed and announced.
+  `window_past_the_last_recorded_message_cuts_an_empty_clip` reaches that path
+  deliberately (the wait above), because on disk such a clip is
+  indistinguishable from one that lost its data. What tells them apart is the
+  clip's document — `window.files_planned = 0` with `clip.short = true`, as
+  against the gap-between-splits empty and the nothing-matched empty ([the three
+  kinds](../../docs/clip-manifest.md)) — so the document is what the test asserts
+  on, with the extractor's `0 msgs from 0 extents` as the corroborating log: a
+  coverage shortfall plans one extent and copies fewer messages out of it, and so
+  can never print that line. The recording is checked to hold data before the
+  window start too, so the clip is empty because the window misses it rather than
+  because nothing was recorded at all.
 - **Restart and deletion scenarios are exercised live** against a real
   `ros2 bag record`: restarts inside an open trigger window (clean restart,
   deletion-then-restart, deletion before the trigger), deletion without a
@@ -593,11 +671,15 @@ rationale.
   ends (producing a valid empty clip), and the no-recovery guarantee — a file
   still on disk after replacement contributes nothing to any subsequent clip.
 - **The MCAP interface is exercised end to end** (`mcap_interface_*`): clipper
-  runs `--interface mcap`, fully ROS-free, against a `ros2 bag record --all`
-  that captures a ROS-published trigger into the bag. clipper lifts that trigger
-  back out of the recording it tails, cuts the clip, and signals completion by
-  the file's appearance in `out_dir` — there is no `Recorded` topic to echo, so
-  the assertion is on the clipped file rather than a published message.
+  runs on the `mcap` trigger source (the harness sets `MOMENTEDGE_TRIGGER_SOURCE`,
+  since `tail` is the binary's only command-line argument there), fully ROS-free,
+  against a `ros2 bag record --all` that captures a ROS-published trigger into the
+  bag. clipper lifts that trigger back out of the recording it tails, cuts the
+  clip, and signals completion by the clip's `clip_metadata.yaml` appearing in
+  `out_dir` — there is no `Recorded` topic to echo, so the harness plays the
+  observer instead: `wait_for_clip_named` polls the output directory and accepts
+  an entry only once `clip::layout::read_document` answers for it, which is the
+  same rule a consumer follows and never a file turning up.
 - **Capture-time windowing is proved against a live momentedge writer**
   (`live_writer_capture_time_windowing`, ROS-free at runtime): clipper tails a
   recording while `examples/custom-mcap-writer` appends it, with every
@@ -605,77 +687,174 @@ rationale.
   the clip's every message is in-window on the *selected* stamp while at least
   one message is out-of-window on the *contrasting* stamp — jointly impossible
   unless the two clock domains genuinely select different message sets. The
-  writer binary is resolved beside `CARGO_BIN_EXE_clipper` (built on demand if
-  absent), so the case needs no extra build step.
+  writer binary is resolved beside `CARGO_BIN_EXE_clipper` (built on
+  demand if absent), so the case needs no extra build step.
 - **A copper (cu29) Producer reaches clipper end to end**
   (`copper_sink_recording_produces_clip`, ROS-free at runtime): the
   `examples/cu-mcap-record` binary — a copper `CuSinkTask` — appends an
-  unchunked, epoch-stamped Recording while clipper tails it `--interface mcap`,
-  writing its own in-Recording `json` `Trigger`; clipper lifts that trigger back
-  out and cuts the clip, proving a copper-rs robot with no ROS surface reaches
+  unchunked, epoch-stamped Recording while clipper tails it on the `mcap` trigger
+  source, writing its own in-Recording `json` `Trigger`; clipper lifts that trigger
+  back out and cuts the clip, proving a copper-rs robot with no ROS surface reaches
   clipper through the Recording alone. The Producer (a workspace member whose
   cu29 deps stay crate-local) is resolved by `cu_mcap_record_bin` beside the
   clipper binary — `CU_MCAP_RECORD_BIN`, else built on demand with `-p
   cu-mcap-record`; CI's matrix `Build` step prebuilds it so the on-demand build
   stays inside the test timeout.
 
-## Retention
-
-The tail prunes `Ended` recordings every poll (not only at rollover). A
-recording is pruned when its max `log_time` (`bounds.log.max`) is older than
-`now - watch_old_files_duration` (default 600 s, env
-`MOMENTEDGE_WATCH_OLD_FILES_DURATION`). Retention always ages on `log_time`,
-whatever the window's [time source](#time-source): a producer must not be able to
-keep a file alive — or force its deletion — through what it writes into
-`publish_time`. Pruning is file-granular — never the `current` recording, never
-mid-file. Dropping a `RecordingIndex` releases its `Arc<File>`, closing the
-descriptor once no in-flight plan still holds a clone. Running the prune every
-poll (rather than only at rollover) is what bounds open fds and index memory when
-the recorder stops splitting or goes idle.
-
-`high_water_ns` (the `log` coverage) is monotonic across prunes: a pruned file is
-below the watch floor and never held the collection maximum, so dropping it never
-lowers the high-water. Handlers never see `log` coverage regress. The `publish`
-high-water is not tied to the retention floor, but the watch only ever raises it,
-so a handler waiting on it never sees it regress either.
-
-By default pruning forgets a recording in-memory only; the `.mcap` file remains
-on disk for `ros2 bag record` and other consumers. When `--delete-old-files` is
-set (env `MOMENTEDGE_DELETE_OLD_FILES`, default false), a prune also unlinks the
-expired file from disk. An in-flight extraction's own `Arc<File>` clone keeps
-the unlinked inode readable to completion (POSIX unlink-while-open), so deletion
-never breaks a clip already in progress.
-
-**Prune vs in-flight trigger:** `watch_old_files_duration` must be set
-comfortably above the largest preroll any trigger will request. A trigger whose
-preroll reaches past the retention floor may lose its oldest segment — that
-recording was intentionally forgotten. See the [README](../../README.md#configuration)
-for the flag reference.
-
 ## Run
 
 ```bash
-nix develop --command cargo run -p clipper
+nix develop --command cargo run -p clipper -- tail
 ```
 
 Needs `scripts/record.sh` running (for `./record`) and a
-trigger publisher (`trigger-pub`). `RUST_LOG=debug` raises verbosity.
+trigger publisher (`trigger-pub`). Logs go to stdout (`main` says why);
+`RUST_LOG=debug` raises verbosity. Where the ROS layer's own diagnostics land
+is in the [Operating clipper](../../docs/operating.md).
+
+The other mode needs neither, and no ROS toolchain either — it takes a finished
+recording and exits:
+
+```bash
+cargo run -p clipper -- clip ./record/rosbag2_0.mcap \
+  --out-dir ./clipped --trigger-time 1738000000000000000 \
+  --preroll 5000000000 --postroll 5000000000
+```
 
 ## Configuration
 
-`Config` is a clap `derive(Parser)`: every field is a CLI flag with a
-`MOMENTEDGE_*` environment fallback and a per-field default, so precedence is
-CLI flag > env var > default. `load_config` in `main.rs` parses it — clap prints
-`--help`/`--version` and any parse error and exits before it returns, so the
-binary still runs with no setup. The `MOMENTEDGE_*` env names are not wired
-per field: `with_env_prefix` walks every argument with `Command::mut_args` and
-binds `<field>` to `MOMENTEDGE_<FIELD>` (`grace_secs` → `MOMENTEDGE_GRACE_SECS`),
-leaving the auto-generated `--help`/`--version` untouched. Changing the prefix is
-the one `ENV_PREFIX` constant. clap's `env` feature provides the per-arg env
-fallback and `string` lets the runtime-built env names be set on the args. The
-flags, env vars, and defaults are tabulated in the
-[README](../../README.md#configuration).
+**One binary, and the mode is a subcommand.** `Cli` is the clap
+`derive(Parser)` and carries a single field, the `Mode` enum — `Tail(Config)`
+for the recorder, `Clip(ClipConfig)` for the one-shot cutter; `main`'s `match`
+over that enum is the dispatch table, so a mode added to the enum is a compile
+error until it has a body to run. Every flag belongs to a mode rather than to
+`clipper` itself: `clipper --help` lists the modes, `clipper tail --help` lists
+the recorder's flags, and a bare `clipper --record-dir …` is a parse error. What makes naming no mode an error
+rather than a run with defaults is `Cli`'s `mode` field being a plain `Mode`
+and not an `Option`: clap's derive requires the subcommand and answers a bare
+`clipper` with the mode listing and a non-zero exit, so
+`subcommand_required`/`arg_required_else_help` would add nothing.
+`mode_hint` maps the error kinds that mean the
+mode went unnamed — an unknown argument, an unknown or missing subcommand — to
+the line `load_cli` prints after clap's own text, so the message names
+`clipper tail`; a failure *inside* a mode (a bad `--time-source` value) gets no
+hint, because the caller already said which mode they wanted. `main.rs`'s
+`a_bare_recorder_flag_is_rejected_and_points_at_the_tail_mode` and
+`tail_help_lists_the_recorder_flags_and_no_modes` hold that shape down.
 
-The interface seam is one such flag: `--interface {ros|mcap}` (env
-`MOMENTEDGE_INTERFACE`, default `ros`), a clap `ValueEnum` over `InterfaceKind`
-that picks the active [interface](#the-two-interfaces) at startup.
+`Config` is the recorder mode's `derive(Args)` and `ClipConfig` the cutter's:
+every field is a CLI flag (or, for the cutter's recording, the positional) with a
+`MOMENTEDGE_*` environment fallback, and every one but `trigger_source` also has
+a `[settings]` key in the configuration file, so precedence is CLI flag > env var
+> per-run file > system file > default
+where there is one ([the four layers](#the-four-configuration-layers) below). `Config`'s fields all have defaults, so
+`clipper tail` runs bare; `ClipConfig`'s window arguments deliberately do not —
+which moment a clip is about is the one thing only the caller knows, so omitting
+`--trigger-time` is a parse error naming the flag rather than a clip about some
+arbitrary instant. `load_cli` in `main.rs` parses it — clap prints
+`--help`/`--version` and any parse error and the process exits before it
+returns, so `clipper tail` still runs with no further setup. The `MOMENTEDGE_*`
+env names are not wired per field: `with_env_prefix` walks every subcommand with
+`Command::mut_subcommand` and each of its arguments with `Command::mut_args`,
+binding `<field>` to `MOMENTEDGE_<FIELD>` (`grace_secs` →
+`MOMENTEDGE_GRACE_SECS`) and leaving the auto-generated `--help`/`--version`
+untouched — so a mode added later inherits the same env fallback with no new
+wiring. Changing the prefix is the one `ENV_PREFIX` constant. clap's `env`
+feature provides the per-arg env fallback and `string` lets the runtime-built
+env names be set on the args. The flags, env vars, and defaults are tabulated in
+the [Configuration](../../docs/configuration.md).
+
+`--trigger-source` is one such flag, and the one whose surface differs per
+subcommand: `clipper tail` takes `{ros|mcap}` and defaults to `ros`,
+`clipper clip` takes `{mcap|param}` and defaults to `param`, both under the one
+env name `MOMENTEDGE_TRIGGER_SOURCE`. Each argument is narrowed to its
+subcommand's subset by `trigger_source_parser`, so the two surfaces stay one fact
+about `TriggerSource` rather than two literals. Under `tail` the value picks the
+active [interface](#the-two-interfaces) at startup; under `clip` there is no
+completion half to pick, so it names the input alone.
+
+**It is also the one flag with no `[settings]` key**, under either subcommand.
+Why is [`clip`'s to state](../clip/CLAUDE.md#the-configuration-file-clipconfig),
+beside the table it is absent from. What that buys *here* is a device's system
+file staying readable by `clipper clip`, whose `--trigger-source` takes neither
+of the recorder's values: a file naming `trigger_source` fails the run the way
+any unknown key does, so a file describing the recorder has nothing in it the
+cutter must accept. `every_mode_argument_is_a_settings_key_and_back` is where
+both reasons for a flag to be no key are written down, one variant each, so an
+argument added without a key has to say which it is; `effective_config` keeps a
+shorter list of its own, because `trigger_source` is a setting the run uses and
+belongs in `--print-config` even though no file may name it.
+
+The layer a shared name can still be set through is the environment:
+`MOMENTEDGE_TRIGGER_SOURCE` is one word bound to both subcommands, whose value
+sets differ, so `ros` exported machine-wide reaches `clipper clip` and stops it.
+`an_argument_both_subcommands_share_accepts_the_same_values_in_both` is the
+guard, over *arguments* rather than keys for exactly that reason, with
+`VALUE_SETS_MAY_DIVERGE` naming the one excused argument and why — and failing
+too when an excuse stops being needed.
+
+### The four configuration layers
+
+A setting resolves through four layers over its built-in default: the **system**
+configuration file (`/etc/momentedge/clipper.toml`), the **per-run** file, the
+`MOMENTEDGE_*` **environment** variable, and the **flag**. `clip::config` owns
+the bottom two and `clap` the top two, and the join between them is one line in
+`with_file_defaults`: what the files resolved for a key becomes that argument's
+`default_value`. clap already resolves a flag over an environment variable over a
+default, so handing it the files' value *as* the default puts all four in order
+with no per-key wiring — and makes a file's value pass exactly the value parser a
+flag's value passes, so a file cannot smuggle in a value the command line would
+have refused. `required` is cleared with the same stroke, since clap's required
+check does not count a default as an answer: a configuration file that names
+`recording`, `--out-dir` and the window is a complete `clipper clip` invocation.
+
+The files have to be read *before* the parser exists, so they are found by scans
+rather than by a parse. `scan_mode` reads the mode out of `argv[1]`, since which
+keys a file may carry is the mode's; `config_paths` scans argv for `--config` and
+`--system-config` (either spelling, on bytes, stopping at `--`) and falls back to
+the environment variable clap would have read for the same flag. Reading one word
+for the mode is sound because nothing can stand between `clipper` and its
+subcommand: `Cli` declares no argument of its own, clap's generated `--help` and
+`--version` take no value, and the three configuration flags go on the
+subcommands. A command line that names no mode there names none at all, has no
+key set, and so reads no file — `parse_cli` builds the parser on its built-in
+defaults and lets clap report it. Those two flags and `--print-config` are also declared as real
+arguments, injected onto every subcommand by `with_config_args` rather than
+declared as fields of `Config`/`ClipConfig` — so `--help` lists them, an unknown
+spelling is refused the ordinary way, and neither mode's struct grows a field it
+never reads. None of the three is a `[settings]` key, so no file can name another
+file.
+
+`clip::config::SETTINGS` is the key table, keyed by subcommand, and it carries
+the one thing no argument definition can: whether a **per-run** file may set the
+key at all. A key naming the machine or the resources it may spend there is the
+system file's alone, and a per-run file setting one is reported by name with the
+system value left standing (`Layered::refusals`). `scope_of` takes the mode, so
+one key name may carry a different scope under each subcommand — a capability no
+shipped key exercises, since the only name both subcommands share, `out_dir`, is
+`Any` under each; `config.rs`'s
+`one_name_can_carry_a_different_scope_under_each_mode` states it over a table
+built for the purpose rather than pretending `SETTINGS` has such a pair. The mode
+governs the scope and nothing else. The key set stays every subcommand's
+(`is_setting_key`), so one file serves both: a key this mode does not have is
+inert, carried through to match no argument, and only a key no mode has fails
+the run. `MODES` is where clap's names for the two subcommands are tied to the
+`clip::config::Mode` whose rows they read, and `main.rs`'s
+`every_mode_argument_is_a_settings_key_and_back` keeps the tie honest in both
+directions: every argument of a mode is a key of *that* mode, and every key of a
+mode is an argument of it.
+
+`--print-config` prints `effective_config` and exits; the same text goes to the
+log at startup, so a run's log states the configuration it ran with. It is built
+from the **parsed** `ArgMatches` — the same matches the mode's struct is built
+from — so it cannot report a value the run does not use; clap's `ValueSource`
+separates the flag and environment layers, and everything it calls a default is a
+file's value where `Layered` says a file named the key. The keys come off the
+`Command` rather than out of `ArgMatches::ids`, which also yields the argument
+group clap's derive names after the config struct.
+
+The `[topics]` half of the same files becomes the `clip::select::ChannelSelection`
+both modes hand to their staging pool — see
+[the copy](../clip/CLAUDE.md#the-copy-is-direct-clipcut). The schema, the layering rule and the
+per-key scope are documented in the
+[Configuration](../../docs/configuration.md#the-configuration-file).
