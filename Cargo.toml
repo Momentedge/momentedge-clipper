@@ -31,6 +31,13 @@ members = [
     # the cu29 tree scoped to this one member.
     "examples/cu-mcap-record",
 ]
+# What a bare `cargo build` / `cargo test` from the root selects: the two
+# libraries and the recorder, on their default features — so the ROS-free build,
+# since `clipper`'s `ros` feature is off by default. The examples are built by
+# name (`-p <example>`), which is what CI does; keeping them out spares a bare
+# build r2r (trigger-pub) and the cu29 tree that makes nightly rustc abort
+# (beads clipper-fgs). `--workspace` still selects every member.
+default-members = ["crates/clip", "crates/tail", "crates/clipper"]
 
 [workspace.package]
 version = "0.2.0"

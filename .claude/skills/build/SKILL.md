@@ -31,6 +31,16 @@ The dev shell is what a build that links ROS needs. `crates/clip`,
 `crates/tail`, and the recorder's own default build need neither it nor nix
 (below).
 
+**A bare `cargo build` / `cargo test` is the ROS-free build of the three
+crates and nothing else.** The root `Cargo.toml` sets `default-members` to
+`clip`, `tail` and `clipper`, and every `ros` feature is off by default, so no
+r2r and no example is compiled unless asked for. The examples are built by name
+(`-p trigger-pub`, `just test-examples`) and CI builds all four: the three
+ROS-free producers in the `cu-mcap-record` job, `trigger-pub` in the distro
+matrix. Keeping `cu-mcap-record` out of the default set is also what keeps a
+bare build off the nightly rustc ICE its cu29 tree hits (beads `clipper-fgs`);
+`--workspace` still selects it.
+
 - **Coverage** is `cargo-llvm-cov`, also from the system, not the flake. The
   system toolchain ships the `llvm-tools` component, so `cargo-llvm-cov` finds
   `llvm-cov`/`llvm-profdata` through the rustc sysroot, version-matched to

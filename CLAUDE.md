@@ -118,8 +118,11 @@ than for shipping. `examples/cu-mcap-record` keeps every copper dependency it
 takes declared in its own `Cargo.toml` rather than in
 `[workspace.dependencies]`, so the heavy cu29 tree stays scoped to that one
 member; it still lives in the shared root lockfile, and a lean ROS-free CI job
-builds and tests it with `-p cu-mcap-record`. `momentedge_msgs/` (ROS2 interface
-package) and `sim/` (the sim camera's launch/config tree) are not Cargo members.
+builds and tests it with `-p cu-mcap-record`. `default-members` is the three
+crates alone, so a bare `cargo build` from the root is the ROS-free build of
+`clip`, `tail` and `clipper` and compiles no example; the examples build by
+name, and CI builds every one. `momentedge_msgs/` (ROS2 interface package) and
+`sim/` (the sim camera's launch/config tree) are not Cargo members.
 
 `crates/clip` and `crates/tail` are the libraries under the recorder, and
 neither needs a ROS toolchain anywhere. `clip` is what every consumer of a

@@ -14,7 +14,8 @@
 # Scope: the recorder's device build (`--features clipper/ros`) on every distro,
 # plus two lean ROS-free lanes on a plain toolchain — the `clip` and `tail`
 # libraries together with the recorder's own default (ROS-free) build, and the
-# `cu-mcap-record` copper example (trigger-pub is not in CI).
+# ROS-free example producers (`cu-mcap-record`, `custom-mcap-writer`,
+# `chunked-mcap-writer`); `trigger-pub` builds in the ROS matrix.
 # Distros: humble, jazzy, lyrical — the three the Rust crates build under
 # (rolling cannot build r2r 0.9.6; see the `build` skill, "r2r / IDL build model
 # and distro support"). The e2e step below runs the full suite on every leg under
@@ -66,9 +67,12 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
-  # Lean ROS-free lane for the copper example: a fast signal that the
-  # cu-mcap-record member builds, clippies, and tests without the ROS toolchain.
-  # It is a workspace member, but its cu29 deps are crate-local (not in
+  # Lean ROS-free lane for the example producers: a fast signal that the
+  # cu-mcap-record, custom-mcap-writer and chunked-mcap-writer members build,
+  # clippy, and test without the ROS toolchain. A bare `cargo build` selects no
+  # example (`default-members`), so this lane and the ROS matrix are where they
+  # are built at all.
+  # cu-mcap-record is a workspace member, but its cu29 deps are crate-local (not in
   # [workspace.dependencies]), so nothing in the ROS lanes compiles cu29 unless
   # it asks for `-p cu-mcap-record` — which the recorder matrix does, once, to
   # prebuild the live-e2e Producer fixture. This job runs from the repo root with
@@ -125,10 +129,10 @@ jobs:
           shared-key: cu-mcap-record
 
       - name: Clippy
-        run: cargo clippy --locked --all-targets -p cu-mcap-record
+        run: cargo clippy --locked --all-targets -p cu-mcap-record -p custom-mcap-writer -p chunked-mcap-writer
 
       - name: Test
-        run: cargo test --locked -p cu-mcap-record
+        run: cargo test --locked -p cu-mcap-record -p custom-mcap-writer -p chunked-mcap-writer
 
   # ROS-free lane for the two library crates. The whole reason the MCAP format
   # layer, the recording index, the cut path and the tail live outside the
@@ -334,8 +338,9 @@ jobs:
       - name: Realise the ROS2 dev shell
         run: nix develop ".#${{ matrix.distro }}" --command true
 
-      # Build the clipper binary, the custom-mcap-writer example producer, and
-      # the cu-mcap-record copper example. The copper binary is the live copper
+      # Build the clipper binary, the custom-mcap-writer example producer, the
+      # trigger-pub example trigger source (it links r2r, so this is its only
+      # lane), and the cu-mcap-record copper example. The copper binary is the live copper
       # e2e's Producer fixture (`copper_sink_recording_produces_clip`);
       # prebuilding it here (its own `-p` target now that it is a member) keeps
       # the cu29 compile out of the test's own timeout — the e2e's on-demand
@@ -347,7 +352,7 @@ jobs:
       # lane that has the ROS toolchain to build it with. The package-qualified
       # spelling is required because more than one package is selected.
       - name: Build
-        run: nix develop ".#${{ matrix.distro }}" --command cargo build --locked --features clipper/ros -p clipper -p custom-mcap-writer -p cu-mcap-record
+        run: nix develop ".#${{ matrix.distro }}" --command cargo build --locked --features clipper/ros -p clipper -p custom-mcap-writer -p cu-mcap-record -p trigger-pub
 
       # The libraries are selected alongside the recorder so their feature-gated
       # tests actually run somewhere. `clip`'s `cdr_round_trips_through_r2r` needs
