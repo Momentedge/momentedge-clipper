@@ -302,8 +302,8 @@ impl Layered {
         .into_iter()
         .flatten()
         .collect();
-        let system_topics = system_file.map(|f| f.topics).unwrap_or_default();
-        let run_topics = run_file.map(|f| f.topics).unwrap_or_default();
+        let system_topics = system_file.map_or_default(|f| f.topics);
+        let run_topics = run_file.map_or_default(|f| f.topics);
         let (spec, topics) = merge_topics(&system_topics, &run_topics);
         let selection = ChannelSelection::try_from(spec)
             .with_context(|| format!("in the [topics] table of {}", read.join(" and ")))?;

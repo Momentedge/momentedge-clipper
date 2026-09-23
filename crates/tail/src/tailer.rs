@@ -775,9 +775,7 @@ impl Tailer {
                 // resolves against a channel defined in an earlier pass. Both
                 // stay empty/idle when the tap is disabled.
                 tap: self.tap.clone(),
-                trigger_channels: current
-                    .map(|r| r.index.trigger_channels.clone())
-                    .unwrap_or_default(),
+                trigger_channels: current.map_or_default(|r| r.index.trigger_channels.clone()),
             }
         };
         let (delta, progress) = index::scan_available(file, offset, file_len, seed);

@@ -1099,15 +1099,12 @@ fn effective_config(
         .collect();
     keys.sort_unstable();
     for key in keys {
-        let value = matches
-            .get_raw(key)
-            .map(|values| {
-                values
-                    .map(|v| v.to_string_lossy().into_owned())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            })
-            .unwrap_or_default();
+        let value = matches.get_raw(key).map_or_default(|values| {
+            values
+                .map(|v| v.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(", ")
+        });
         let layer = match matches.value_source(key) {
             Some(clap::parser::ValueSource::CommandLine) => Layer::Flag,
             Some(clap::parser::ValueSource::EnvVariable) => Layer::Env,
