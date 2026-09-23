@@ -55,7 +55,7 @@ clip:
 producer:
   name: clipper
   mode: tail
-  version: 0.1.3
+  version: 0.2.0
   url: https://github.com/Momentedge/momentedge-clipper
 trigger:
   name: brake-event
