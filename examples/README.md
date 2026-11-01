@@ -16,6 +16,11 @@ root is the minimal continuous setup; the guides expand on it.
 - [`trigger-pub/`](trigger-pub/README.md) — an example trigger source: a small
   r2r node that publishes `momentedge_msgs/Trigger` periodically, so you can
   exercise the recorder without a real trigger publisher.
+- [`ros2-pulse-trigger/`](ros2-pulse-trigger/README.md) — a real trigger
+  source: a small rclpy node that publishes `momentedge_msgs/Trigger` when a
+  [ros2_pulse](https://github.com/TanayK07/ros2_pulse) topic-rate diagnostic on
+  `/diagnostics` leaves `OK`, so a clip holds the seconds before a topic slowed
+  down or stopped.
 - [`custom-mcap-writer/`](custom-mcap-writer/README.md) — a minimal standalone
   program that writes an MCAP file directly with the `mcap` crate (no ROS): two
   JSON data channels (a typed struct and a raw JSON string) each carrying a
